@@ -26,10 +26,16 @@ pub enum Request {
     Invite,
     /// Join a room from a ticket and announce a join request.
     Join { ticket: String },
+    /// One-step onboarding: join a room from a ticket, auto-add the host as a
+    /// contact, and announce a join request (the host auto-approves).
+    Connect { ticket: String },
     /// Broadcast a chat line to the room.
     Send { text: String },
     /// Fetch chat/system events with seq greater than `since`.
     Log { since: u64 },
+    /// Block until an event with seq greater than `since` arrives (event-based
+    /// delivery), or until `timeout_ms` elapses. Returns whatever is available.
+    Wait { since: u64, timeout_ms: u64 },
     /// List known peers and their online/contact status.
     Who,
     /// List saved contacts.

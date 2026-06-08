@@ -38,31 +38,28 @@ State lives under `$GROUPCHAT_HOME` (or the platform config dir): `secret.key`,
 cargo build --release
 ```
 
-## Quickstart (two people)
+## Quickstart (two people) — one step each
 
 ```bash
 # --- you ---
-groupchat init --nick alice --room our-room
-groupchat invite                      # prints a ticket; send it to your coworker
+groupchat invite --nick alice         # prints a ticket; send it to your coworker
+                                      # (minting an invite auto-approves who joins with it)
 
-# --- coworker ---
-groupchat init --nick bob --room our-room
-groupchat join <TICKET>               # joins and says "add me to the chat"
-
-# --- you: approve them (the join request shows up in your log) ---
-groupchat log
-groupchat contacts add <bob-endpoint-id> bob
-
-# --- coworker: approve you back ---
-groupchat contacts add <alice-endpoint-id> alice
+# --- coworker (cold machine — no init needed) ---
+groupchat connect <TICKET> --nick bob # joins, auto-adds you as a contact, goes live
 
 # now chat, see presence, call, and share
 groupchat send "hey, want to pair?"
+groupchat wait                        # block until the next message lands (event-based)
 groupchat who                         # ● online  ○ offline, ✓contact
 groupchat call bob --message "jump on a call?"
 groupchat share ./design.pdf
 groupchat get design.pdf --out ./design.pdf
 ```
+
+After `invite` + `connect`, both sides are mutual contacts and live — no `init`,
+no manual approvals. (The longhand path — `init`, `join`, and explicit
+`contacts add` on each side — still works if you want to approve joiners by hand.)
 
 Contacts gate the calls: you can only call someone who is in your contacts and
 currently online, and inbound calls from non-contacts are refused.
@@ -74,10 +71,12 @@ currently online, and inbound calls from non-contacts are refused.
 | `init [--nick N] [--room R]` | Create identity + settings |
 | `id` | Print your endpoint id |
 | `status` | Node + room status |
-| `invite` | Print a room ticket to share |
-| `join <ticket>` | Join a room and request to be added |
+| `invite` | Print a room ticket to share (and auto-approve who joins with it) |
+| `join <ticket>` | Join a room and request to be added (manual approval path) |
+| `connect <ticket> [--nick N]` | **One step:** join + auto-add the host + go live (no `init` needed) |
 | `send <text...>` | Broadcast a chat message |
-| `log [--since N]` | Print chat/system events |
+| `log [--since N]` | Print chat/system events (returns immediately) |
+| `wait [--since N] [--timeout-ms M]` | **Block** until a new event arrives, then print it (event-based) |
 | `who` | List peers with online/contact status |
 | `contacts add <id> [nick]` / `list` / `remove <id>` | Manage contacts |
 | `call <who> [--message M]` | 1:1 call an online contact |
@@ -104,10 +103,15 @@ Register the MCP server with your agent. For Claude Code, add to `.mcp.json`:
 }
 ```
 
-Tools exposed: `my_id`, `invite_ticket`, `join_room`, `contacts_add`,
-`contacts_list`, `chat_send`, `chat_poll`, `who`, `call`, `share_resource`,
-`get_resource`, `resources`, `status`. The agent typically loops on `chat_poll`
-(passing back the `last` cursor) to follow the conversation.
+Tools exposed: `my_id`, `invite_ticket`, `join_room`, `connect`, `contacts_add`,
+`contacts_list`, `chat_send`, `chat_poll`, `chat_wait`, `who`, `call`,
+`share_resource`, `get_resource`, `resources`, `status`.
+
+The fast path for an agent: the host calls `invite_ticket`; the other side calls
+`connect` once (joins, auto-adds the host, goes live). To follow the
+conversation, loop on **`chat_wait`** (passing back the `last` cursor) — it
+blocks server-side and returns the instant a message arrives, so the agent is
+woken by events instead of busy-polling `chat_poll`.
 
 ## Running several nodes on one machine
 

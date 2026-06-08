@@ -5,7 +5,7 @@ use std::{
     collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -59,14 +59,23 @@ pub struct Peer {
     pub last_seen: Instant,
 }
 
-/// Append-only-ish ring buffer of chat/system events.
+/// Append-only-ish ring buffer of chat/system events. Holds a `Notify` that is
+/// fired on every push so blocking waiters (`Request::Wait`) wake the instant a
+/// new event lands — event-based delivery instead of poll loops.
 #[derive(Debug, Default)]
 pub struct EventLog {
     seq: u64,
     events: VecDeque<LogEvent>,
+    notify: Arc<Notify>,
 }
 
 impl EventLog {
+    /// A handle to the wake source, fired on every `push`. Cloneable and usable
+    /// without holding the log's mutex.
+    pub fn notify(&self) -> Arc<Notify> {
+        self.notify.clone()
+    }
+
     pub fn push(&mut self, kind: EventKind, id: String, nick: String, text: String) {
         self.seq += 1;
         self.events.push_back(LogEvent {
@@ -80,6 +89,8 @@ impl EventLog {
         while self.events.len() > 1000 {
             self.events.pop_front();
         }
+        // Wake everyone blocked in Request::Wait.
+        self.notify.notify_waiters();
     }
 
     pub fn since(&self, since: u64) -> (Vec<LogEvent>, u64) {
@@ -120,6 +131,9 @@ pub struct Node {
     shutdown: Arc<Notify>,
     /// Bumped on every (re)subscribe so stale receive loops exit.
     recv_gen: AtomicU64,
+    /// When set (after minting an invite), inbound join requests are auto-added
+    /// as contacts so onboarding is mutual and one-step.
+    auto_approve: AtomicBool,
 }
 
 impl Node {
@@ -150,6 +164,23 @@ impl Node {
             .unwrap_or_else(|| id.fmt_short().to_string())
     }
 
+    /// Add (or update) a contact, persist it, and log a system event. Returns
+    /// the nick used. Idempotent.
+    fn add_contact(&self, id: EndpointId, nick: String) -> Result<String> {
+        {
+            let mut c = self.shared.contacts.lock().unwrap();
+            c.add(id, nick.clone());
+            c.save(&self.home)?;
+        }
+        self.shared.events.lock().unwrap().push(
+            EventKind::System,
+            id.to_string(),
+            nick.clone(),
+            format!("added {nick} to contacts"),
+        );
+        Ok(nick)
+    }
+
     fn handle_payload(&self, from: EndpointId, payload: Payload) {
         match payload {
             Payload::Hello { nick } | Payload::Presence { nick } => {
@@ -166,18 +197,33 @@ impl Node {
             Payload::JoinRequest { nick } => {
                 let display = self.touch(from, Some(nick.clone()));
                 let already = self.shared.contacts.lock().unwrap().contains(&from);
-                let text = if already {
-                    format!("{display} (already a contact) joined the room")
+                if already {
+                    self.shared.events.lock().unwrap().push(
+                        EventKind::Join,
+                        from.to_string(),
+                        display.clone(),
+                        format!("{display} (already a contact) joined the room"),
+                    );
+                } else if self.auto_approve.load(Ordering::SeqCst) {
+                    // They joined via an invite we minted: auto-approve so the
+                    // contact link is mutual without a manual step.
+                    let _ = self.add_contact(from, nick.clone());
+                    self.shared.events.lock().unwrap().push(
+                        EventKind::Join,
+                        from.to_string(),
+                        nick.clone(),
+                        format!("{nick} joined via your invite \u{2014} auto-approved as a contact"),
+                    );
                 } else {
-                    format!(
-                        "{nick} wants to join \u{2014} approve with: groupchat contacts add {from} {nick}"
-                    )
-                };
-                self.shared
-                    .events
-                    .lock()
-                    .unwrap()
-                    .push(EventKind::Join, from.to_string(), display, text);
+                    self.shared.events.lock().unwrap().push(
+                        EventKind::Join,
+                        from.to_string(),
+                        display,
+                        format!(
+                            "{nick} wants to join \u{2014} approve with: groupchat contacts add {from} {nick}"
+                        ),
+                    );
+                }
             }
             Payload::Resource { label, ticket } => {
                 let nick = self.touch(from, None);
@@ -323,9 +369,13 @@ impl Node {
                 text: self.shared.my_id.to_string(),
             }),
             Request::Invite => {
+                // Minting an invite is an explicit "let this person in", so
+                // auto-approve their inbound join request for one-step onboarding.
+                self.auto_approve.store(true, Ordering::SeqCst);
                 let ticket = RoomTicket {
                     topic: topic_for_room(&self.shared.room),
                     peers: vec![self.endpoint.addr()],
+                    host_nick: self.shared.nick.clone(),
                 };
                 Ok(Response::Text {
                     text: ticket.to_string(),
@@ -343,6 +393,35 @@ impl Node {
                     message: Some("joined room and sent join request".to_string()),
                 })
             }
+            Request::Connect { ticket } => {
+                let ticket: RoomTicket = ticket.parse().context("parse room ticket")?;
+                let host = ticket.host();
+                self.join_topic(ticket.topic, ticket.peers).await?;
+                // Auto-add the host as a contact (their id is the first peer).
+                let host_msg = if let Some(addr) = host {
+                    if addr.id != self.shared.my_id {
+                        let nick = if ticket.host_nick.is_empty() {
+                            addr.id.fmt_short().to_string()
+                        } else {
+                            ticket.host_nick.clone()
+                        };
+                        self.add_contact(addr.id, nick.clone())?;
+                        format!(" and added {nick} as a contact")
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+                self.broadcast(Payload::JoinRequest {
+                    nick: self.shared.nick.clone(),
+                })
+                .await
+                .ok();
+                Ok(Response::Ok {
+                    message: Some(format!("connected to room{host_msg} \u{2014} you're live")),
+                })
+            }
             Request::Send { text } => {
                 self.broadcast(Payload::Chat { text: text.clone() }).await?;
                 // echo into our own log so the sender sees it too
@@ -357,6 +436,34 @@ impl Node {
             Request::Log { since } => {
                 let (events, last) = self.shared.events.lock().unwrap().since(since);
                 Ok(Response::Events { events, last })
+            }
+            Request::Wait { since, timeout_ms } => {
+                // Event-based delivery: block until an event newer than `since`
+                // lands (woken by EventLog::push) or the timeout fires. No busy
+                // poll — the connection task simply parks until notified.
+                let timeout_ms = timeout_ms.clamp(0, 300_000);
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+                let notify = self.shared.events.lock().unwrap().notify();
+                loop {
+                    // Register interest *before* re-checking so a push between
+                    // the check and the await can't be lost.
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+
+                    let (events, last) = self.shared.events.lock().unwrap().since(since);
+                    if !events.is_empty() {
+                        return Ok(Response::Events { events, last });
+                    }
+
+                    tokio::select! {
+                        _ = &mut notified => continue,
+                        _ = tokio::time::sleep_until(deadline) => {
+                            let (events, last) = self.shared.events.lock().unwrap().since(since);
+                            return Ok(Response::Events { events, last });
+                        }
+                    }
+                }
             }
             Request::Who => {
                 let contacts = self.shared.contacts.lock().unwrap();
@@ -394,17 +501,7 @@ impl Node {
                         .map(|p| p.nick.clone())
                         .unwrap_or_else(|| eid.fmt_short().to_string())
                 });
-                {
-                    let mut c = self.shared.contacts.lock().unwrap();
-                    c.add(eid, nick.clone());
-                    c.save(&self.home)?;
-                }
-                self.shared.events.lock().unwrap().push(
-                    EventKind::System,
-                    eid.to_string(),
-                    nick.clone(),
-                    format!("added {nick} to contacts"),
-                );
+                self.add_contact(eid, nick.clone())?;
                 Ok(Response::Ok {
                     message: Some(format!("added contact {nick}")),
                 })
@@ -604,6 +701,7 @@ pub async fn run_daemon(home: PathBuf) -> Result<()> {
         shared,
         shutdown: Arc::new(Notify::new()),
         recv_gen: AtomicU64::new(1),
+        auto_approve: AtomicBool::new(false),
     });
 
     tokio::spawn(node.clone().recv_loop(receiver, 1));

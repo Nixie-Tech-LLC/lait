@@ -49,12 +49,27 @@ enum Command {
     Invite,
     /// Join a room from a ticket and ask to be added.
     Join { ticket: String },
+    /// One-step onboarding: connect to a room from a ticket (joins, auto-adds
+    /// the host as a contact, goes live). Optionally set your nick first.
+    Connect {
+        ticket: String,
+        #[arg(long)]
+        nick: Option<String>,
+    },
     /// Send a chat message to the room.
     Send { text: Vec<String> },
     /// Print chat/system log (optionally only entries after --since).
     Log {
         #[arg(long, default_value_t = 0)]
         since: u64,
+    },
+    /// Block until a new event arrives (event-based), then print it. Loops
+    /// cleanly to follow a conversation without busy-polling.
+    Wait {
+        #[arg(long, default_value_t = 0)]
+        since: u64,
+        #[arg(long, default_value_t = 30_000)]
+        timeout_ms: u64,
     },
     /// List peers and their online/contact status.
     Who,
@@ -138,6 +153,17 @@ async fn main() -> Result<()> {
         Command::Status => cli::run(&home, Request::Status).await?,
         Command::Invite => cli::run(&home, Request::Invite).await?,
         Command::Join { ticket } => cli::run(&home, Request::Join { ticket }).await?,
+        Command::Connect { ticket, nick } => {
+            // For a cold machine, set the nick before the daemon spawns so it
+            // advertises the right name. (If the daemon is already up, this
+            // applies on its next restart.)
+            if let Some(n) = nick {
+                let mut profile = Profile::load(&home)?;
+                profile.nick = n;
+                profile.save(&home)?;
+            }
+            cli::run(&home, Request::Connect { ticket }).await?
+        }
         Command::Send { text } => {
             cli::run(
                 &home,
@@ -148,6 +174,9 @@ async fn main() -> Result<()> {
             .await?
         }
         Command::Log { since } => cli::run(&home, Request::Log { since }).await?,
+        Command::Wait { since, timeout_ms } => {
+            cli::run(&home, Request::Wait { since, timeout_ms }).await?
+        }
         Command::Who => cli::run(&home, Request::Who).await?,
         Command::Contacts { action } => {
             let req = match action {

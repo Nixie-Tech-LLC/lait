@@ -74,11 +74,23 @@ impl SignedMessage {
     }
 }
 
-/// A base32-encoded invite to join a room: the topic plus bootstrap peers.
+/// A base32-encoded invite to join a room: the topic, bootstrap peers, and the
+/// minting host's nickname so a joiner can auto-add them as a contact in one
+/// step (the host's endpoint id is `peers[0].id`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoomTicket {
     pub topic: TopicId,
     pub peers: Vec<EndpointAddr>,
+    /// Nick of the host who minted this ticket (for one-step `connect`).
+    pub host_nick: String,
+}
+
+impl RoomTicket {
+    /// The endpoint id of the host who minted the ticket, if any bootstrap
+    /// peer is present (the first peer is always the minting host).
+    pub fn host(&self) -> Option<EndpointAddr> {
+        self.peers.first().cloned()
+    }
 }
 
 impl RoomTicket {

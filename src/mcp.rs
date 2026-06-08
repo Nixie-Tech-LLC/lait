@@ -36,8 +36,30 @@ pub struct PollArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WaitArgs {
+    /// Block until an event with sequence greater than this arrives. Pass back
+    /// the `last` cursor from the previous call to follow the conversation.
+    #[serde(default)]
+    pub since: u64,
+    /// Max milliseconds to block before returning (possibly with no new events).
+    /// Defaults to 30000. Capped at 300000.
+    #[serde(default = "default_wait_timeout")]
+    pub timeout_ms: u64,
+}
+
+fn default_wait_timeout() -> u64 {
+    30_000
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct JoinArgs {
     /// A base32 room ticket from `invite_ticket`.
+    pub ticket: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConnectArgs {
+    /// A base32 room ticket from a coworker's `invite_ticket`.
     pub ticket: String,
 }
 
@@ -128,6 +150,11 @@ impl GroupchatMcp {
         self.run(Request::Join { ticket: a.ticket }).await
     }
 
+    #[tool(description = "One-step onboarding: connect to a coworker's room from their ticket. Joins the room, auto-adds them as a contact, and goes live — no separate approval needed. Use this instead of join_room when you have a ticket.")]
+    async fn connect(&self, Parameters(a): Parameters<ConnectArgs>) -> Result<CallToolResult, McpError> {
+        self.run(Request::Connect { ticket: a.ticket }).await
+    }
+
     #[tool(description = "Send a chat message to everyone in the room.")]
     async fn chat_send(&self, Parameters(a): Parameters<SendArgs>) -> Result<CallToolResult, McpError> {
         self.run(Request::Send { text: a.text }).await
@@ -136,6 +163,11 @@ impl GroupchatMcp {
     #[tool(description = "Poll the chat log for new messages and events (join requests, calls, shared resources). Returns events plus a `last` sequence cursor to pass next time.")]
     async fn chat_poll(&self, Parameters(a): Parameters<PollArgs>) -> Result<CallToolResult, McpError> {
         self.run(Request::Log { since: a.since }).await
+    }
+
+    #[tool(description = "Event-based read: BLOCK until a new message or event (seq > since) arrives, then return it immediately — or return empty after timeout_ms (default 30s). Prefer this over chat_poll: call it in a loop passing back `last` to follow the conversation in real time without busy-polling.")]
+    async fn chat_wait(&self, Parameters(a): Parameters<WaitArgs>) -> Result<CallToolResult, McpError> {
+        self.run(Request::Wait { since: a.since, timeout_ms: a.timeout_ms }).await
     }
 
     #[tool(description = "List known peers and whether they are online and a saved contact.")]
@@ -181,10 +213,12 @@ impl ServerHandler for GroupchatMcp {
             .with_server_info(Implementation::from_build_env())
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions(
-                "Agent-to-agent group chat over iroh. Workflow: my_id to learn your handle; \
-                 invite_ticket / join_room to connect with a coworker; contacts_add to approve \
-                 each other; chat_send / chat_poll for the group chat; call for a 1:1; \
-                 share_resource / get_resource to exchange files."
+                "Agent-to-agent group chat over iroh. Onboarding is one step: the host calls \
+                 invite_ticket and shares the ticket; the other side calls connect (joins, \
+                 auto-adds the host as a contact, goes live — no manual approval). Then \
+                 chat_send to talk and chat_wait (blocking, event-based) in a loop — passing \
+                 back the `last` cursor — to follow replies in real time. call for a 1:1; \
+                 share_resource / get_resource to exchange files; who for presence."
                     .to_string(),
             )
     }
