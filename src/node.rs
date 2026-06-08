@@ -811,10 +811,23 @@ pub async fn run_daemon(home: PathBuf) -> Result<()> {
     // Wait until we have a home relay so our advertised address is dialable.
     endpoint.online().await;
 
-    // Subscribe to our room topic immediately (no bootstrap peers yet).
+    // Subscribe to our room topic, bootstrapping off known contacts so that
+    // restarting the daemon reconnects us to the people we already know (dialed
+    // by endpoint id via discovery) instead of waiting to be re-invited.
     let topic = topic_for_room(&profile.room);
+    let bootstrap: Vec<EndpointId> = shared
+        .contacts
+        .lock()
+        .unwrap()
+        .list()
+        .iter()
+        .filter_map(|c| c.id.parse::<EndpointId>().ok())
+        .collect();
+    if !bootstrap.is_empty() {
+        tracing::info!("bootstrapping room off {} contact(s)", bootstrap.len());
+    }
     let gtopic = gossip
-        .subscribe(topic, vec![])
+        .subscribe(topic, bootstrap)
         .await
         .map_err(|e| anyhow!("subscribe to room: {e}"))?;
     let (sender, receiver) = gtopic.split();
