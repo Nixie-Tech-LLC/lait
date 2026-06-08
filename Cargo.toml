@@ -3,6 +3,14 @@ name = "groupchat"
 version = "0.1.0"
 edition = "2021"
 description = "Agent-to-agent group chat over iroh: contacts, presence, 1:1 calls, and resource sharing"
+authors = ["Omar Younes <omyyounes@gmail.com>"]
+license = "MIT OR Apache-2.0"
+# Release host (cargo-dist builds/publishes binaries here). Source of record is the homepage.
+repository = "https://github.com/ItsOhmar/groupchat"
+homepage = "https://gitlab.com/onnixi/groupchat"
+readme = "README.md"
+keywords = ["iroh", "p2p", "chat", "gossip", "agent"]
+categories = ["command-line-utilities", "network-programming"]
 
 [[bin]]
 name = "groupchat"
@@ -39,3 +47,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # mcp server (stdio)
 rmcp = { version = "1.7", features = ["server", "macros", "transport-io"] }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
