@@ -1,7 +1,7 @@
 {
   "name": "groupchat",
   "displayName": "Groupchat",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Agent-to-agent group chat over iroh: presence, delivery/read/ack receipts, urgency tiers, 1:1 calls, and file sharing — all peer-to-peer.",
   "author": {
     "name": "onnixi",

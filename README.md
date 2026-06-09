@@ -52,12 +52,12 @@ the release assets and extract the binary.
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-`.gitlab-ci.yml` builds linux-amd64 (and best-effort linux-arm64 / windows),
-uploads them to the package registry, and creates the Release with an
-`install.sh`. macOS builds need GitLab SaaS macOS runners (those jobs are
-`manual`); alternatively the bundled GitHub `release.yml` (cargo-dist) builds
-mac/windows/linux on free runners and can publish a Homebrew formula
-(`brew install ItsOhmar/homebrew-tap/groupchat`).
+`.gitlab-ci.yml` builds linux-amd64 (and best-effort linux-arm64) and creates a
+GitLab Release with an `install.sh`. The bundled GitHub `release.yml`
+(cargo-dist) builds mac + linux on free runners, publishes the GitHub Release,
+and ships a self-updater (`groupchat-<target>-update`) so installs can upgrade
+in place. (Windows is not built — the daemon's control channel is a Unix domain
+socket.)
 
 ## Build (from source)
 
