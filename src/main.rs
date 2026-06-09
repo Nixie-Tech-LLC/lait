@@ -19,6 +19,7 @@ use clap::{Parser, Subcommand};
 use crate::{
     config::{home_dir, load_or_create_identity, Profile},
     control::Request,
+    proto::Tier,
 };
 
 #[derive(Parser, Debug)]
@@ -57,7 +58,42 @@ enum Command {
         nick: Option<String>,
     },
     /// Send a chat message to the room.
-    Send { text: Vec<String> },
+    Send {
+        text: Vec<String>,
+        /// Address specific recipients by nick or id (repeatable). Empty = whole
+        /// room. Addressed recipients always get receipts.
+        #[arg(long)]
+        to: Vec<String>,
+        /// Urgency: ambient | direct | needs_ack | interrupt. needs_ack and
+        /// interrupt track delivery/read/ack and alert you if unacked.
+        #[arg(long, value_enum, default_value_t = Tier::Ambient)]
+        tier: Tier,
+        /// Ack window in milliseconds for needs_ack/interrupt (defaults to 60s).
+        #[arg(long)]
+        deadline_ms: Option<u64>,
+        /// Override the receiver's focus/mute (iMessage "Notify Anyway").
+        #[arg(long)]
+        notify_anyway: bool,
+    },
+    /// Acknowledge a received message by its log seq (sends a read/ack receipt
+    /// back to the sender).
+    Ack { seq: u64 },
+    /// Show delivery/read/ack status for messages you sent that expect receipts.
+    Receipts {
+        /// Scope to a single message by its log seq.
+        #[arg(long)]
+        seq: Option<u64>,
+    },
+    /// Set or clear your receiver focus: mute anything below a tier unless it's
+    /// sent with --notify-anyway.
+    Focus {
+        /// Mute anything below this tier (ambient | direct | needs_ack | interrupt).
+        #[arg(long, value_enum)]
+        mute_below: Option<Tier>,
+        /// Clear focus (mute nothing).
+        #[arg(long)]
+        clear: bool,
+    },
     /// Print chat/system log (optionally only entries after --since).
     Log {
         #[arg(long, default_value_t = 0)]
@@ -81,10 +117,17 @@ enum Command {
         /// Only act on direct events (@mentions and incoming calls).
         #[arg(long)]
         direct_only: bool,
+        /// Only act on events at or above this tier (ambient | direct | needs_ack | interrupt).
+        #[arg(long, value_enum)]
+        min_tier: Option<Tier>,
         /// Shell command to run per event. Event fields arrive as GROUPCHAT_EVENT_*
         /// env vars and the full event JSON on stdin.
         #[arg(long)]
         exec: Option<String>,
+        /// Preemption hook: a command run ONLY for interrupt-tier ("notify
+        /// anyway") events — the channel that reaches a heads-down agent.
+        #[arg(long)]
+        on_interrupt: Option<String>,
         /// Raise a native desktop notification per event (macOS/Linux).
         #[arg(long)]
         notify: bool,
@@ -184,14 +227,29 @@ async fn main() -> Result<()> {
             }
             cli::run(&home, Request::Connect { ticket }).await?
         }
-        Command::Send { text } => {
+        Command::Send {
+            text,
+            to,
+            tier,
+            deadline_ms,
+            notify_anyway,
+        } => {
             cli::run(
                 &home,
                 Request::Send {
                     text: text.join(" "),
+                    to,
+                    tier,
+                    deadline_ms,
+                    notify_anyway,
                 },
             )
             .await?
+        }
+        Command::Ack { seq } => cli::run(&home, Request::Ack { seq }).await?,
+        Command::Receipts { seq } => cli::run(&home, Request::Receipts { seq }).await?,
+        Command::Focus { mute_below, clear } => {
+            cli::run(&home, Request::Focus { mute_below, clear }).await?
         }
         Command::Log { since } => cli::run(&home, Request::Log { since }).await?,
         Command::Wait { since, timeout_ms } => {
@@ -200,10 +258,24 @@ async fn main() -> Result<()> {
         Command::Watch {
             since,
             direct_only,
+            min_tier,
             exec,
+            on_interrupt,
             notify,
             timeout_ms,
-        } => cli::watch(&home, since, direct_only, exec, notify, timeout_ms).await?,
+        } => {
+            cli::watch(
+                &home,
+                since,
+                direct_only,
+                min_tier,
+                exec,
+                on_interrupt,
+                notify,
+                timeout_ms,
+            )
+            .await?
+        }
         Command::Who => cli::run(&home, Request::Who).await?,
         Command::Contacts { action } => {
             let req = match action {

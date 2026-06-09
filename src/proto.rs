@@ -23,13 +23,64 @@ pub fn topic_for_room(room: &str) -> TopicId {
     TopicId::from_bytes(*hash.as_bytes())
 }
 
+/// Urgency tier of a chat message — the agent-facing analogue of iMessage's
+/// notification levels. The receiver's effective tier is lifted to at least
+/// `Direct` when the message addresses it (an `@mention` or an entry in `to`).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize, clap::ValueEnum,
+)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum Tier {
+    /// Ambient room chatter — logged, glanced at, no receipts expected.
+    #[default]
+    Ambient,
+    /// Addressed to you and worth a reply (an `@mention` or an inbound call).
+    Direct,
+    /// Requires an explicit `ack` within the deadline; the sender is alerted if
+    /// none arrives.
+    NeedsAck,
+    /// "Notify anyway": overrides the receiver's focus/mute and re-broadcasts
+    /// until acked. The preemption tier.
+    Interrupt,
+}
+
+/// State of a delivery/read/ack receipt for a specific message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptState {
+    /// The message reached the recipient's daemon.
+    Delivered,
+    /// The recipient's read cursor passed the message (the agent read it).
+    Seen,
+    /// The recipient explicitly acknowledged the message.
+    Acked,
+}
+
 /// The application-level payload carried inside a signed gossip message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Payload {
     /// Announce/refresh our nickname.
     Hello { nick: String },
-    /// A normal chat line for the room.
-    Chat { text: String },
+    /// A chat line for the room. Carries a sender-assigned `msg_id` (the global
+    /// identity is `(from_key, msg_id)`), an urgency `tier`, an optional set of
+    /// addressed recipients (`to`; empty = whole room), an optional ack
+    /// `deadline_ms`, and a `notify_anyway` override of the receiver's focus.
+    Chat {
+        text: String,
+        msg_id: u64,
+        tier: Tier,
+        to: Vec<PublicKey>,
+        deadline_ms: Option<u64>,
+        notify_anyway: bool,
+    },
+    /// A delivery/read/ack receipt for a message we received, addressed back to
+    /// that message's original sender (`ref_from`, `ref_msg_id`).
+    Receipt {
+        ref_from: PublicKey,
+        ref_msg_id: u64,
+        state: ReceiptState,
+    },
     /// A request to be added to the chat (surfaces for members to approve).
     JoinRequest { nick: String },
     /// Periodic liveness heartbeat for presence tracking.

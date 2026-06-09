@@ -2,7 +2,7 @@
 //! store, presence, and the local control server that CLI/MCP clients drive.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -35,9 +35,10 @@ use crate::{
         blob_store_path, load_or_create_identity, socket_path, Contacts, Profile,
     },
     control::{
-        Event as LogEvent, EventKind, PresenceEntry, Request, ResourceEntry, Response, StatusInfo,
+        Event as LogEvent, EventKind, MessageReceipts, PresenceEntry, RecipientReceipt, Request,
+        ResourceEntry, Response, StatusInfo,
     },
-    proto::{topic_for_room, Payload, RoomTicket, SignedMessage},
+    proto::{topic_for_room, Payload, ReceiptState, RoomTicket, SignedMessage, Tier},
 };
 
 /// How recently a peer must have been heard from to count as online.
@@ -48,12 +49,32 @@ const HEARTBEAT: Duration = Duration::from_secs(10);
 const REAP_INTERVAL: Duration = Duration::from_secs(5);
 /// Drop an offline peer from the presence table entirely after this long.
 const PRUNE_WINDOW: Duration = Duration::from_secs(600);
+/// Default ack window for a needs_ack/interrupt message that gives no explicit
+/// deadline.
+const ACK_DEADLINE_DEFAULT: Duration = Duration::from_secs(60);
+/// How often the ack reaper checks outstanding messages for overdue acks.
+const ACK_REAP_INTERVAL: Duration = Duration::from_secs(1);
+/// How many times an interrupt-tier message is re-broadcast before giving up.
+const MAX_ESCALATIONS: u32 = 3;
+/// Base spacing between interrupt re-broadcasts (grows per escalation).
+const ESCALATION_BACKOFF: Duration = Duration::from_secs(15);
 
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Shorten a message for inclusion in a receipt/alert line.
+fn truncate(text: &str) -> String {
+    const MAX: usize = 48;
+    if text.chars().count() <= MAX {
+        text.to_string()
+    } else {
+        let cut: String = text.chars().take(MAX).collect();
+        format!("{cut}\u{2026}")
+    }
 }
 
 /// A peer we have heard from on the gossip topic.
@@ -84,16 +105,39 @@ impl EventLog {
     }
 
     pub fn push(&mut self, kind: EventKind, id: String, nick: String, text: String) {
-        self.push_full(kind, id, nick, text, false);
+        self.push_full(kind, id, nick, text, Tier::Ambient, None);
     }
 
     /// Push an event marked `direct` — addressed to us, warranting a response
     /// (an @mention or an inbound call).
     pub fn push_direct(&mut self, kind: EventKind, id: String, nick: String, text: String) {
-        self.push_full(kind, id, nick, text, true);
+        self.push_full(kind, id, nick, text, Tier::Direct, None);
     }
 
-    fn push_full(&mut self, kind: EventKind, id: String, nick: String, text: String, direct: bool) {
+    /// Push a chat event carrying an explicit tier and the sender's message id
+    /// (the handle used to `ack` it).
+    pub fn push_chat(
+        &mut self,
+        id: String,
+        nick: String,
+        text: String,
+        tier: Tier,
+        msg_id: u64,
+    ) {
+        self.push_full(EventKind::Chat, id, nick, text, tier, Some(msg_id));
+    }
+
+    /// Push with full control over tier and msg_id. `direct` is derived from the
+    /// tier (anything `>= Direct` warrants a response).
+    pub fn push_full(
+        &mut self,
+        kind: EventKind,
+        id: String,
+        nick: String,
+        text: String,
+        tier: Tier,
+        msg_id: Option<u64>,
+    ) {
         self.seq += 1;
         self.events.push_back(LogEvent {
             seq: self.seq,
@@ -102,7 +146,9 @@ impl EventLog {
             nick,
             text,
             ts: now_secs(),
-            direct,
+            direct: tier >= Tier::Direct,
+            tier,
+            msg_id,
         });
         while self.events.len() > 1000 {
             self.events.pop_front();
@@ -121,6 +167,48 @@ impl EventLog {
         let last = self.events.back().map(|e| e.seq).unwrap_or(since);
         (out, last)
     }
+
+    /// Resolve a local event `seq` to the chat message it refers to: its
+    /// sender's id string and message id. Used to turn a user-facing `ack <seq>`
+    /// into a receipt addressed at the original sender.
+    pub fn chat_ref(&self, seq: u64) -> Option<(String, u64)> {
+        self.events
+            .iter()
+            .find(|e| e.seq == seq && matches!(e.kind, EventKind::Chat))
+            .and_then(|e| e.msg_id.map(|m| (e.id.clone(), m)))
+    }
+}
+
+/// One message we sent that we're tracking receipts for, reconciled against the
+/// expected recipient roster.
+#[derive(Debug, Clone)]
+struct Pending {
+    text: String,
+    tier: Tier,
+    /// Resolved recipient roster we expect acks from.
+    to: Vec<EndpointId>,
+    deadline: Option<Instant>,
+    deadline_ms: Option<u64>,
+    delivered: HashSet<EndpointId>,
+    seen: HashSet<EndpointId>,
+    acked: HashSet<EndpointId>,
+    /// Whether we've already surfaced the overdue-ack alert.
+    alerted: bool,
+    /// Interrupt-tier re-broadcast bookkeeping.
+    escalations: u32,
+    next_escalation: Option<Instant>,
+}
+
+impl Pending {
+    fn all_acked(&self) -> bool {
+        self.to.iter().all(|id| self.acked.contains(id))
+    }
+}
+
+/// Outbox of messages we sent that expect receipts, keyed by msg_id.
+#[derive(Debug, Default)]
+pub struct Outbox {
+    pending: HashMap<u64, Pending>,
 }
 
 /// Cheaply-cloneable shared state, also handed to the call handler.
@@ -133,6 +221,10 @@ pub struct Shared {
     pub presence: Arc<Mutex<HashMap<EndpointId, Peer>>>,
     pub events: Arc<Mutex<EventLog>>,
     pub resources: Arc<Mutex<Vec<ResourceEntry>>>,
+    /// Messages we've sent that are awaiting delivery/read/ack receipts.
+    pub outbox: Arc<Mutex<Outbox>>,
+    /// Receiver focus: silence anything below this tier unless it's notify_anyway.
+    pub mute_below: Arc<Mutex<Tier>>,
 }
 
 /// The running node.
@@ -152,6 +244,11 @@ pub struct Node {
     /// When set (after minting an invite), inbound join requests are auto-added
     /// as contacts so onboarding is mutual and one-step.
     auto_approve: AtomicBool,
+    /// Monotonic source of message ids; the global identity is `(my_id, msg_id)`.
+    next_msg_id: AtomicU64,
+    /// Local event seqs we've already emitted a Seen receipt for, so following
+    /// the log with several clients doesn't re-emit.
+    seen_emitted: Mutex<HashSet<u64>>,
 }
 
 impl Node {
@@ -281,6 +378,104 @@ impl Node {
         }
     }
 
+    /// Emit Seen receipts for tracked chat events being handed to a client (via
+    /// `wait`/`log`) — the agent reading them is our proxy for "seen". Tracked
+    /// inbound messages always surface at `tier >= Direct`; ambient room chatter
+    /// generates no receipt traffic. Deduped by local seq.
+    async fn emit_seen(&self, events: &[LogEvent]) {
+        let mut to_send: Vec<(EndpointId, u64)> = Vec::new();
+        {
+            let mut em = self.seen_emitted.lock().unwrap();
+            for e in events {
+                if e.tier < Tier::Direct {
+                    continue;
+                }
+                let Some(mid) = e.msg_id else { continue };
+                let Ok(src) = e.id.parse::<EndpointId>() else {
+                    continue;
+                };
+                if src != self.shared.my_id && em.insert(e.seq) {
+                    to_send.push((src, mid));
+                }
+            }
+        }
+        for (src, mid) in to_send {
+            let _ = self
+                .broadcast(Payload::Receipt {
+                    ref_from: src,
+                    ref_msg_id: mid,
+                    state: ReceiptState::Seen,
+                })
+                .await;
+        }
+    }
+
+    /// Watch the outbox for needs_ack/interrupt messages whose deadline lapsed
+    /// without a full set of acks. Surfaces a local (direct) alert so the
+    /// sender's agent notices, and re-broadcasts interrupt-tier messages on a
+    /// backoff until they're acked or the retry budget is spent.
+    async fn ack_reaper_loop(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(ACK_REAP_INTERVAL);
+        loop {
+            interval.tick().await;
+            let now = Instant::now();
+            let mut alerts: Vec<(u64, String, String)> = Vec::new();
+            let mut rebroadcasts: Vec<Payload> = Vec::new();
+            {
+                let mut ob = self.shared.outbox.lock().unwrap();
+                for (msg_id, p) in ob.pending.iter_mut() {
+                    let Some(deadline) = p.deadline else { continue };
+                    if p.all_acked() || now < deadline {
+                        continue;
+                    }
+                    if !p.alerted {
+                        p.alerted = true;
+                        let missing: Vec<String> = p
+                            .to
+                            .iter()
+                            .filter(|id| !p.acked.contains(*id))
+                            .map(|id| self.display_nick(id))
+                            .collect();
+                        alerts.push((*msg_id, truncate(&p.text), missing.join(", ")));
+                    }
+                    if p.tier == Tier::Interrupt && p.escalations < MAX_ESCALATIONS {
+                        let due = p.next_escalation.map(|t| now >= t).unwrap_or(true);
+                        if due {
+                            p.escalations += 1;
+                            p.next_escalation = Some(now + ESCALATION_BACKOFF * p.escalations);
+                            // Annotate with the nudge count so each re-broadcast
+                            // is byte-distinct — iroh-gossip drops byte-identical
+                            // repeats as loop prevention — and the repeat reads as
+                            // an escalation to the receiver. The msg_id is
+                            // unchanged, so an ack still resolves to it.
+                            rebroadcasts.push(Payload::Chat {
+                                text: format!("{} \u{23EB}(nudge {})", p.text, p.escalations),
+                                msg_id: *msg_id,
+                                tier: Tier::Interrupt,
+                                to: p.to.clone(),
+                                deadline_ms: p.deadline_ms,
+                                notify_anyway: true,
+                            });
+                        }
+                    }
+                }
+            }
+            for (msg_id, text, who) in alerts {
+                self.shared.events.lock().unwrap().push_full(
+                    EventKind::Receipt,
+                    self.shared.my_id.to_string(),
+                    "system".to_string(),
+                    format!("\u{26A0} no ack for msg {msg_id} (\u{201C}{text}\u{201D}) from: {who}"),
+                    Tier::Direct,
+                    None,
+                );
+            }
+            for payload in rebroadcasts {
+                let _ = self.broadcast(payload).await;
+            }
+        }
+    }
+
     /// Whether a chat line addresses us directly (an `@nick` or a bare mention
     /// of our nick as a word) — worth a response rather than a glance.
     fn mentions_me(&self, text: &str) -> bool {
@@ -293,7 +488,26 @@ impl Node {
             || t.split(|c: char| !c.is_alphanumeric()).any(|w| w == nick)
     }
 
-    fn handle_payload(&self, from: EndpointId, payload: Payload) {
+    /// Best display name for a peer: contact nick, else last-seen presence nick,
+    /// else the short id.
+    fn display_nick(&self, id: &EndpointId) -> String {
+        self.shared
+            .contacts
+            .lock()
+            .unwrap()
+            .nick_of(id)
+            .or_else(|| {
+                self.shared
+                    .presence
+                    .lock()
+                    .unwrap()
+                    .get(id)
+                    .map(|p| p.nick.clone())
+            })
+            .unwrap_or_else(|| id.fmt_short().to_string())
+    }
+
+    async fn handle_payload(&self, from: EndpointId, payload: Payload) {
         match payload {
             Payload::Hello { nick } | Payload::Presence { nick } => {
                 self.touch(from, Some(nick));
@@ -302,14 +516,93 @@ impl Node {
                 self.touch(from, Some(nick));
                 self.mark_offline(from, true);
             }
-            Payload::Chat { text } => {
+            Payload::Chat {
+                text,
+                msg_id,
+                tier,
+                to,
+                deadline_ms: _,
+                notify_anyway,
+            } => {
                 let nick = self.touch(from, None);
-                let direct = self.mentions_me(&text);
-                let mut log = self.shared.events.lock().unwrap();
-                if direct {
-                    log.push_direct(EventKind::Chat, from.to_string(), nick, text);
+                let me = self.shared.my_id;
+                // Addressed to us? An explicit `to` wins; otherwise an @mention.
+                let addressed = if to.is_empty() {
+                    self.mentions_me(&text)
                 } else {
-                    log.push(EventKind::Chat, from.to_string(), nick, text);
+                    to.contains(&me)
+                };
+                // Effective tier: addressing lifts to at least Direct, then the
+                // receiver's focus may silence it (unless notify_anyway).
+                let mut eff = tier.max(if addressed { Tier::Direct } else { Tier::Ambient });
+                let mute_below = *self.shared.mute_below.lock().unwrap();
+                if eff < mute_below && !notify_anyway {
+                    eff = Tier::Ambient;
+                }
+                // The sender tracks receipts for needs_ack/interrupt or any
+                // explicitly-addressed message; emit a Delivered receipt for those.
+                let tracked = tier >= Tier::NeedsAck || !to.is_empty();
+                if tracked && from != me {
+                    let _ = self
+                        .broadcast(Payload::Receipt {
+                            ref_from: from,
+                            ref_msg_id: msg_id,
+                            state: ReceiptState::Delivered,
+                        })
+                        .await;
+                }
+                self.shared
+                    .events
+                    .lock()
+                    .unwrap()
+                    .push_chat(from.to_string(), nick, text, eff, msg_id);
+            }
+            Payload::Receipt {
+                ref_from,
+                ref_msg_id,
+                state,
+            } => {
+                // Only the original sender acts on a receipt; everyone else on
+                // the gossip topic ignores it.
+                if ref_from != self.shared.my_id || from == self.shared.my_id {
+                    return;
+                }
+                let display = self.display_nick(&from);
+                let mut acked_text: Option<String> = None;
+                {
+                    let mut ob = self.shared.outbox.lock().unwrap();
+                    if let Some(p) = ob.pending.get_mut(&ref_msg_id) {
+                        // Make sure this peer is on the tracked roster (a room
+                        // needs_ack reaches peers that joined after send).
+                        if !p.to.contains(&from) {
+                            p.to.push(from);
+                        }
+                        match state {
+                            ReceiptState::Delivered => {
+                                p.delivered.insert(from);
+                            }
+                            ReceiptState::Seen => {
+                                p.delivered.insert(from);
+                                p.seen.insert(from);
+                            }
+                            ReceiptState::Acked => {
+                                p.delivered.insert(from);
+                                p.seen.insert(from);
+                                p.acked.insert(from);
+                                acked_text = Some(p.text.clone());
+                            }
+                        }
+                    }
+                }
+                if let Some(text) = acked_text {
+                    self.shared.events.lock().unwrap().push_full(
+                        EventKind::Receipt,
+                        from.to_string(),
+                        display.clone(),
+                        format!("{display} acked: \u{201C}{}\u{201D}", truncate(&text)),
+                        Tier::Ambient,
+                        None,
+                    );
                 }
             }
             Payload::JoinRequest { nick } => {
@@ -402,7 +695,7 @@ impl Node {
                 Ok(Some(event)) => match event {
                     Event::Received(msg) => {
                         if let Ok((from, payload)) = SignedMessage::verify_and_decode(&msg.content) {
-                            self.handle_payload(from, payload);
+                            self.handle_payload(from, payload).await;
                         }
                     }
                     Event::NeighborUp(id) => {
@@ -552,19 +845,93 @@ impl Node {
                     message: Some(format!("connected to room{host_msg} \u{2014} you're live")),
                 })
             }
-            Request::Send { text } => {
-                self.broadcast(Payload::Chat { text: text.clone() }).await?;
+            Request::Send {
+                text,
+                to,
+                tier,
+                deadline_ms,
+                notify_anyway,
+            } => {
+                let msg_id = self.next_msg_id.fetch_add(1, Ordering::SeqCst);
+                // Resolve the addressed recipients (nick or id) to endpoint ids.
+                let mut to_ids: Vec<EndpointId> = Vec::new();
+                let mut unknown: Vec<String> = Vec::new();
+                for w in &to {
+                    match self.resolve_target(w) {
+                        Some(id) => to_ids.push(id),
+                        None => unknown.push(w.clone()),
+                    }
+                }
+                if !unknown.is_empty() {
+                    return Err(anyhow!("unknown recipient(s): {}", unknown.join(", ")));
+                }
+                // We track receipts when the sender wants them: needs_ack /
+                // interrupt, or any explicitly-addressed message.
+                let tracked = tier >= Tier::NeedsAck || !to_ids.is_empty();
+                if tracked {
+                    let expected: Vec<EndpointId> = if !to_ids.is_empty() {
+                        to_ids.clone()
+                    } else {
+                        // Room-wide needs_ack: expect acks from everyone online.
+                        self.shared
+                            .presence
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|(id, p)| p.online && **id != self.shared.my_id)
+                            .map(|(id, _)| *id)
+                            .collect()
+                    };
+                    let deadline = match deadline_ms {
+                        Some(ms) => Some(Instant::now() + Duration::from_millis(ms)),
+                        None if tier >= Tier::NeedsAck => Some(Instant::now() + ACK_DEADLINE_DEFAULT),
+                        None => None,
+                    };
+                    self.shared.outbox.lock().unwrap().pending.insert(
+                        msg_id,
+                        Pending {
+                            text: text.clone(),
+                            tier,
+                            to: expected,
+                            deadline,
+                            deadline_ms,
+                            delivered: HashSet::new(),
+                            seen: HashSet::new(),
+                            acked: HashSet::new(),
+                            alerted: false,
+                            escalations: 0,
+                            next_escalation: None,
+                        },
+                    );
+                }
+                self.broadcast(Payload::Chat {
+                    text: text.clone(),
+                    msg_id,
+                    tier,
+                    to: to_ids,
+                    deadline_ms,
+                    notify_anyway,
+                })
+                .await?;
                 // echo into our own log so the sender sees it too
-                self.shared.events.lock().unwrap().push(
-                    EventKind::Chat,
+                self.shared.events.lock().unwrap().push_chat(
                     self.shared.my_id.to_string(),
                     format!("{} (me)", self.shared.nick),
                     text,
+                    tier,
+                    msg_id,
                 );
-                Ok(Response::Ok { message: None })
+                Ok(Response::Text {
+                    text: if tracked {
+                        format!("sent (msg {msg_id}); ack/receipts track it")
+                    } else {
+                        format!("sent (msg {msg_id})")
+                    },
+                })
             }
             Request::Log { since } => {
                 let (events, last) = self.shared.events.lock().unwrap().since(since);
+                self.emit_seen(&events).await;
                 Ok(Response::Events { events, last })
             }
             Request::Wait { since, timeout_ms } => {
@@ -583,6 +950,7 @@ impl Node {
 
                     let (events, last) = self.shared.events.lock().unwrap().since(since);
                     if !events.is_empty() {
+                        self.emit_seen(&events).await;
                         return Ok(Response::Events { events, last });
                     }
 
@@ -590,6 +958,7 @@ impl Node {
                         _ = &mut notified => continue,
                         _ = tokio::time::sleep_until(deadline) => {
                             let (events, last) = self.shared.events.lock().unwrap().since(since);
+                            self.emit_seen(&events).await;
                             return Ok(Response::Events { events, last });
                         }
                     }
@@ -732,6 +1101,93 @@ impl Node {
             Request::Resources => Ok(Response::Resources {
                 resources: self.shared.resources.lock().unwrap().clone(),
             }),
+            Request::Ack { seq } => {
+                let (sender_id, msg_id) = self
+                    .shared
+                    .events
+                    .lock()
+                    .unwrap()
+                    .chat_ref(seq)
+                    .ok_or_else(|| anyhow!("no chat message at seq {seq}"))?;
+                let ref_from: EndpointId = sender_id
+                    .parse()
+                    .map_err(|e| anyhow!("parse sender id: {e}"))?;
+                if ref_from == self.shared.my_id {
+                    return Err(anyhow!("that's your own message"));
+                }
+                self.broadcast(Payload::Receipt {
+                    ref_from,
+                    ref_msg_id: msg_id,
+                    state: ReceiptState::Acked,
+                })
+                .await?;
+                Ok(Response::Ok {
+                    message: Some(format!("acked msg {msg_id}")),
+                })
+            }
+            Request::Receipts { seq } => {
+                // Optionally scope to one message identified by a local seq.
+                let only = match seq {
+                    Some(s) => Some(
+                        self.shared
+                            .events
+                            .lock()
+                            .unwrap()
+                            .chat_ref(s)
+                            .ok_or_else(|| anyhow!("no chat message at seq {s}"))?
+                            .1,
+                    ),
+                    None => None,
+                };
+                let now = Instant::now();
+                let ob = self.shared.outbox.lock().unwrap();
+                let mut messages: Vec<MessageReceipts> = ob
+                    .pending
+                    .iter()
+                    .filter(|(mid, _)| only.map(|o| **mid == o).unwrap_or(true))
+                    .map(|(mid, p)| {
+                        let overdue = p.deadline.map(|d| now >= d).unwrap_or(false) && !p.all_acked();
+                        let recipients = p
+                            .to
+                            .iter()
+                            .map(|id| RecipientReceipt {
+                                id: id.to_string(),
+                                nick: self.display_nick(id),
+                                delivered: p.delivered.contains(id),
+                                seen: p.seen.contains(id),
+                                acked: p.acked.contains(id),
+                            })
+                            .collect();
+                        MessageReceipts {
+                            msg_id: *mid,
+                            text: p.text.clone(),
+                            tier: p.tier,
+                            overdue,
+                            recipients,
+                        }
+                    })
+                    .collect();
+                messages.sort_by_key(|m| m.msg_id);
+                Ok(Response::Receipts { messages })
+            }
+            Request::Focus { mute_below, clear } => {
+                let new = if clear {
+                    Tier::Ambient
+                } else {
+                    mute_below.unwrap_or(*self.shared.mute_below.lock().unwrap())
+                };
+                *self.shared.mute_below.lock().unwrap() = new;
+                if let Ok(mut p) = Profile::load(&self.home) {
+                    p.mute_below = new;
+                    let _ = p.save(&self.home);
+                }
+                Ok(Response::Ok {
+                    message: Some(match new {
+                        Tier::Ambient => "focus cleared \u{2014} nothing muted".to_string(),
+                        t => format!("focus on \u{2014} muting below {t:?} (notify_anyway overrides)"),
+                    }),
+                })
+            }
             Request::Stop => {
                 let s = self.shutdown.clone();
                 tokio::spawn(async move {
@@ -799,6 +1255,8 @@ pub async fn run_daemon(home: PathBuf) -> Result<()> {
         presence: Arc::new(Mutex::new(HashMap::new())),
         events: Arc::new(Mutex::new(EventLog::default())),
         resources: Arc::new(Mutex::new(Vec::new())),
+        outbox: Arc::new(Mutex::new(Outbox::default())),
+        mute_below: Arc::new(Mutex::new(profile.mute_below)),
     };
 
     let call_handler = CallHandler::new(shared.clone());
@@ -845,11 +1303,14 @@ pub async fn run_daemon(home: PathBuf) -> Result<()> {
         shutdown: Arc::new(Notify::new()),
         recv_gen: AtomicU64::new(1),
         auto_approve: AtomicBool::new(profile.auto_approve),
+        next_msg_id: AtomicU64::new(now_secs().saturating_mul(1000)),
+        seen_emitted: Mutex::new(HashSet::new()),
     });
 
     tokio::spawn(node.clone().recv_loop(receiver, 1));
     tokio::spawn(node.clone().heartbeat_loop());
     tokio::spawn(node.clone().reaper_loop());
+    tokio::spawn(node.clone().ack_reaper_loop());
 
     // announce ourselves
     node.broadcast(Payload::Hello {

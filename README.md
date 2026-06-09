@@ -101,10 +101,13 @@ currently online, and inbound calls from non-contacts are refused.
 | `invite` | Print a room ticket to share (and auto-approve who joins with it) |
 | `join <ticket>` | Join a room and request to be added (manual approval path) |
 | `connect <ticket> [--nick N]` | **One step:** join + auto-add the host + go live (no `init` needed) |
-| `send <text...>` | Broadcast a chat message |
+| `send <text...> [--to N] [--tier T] [--deadline-ms M] [--notify-anyway]` | Broadcast a chat message (optionally addressed, with an urgency tier) |
+| `ack <seq>` | Acknowledge a received message — sends a read+ack receipt to its sender |
+| `receipts [--seq N]` | Show per-recipient delivered/seen/acked status for messages you sent |
+| `focus [--mute-below T] [--clear]` | Silence anything below a tier (unless sent `--notify-anyway`) |
 | `log [--since N]` | Print chat/system events (returns immediately) |
 | `wait [--since N] [--timeout-ms M]` | **Block** until a new event arrives, then print it (event-based) |
-| `watch [--direct-only] [--exec CMD] [--notify]` | Follow events and run a hook / desktop-notify per event |
+| `watch [--direct-only] [--min-tier T] [--exec CMD] [--on-interrupt CMD] [--notify]` | Follow events and run a hook / desktop-notify per event |
 | `who` | List peers with online/contact status |
 | `contacts add <id> [nick]` / `list` / `remove <id>` | Manage contacts |
 | `call <who> [--message M]` | 1:1 call an online contact |
@@ -137,6 +140,72 @@ The daemon keeps the room tidy on its own — you don't manage it:
 The event-based primitive for all of this is `wait` (CLI) / `chat_wait` (MCP):
 it blocks until the next event and returns immediately, so you follow the room
 by looping on it rather than polling.
+
+## Delivery, read receipts & urgency tiers
+
+Group chat is best-effort by default, which is fine for ambient chatter but not
+for "did my agent actually see this, and act on it?" Messages can carry an
+**urgency tier**, and tiered messages get the Sent → Delivered → Read → **Acted**
+ladder of a real messaging app — with an iMessage-style **"Notify Anyway"**
+override. (Design notes + diagrams: [`docs/HARDENING.md`](docs/HARDENING.md).)
+
+**The tiers** (`--tier` on `send`):
+
+| Tier | Meaning | Receiver behavior |
+|---|---|---|
+| `ambient` (default) | room chatter | logged, glanceable, no receipts |
+| `direct` | `@mention` / addressed | 🔔, reply expected |
+| `needs_ack` | "respond by the deadline" | ⏰; **must** `ack`; sender alerted if it lapses |
+| `interrupt` | "notify anyway" | 🚨; overrides the receiver's focus; re-broadcasts until acked |
+
+**Three guarantees, three mechanisms:**
+
+- **Delivered** — the recipient's daemon auto-emits a receipt the moment a tiered
+  message lands. No agent cooperation.
+- **Seen** — the recipient emits a *seen* receipt when its `wait`/`log` cursor
+  passes the message (the agent read it).
+- **Acted** — the recipient runs `ack <seq>` (or the `chat_ack` tool). This is the
+  only rung that needs the agent, so if it lapses the **sender** is alerted with a
+  `⚠ no ack` event and — for `interrupt` — the message re-fires on a backoff.
+
+```bash
+# Ask agent3 to confirm, with a 30s ack window
+groupchat send --to agent3 --tier needs_ack --deadline-ms 30000 "merge the PR?"
+# → sent (msg 17…); ack/receipts track it
+
+# See who got it / read it / acked it
+groupchat receipts
+# msg 17… [needs_ack]  "merge the PR?"
+#     agent3 ✓delivered ✓seen —acked   ← saw it, hasn't acted
+
+# On agent3's side, after reading the 🔔/⏰ event at seq 4:
+groupchat ack 4
+```
+
+**Receiver focus + Notify Anyway.** A busy receiver can mute low-tier noise; a
+sender can override that mute for something that truly can't wait:
+
+```bash
+# agent3: while heads-down, silence anything below interrupt
+groupchat focus --mute-below interrupt
+# sender: break through the mute anyway
+groupchat send --to agent3 --tier direct --notify-anyway "you're blocking the release"
+```
+
+**Reaching a heads-down agent.** An agent's attention is its `wait`/`watch` loop,
+so tiers shape what happens at loop boundaries — and `watch` adds a preemption
+hook that fires *only* for `interrupt` events, the channel meant to break an agent
+out of its current work:
+
+```bash
+# Cooperative: act on direct-and-up events
+groupchat watch --min-tier direct --exec 'enqueue-reply "$GROUPCHAT_EVENT_TEXT"'
+# Preemptive: only interrupt-tier fires this (e.g. signal the agent process)
+groupchat watch --on-interrupt 'preempt-agent --msg "$GROUPCHAT_EVENT_MSG_ID"'
+```
+
+Hooks get `GROUPCHAT_EVENT_TIER`, `GROUPCHAT_EVENT_MSG_ID`, and
+`GROUPCHAT_EVENT_PREEMPT` alongside the existing `GROUPCHAT_EVENT_*` vars.
 
 ### Make notifications *do* something: `groupchat watch`
 
@@ -175,7 +244,8 @@ Register the MCP server with your agent. For Claude Code, add to `.mcp.json`:
 ```
 
 Tools exposed: `my_id`, `invite_ticket`, `join_room`, `connect`, `contacts_add`,
-`contacts_list`, `chat_send`, `chat_poll`, `chat_wait`, `who`, `call`,
+`contacts_list`, `chat_send` (with `tier`/`to`/`deadline_ms`/`notify_anyway`),
+`chat_ack`, `receipts`, `focus`, `chat_poll`, `chat_wait`, `who`, `call`,
 `share_resource`, `get_resource`, `resources`, `status`.
 
 The fast path for an agent: the host calls `invite_ticket`; the other side calls

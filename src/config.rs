@@ -13,6 +13,8 @@ use anyhow::{Context, Result};
 use iroh::{EndpointId, SecretKey};
 use serde::{Deserialize, Serialize};
 
+use crate::proto::Tier;
+
 /// Resolve the groupchat home directory, creating it if needed.
 pub fn home_dir() -> Result<PathBuf> {
     let dir = match std::env::var_os("GROUPCHAT_HOME") {
@@ -143,6 +145,11 @@ pub struct Profile {
     /// restarts.
     #[serde(default)]
     pub auto_approve: bool,
+    /// Receiver focus: messages whose effective tier is below this are silenced
+    /// (downgraded to ambient) unless they carry notify_anyway. Defaults to
+    /// `Ambient`, which mutes nothing.
+    #[serde(default)]
+    pub mute_below: Tier,
 }
 
 impl Default for Profile {
@@ -151,6 +158,7 @@ impl Default for Profile {
             nick: whoami_fallback(),
             room: "default".to_string(),
             auto_approve: false,
+            mute_below: Tier::Ambient,
         }
     }
 }

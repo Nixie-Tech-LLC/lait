@@ -19,12 +19,69 @@ use serde::Deserialize;
 use crate::{
     cli::client,
     control::{Request, Response},
+    proto::Tier,
 };
+
+/// Map an agent-supplied tier name to a `Tier` (defaults to ambient).
+fn parse_tier(s: Option<&str>) -> Result<Tier, McpError> {
+    Ok(match s.map(|s| s.trim().to_lowercase()).as_deref() {
+        None | Some("") | Some("ambient") => Tier::Ambient,
+        Some("direct") => Tier::Direct,
+        Some("needs_ack") | Some("needs-ack") | Some("needsack") => Tier::NeedsAck,
+        Some("interrupt") => Tier::Interrupt,
+        Some(other) => {
+            return Err(McpError::invalid_params(
+                format!("unknown tier '{other}' (use ambient|direct|needs_ack|interrupt)"),
+                None,
+            ))
+        }
+    })
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SendArgs {
     /// The chat message to broadcast to the room.
     pub text: String,
+    /// Address specific recipients by nick or id (empty = whole room). Addressed
+    /// recipients always get delivery/read/ack receipts.
+    #[serde(default)]
+    pub to: Vec<String>,
+    /// Urgency tier: "ambient" (default, room chatter), "direct" (worth a reply),
+    /// "needs_ack" (require an explicit ack within the deadline — you'll be
+    /// alerted if it isn't acked), or "interrupt" ("notify anyway": overrides the
+    /// receiver's focus and re-broadcasts until acked).
+    #[serde(default)]
+    pub tier: Option<String>,
+    /// Ack window in milliseconds for needs_ack/interrupt (defaults to 60000).
+    #[serde(default)]
+    pub deadline_ms: Option<u64>,
+    /// Override the receiver's focus/mute (the iMessage "Notify Anyway" action).
+    #[serde(default)]
+    pub notify_anyway: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AckArgs {
+    /// The `seq` of the event you're acknowledging (from chat_wait/chat_poll).
+    pub seq: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReceiptsArgs {
+    /// Optionally scope to one message you sent, by its `seq`.
+    #[serde(default)]
+    pub seq: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FocusArgs {
+    /// Mute anything below this tier (ambient|direct|needs_ack|interrupt) unless
+    /// it's sent with notify_anyway. Omit with clear=true to mute nothing.
+    #[serde(default)]
+    pub mute_below: Option<String>,
+    /// Clear focus — mute nothing.
+    #[serde(default)]
+    pub clear: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -155,9 +212,40 @@ impl GroupchatMcp {
         self.run(Request::Connect { ticket: a.ticket }).await
     }
 
-    #[tool(description = "Send a chat message to everyone in the room.")]
+    #[tool(description = "Send a chat message to the room. Set `tier` to control urgency: ambient (default) is glanceable chatter; direct warrants a reply; needs_ack REQUIRES the recipient to ack within the deadline (you're alerted if they don't); interrupt is \"notify anyway\" — it overrides their focus and re-broadcasts until acked. Use `to` to address specific recipients (by nick/id); addressed messages always get delivery/read/ack receipts. Returns the message id.")]
     async fn chat_send(&self, Parameters(a): Parameters<SendArgs>) -> Result<CallToolResult, McpError> {
-        self.run(Request::Send { text: a.text }).await
+        let tier = parse_tier(a.tier.as_deref())?;
+        self.run(Request::Send {
+            text: a.text,
+            to: a.to,
+            tier,
+            deadline_ms: a.deadline_ms,
+            notify_anyway: a.notify_anyway,
+        })
+        .await
+    }
+
+    #[tool(description = "Acknowledge a message addressed to you, by its event `seq`. This sends a read+ack receipt back to the sender so they know you saw it and are acting on it. ALWAYS ack a needs_ack or interrupt event (tier in the event) — otherwise the sender is alerted that you ignored it and an interrupt will keep re-firing.")]
+    async fn chat_ack(&self, Parameters(a): Parameters<AckArgs>) -> Result<CallToolResult, McpError> {
+        self.run(Request::Ack { seq: a.seq }).await
+    }
+
+    #[tool(description = "Show delivery/read/ack status for messages you sent that expect receipts (needs_ack/interrupt or addressed). Tells you, per recipient, whether your message was delivered, seen, and acked — and whether the ack deadline is overdue.")]
+    async fn receipts(&self, Parameters(a): Parameters<ReceiptsArgs>) -> Result<CallToolResult, McpError> {
+        self.run(Request::Receipts { seq: a.seq }).await
+    }
+
+    #[tool(description = "Set or clear your receiver focus. With mute_below set, messages below that tier are silenced (logged but not flagged for you) unless the sender used notify_anyway. Use clear=true to mute nothing.")]
+    async fn focus(&self, Parameters(a): Parameters<FocusArgs>) -> Result<CallToolResult, McpError> {
+        let mute_below = match a.mute_below.as_deref() {
+            Some(_) => Some(parse_tier(a.mute_below.as_deref())?),
+            None => None,
+        };
+        self.run(Request::Focus {
+            mute_below,
+            clear: a.clear,
+        })
+        .await
     }
 
     #[tool(description = "Poll the chat log for new messages and events (join requests, calls, shared resources). Returns events plus a `last` sequence cursor to pass next time.")]
@@ -220,15 +308,24 @@ impl ServerHandler for GroupchatMcp {
                  \
                  Then run the notification loop: call chat_wait (it BLOCKS until something \
                  happens, passing back the `last` cursor) and triage each event like a human \
-                 glancing at a notification. Events carry a `direct` flag: when `direct` is true \
-                 (someone @mentioned you, or an incoming call) it's addressed to you — open it \
-                 and reply with chat_send, or at least ack. When `direct` is false it's ambient \
-                 room chatter or a presence change (`kind:\"presence\"`, e.g. 'X is online' / \
-                 'X went offline') — note it and move on; only chime in if it's relevant. Then \
-                 loop back to chat_wait. Presence is kept accurate for you automatically (online/ \
-                 offline pings, stale-peer cleanup) — no need to manage contacts or the room by \
-                 hand. call for a 1:1; share_resource / get_resource to exchange files; who for \
-                 a presence snapshot."
+                 glancing at a notification. \
+                 \
+                 Each event has a `tier`: ambient (glanceable room chatter / presence changes — \
+                 note and move on), direct (someone @mentioned you or addressed you — open and \
+                 reply), needs_ack (they REQUIRE you to acknowledge — reply and call chat_ack with \
+                 the event's `seq`, or you'll be marked as having ignored it), and interrupt \
+                 ('notify anyway' — highest urgency, handle it now and chat_ack it; it keeps \
+                 re-firing until you do). The `direct` flag is true for tier >= direct. \
+                 \
+                 When YOU need a guarantee the other side acted, send at tier needs_ack (or \
+                 interrupt for must-not-miss) and then use `receipts` to see who delivered/saw/ \
+                 acked it — you'll get an alert event if it goes unacked past the deadline. Use \
+                 `focus` to mute low-tier noise while you work; senders can still break through \
+                 with notify_anyway. \
+                 \
+                 Then loop back to chat_wait. Presence is kept accurate for you automatically — \
+                 no need to manage contacts or the room by hand. call for a 1:1; share_resource / \
+                 get_resource to exchange files; who for a presence snapshot."
                     .to_string(),
             )
     }

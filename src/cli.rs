@@ -7,6 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use crate::{
     config::socket_path,
     control::{request, Event, EventKind, Request, Response},
+    proto::Tier,
 };
 
 /// Ensure a daemon is running for this home dir, spawning one if needed.
@@ -104,9 +105,55 @@ fn print_response(resp: Response) {
                 println!("{}  from {}\n    {}", r.label, r.from, r.ticket);
             }
         }
+        Response::Receipts { messages } => {
+            if messages.is_empty() {
+                println!("(no tracked messages)");
+            }
+            for m in messages {
+                let flag = if m.overdue { " \u{26A0} overdue" } else { "" };
+                println!(
+                    "msg {} [{}]{}  \u{201C}{}\u{201D}",
+                    m.msg_id,
+                    tier_str(&m.tier),
+                    flag,
+                    m.text
+                );
+                for r in m.recipients {
+                    let mark = |b: bool| if b { "\u{2713}" } else { "\u{2014}" };
+                    println!(
+                        "    {} {}delivered {}seen {}acked  ({})",
+                        r.nick,
+                        mark(r.delivered),
+                        mark(r.seen),
+                        mark(r.acked),
+                        r.id
+                    );
+                }
+            }
+        }
         Response::Error { message } => {
             eprintln!("error: {message}");
         }
+    }
+}
+
+/// Short machine-readable name for a tier (also a hook env var value).
+fn tier_str(t: &Tier) -> &'static str {
+    match t {
+        Tier::Ambient => "ambient",
+        Tier::Direct => "direct",
+        Tier::NeedsAck => "needs_ack",
+        Tier::Interrupt => "interrupt",
+    }
+}
+
+/// A short urgency badge for a tier, shown ahead of the event text.
+fn tier_badge(t: &Tier) -> &'static str {
+    match t {
+        Tier::Ambient => "",
+        Tier::Direct => "\u{1F514} ",       // 🔔
+        Tier::NeedsAck => "\u{23F0} ",      // ⏰
+        Tier::Interrupt => "\u{1F6A8} ",    // 🚨
     }
 }
 
@@ -118,11 +165,13 @@ fn kind_str(k: &EventKind) -> &'static str {
         EventKind::Call => "call",
         EventKind::Resource => "resource",
         EventKind::Presence => "presence",
+        EventKind::Receipt => "receipt",
         EventKind::System => "system",
     }
 }
 
-/// Print one event the way `log`/`watch` show it (🔔 marks direct ones).
+/// Print one event the way `log`/`watch` show it. A tier badge (🔔/⏰/🚨) marks
+/// urgency; needs_ack/interrupt chat lines show their seq so you can `ack` them.
 fn print_event(e: &Event) {
     let tag = match e.kind {
         EventKind::Chat => "",
@@ -130,10 +179,20 @@ fn print_event(e: &Event) {
         EventKind::Call => "[call] ",
         EventKind::Resource => "[resource] ",
         EventKind::Presence => "[presence] ",
+        EventKind::Receipt => "[receipt] ",
         EventKind::System => "[system] ",
     };
-    let bell = if e.direct { "\u{1F514} " } else { "" };
-    println!("{bell}{tag}{}: {}", e.nick, e.text);
+    let badge = tier_badge(&e.tier);
+    // Prompt the reader to ack messages that asked for one.
+    let ack_hint = if matches!(e.kind, EventKind::Chat)
+        && e.tier >= Tier::NeedsAck
+        && e.msg_id.is_some()
+    {
+        format!("  \u{2190} ack {}", e.seq)
+    } else {
+        String::new()
+    };
+    println!("{badge}{tag}{}: {}{ack_hint}", e.nick, e.text);
 }
 
 /// Run a user hook for an event: the event fields are exported as environment
@@ -150,6 +209,15 @@ fn run_hook(cmd: &str, e: &Event) {
         .env("GROUPCHAT_EVENT_ID", &e.id)
         .env("GROUPCHAT_EVENT_TEXT", &e.text)
         .env("GROUPCHAT_EVENT_DIRECT", if e.direct { "true" } else { "false" })
+        .env("GROUPCHAT_EVENT_TIER", tier_str(&e.tier))
+        .env(
+            "GROUPCHAT_EVENT_PREEMPT",
+            if e.tier >= Tier::Interrupt { "true" } else { "false" },
+        )
+        .env(
+            "GROUPCHAT_EVENT_MSG_ID",
+            e.msg_id.map(|m| m.to_string()).unwrap_or_default(),
+        )
         .env("GROUPCHAT_EVENT_TS", e.ts.to_string())
         .stdin(Stdio::piped())
         .spawn();
@@ -190,11 +258,14 @@ fn desktop_notify(e: &Event) {
 /// Foreground notification runner: block on `chat_wait`, print each event, and
 /// for matching events run a hook command and/or raise a desktop notification.
 /// Loops forever (Ctrl-C to stop), reconnecting if the daemon restarts.
+#[allow(clippy::too_many_arguments)]
 pub async fn watch(
     home: &Path,
     since: Option<u64>,
     direct_only: bool,
+    min_tier: Option<Tier>,
     exec: Option<String>,
+    on_interrupt: Option<String>,
     notify: bool,
     timeout_ms: u64,
 ) -> Result<()> {
@@ -225,7 +296,16 @@ pub async fn watch(
         if let Response::Events { events, last } = resp {
             for e in &events {
                 print_event(e);
-                if !direct_only || e.direct {
+                // The preemption hook fires only for interrupt-tier ("notify
+                // anyway") events — independent of the direct/min-tier gate.
+                if e.tier >= Tier::Interrupt {
+                    if let Some(cmd) = &on_interrupt {
+                        run_hook(cmd, e);
+                    }
+                }
+                let passes = !direct_only && min_tier.map(|m| e.tier >= m).unwrap_or(true)
+                    || direct_only && e.direct;
+                if passes {
                     if let Some(cmd) = &exec {
                         run_hook(cmd, e);
                     }

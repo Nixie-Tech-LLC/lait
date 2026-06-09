@@ -12,7 +12,7 @@ use tokio::{
     net::UnixStream,
 };
 
-use crate::config::Contact;
+use crate::{config::Contact, proto::Tier};
 
 /// A request from a client to the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,8 +29,35 @@ pub enum Request {
     /// One-step onboarding: join a room from a ticket, auto-add the host as a
     /// contact, and announce a join request (the host auto-approves).
     Connect { ticket: String },
-    /// Broadcast a chat line to the room.
-    Send { text: String },
+    /// Broadcast a chat line to the room. `to` addresses specific recipients by
+    /// nick or id (empty = whole room); `tier` sets urgency; `deadline_ms` is
+    /// the ack window for needs_ack/interrupt; `notify_anyway` overrides the
+    /// receiver's focus/mute.
+    Send {
+        text: String,
+        #[serde(default)]
+        to: Vec<String>,
+        #[serde(default)]
+        tier: Tier,
+        #[serde(default)]
+        deadline_ms: Option<u64>,
+        #[serde(default)]
+        notify_anyway: bool,
+    },
+    /// Acknowledge a received message by its local event `seq` — broadcasts an
+    /// Acked receipt to its original sender.
+    Ack { seq: u64 },
+    /// Report delivery/read/ack status for outstanding messages we sent (or for
+    /// one message by its local `seq`).
+    Receipts { seq: Option<u64> },
+    /// Set or clear the receiver focus: mute anything below `mute_below` unless
+    /// it carries notify_anyway.
+    Focus {
+        #[serde(default)]
+        mute_below: Option<Tier>,
+        #[serde(default)]
+        clear: bool,
+    },
     /// Fetch chat/system events with seq greater than `since`.
     Log { since: u64 },
     /// Block until an event with seq greater than `since` arrives (event-based
@@ -67,7 +94,29 @@ pub enum Response {
     Contacts { contacts: Vec<Contact> },
     Who { peers: Vec<PresenceEntry> },
     Resources { resources: Vec<ResourceEntry> },
+    Receipts { messages: Vec<MessageReceipts> },
     Error { message: String },
+}
+
+/// Delivery/read/ack status of one message we sent, reconciled against the
+/// expected recipient roster.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageReceipts {
+    pub msg_id: u64,
+    pub text: String,
+    pub tier: Tier,
+    /// Whether the ack deadline has lapsed with acks still outstanding.
+    pub overdue: bool,
+    pub recipients: Vec<RecipientReceipt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecipientReceipt {
+    pub id: String,
+    pub nick: String,
+    pub delivered: bool,
+    pub seen: bool,
+    pub acked: bool,
 }
 
 /// A chat/system log entry kept in the daemon's ring buffer.
@@ -82,8 +131,16 @@ pub struct Event {
     /// Whether this event is addressed to us and warrants a response — a direct
     /// @mention or an inbound call — versus ambient room traffic worth only a
     /// glance. Lets an agent triage like a human reading notifications.
+    /// Equivalent to `tier >= Direct` after the receiver's focus is applied.
     #[serde(default)]
     pub direct: bool,
+    /// Effective urgency tier of this event after addressing + focus are applied.
+    #[serde(default)]
+    pub tier: Tier,
+    /// For chat events, the original sender's message id — the handle used to
+    /// `ack` it. The global identity is `(id, msg_id)`.
+    #[serde(default)]
+    pub msg_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +152,9 @@ pub enum EventKind {
     Resource,
     /// A peer's presence changed (came online / went offline / left).
     Presence,
+    /// A receipt update for a message we sent (e.g. a peer acked it) or an
+    /// overdue-ack alert.
+    Receipt,
     System,
 }
 
