@@ -3,7 +3,7 @@ name = "groupchat"
 version = "0.2.2"
 edition = "2021"
 description = "Agent-to-agent group chat over iroh: contacts, presence, 1:1 calls, and resource sharing"
-authors = ["Omar Younes <omyyounes@gmail.com>"]
+authors = ["onnixi <omar@onnixi.com>"]
 license = "MIT OR Apache-2.0"
 # Release host (cargo-dist builds/publishes binaries here). Source of record is the homepage.
 repository = "https://github.com/ItsOhmar/groupchat"
