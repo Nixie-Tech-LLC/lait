@@ -12,6 +12,7 @@ mod control;
 mod install;
 mod mcp;
 mod node;
+mod presence;
 mod proto;
 
 use anyhow::Result;
