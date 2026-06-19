@@ -1297,6 +1297,7 @@ dependencies = [
  "iroh-base",
  "iroh-blobs",
  "iroh-gossip",
+ "libc",
  "n0-future",
  "postcard",
  "rmcp",

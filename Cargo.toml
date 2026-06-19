@@ -42,6 +42,7 @@ blake3 = "1"
 # misc
 anyhow = "1"
 directories = "5"
+libc = "0.2"  # unix flock(2) for the daemon single-instance lock
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
