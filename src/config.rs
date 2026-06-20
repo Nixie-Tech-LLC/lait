@@ -13,19 +13,112 @@ use anyhow::{anyhow, Context, Result};
 use iroh::{EndpointId, SecretKey};
 use serde::{Deserialize, Serialize};
 
-use crate::proto::Tier;
+use crate::{
+    proto::Tier,
+    registry::{agents_base, select, Registry, Selection, SessionMap},
+};
 
-/// Resolve the groupchat home directory, creating it if needed.
-pub fn home_dir() -> Result<PathBuf> {
-    let dir = match std::env::var_os("GROUPCHAT_HOME") {
+/// The base config directory (ignoring `$GROUPCHAT_HOME`) — where the named
+/// identity registry (`agents/`) and the session map live.
+pub fn config_root() -> Result<PathBuf> {
+    let dir = match std::env::var_os("GROUPCHAT_CONFIG_ROOT") {
         Some(p) => PathBuf::from(p),
         None => directories::ProjectDirs::from("dev", "nixi", "groupchat")
             .context("could not determine config directory")?
             .config_dir()
             .to_path_buf(),
     };
-    fs::create_dir_all(&dir).with_context(|| format!("create home dir {}", dir.display()))?;
+    fs::create_dir_all(&dir).with_context(|| format!("create config dir {}", dir.display()))?;
     Ok(dir)
+}
+
+/// The registry of named identities, and the session→identity map beside it.
+pub fn registry() -> Result<(Registry, PathBuf)> {
+    let root = config_root()?;
+    let base = agents_base(&root);
+    fs::create_dir_all(&base)?;
+    Ok((Registry::new(base), root.join("sessions.json")))
+}
+
+/// Mint a fresh per-session identity name, unique within the registry.
+fn mint_name(reg: &Registry, session_id: &str) -> String {
+    let short = &session_id[..session_id.len().min(6)];
+    let mut name = format!("agent-{short}");
+    let mut n = 2;
+    while reg.exists(&name) {
+        name = format!("agent-{short}-{n}");
+        n += 1;
+    }
+    name
+}
+
+/// Resolve which identity's home directory this invocation should use, and
+/// return it (created on demand). Order:
+///   1. `$GROUPCHAT_HOME` — explicit override (advanced / the spawned daemon).
+///   2. an explicit `--as <name>` — use/create that named identity.
+///   3. a session already mapped to an existing identity — recall it (0-step).
+///   4. otherwise (model B) mint a fresh per-session identity, so each new
+///      agent/tab is private by default; without a session id, fall back to the
+///      single identity, or require `--as` when there are several.
+pub fn resolve_home(explicit: Option<&str>) -> Result<PathBuf> {
+    if let Some(p) = std::env::var_os("GROUPCHAT_HOME") {
+        let dir = PathBuf::from(p);
+        fs::create_dir_all(&dir)?;
+        return Ok(dir);
+    }
+
+    let (reg, sessions_path) = registry()?;
+    let mut map = SessionMap::load(sessions_path);
+    let sid = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
+
+    let name = if let Some(name) = explicit {
+        name.to_string()
+    } else if let Some(s) = sid.as_deref() {
+        // Model B: recall this session's identity if mapped, else mint a FRESH
+        // per-session identity. Never auto-attach to another session's identity.
+        match map.get(s) {
+            Some(n) if reg.exists(n) => n.to_string(),
+            _ => mint_name(&reg, s),
+        }
+    } else {
+        // No session anchor (e.g. plain shell): fall back to the never-guess
+        // selection — attach only when there's exactly one identity.
+        match select(reg.list(), None) {
+            Selection::Attach(n) => n,
+            Selection::Empty => "default".to_string(),
+            Selection::Choose(opts) => {
+                return Err(anyhow!(
+                    "multiple identities — choose one with --as <name>: {}",
+                    opts.join(", ")
+                ))
+            }
+        }
+    };
+
+    if let Some(s) = sid.as_deref() {
+        let _ = map.set(s, &name);
+    }
+    let home = reg.home_for(&name);
+    fs::create_dir_all(&home)?;
+    Ok(home)
+}
+
+/// Names of all registered identities.
+pub fn list_identities() -> Result<Vec<String>> {
+    let (reg, _) = registry()?;
+    Ok(reg.list())
+}
+
+/// Bind the current session to a named identity (creating it if needed) so this
+/// session — and future resumes of it — recall that identity. Returns its home.
+pub fn bind_session(name: &str) -> Result<PathBuf> {
+    let (reg, sessions) = registry()?;
+    let home = reg.home_for(name);
+    fs::create_dir_all(&home)?;
+    if let Ok(sid) = std::env::var("CLAUDE_CODE_SESSION_ID") {
+        SessionMap::load(sessions).set(&sid, name)?;
+    }
+    Ok(home)
 }
 
 /// Path to the control socket for the running daemon.
