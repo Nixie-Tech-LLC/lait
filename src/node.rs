@@ -13,8 +13,10 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use iroh::{
-    address_lookup::memory::MemoryLookup, endpoint::presets, protocol::Router, Endpoint,
-    EndpointAddr, EndpointId, SecretKey,
+    address_lookup::memory::MemoryLookup,
+    endpoint::{presets, Connection},
+    protocol::{AcceptError, ProtocolHandler, Router},
+    Endpoint, EndpointAddr, EndpointId, SecretKey,
 };
 use iroh_blobs::{store::fs::FsStore, ticket::BlobTicket, BlobsProtocol};
 use iroh_gossip::{
@@ -38,13 +40,20 @@ use crate::{
         Event as LogEvent, EventKind, MessageReceipts, PresenceEntry, RecipientReceipt, Request,
         ResourceEntry, Response, StatusInfo,
     },
+    presence::PeerState,
     proto::{topic_for_room, Payload, ReceiptState, RoomTicket, SignedMessage, Tier},
 };
 
-/// How recently a peer must have been heard from to count as online.
-const ONLINE_WINDOW: Duration = Duration::from_secs(30);
-/// How often we broadcast a presence heartbeat.
+/// ALPN for the lightweight liveness-probe protocol. A completed QUIC handshake
+/// is the entire signal — there is no payload.
+const PRESENCE_ALPN: &[u8] = b"groupchat/presence/0";
+/// How often we broadcast a presence heartbeat. This is only a keepalive for the
+/// gossip connection; presence itself is driven by neighbor events + direct
+/// probes (see `presence.rs`), not by whether these are delivered.
 const HEARTBEAT: Duration = Duration::from_secs(10);
+/// How long a direct liveness probe waits for a QUIC handshake before concluding
+/// the peer is gone.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the reaper sweeps for stale peers.
 const REAP_INTERVAL: Duration = Duration::from_secs(5);
 /// Drop an offline peer from the presence table entirely after this long.
@@ -82,9 +91,20 @@ fn truncate(text: &str) -> String {
 pub struct Peer {
     pub nick: String,
     pub last_seen: Instant,
-    /// Last broadcast presence state, so we emit a notification only on the
-    /// online<->offline transition rather than on every heartbeat.
-    pub online: bool,
+    /// Neighbor-driven, probe-confirmed presence state (see `presence.rs`).
+    pub presence: PeerState,
+}
+
+/// Accepts liveness probes (see `Node::probe_peer`). The completed QUIC
+/// handshake is the entire signal; the handler just lets the connection close.
+#[derive(Debug, Clone)]
+struct PresencePing;
+
+impl ProtocolHandler for PresencePing {
+    async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
+        connection.closed().await;
+        Ok(())
+    }
 }
 
 /// Append-only-ish ring buffer of chat/system events. Holds a `Notify` that is
@@ -255,25 +275,36 @@ impl Node {
     /// Update presence for a peer and return the best display nick. Emits a
     /// "is online" notification when a peer transitions from offline to online.
     fn touch(&self, id: EndpointId, nick: Option<String>) -> String {
-        let mut came_online = false;
-        {
+        let now = Instant::now();
+        let came_online = {
             let mut p = self.shared.presence.lock().unwrap();
-            let entry = p.entry(id).or_insert_with(|| Peer {
-                nick: id.fmt_short().to_string(),
-                last_seen: Instant::now(),
-                online: false,
-            });
-            if !entry.online {
-                entry.online = true;
-                came_online = true;
-            }
-            entry.last_seen = Instant::now();
-            if let Some(n) = nick {
-                if !n.is_empty() {
-                    entry.nick = n;
+            match p.get_mut(&id) {
+                Some(entry) => {
+                    entry.last_seen = now;
+                    let came = entry.presence.seen(now);
+                    if let Some(n) = nick {
+                        if !n.is_empty() {
+                            entry.nick = n;
+                        }
+                    }
+                    came
+                }
+                None => {
+                    let nm = nick
+                        .filter(|n| !n.is_empty())
+                        .unwrap_or_else(|| id.fmt_short().to_string());
+                    p.insert(
+                        id,
+                        Peer {
+                            nick: nm,
+                            last_seen: now,
+                            presence: PeerState::new_online(now),
+                        },
+                    );
+                    true
                 }
             }
-        }
+        };
         let display = self
             .shared
             .contacts
@@ -300,19 +331,83 @@ impl Node {
         display
     }
 
-    /// Mark a peer offline and emit a "went offline" notification, once.
+    /// Mark a peer offline and emit a "went offline"/"left" notification, once.
     fn mark_offline(&self, id: EndpointId, left: bool) {
-        let nick = {
+        let visible = {
             let mut p = self.shared.presence.lock().unwrap();
             match p.get_mut(&id) {
-                Some(peer) if peer.online => {
-                    peer.online = false;
-                    peer.nick.clone()
-                }
-                _ => return, // unknown or already offline — nothing to announce
+                Some(peer) => peer.presence.force_offline(),
+                None => false,
             }
         };
-        let display = self.shared.contacts.lock().unwrap().nick_of(&id).unwrap_or(nick);
+        if visible {
+            self.announce_offline(id, left);
+        }
+    }
+
+    /// Handle a gossip NeighborDown: drop the peer to Suspect (not offline) and
+    /// launch a direct liveness probe to decide whether it actually left. This
+    /// is what makes presence robust against Plumtree's tree reshuffling and the
+    /// 2-node lazy-push oscillation that used to flap peers offline every ~30s.
+    fn on_neighbor_down(self: Arc<Self>, id: EndpointId) {
+        let became_suspect = {
+            let mut p = self.shared.presence.lock().unwrap();
+            match p.get_mut(&id) {
+                Some(peer) => peer.presence.neighbor_down(Instant::now()),
+                None => false,
+            }
+        };
+        if became_suspect {
+            tokio::spawn(self.probe_peer(id));
+        }
+    }
+
+    /// Directly dial a suspect peer on the presence ALPN. A completed QUIC
+    /// handshake means it is alive and reachable regardless of the gossip tree
+    /// state; a failure within the timeout means it is gone.
+    async fn probe_peer(self: Arc<Self>, id: EndpointId) {
+        let alive = match tokio::time::timeout(
+            PROBE_TIMEOUT,
+            self.endpoint.connect(id, PRESENCE_ALPN),
+        )
+        .await
+        {
+            Ok(Ok(conn)) => {
+                conn.close(0u32.into(), b"probe");
+                true
+            }
+            _ => false,
+        };
+        let transition = {
+            let mut p = self.shared.presence.lock().unwrap();
+            p.get_mut(&id)
+                .and_then(|peer| peer.presence.probe_result(alive, Instant::now()))
+        };
+        match transition {
+            Some(true) => self.announce_online(id),
+            Some(false) => self.announce_offline(id, false),
+            None => {}
+        }
+    }
+
+    /// Emit an "is online" presence event. The caller has already transitioned
+    /// the peer's state; this only notifies.
+    fn announce_online(&self, id: EndpointId) {
+        if id == self.shared.my_id {
+            return;
+        }
+        let display = self.display_nick(&id);
+        self.shared.events.lock().unwrap().push(
+            EventKind::Presence,
+            id.to_string(),
+            display.clone(),
+            format!("{display} is online"),
+        );
+    }
+
+    /// Emit a "went offline"/"left" presence event. State is already updated.
+    fn announce_offline(&self, id: EndpointId, left: bool) {
+        let display = self.display_nick(&id);
         let text = if left {
             format!("{display} left")
         } else {
@@ -360,10 +455,14 @@ impl Node {
         let mut interval = tokio::time::interval(REAP_INTERVAL);
         loop {
             interval.tick().await;
+            let now = Instant::now();
+            // Only reap peers that went Suspect (NeighborDown) and stayed
+            // unconfirmed past the grace window. A plain connected peer is never
+            // reaped on a timer, no matter how quiet — that was the old bug.
             let stale: Vec<EndpointId> = {
                 let p = self.shared.presence.lock().unwrap();
                 p.iter()
-                    .filter(|(_, peer)| peer.online && peer.last_seen.elapsed() >= ONLINE_WINDOW)
+                    .filter(|(_, peer)| peer.presence.should_reap(now))
                     .map(|(id, _)| *id)
                     .collect()
             };
@@ -374,7 +473,7 @@ impl Node {
                 .presence
                 .lock()
                 .unwrap()
-                .retain(|_, peer| peer.online || peer.last_seen.elapsed() < PRUNE_WINDOW);
+                .retain(|_, peer| peer.presence.is_online() || peer.last_seen.elapsed() < PRUNE_WINDOW);
         }
     }
 
@@ -701,13 +800,14 @@ impl Node {
                     Event::NeighborUp(id) => {
                         self.touch(id, None);
                     }
-                    // NeighborDown only means this peer is no longer one of our
-                    // *direct* gossip neighbors — the mesh reshuffles neighbors
-                    // constantly without anyone actually leaving. Treating it as
-                    // "offline" causes online/offline flapping. Presence is driven
-                    // by heartbeats instead: a peer goes offline when its
-                    // heartbeats lapse (the reaper) or it sends a graceful Bye.
-                    Event::NeighborDown(_) | Event::Lagged => {}
+                    // A NeighborDown may mean the peer left, OR (in a larger
+                    // mesh) just that it is no longer one of our *direct* gossip
+                    // neighbors. Don't trust it outright: drop to Suspect and
+                    // confirm with a direct probe before declaring offline.
+                    Event::NeighborDown(id) => {
+                        self.clone().on_neighbor_down(id);
+                    }
+                    Event::Lagged => {}
                 },
                 Ok(None) => break,
                 Err(_) => break,
@@ -719,14 +819,14 @@ impl Node {
         let mut interval = tokio::time::interval(HEARTBEAT);
         loop {
             interval.tick().await;
-            if self.recv_gen.load(Ordering::SeqCst) == 0 {
-                // not subscribed yet; skip
-            }
-            let _ = self
+            if let Err(e) = self
                 .broadcast(Payload::Presence {
                     nick: self.shared.nick.clone(),
                 })
-                .await;
+                .await
+            {
+                tracing::debug!("heartbeat broadcast failed: {e}");
+            }
         }
     }
 
@@ -758,7 +858,7 @@ impl Node {
             .lock()
             .unwrap()
             .get(id)
-            .map(|p| p.online)
+            .map(|p| p.presence.is_online())
             .unwrap_or(false)
     }
 
@@ -771,7 +871,7 @@ impl Node {
                     .lock()
                     .unwrap()
                     .values()
-                    .filter(|p| p.online)
+                    .filter(|p| p.presence.is_online())
                     .count();
                 Ok(Response::Status(StatusInfo {
                     id: self.shared.my_id.to_string(),
@@ -878,7 +978,7 @@ impl Node {
                             .lock()
                             .unwrap()
                             .iter()
-                            .filter(|(id, p)| p.online && **id != self.shared.my_id)
+                            .filter(|(id, p)| p.presence.is_online() && **id != self.shared.my_id)
                             .map(|(id, _)| *id)
                             .collect()
                     };
@@ -978,7 +1078,7 @@ impl Node {
                         PresenceEntry {
                             id: id.to_string(),
                             nick,
-                            online: p.online,
+                            online: p.presence.is_online(),
                             is_contact,
                             last_seen_secs: p.last_seen.elapsed().as_secs(),
                         }
@@ -1264,6 +1364,7 @@ pub async fn run_daemon(home: PathBuf) -> Result<()> {
         .accept(GOSSIP_ALPN, gossip.clone())
         .accept(iroh_blobs::ALPN, blobs)
         .accept(CALL_ALPN, call_handler)
+        .accept(PRESENCE_ALPN, PresencePing)
         .spawn();
 
     // Wait until we have a home relay so our advertised address is dialable.
