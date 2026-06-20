@@ -13,12 +13,13 @@ mod install;
 mod mcp;
 mod node;
 mod proto;
+mod registry;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::{
-    config::{home_dir, load_or_create_identity, Profile},
+    config::{load_or_create_identity, Profile},
     control::Request,
     install::{Client, Scope},
     proto::Tier,
@@ -179,6 +180,11 @@ enum Command {
     },
     /// List announced resources.
     Resources,
+    /// List your identities (each agent/session is its own private identity).
+    Agents,
+    /// Resume (or create) a named identity for this session, so future resumes
+    /// of this session come back as it.
+    Resume { name: String },
     /// Stop the running daemon.
     Stop,
 }
@@ -196,7 +202,33 @@ enum ContactsCmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Cli::parse();
-    let home = home_dir()?;
+
+    // Registry-level commands that operate across identities, not on one
+    // resolved home — handle them before resolution so they never mint.
+    match &args.command {
+        Command::Agents => {
+            let names = config::list_identities()?;
+            if names.is_empty() {
+                println!("no identities yet — one is created on first use");
+            } else {
+                for n in names {
+                    println!("{n}");
+                }
+            }
+            return Ok(());
+        }
+        Command::Resume { name } => {
+            let home = config::bind_session(name)?;
+            load_or_create_identity(&home)?;
+            println!("resumed identity '{name}'");
+            return cli::run(&home, Request::Status).await;
+        }
+        _ => {}
+    }
+
+    // Every other command acts as one identity: resolve which (model B —
+    // recall a mapped session, else mint a fresh per-session identity).
+    let home = config::resolve_home(None)?;
 
     match args.command {
         Command::Init { nick, room } => {
@@ -318,6 +350,7 @@ async fn main() -> Result<()> {
         Command::Share { path, label } => cli::run(&home, Request::Share { path, label }).await?,
         Command::Get { resource, out } => cli::run(&home, Request::Get { resource, out }).await?,
         Command::Resources => cli::run(&home, Request::Resources).await?,
+        Command::Agents | Command::Resume { .. } => unreachable!("handled before resolution"),
         Command::Stop => cli::run(&home, Request::Stop).await?,
     }
 
