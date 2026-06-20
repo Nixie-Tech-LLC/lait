@@ -8,7 +8,7 @@ use std::{fmt, str::FromStr};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use iroh::{EndpointAddr, PublicKey, SecretKey};
+use iroh::{EndpointId, PublicKey, SecretKey};
 use iroh_gossip::proto::TopicId;
 use serde::{Deserialize, Serialize};
 use serde_byte_array::ByteArray;
@@ -128,26 +128,31 @@ impl SignedMessage {
     }
 }
 
-/// A base32-encoded invite to join a room: the topic, bootstrap peers, and the
-/// minting host's nickname so a joiner can auto-add them as a contact in one
-/// step (the host's endpoint id is `peers[0].id`).
+/// A compact, base32-encoded invite to join a room. It carries only what a
+/// joiner cannot derive on its own: the room name (the topic is
+/// `topic_for_room(room)`), the host's endpoint id, and the host's nick (for
+/// one-step `connect`). We deliberately do NOT ship relay/socket addresses —
+/// iroh discovery resolves a reachable address from the pubkey — so the ticket
+/// stays short enough to survive copy-paste as a single line.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoomTicket {
-    pub topic: TopicId,
-    pub peers: Vec<EndpointAddr>,
+    pub room: String,
+    pub host: EndpointId,
     /// Nick of the host who minted this ticket (for one-step `connect`).
     pub host_nick: String,
 }
 
 impl RoomTicket {
-    /// The endpoint id of the host who minted the ticket, if any bootstrap
-    /// peer is present (the first peer is always the minting host).
-    pub fn host(&self) -> Option<EndpointAddr> {
-        self.peers.first().cloned()
+    /// The gossip topic this ticket joins (derived from the room name).
+    pub fn topic(&self) -> TopicId {
+        topic_for_room(&self.room)
     }
-}
 
-impl RoomTicket {
+    /// The `groupchat://` link form of this ticket, for humans/chat apps.
+    pub fn link(&self) -> String {
+        format!("groupchat://join/{self}")
+    }
+
     fn to_bytes(&self) -> Vec<u8> {
         postcard::to_stdvec(self).expect("postcard::to_stdvec is infallible")
     }
@@ -167,9 +172,69 @@ impl fmt::Display for RoomTicket {
 impl FromStr for RoomTicket {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
+        // Accept a bare token or a `groupchat://join/<token>` link, and tolerate
+        // stray whitespace/newlines a terminal may have wrapped in on copy.
+        let s = s.trim();
+        let token = s.strip_prefix("groupchat://join/").unwrap_or(s);
+        let cleaned: String = token.chars().filter(|c| !c.is_whitespace()).collect();
         let bytes = data_encoding::BASE32_NOPAD
-            .decode(s.trim().to_ascii_uppercase().as_bytes())
+            .decode(cleaned.to_ascii_uppercase().as_bytes())
             .context("decode room ticket base32")?;
         Self::from_bytes(&bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host_key() -> EndpointId {
+        SecretKey::from_bytes(&[7u8; 32]).public()
+    }
+
+    fn sample() -> RoomTicket {
+        RoomTicket {
+            room: "demo".into(),
+            host: host_key(),
+            host_nick: "alice".into(),
+        }
+    }
+
+    #[test]
+    fn ticket_roundtrips_through_base32() {
+        let t = sample();
+        let back: RoomTicket = t.to_string().parse().unwrap();
+        assert_eq!(back.room, "demo");
+        assert_eq!(back.host, host_key());
+        assert_eq!(back.host_nick, "alice");
+        assert_eq!(back.topic(), topic_for_room("demo"));
+    }
+
+    #[test]
+    fn ticket_is_a_short_one_liner() {
+        let s = sample().to_string();
+        assert!(
+            s.len() < 120,
+            "ticket should be a short one-liner, got {} chars",
+            s.len()
+        );
+    }
+
+    #[test]
+    fn parses_groupchat_link_form() {
+        let t = sample();
+        let link = t.link();
+        assert!(link.starts_with("groupchat://join/"));
+        let back: RoomTicket = link.parse().unwrap();
+        assert_eq!(back.host, host_key());
+    }
+
+    #[test]
+    fn tolerates_whitespace_from_paste() {
+        let s = sample().to_string();
+        // Simulate a terminal wrapping the token across lines on copy.
+        let mangled = format!("  {}\n   {}  ", &s[..s.len() / 2], &s[s.len() / 2..]);
+        let back: RoomTicket = mangled.parse().unwrap();
+        assert_eq!(back.host, host_key());
     }
 }

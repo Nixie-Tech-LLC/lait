@@ -242,7 +242,7 @@ async fn main() -> Result<()> {
             println!("{out}");
         }
         Command::Status => cli::run(&home, Request::Status).await?,
-        Command::Invite => cli::run(&home, Request::Invite).await?,
+        Command::Invite => cli::run_invite(&home).await?,
         Command::Join { ticket } => cli::run(&home, Request::Join { ticket }).await?,
         Command::Connect { ticket, nick } => {
             // For a cold machine, set the nick before the daemon spawns so it

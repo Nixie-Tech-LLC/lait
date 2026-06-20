@@ -7,7 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use crate::{
     config::socket_path,
     control::{request, Event, EventKind, Request, Response},
-    proto::Tier,
+    proto::{RoomTicket, Tier},
 };
 
 /// Ensure a daemon is running for this home dir, spawning one if needed.
@@ -48,6 +48,57 @@ pub async fn run(home: &Path, req: Request) -> Result<()> {
     let resp = client(home, req).await?;
     print_response(resp);
     Ok(())
+}
+
+/// `invite` gets special display: print the bare token (for agents to paste into
+/// `connect`) AND the `groupchat://` link (for humans/chat apps), and best-effort
+/// copy the token to the clipboard so there's nothing to hand-select.
+pub async fn run_invite(home: &Path) -> Result<()> {
+    let resp = client(home, Request::Invite).await?;
+    let token = match resp {
+        Response::Text { text } => text.trim().to_string(),
+        other => {
+            print_response(other);
+            return Ok(());
+        }
+    };
+    let link = token
+        .parse::<RoomTicket>()
+        .map(|t| t.link())
+        .unwrap_or_else(|_| format!("groupchat://join/{token}"));
+    let copied = copy_to_clipboard(&token);
+    println!("{token}");
+    println!("{link}");
+    if copied {
+        println!("(copied to clipboard — paste into `groupchat connect`)");
+    }
+    Ok(())
+}
+
+/// Best-effort copy to the OS clipboard. Tries macOS `pbcopy`, then Wayland
+/// `wl-copy`, then X11 `xclip`. Returns whether it succeeded; never errors.
+fn copy_to_clipboard(s: &str) -> bool {
+    let candidates: [(&str, &[&str]); 3] = [
+        ("pbcopy", &[]),
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+    ];
+    for (cmd, args) in candidates {
+        let Ok(mut child) = std::process::Command::new(cmd)
+            .args(args)
+            .stdin(Stdio::piped())
+            .spawn()
+        else {
+            continue;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(s.as_bytes());
+        }
+        if child.wait().map(|st| st.success()).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
 }
 
 fn print_response(resp: Response) {

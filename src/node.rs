@@ -16,7 +16,7 @@ use iroh::{
     address_lookup::memory::MemoryLookup,
     endpoint::{presets, Connection},
     protocol::{AcceptError, ProtocolHandler, Router},
-    Endpoint, EndpointAddr, EndpointId, SecretKey,
+    Endpoint, EndpointId, SecretKey,
 };
 use iroh_blobs::{store::fs::FsStore, ticket::BlobTicket, BlobsProtocol};
 use iroh_gossip::{
@@ -256,7 +256,6 @@ pub struct Node {
     sender: Mutex<GossipSender>,
     store: FsStore,
     secret_key: SecretKey,
-    memory_lookup: MemoryLookup,
     router: Router,
     shared: Shared,
     shutdown: Arc<Notify>,
@@ -767,14 +766,12 @@ impl Node {
     /// (Re)subscribe to a topic, replacing the active sender/receiver. Waits
     /// until the gossip mesh has formed (at least one neighbor) so that a
     /// message broadcast right after joining is not dropped.
-    async fn join_topic(self: &Arc<Self>, topic: TopicId, peers: Vec<EndpointAddr>) -> Result<()> {
-        let peer_ids: Vec<EndpointId> = peers.iter().map(|p| p.id).collect();
-        for p in peers {
-            self.memory_lookup.add_endpoint_info(p);
-        }
+    async fn join_topic(self: &Arc<Self>, topic: TopicId, peers: Vec<EndpointId>) -> Result<()> {
+        // We bootstrap off endpoint ids only; iroh discovery resolves a
+        // reachable address from each pubkey, so no explicit addresses needed.
         let gtopic = tokio::time::timeout(
             Duration::from_secs(15),
-            self.gossip.subscribe_and_join(topic, peer_ids),
+            self.gossip.subscribe_and_join(topic, peers),
         )
         .await
         .map_err(|_| anyhow!("timed out connecting to the room's peers"))?
@@ -897,17 +894,19 @@ impl Node {
                     }
                 }
                 let ticket = RoomTicket {
-                    topic: topic_for_room(&self.shared.room),
-                    peers: vec![self.endpoint.addr()],
+                    room: self.shared.room.clone(),
+                    host: self.shared.my_id,
                     host_nick: self.shared.nick.clone(),
                 };
+                // Return the bare token — clean for agents to pass to `connect`.
+                // The CLI presents the link form + clipboard for humans.
                 Ok(Response::Text {
                     text: ticket.to_string(),
                 })
             }
             Request::Join { ticket } => {
                 let ticket: RoomTicket = ticket.parse().context("parse room ticket")?;
-                self.join_topic(ticket.topic, ticket.peers).await?;
+                self.join_topic(ticket.topic(), vec![ticket.host]).await?;
                 self.broadcast(Payload::JoinRequest {
                     nick: self.shared.nick.clone(),
                 })
@@ -919,21 +918,17 @@ impl Node {
             }
             Request::Connect { ticket } => {
                 let ticket: RoomTicket = ticket.parse().context("parse room ticket")?;
-                let host = ticket.host();
-                self.join_topic(ticket.topic, ticket.peers).await?;
-                // Auto-add the host as a contact (their id is the first peer).
-                let host_msg = if let Some(addr) = host {
-                    if addr.id != self.shared.my_id {
-                        let nick = if ticket.host_nick.is_empty() {
-                            addr.id.fmt_short().to_string()
-                        } else {
-                            ticket.host_nick.clone()
-                        };
-                        self.add_contact(addr.id, nick.clone())?;
-                        format!(" and added {nick} as a contact")
+                let host = ticket.host;
+                self.join_topic(ticket.topic(), vec![host]).await?;
+                // Auto-add the host as a contact (one-step mutual onboarding).
+                let host_msg = if host != self.shared.my_id {
+                    let nick = if ticket.host_nick.is_empty() {
+                        host.fmt_short().to_string()
                     } else {
-                        String::new()
-                    }
+                        ticket.host_nick.clone()
+                    };
+                    self.add_contact(host, nick.clone())?;
+                    format!(" and added {nick} as a contact")
                 } else {
                     String::new()
                 };
@@ -1405,7 +1400,6 @@ pub async fn run_daemon(home: PathBuf) -> Result<()> {
         sender: Mutex::new(sender),
         store,
         secret_key,
-        memory_lookup,
         router,
         shared,
         shutdown: Arc::new(Notify::new()),
