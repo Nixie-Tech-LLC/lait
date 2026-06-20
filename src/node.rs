@@ -58,12 +58,36 @@ const ACK_REAP_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_ESCALATIONS: u32 = 3;
 /// Base spacing between interrupt re-broadcasts (grows per escalation).
 const ESCALATION_BACKOFF: Duration = Duration::from_secs(15);
+/// Default idle window before an unused daemon shuts itself down. Overridable
+/// via `GROUPCHAT_IDLE_SECS` (0 disables). Keeps per-session daemons from piling
+/// up, while never shutting one that has a client connected.
+const IDLE_SHUTDOWN: Duration = Duration::from_secs(30 * 60);
+/// How often the idle-shutdown loop checks for inactivity.
+const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Whether an idle daemon should shut down: no clients connected AND no activity
+/// within the window. A zero window disables idle shutdown entirely.
+fn should_idle_shutdown(active_conns: u64, idle_for: Duration, window: Duration) -> bool {
+    !window.is_zero() && active_conns == 0 && idle_for >= window
+}
+
+/// Idle-shutdown window, overridable via `GROUPCHAT_IDLE_SECS` (0 disables).
+fn idle_window_from_env() -> Duration {
+    match std::env::var("GROUPCHAT_IDLE_SECS") {
+        Ok(s) => s
+            .trim()
+            .parse::<u64>()
+            .map(Duration::from_secs)
+            .unwrap_or(IDLE_SHUTDOWN),
+        Err(_) => IDLE_SHUTDOWN,
+    }
 }
 
 /// Shorten a message for inclusion in a receipt/alert line.
@@ -249,6 +273,12 @@ pub struct Node {
     /// Local event seqs we've already emitted a Seen receipt for, so following
     /// the log with several clients doesn't re-emit.
     seen_emitted: Mutex<HashSet<u64>>,
+    /// Number of control connections currently open (0 ⇒ idle).
+    active_conns: AtomicU64,
+    /// Last time a client connected or acted — drives idle-shutdown.
+    last_active: Mutex<Instant>,
+    /// Idle window before self-shutdown (`Duration::ZERO` disables).
+    idle_window: Duration,
 }
 
 impl Node {
@@ -1201,7 +1231,37 @@ impl Node {
         }
     }
 
+    /// Count the connection for idle-shutdown, then handle it. Keeping the count
+    /// accurate is what lets a daemon nap only when truly unused — never while a
+    /// client (a `watch`/`wait`, or any in-flight request) is connected.
     async fn handle_conn(self: Arc<Self>, stream: UnixStream) {
+        self.active_conns.fetch_add(1, Ordering::SeqCst);
+        *self.last_active.lock().unwrap() = Instant::now();
+        self.clone().handle_conn_inner(stream).await;
+        self.active_conns.fetch_sub(1, Ordering::SeqCst);
+        *self.last_active.lock().unwrap() = Instant::now();
+    }
+
+    /// Shut the daemon down once it has been idle (no open connections and no
+    /// activity) for `idle_window`. Disabled when the window is zero.
+    async fn idle_shutdown_loop(self: Arc<Self>) {
+        if self.idle_window.is_zero() {
+            return;
+        }
+        let mut interval = tokio::time::interval(IDLE_CHECK_INTERVAL);
+        loop {
+            interval.tick().await;
+            let active = self.active_conns.load(Ordering::SeqCst);
+            let idle_for = self.last_active.lock().unwrap().elapsed();
+            if should_idle_shutdown(active, idle_for, self.idle_window) {
+                tracing::info!("idle {idle_for:?} with no clients — shutting down");
+                self.shutdown.notify_one();
+                break;
+            }
+        }
+    }
+
+    async fn handle_conn_inner(self: Arc<Self>, stream: UnixStream) {
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
         let mut line = String::new();
@@ -1305,12 +1365,16 @@ pub async fn run_daemon(home: PathBuf) -> Result<()> {
         auto_approve: AtomicBool::new(profile.auto_approve),
         next_msg_id: AtomicU64::new(now_secs().saturating_mul(1000)),
         seen_emitted: Mutex::new(HashSet::new()),
+        active_conns: AtomicU64::new(0),
+        last_active: Mutex::new(Instant::now()),
+        idle_window: idle_window_from_env(),
     });
 
     tokio::spawn(node.clone().recv_loop(receiver, 1));
     tokio::spawn(node.clone().heartbeat_loop());
     tokio::spawn(node.clone().reaper_loop());
     tokio::spawn(node.clone().ack_reaper_loop());
+    tokio::spawn(node.clone().idle_shutdown_loop());
 
     // announce ourselves
     node.broadcast(Payload::Hello {
@@ -1356,4 +1420,22 @@ pub async fn run_daemon(home: PathBuf) -> Result<()> {
     let _ = std::fs::remove_file(&socket);
     node.router.shutdown().await.ok();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_shutdown_only_when_unused_and_past_window() {
+        let w = Duration::from_secs(60);
+        // idle (no conns) and past the window → shut down
+        assert!(should_idle_shutdown(0, Duration::from_secs(61), w));
+        // idle but not yet past the window → keep running
+        assert!(!should_idle_shutdown(0, Duration::from_secs(30), w));
+        // a client is connected → never shut down, however long
+        assert!(!should_idle_shutdown(1, Duration::from_secs(600), w));
+        // zero window disables idle shutdown
+        assert!(!should_idle_shutdown(0, Duration::from_secs(600), Duration::ZERO));
+    }
 }
