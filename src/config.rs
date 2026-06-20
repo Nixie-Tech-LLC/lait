@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use iroh::{EndpointId, SecretKey};
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +36,67 @@ pub fn socket_path(home: &Path) -> PathBuf {
 /// Path to the blob store directory.
 pub fn blob_store_path(home: &Path) -> PathBuf {
     home.join("blobs")
+}
+
+/// Path to the single-instance lock file for a home.
+fn lock_path(home: &Path) -> PathBuf {
+    home.join("daemon.lock")
+}
+
+/// A held single-instance lock for a daemon home. The underlying `flock(2)` is
+/// released automatically when this value is dropped or the process exits — even
+/// on a crash — so the lock can never go stale.
+#[derive(Debug)]
+pub struct DaemonLock {
+    _file: fs::File,
+}
+
+/// Acquire the exclusive single-instance lock for a home, guaranteeing at most
+/// one daemon per home. Returns an error if another daemon already holds it,
+/// which is how we avoid the startup race that used to spawn duplicate daemons.
+pub fn acquire_daemon_lock(home: &Path) -> Result<DaemonLock> {
+    use std::os::fd::AsRawFd;
+    let path = lock_path(home);
+    let file = fs::File::create(&path)
+        .with_context(|| format!("create lock file {}", path.display()))?;
+    // Exclusive, non-blocking advisory lock held by this open file description.
+    // flock(2) is released automatically when the fd closes (process exit or
+    // crash), so the lock can never go stale. A second daemon for the same home
+    // gets EWOULDBLOCK here and bails instead of clobbering the live one.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return Err(anyhow!(
+            "another groupchat daemon is already running for this home ({})",
+            home.display()
+        ));
+    }
+    Ok(DaemonLock { _file: file })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn second_daemon_lock_fails_while_first_is_held() {
+        let dir = std::env::temp_dir().join(format!("gc-locktest-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let first = acquire_daemon_lock(&dir).expect("first lock should succeed");
+        let second = acquire_daemon_lock(&dir);
+        assert!(
+            second.is_err(),
+            "a second daemon lock must fail while the first is held"
+        );
+
+        drop(first);
+        let third = acquire_daemon_lock(&dir)
+            .expect("lock should be available again after the first is dropped");
+        drop(third);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
 fn secret_key_path(home: &Path) -> PathBuf {

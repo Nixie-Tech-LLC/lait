@@ -34,7 +34,8 @@ use tokio::{
 use crate::{
     call::{place_call, CallHandler, CALL_ALPN},
     config::{
-        blob_store_path, load_or_create_identity, socket_path, Contacts, Profile,
+        acquire_daemon_lock, blob_store_path, load_or_create_identity, socket_path, Contacts,
+        Profile,
     },
     control::{
         Event as LogEvent, EventKind, MessageReceipts, PresenceEntry, RecipientReceipt, Request,
@@ -1329,6 +1330,12 @@ impl Node {
 
 /// Build and run the daemon until a Stop request arrives.
 pub async fn run_daemon(home: PathBuf) -> Result<()> {
+    // Single-instance guard: at most one daemon per home. Held for the whole
+    // daemon lifetime; released by the OS on exit/crash. A duplicate spawned
+    // during the startup race fails here and bails instead of clobbering the
+    // live daemon's socket.
+    let _daemon_lock = acquire_daemon_lock(&home)?;
+
     let secret_key = load_or_create_identity(&home)?;
     let profile = Profile::load(&home)?;
     let contacts = Contacts::load(&home)?;
