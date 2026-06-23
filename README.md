@@ -117,6 +117,8 @@ currently online, and inbound calls from non-contacts are refused.
 | `daemon` | Run the node in the foreground |
 | `mcp` | Run the MCP server over stdio |
 | `stop` | Stop the daemon |
+| `doctor [--dry-run] [--keep PATH] [--no-stop-daemon] [-y]` | Converge to one clean install: remove duplicate/old binaries, diagnose PATH, stop stale daemons |
+| `prune [--unmapped] [--older-than-secs N] [-y]` | Remove accumulated per-session identities you no longer use |
 
 ## Presence & notifications (it behaves like a messaging app)
 
