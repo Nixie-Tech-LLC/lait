@@ -7,6 +7,25 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::{cli, config, control::Request};
+
+/// Best-effort: send `Stop` to every identity home with a live control socket,
+/// so after a binary swap no stale-version daemon keeps running. Failures
+/// (no socket, daemon already down) are ignored. Returns the number stopped.
+pub async fn stop_running_daemons() -> usize {
+    let homes = match config::identity_homes() {
+        Ok(h) => h,
+        Err(_) => return 0,
+    };
+    let mut stopped = 0;
+    for home in homes {
+        if config::socket_path(&home).exists() && cli::run(&home, Request::Stop).await.is_ok() {
+            stopped += 1;
+        }
+    }
+    stopped
+}
+
 /// Directories worth scanning for a groupchat binary: everything on `$PATH`
 /// plus the install locations our two installers use, even if not on PATH.
 pub fn candidate_dirs() -> Vec<PathBuf> {

@@ -109,6 +109,13 @@ pub fn list_identities() -> Result<Vec<String>> {
     Ok(reg.list())
 }
 
+/// Home directories of all registered identities (each is a node home with its
+/// own socket/state). Used by `doctor` to find daemons to stop.
+pub fn identity_homes() -> Result<Vec<PathBuf>> {
+    let (reg, _) = registry()?;
+    Ok(reg.list().into_iter().map(|n| reg.home_for(&n)).collect())
+}
+
 /// Bind the current session to a named identity (creating it if needed) so this
 /// session — and future resumes of it — recall that identity. Returns its home.
 pub fn bind_session(name: &str) -> Result<PathBuf> {
@@ -169,6 +176,24 @@ pub fn acquire_daemon_lock(home: &Path) -> Result<DaemonLock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_homes_lists_agent_dirs() {
+        let root = std::env::temp_dir().join(format!("gc-homes-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        std::env::set_var("GROUPCHAT_CONFIG_ROOT", &root);
+        let (reg, _) = registry().unwrap();
+        let h = reg.home_for("agent-aaaaaa");
+        fs::create_dir_all(&h).unwrap();
+        // list() only counts identities that have a secret.key — write one.
+        fs::write(h.join("secret.key"), "deadbeef").unwrap();
+
+        let homes = identity_homes().unwrap();
+        assert!(homes.iter().any(|p| p.ends_with("agent-aaaaaa")));
+
+        std::env::remove_var("GROUPCHAT_CONFIG_ROOT");
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn second_daemon_lock_fails_while_first_is_held() {
