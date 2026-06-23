@@ -108,6 +108,101 @@ pub fn updater_sibling(binary: &Path) -> PathBuf {
     binary.with_file_name("groupchat-update")
 }
 
+/// Converge the machine to a single groupchat binary. Non-destructive to
+/// identity/state. With `dry_run`, only report. The keeper defaults to the
+/// running binary (`current_exe`).
+pub async fn run_doctor(
+    dry_run: bool,
+    yes: bool,
+    keep: Option<PathBuf>,
+    stop_daemon: bool,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::io::IsTerminal;
+
+    let keeper = match keep {
+        Some(p) => p.canonicalize().unwrap_or(p),
+        None => {
+            let exe = std::env::current_exe().context("locate current binary")?;
+            exe.canonicalize().unwrap_or(exe)
+        }
+    };
+    let dirs = candidate_dirs();
+    let found = discover_binaries(&dirs);
+    let to_remove = removal_set(&found, &keeper);
+
+    println!("keeper: {}", keeper.display());
+    println!(
+        "found {} groupchat binar{}",
+        found.len(),
+        if found.len() == 1 { "y" } else { "ies" }
+    );
+
+    if to_remove.is_empty() {
+        println!("no duplicates to remove.");
+    } else {
+        for p in &to_remove {
+            println!("  will remove: {}", p.display());
+        }
+        if dry_run {
+            println!("(dry run — nothing removed)");
+        } else {
+            if !yes {
+                if !std::io::stdin().is_terminal() {
+                    anyhow::bail!("refusing to remove without --yes in a non-interactive context");
+                }
+                eprint!("Remove the above {} binar(y/ies)? [y/N] ", to_remove.len());
+                use std::io::Write;
+                std::io::stderr().flush().ok();
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line).ok();
+                if !matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
+                    println!("aborted.");
+                    return Ok(());
+                }
+            }
+            for (p, res) in remove_binaries(&to_remove) {
+                match res {
+                    Ok(()) => println!("  removed: {}", p.display()),
+                    Err(e) => eprintln!("  could not remove {} ({e}) — skipped", p.display()),
+                }
+            }
+        }
+    }
+
+    // PATH diagnosis (warn only).
+    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    if let Some(keeper_dir) = keeper.parent() {
+        if !dir_on_path(&path_dirs, keeper_dir) {
+            println!(
+                "note: {} is not on your PATH. Add this line to your shell rc:",
+                keeper_dir.display()
+            );
+            println!("  export PATH=\"{}:$PATH\"", keeper_dir.display());
+        } else if dry_run {
+            // Nothing was removed, so the shadow report reflects the live state.
+            let binary_dirs: Vec<PathBuf> =
+                found.iter().filter_map(|b| b.parent().map(Path::to_path_buf)).collect();
+            if let Some(shadow) = shadowed_by(&path_dirs, keeper_dir, &binary_dirs) {
+                println!(
+                    "note: {} is earlier on PATH and also holds a groupchat — it would shadow the keeper.",
+                    shadow.display()
+                );
+            }
+        }
+    }
+
+    if stop_daemon && !dry_run {
+        let n = stop_running_daemons().await;
+        if n > 0 {
+            println!("stopped {n} running daemon(s) so the kept binary takes over.");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

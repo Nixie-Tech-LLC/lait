@@ -189,6 +189,22 @@ enum Command {
     Resume { name: String },
     /// Stop the running daemon.
     Stop,
+    /// Converge to a single clean install: remove duplicate/old groupchat
+    /// binaries, diagnose PATH, and stop stale daemons. Never touches identity.
+    Doctor {
+        /// Report what would change without removing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Don't prompt before removing (used by installers).
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Keep this binary instead of the currently-running one.
+        #[arg(long)]
+        keep: Option<std::path::PathBuf>,
+        /// Don't stop running daemons.
+        #[arg(long)]
+        no_stop_daemon: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -224,6 +240,14 @@ async fn main() -> Result<()> {
             load_or_create_identity(&home)?;
             println!("resumed identity '{name}'");
             return cli::run(&home, Request::Status).await;
+        }
+        Command::Doctor {
+            dry_run,
+            yes,
+            keep,
+            no_stop_daemon,
+        } => {
+            return doctor::run_doctor(*dry_run, *yes, keep.clone(), !*no_stop_daemon).await;
         }
         _ => {}
     }
@@ -352,7 +376,9 @@ async fn main() -> Result<()> {
         Command::Share { path, label } => cli::run(&home, Request::Share { path, label }).await?,
         Command::Get { resource, out } => cli::run(&home, Request::Get { resource, out }).await?,
         Command::Resources => cli::run(&home, Request::Resources).await?,
-        Command::Agents | Command::Resume { .. } => unreachable!("handled before resolution"),
+        Command::Agents | Command::Resume { .. } | Command::Doctor { .. } => {
+            unreachable!("handled before resolution")
+        }
         Command::Stop => cli::run(&home, Request::Stop).await?,
     }
 
