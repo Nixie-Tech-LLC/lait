@@ -205,6 +205,19 @@ enum Command {
         #[arg(long)]
         no_stop_daemon: bool,
     },
+    /// Remove accumulated per-session identities you no longer use. Manual and
+    /// confirmed — never automatic, never run by reinstall.
+    Prune {
+        /// Only identities not mapped to any session.
+        #[arg(long)]
+        unmapped: bool,
+        /// Only identities inactive for at least this many seconds.
+        #[arg(long)]
+        older_than_secs: Option<u64>,
+        /// Don't prompt before removing.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -256,6 +269,13 @@ async fn main() -> Result<()> {
             no_stop_daemon,
         } => {
             return doctor::run_doctor(*dry_run, *yes, keep.clone(), !*no_stop_daemon).await;
+        }
+        Command::Prune {
+            unmapped,
+            older_than_secs,
+            yes,
+        } => {
+            return doctor::run_prune(*unmapped, *older_than_secs, *yes);
         }
         _ => {}
     }
@@ -384,7 +404,10 @@ async fn main() -> Result<()> {
         Command::Share { path, label } => cli::run(&home, Request::Share { path, label }).await?,
         Command::Get { resource, out } => cli::run(&home, Request::Get { resource, out }).await?,
         Command::Resources => cli::run(&home, Request::Resources).await?,
-        Command::Agents | Command::Resume { .. } | Command::Doctor { .. } => {
+        Command::Agents
+        | Command::Resume { .. }
+        | Command::Doctor { .. }
+        | Command::Prune { .. } => {
             unreachable!("handled before resolution")
         }
         Command::Stop => cli::run(&home, Request::Stop).await?,

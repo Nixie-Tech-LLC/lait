@@ -65,6 +65,57 @@ pub fn remove_identity_home(h: &IdentityHome) -> std::io::Result<()> {
     fs::remove_dir_all(&h.path)
 }
 
+/// List accumulated per-session identities and remove the selected ones. Always
+/// confirms unless `yes`. Never automatic.
+pub fn run_prune(unmapped: bool, older_than_secs: Option<u64>, yes: bool) -> anyhow::Result<()> {
+    use std::io::IsTerminal;
+
+    let homes = list_identity_homes()?;
+    if homes.is_empty() {
+        println!("no identities to prune.");
+        return Ok(());
+    }
+    let idxs = prune_set(&homes, unmapped, older_than_secs);
+    if idxs.is_empty() {
+        println!("nothing matches the prune filters.");
+        return Ok(());
+    }
+    for &i in &idxs {
+        let h = &homes[i];
+        println!(
+            "  {}  ({}, last active {}s ago)",
+            h.name,
+            if h.mapped { "mapped" } else { "unmapped" },
+            h.modified_secs_ago
+        );
+    }
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!("refusing to prune without --yes in a non-interactive context");
+        }
+        eprint!(
+            "Remove the above {} identit(y/ies) and their state? [y/N] ",
+            idxs.len()
+        );
+        use std::io::Write;
+        std::io::stderr().flush().ok();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).ok();
+        if !matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("aborted.");
+            return Ok(());
+        }
+    }
+    for &i in &idxs {
+        let h = &homes[i];
+        match remove_identity_home(h) {
+            Ok(()) => println!("  removed {}", h.name),
+            Err(e) => eprintln!("  could not remove {} ({e}) — skipped", h.name),
+        }
+    }
+    Ok(())
+}
+
 /// Best-effort: send `Stop` to every identity home with a live control socket,
 /// so after a binary swap no stale-version daemon keeps running. Failures
 /// (no socket, daemon already down) are ignored. Returns the number stopped.
