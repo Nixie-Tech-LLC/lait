@@ -4,7 +4,59 @@
 //! which identities to prune) live here, separated from the thin fs/daemon
 //! side-effecting wrappers so the risky "what to delete" logic is unit-tested.
 
+use std::fs;
 use std::path::{Path, PathBuf};
+
+/// Directories worth scanning for a groupchat binary: everything on `$PATH`
+/// plus the install locations our two installers use, even if not on PATH.
+pub fn candidate_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    if let Some(home) = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()) {
+        for sub in [".cargo/bin", ".local/bin", "bin"] {
+            dirs.push(home.join(sub));
+        }
+    }
+    dirs.push(PathBuf::from("/usr/local/bin"));
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs
+}
+
+/// Existing `groupchat` files in `dirs`, canonicalized and deduped.
+pub fn discover_binaries(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for dir in dirs {
+        let candidate = dir.join("groupchat");
+        if !candidate.is_file() {
+            continue;
+        }
+        let canon = candidate.canonicalize().unwrap_or(candidate);
+        if !out.contains(&canon) {
+            out.push(canon);
+        }
+    }
+    out
+}
+
+/// Remove each binary and its `groupchat-update` sibling (if present). Returns
+/// the outcome per binary path so callers can report permission errors without
+/// aborting the run.
+pub fn remove_binaries(paths: &[PathBuf]) -> Vec<(PathBuf, std::io::Result<()>)> {
+    let mut outcomes = Vec::new();
+    for p in paths {
+        let res = fs::remove_file(p);
+        if res.is_ok() {
+            let upd = updater_sibling(p);
+            if upd.exists() {
+                let _ = fs::remove_file(&upd);
+            }
+        }
+        outcomes.push((p.clone(), res));
+    }
+    outcomes
+}
 
 /// Every found binary except the keeper (compared by canonical path).
 pub fn removal_set(found: &[PathBuf], keeper: &Path) -> Vec<PathBuf> {
@@ -82,5 +134,40 @@ mod tests {
             updater_sibling(Path::new("/home/me/.cargo/bin/groupchat")),
             PathBuf::from("/home/me/.cargo/bin/groupchat-update")
         );
+    }
+
+    #[test]
+    fn discover_finds_groupchat_files_and_dedupes() {
+        let base = std::env::temp_dir().join(format!("gc-discover-{}", std::process::id()));
+        let d1 = base.join("a");
+        let d2 = base.join("b");
+        std::fs::create_dir_all(&d1).unwrap();
+        std::fs::create_dir_all(&d2).unwrap();
+        std::fs::write(d1.join("groupchat"), b"x").unwrap();
+        std::fs::write(d2.join("groupchat"), b"x").unwrap();
+        std::fs::write(d2.join("other"), b"x").unwrap();
+
+        let found = discover_binaries(&[d1.clone(), d2.clone(), d1.clone()]);
+        assert_eq!(found.len(), 2, "two groupchat files, dir listed twice deduped");
+        assert!(found.iter().all(|p| p.ends_with("groupchat")));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn remove_binaries_deletes_targets_and_updater() {
+        let base = std::env::temp_dir().join(format!("gc-remove-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let bin = base.join("groupchat");
+        let upd = base.join("groupchat-update");
+        std::fs::write(&bin, b"x").unwrap();
+        std::fs::write(&upd, b"x").unwrap();
+
+        let outcomes = remove_binaries(&[bin.clone()]);
+        assert!(outcomes.iter().all(|(_, r)| r.is_ok()));
+        assert!(!bin.exists(), "binary removed");
+        assert!(!upd.exists(), "sibling updater removed");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
