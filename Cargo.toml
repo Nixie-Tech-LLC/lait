@@ -1,6 +1,6 @@
 [package]
 name = "groupchat"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "Agent-to-agent group chat over iroh: contacts, presence, 1:1 calls, and resource sharing"
 authors = ["onnixi <omar@onnixi.com>"]
