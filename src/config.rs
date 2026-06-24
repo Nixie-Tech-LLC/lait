@@ -122,8 +122,28 @@ pub fn bind_session(name: &str) -> Result<PathBuf> {
 }
 
 /// Path to the control socket for the running daemon.
+///
+/// AF_UNIX socket paths are capped at 104 bytes on macOS (`sun_path`; 108 on
+/// Linux). The per-agent home under `~/Library/Application Support/…/agents/
+/// agent-XXXXXX/` can exceed that for longer usernames — the daemon then fails
+/// to `bind()` and never comes online ("daemon did not come online in time").
+/// When the natural in-home path would be too long, fall back to a short, stable
+/// path in the temp dir derived from a hash of the home. Both the daemon and the
+/// CLI client resolve this the same way (same binary, same home), so they agree
+/// on where to bind/connect.
 pub fn socket_path(home: &Path) -> PathBuf {
-    home.join("control.sock")
+    use std::hash::{Hash, Hasher};
+
+    let direct = home.join("control.sock");
+    // Leave margin below the 104-byte macOS limit (path bytes + NUL terminator).
+    const MAX_SUN_PATH: usize = 100;
+    if direct.as_os_str().len() <= MAX_SUN_PATH {
+        return direct;
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    home.hash(&mut hasher);
+    std::env::temp_dir().join(format!("gc-{:016x}.sock", hasher.finish()))
 }
 
 /// Path to the blob store directory.
@@ -189,6 +209,34 @@ mod tests {
         drop(third);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn socket_path_stays_under_the_unix_limit() {
+        // Short home: socket lives in the home, as before.
+        let short = PathBuf::from("/Users/moon/Library/Application Support/dev.nixi.groupchat");
+        assert_eq!(socket_path(&short), short.join("control.sock"));
+
+        // Long per-agent home (longer username) that would blow past macOS's
+        // 104-byte sun_path limit — must fall back to a short, bindable path.
+        let long = PathBuf::from(
+            "/Users/savannahmoongoldstein/Library/Application Support/\
+             dev.nixi.groupchat/agents/agent-6c8502",
+        );
+        assert!(
+            long.join("control.sock").as_os_str().len() > 104,
+            "test premise: the natural path should exceed the limit"
+        );
+        let p = socket_path(&long);
+        assert!(
+            p.as_os_str().len() <= 104,
+            "control socket path must fit in sun_path: {} bytes ({})",
+            p.as_os_str().len(),
+            p.display()
+        );
+
+        // Deterministic: daemon and CLI must resolve the same long home identically.
+        assert_eq!(socket_path(&long), socket_path(&long));
     }
 }
 
