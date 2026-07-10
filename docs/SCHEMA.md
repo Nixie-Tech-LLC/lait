@@ -114,7 +114,7 @@ Catalog (root LoroMap)
 | `docs[DocId]` presence | grow-only set (+ tombstone flag) | syncing the Catalog conveys the entire DocId set — no crawl (A§7). |
 | `DocMeta.*` row fields | see §3.1 | **synced cache**, not truth. |
 | `projects[*]`, `labels[*]` | per-key LWW on each leaf | config; concurrent renames resolve LWW. |
-| `boards[proj]` | movable-list (move op, no dup) | **ordering within a project only**, not membership (§5.5). |
+| `boards[proj]` | movable-list (move op, no dup) | **ordering within a project only**, not membership (§5.5); completed issues are removed from it and render via the append rule (§5.7). |
 | `workflow` | movable-list | status columns + their order. |
 | `acl` | grow-only union of opaque signed ops | trust computed by replay (§6), *not* by Loro. |
 | `aliases[proj]` | LWW counter view | advisory high-water for `KEY-n`; may race (§5.4). |
@@ -224,6 +224,27 @@ row. Only the first write is authoritative; the rest are cache maintenance.
 Loro retains history, so an issue doc is never truly deleted. Deletion sets
 `DocMeta.tombstone` and removes the DocId from board lists; `ls`/`board` filter tombstoned
 docs. The doc still exists for backfill and time-travel.
+
+### 5.7 Completion vs. deletion — done issues leave the ordered list, not the traversal set
+Completion and deletion are different operations with different effects on traversal.
+Completion is only a `status` change to a `done`-category `WorkflowState` (LWW value, §5) —
+the issue is **not** tombstoned and stays in `Catalog.docs` forever (history, time-travel,
+backfill). But because the board movable list is **ordering, not membership** (§5.5), a
+completed issue does not need to occupy a slot in it:
+
+> **On completion, remove the `DocId` from `Catalog.boards[projectId]`** (keep it in `docs`,
+> keep `Issue.projectId`). The issue still belongs to the project, so it renders on the
+> **Done** view via §5.5's append rule (belonging-but-unlisted issues are appended).
+> **On reopen, re-insert** the `DocId` into the ordered list (default: top of its status
+> lane). Done-view display order is by wall-clock `ts` descending (advisory, §2), since the
+> movable list no longer ranks it.
+
+This keeps the active board's movable list **bounded to roughly the active set** instead of
+growing without bound as issues close, while the full issue set remains reachable by
+traversal (`docs` filtered by `projectId`). It falls straight out of the
+membership-vs-ordering split (§5.5) and needs no new structure. Distinct from store GC
+(A§10 shallow-snapshot), which trims op *history* and never changes what is in the traversal
+set.
 
 ## 6. Membership / ACL — signed ops that ride in Loro, validated by replay
 
@@ -362,3 +383,5 @@ after it ships — the old ops live forever. Rules:
 - **§2** member identity — **single key P0** (default) vs account-aggregates-devices.
 - **§5.5** project membership source — **`Issue.projectId`** (agreed) with board lists +
   `DocMeta.projectId` as self-healing caches.
+- **§5.7** completion policy — **done issues leave `boards[proj]`, stay in `docs`** (agreed),
+  rendering on the Done view via the append rule; bounded active board.
