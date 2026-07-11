@@ -1,22 +1,18 @@
-//! On-disk state: identity, contacts, and room/profile settings.
+//! On-disk state: identity and room/profile settings.
 //!
 //! Everything lives under one home directory, resolved from `$GROUPCHAT_HOME`
 //! (handy for running several nodes on one machine) or the platform config dir.
 
 use std::{
-    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
 
 use anyhow::{anyhow, Context, Result};
-use iroh::{EndpointId, SecretKey};
+use iroh::SecretKey;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    proto::Tier,
-    registry::{agents_base, select, Registry, Selection, SessionMap},
-};
+use crate::registry::{agents_base, select, Registry, Selection, SessionMap};
 
 /// The base config directory (ignoring `$GROUPCHAT_HOME`) — where the named
 /// identity registry (`agents/`) and the session map live.
@@ -121,7 +117,19 @@ pub fn bind_session(name: &str) -> Result<PathBuf> {
     Ok(home)
 }
 
-/// Path to the control socket for the running daemon.
+/// A short, stable hex token derived from a home path. Used to name the control
+/// channel uniquely per home (so several `$GROUPCHAT_HOME` nodes on one machine
+/// never collide) — as a filesystem socket name on unix and a named-pipe name on
+/// Windows. Both the daemon and its clients hash the same home, so they agree.
+pub fn home_hash(home: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    home.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Filesystem path to the control socket for the running daemon (unix only; on
+/// Windows the control channel is a named pipe, see `control::control_name`).
 ///
 /// AF_UNIX socket paths are capped at 104 bytes on macOS (`sun_path`; 108 on
 /// Linux). The per-agent home under `~/Library/Application Support/…/agents/
@@ -131,9 +139,8 @@ pub fn bind_session(name: &str) -> Result<PathBuf> {
 /// path in the temp dir derived from a hash of the home. Both the daemon and the
 /// CLI client resolve this the same way (same binary, same home), so they agree
 /// on where to bind/connect.
+#[cfg(unix)]
 pub fn socket_path(home: &Path) -> PathBuf {
-    use std::hash::{Hash, Hasher};
-
     let direct = home.join("control.sock");
     // Leave margin below the 104-byte macOS limit (path bytes + NUL terminator).
     const MAX_SUN_PATH: usize = 100;
@@ -141,14 +148,7 @@ pub fn socket_path(home: &Path) -> PathBuf {
         return direct;
     }
 
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    home.hash(&mut hasher);
-    std::env::temp_dir().join(format!("gc-{:016x}.sock", hasher.finish()))
-}
-
-/// Path to the blob store directory.
-pub fn blob_store_path(home: &Path) -> PathBuf {
-    home.join("blobs")
+    std::env::temp_dir().join(format!("gc-{}.sock", home_hash(home)))
 }
 
 /// Path to the single-instance lock file for a home.
@@ -156,9 +156,10 @@ fn lock_path(home: &Path) -> PathBuf {
     home.join("daemon.lock")
 }
 
-/// A held single-instance lock for a daemon home. The underlying `flock(2)` is
-/// released automatically when this value is dropped or the process exits — even
-/// on a crash — so the lock can never go stale.
+/// A held single-instance lock for a daemon home. The underlying OS advisory
+/// lock (`flock(2)` on unix, `LockFileEx` on Windows, via `fs2`) is released
+/// automatically when this value is dropped or the process exits — even on a
+/// crash — so the lock can never go stale.
 #[derive(Debug)]
 pub struct DaemonLock {
     _file: fs::File,
@@ -168,21 +169,21 @@ pub struct DaemonLock {
 /// one daemon per home. Returns an error if another daemon already holds it,
 /// which is how we avoid the startup race that used to spawn duplicate daemons.
 pub fn acquire_daemon_lock(home: &Path) -> Result<DaemonLock> {
-    use std::os::fd::AsRawFd;
+    use fs2::FileExt;
     let path = lock_path(home);
     let file = fs::File::create(&path)
         .with_context(|| format!("create lock file {}", path.display()))?;
-    // Exclusive, non-blocking advisory lock held by this open file description.
-    // flock(2) is released automatically when the fd closes (process exit or
-    // crash), so the lock can never go stale. A second daemon for the same home
-    // gets EWOULDBLOCK here and bails instead of clobbering the live one.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        return Err(anyhow!(
+    // Exclusive, non-blocking advisory lock held by this open file handle. The
+    // OS releases it when the handle closes (process exit or crash), so the lock
+    // can never go stale. A second daemon for the same home gets a would-block
+    // error here and bails instead of clobbering the live one. `fs2` maps to
+    // flock(2) on unix and LockFileEx on Windows — same guarantee, portably.
+    file.try_lock_exclusive().map_err(|_| {
+        anyhow!(
             "another groupchat daemon is already running for this home ({})",
             home.display()
-        ));
-    }
+        )
+    })?;
     Ok(DaemonLock { _file: file })
 }
 
@@ -211,6 +212,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn socket_path_stays_under_the_unix_limit() {
         // Short home: socket lives in the home, as before.
@@ -262,96 +264,14 @@ pub fn load_or_create_identity(home: &Path) -> Result<SecretKey> {
     }
 }
 
-/// A single contact: an endpoint id (the identity/handle) plus a nickname.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Contact {
-    pub id: String,
-    pub nick: String,
-}
-
-/// Persisted contact list, keyed by endpoint id string.
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct Contacts {
-    #[serde(default)]
-    contacts: BTreeMap<String, Contact>,
-}
-
-impl Contacts {
-    fn path(home: &Path) -> PathBuf {
-        home.join("contacts.json")
-    }
-
-    pub fn load(home: &Path) -> Result<Self> {
-        let path = Self::path(home);
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let data = fs::read_to_string(&path).context("read contacts")?;
-        Ok(serde_json::from_str(&data).context("parse contacts")?)
-    }
-
-    pub fn save(&self, home: &Path) -> Result<()> {
-        let data = serde_json::to_string_pretty(self).context("serialize contacts")?;
-        fs::write(Self::path(home), data).context("write contacts")?;
-        Ok(())
-    }
-
-    pub fn add(&mut self, id: EndpointId, nick: String) {
-        let id = id.to_string();
-        self.contacts.insert(id.clone(), Contact { id, nick });
-    }
-
-    pub fn remove(&mut self, id: &EndpointId) -> bool {
-        self.contacts.remove(&id.to_string()).is_some()
-    }
-
-    /// Remove any contacts that share `nick` but are not `keep` — used to dedupe
-    /// when a peer rejoins under the same nick with a fresh identity (e.g. after
-    /// a reinstall). Returns the nicks/ids removed.
-    pub fn remove_stale_nick(&mut self, nick: &str, keep: &EndpointId) -> Vec<String> {
-        let keep = keep.to_string();
-        let stale: Vec<String> = self
-            .contacts
-            .values()
-            .filter(|c| c.nick == nick && c.id != keep)
-            .map(|c| c.id.clone())
-            .collect();
-        for id in &stale {
-            self.contacts.remove(id);
-        }
-        stale
-    }
-
-    pub fn contains(&self, id: &EndpointId) -> bool {
-        self.contacts.contains_key(&id.to_string())
-    }
-
-    pub fn nick_of(&self, id: &EndpointId) -> Option<String> {
-        self.contacts.get(&id.to_string()).map(|c| c.nick.clone())
-    }
-
-    pub fn list(&self) -> Vec<Contact> {
-        self.contacts.values().cloned().collect()
-    }
-}
-
 /// Profile/room settings, persisted to `profile.json`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Profile {
     /// Our display nickname.
     pub nick: String,
-    /// The room name we chat in (everyone sharing a name shares a topic).
+    /// The room name we share a gossip topic with (everyone using the same name
+    /// lands in the same topic). Becomes the per-workspace topic in the tracker.
     pub room: String,
-    /// Whether to auto-approve inbound join requests as contacts. Set once you
-    /// mint an invite; persisted so a reused ticket keeps working across daemon
-    /// restarts.
-    #[serde(default)]
-    pub auto_approve: bool,
-    /// Receiver focus: messages whose effective tier is below this are silenced
-    /// (downgraded to ambient) unless they carry notify_anyway. Defaults to
-    /// `Ambient`, which mutes nothing.
-    #[serde(default)]
-    pub mute_below: Tier,
 }
 
 impl Default for Profile {
@@ -359,8 +279,6 @@ impl Default for Profile {
         Self {
             nick: whoami_fallback(),
             room: "default".to_string(),
-            auto_approve: false,
-            mute_below: Tier::Ambient,
         }
     }
 }

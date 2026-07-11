@@ -2,14 +2,14 @@
 name = "groupchat"
 version = "0.2.4"
 edition = "2021"
-description = "Agent-to-agent group chat over iroh: contacts, presence, 1:1 calls, and resource sharing"
+description = "A peer-to-peer node built on iroh — the transport/identity/presence foundation for a P2P issue tracker"
 authors = ["onnixi <omar@onnixi.com>"]
 license = "MIT OR Apache-2.0"
 # Release host (cargo-dist builds/publishes binaries here). Source of record is the homepage.
 repository = "https://github.com/Nixie-Tech-LLC/groupchat"
 homepage = "https://gitlab.com/onnixi/groupchat"
 readme = "README.md"
-keywords = ["iroh", "p2p", "chat", "gossip", "agent"]
+keywords = ["iroh", "p2p", "gossip", "crdt", "issue-tracker"]
 categories = ["command-line-utilities", "network-programming"]
 
 [[bin]]
@@ -17,11 +17,11 @@ name = "groupchat"
 path = "src/main.rs"
 
 [dependencies]
-# iroh core + the two protocols we build on. All pin iroh =1.0.0-rc.1.
+# iroh core + gossip (the room/announce transport). iroh-blobs returns at P2 for
+# snapshots/attachments. All pin iroh =1.0.0-rc.1.
 iroh = "=1.0.0-rc.1"
 iroh-base = "=1.0.0-rc.1"
 iroh-gossip = "0.100"
-iroh-blobs = { version = "0.102", features = ["fs-store"] }
 
 # async runtime + streams
 tokio = { version = "1", features = ["full"] }
@@ -39,10 +39,16 @@ bytes = "1"
 data-encoding = "2.6"
 blake3 = "1"
 
+# cross-platform local IPC for the daemon control channel: a Unix-domain socket
+# on unix, a named pipe on Windows — same API, so the daemon/CLI/MCP are portable.
+interprocess = { version = "2", features = ["tokio"] }
+# cross-platform advisory file lock for the single-instance daemon guard
+# (replaces the unix-only flock(2)).
+fs2 = "0.4"
+
 # misc
 anyhow = "1"
 directories = "5"
-libc = "0.2"  # unix flock(2) for the daemon single-instance lock
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

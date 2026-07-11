@@ -5,15 +5,13 @@ use std::{io::Write, path::Path, process::Stdio, time::Duration};
 use anyhow::{anyhow, Context, Result};
 
 use crate::{
-    config::socket_path,
     control::{request, Event, EventKind, Request, Response},
-    proto::{RoomTicket, Tier},
+    proto::RoomTicket,
 };
 
 /// Ensure a daemon is running for this home dir, spawning one if needed.
 pub async fn ensure_daemon(home: &Path) -> Result<()> {
-    let socket = socket_path(home);
-    if request(&socket, &Request::Status).await.is_ok() {
+    if request(home, &Request::Status).await.is_ok() {
         return Ok(());
     }
 
@@ -30,7 +28,7 @@ pub async fn ensure_daemon(home: &Path) -> Result<()> {
     // Wait for the daemon to come online (it binds a relay before serving).
     for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(200)).await;
-        if request(&socket, &Request::Status).await.is_ok() {
+        if request(home, &Request::Status).await.is_ok() {
             return Ok(());
         }
     }
@@ -40,7 +38,7 @@ pub async fn ensure_daemon(home: &Path) -> Result<()> {
 /// Ensure the daemon is up, then send one request.
 pub async fn client(home: &Path, req: Request) -> Result<Response> {
     ensure_daemon(home).await?;
-    request(&socket_path(home), &req).await
+    request(home, &req).await
 }
 
 /// Run a request and pretty-print the response for terminal users.
@@ -112,29 +110,19 @@ fn print_response(resp: Response) {
         }
         Response::Text { text } => println!("{text}"),
         Response::Status(s) => {
-            println!("id:        {}", s.id);
-            println!("nick:      {}", s.nick);
-            println!("room:      {}", s.room);
-            println!("online:    {} peer(s)", s.online_peers);
-            println!("contacts:  {}", s.contacts);
-            println!("resources: {}", s.resources);
+            println!("id:      {}", s.id);
+            println!("nick:    {}", s.nick);
+            println!("room:    {}", s.room);
+            println!("online:  {} peer(s)", s.online_peers);
         }
         Response::Events { events, last } => {
             for e in &events {
                 print_event(e);
             }
             if events.is_empty() {
-                println!("(no new messages)");
+                println!("(no new events)");
             } else {
                 println!("--- last seq {last} ---");
-            }
-        }
-        Response::Contacts { contacts } => {
-            if contacts.is_empty() {
-                println!("(no contacts)");
-            }
-            for c in contacts {
-                println!("{}  {}", c.nick, c.id);
             }
         }
         Response::Who { mut peers } => {
@@ -144,42 +132,7 @@ fn print_response(resp: Response) {
             peers.sort_by_key(|p| (!p.online, p.nick.clone()));
             for p in peers {
                 let dot = if p.online { "\u{25CF}" } else { "\u{25CB}" };
-                let star = if p.is_contact { " \u{2713}contact" } else { "" };
-                println!("{dot} {}  ({}){star}", p.nick, p.id);
-            }
-        }
-        Response::Resources { resources } => {
-            if resources.is_empty() {
-                println!("(no resources shared)");
-            }
-            for r in resources {
-                println!("{}  from {}\n    {}", r.label, r.from, r.ticket);
-            }
-        }
-        Response::Receipts { messages } => {
-            if messages.is_empty() {
-                println!("(no tracked messages)");
-            }
-            for m in messages {
-                let flag = if m.overdue { " \u{26A0} overdue" } else { "" };
-                println!(
-                    "msg {} [{}]{}  \u{201C}{}\u{201D}",
-                    m.msg_id,
-                    tier_str(&m.tier),
-                    flag,
-                    m.text
-                );
-                for r in m.recipients {
-                    let mark = |b: bool| if b { "\u{2713}" } else { "\u{2014}" };
-                    println!(
-                        "    {} {}delivered {}seen {}acked  ({})",
-                        r.nick,
-                        mark(r.delivered),
-                        mark(r.seen),
-                        mark(r.acked),
-                        r.id
-                    );
-                }
+                println!("{dot} {}  ({})", p.nick, p.id);
             }
         }
         Response::Error { message } => {
@@ -188,62 +141,23 @@ fn print_response(resp: Response) {
     }
 }
 
-/// Short machine-readable name for a tier (also a hook env var value).
-fn tier_str(t: &Tier) -> &'static str {
-    match t {
-        Tier::Ambient => "ambient",
-        Tier::Direct => "direct",
-        Tier::NeedsAck => "needs_ack",
-        Tier::Interrupt => "interrupt",
-    }
-}
-
-/// A short urgency badge for a tier, shown ahead of the event text.
-fn tier_badge(t: &Tier) -> &'static str {
-    match t {
-        Tier::Ambient => "",
-        Tier::Direct => "\u{1F514} ",       // 🔔
-        Tier::NeedsAck => "\u{23F0} ",      // ⏰
-        Tier::Interrupt => "\u{1F6A8} ",    // 🚨
-    }
-}
-
 /// Short machine-readable name for an event kind (also used as a hook env var).
 fn kind_str(k: &EventKind) -> &'static str {
     match k {
-        EventKind::Chat => "chat",
         EventKind::Join => "join",
-        EventKind::Call => "call",
-        EventKind::Resource => "resource",
         EventKind::Presence => "presence",
-        EventKind::Receipt => "receipt",
         EventKind::System => "system",
     }
 }
 
-/// Print one event the way `log`/`watch` show it. A tier badge (🔔/⏰/🚨) marks
-/// urgency; needs_ack/interrupt chat lines show their seq so you can `ack` them.
+/// Print one event the way `log`/`watch` show it.
 fn print_event(e: &Event) {
     let tag = match e.kind {
-        EventKind::Chat => "",
         EventKind::Join => "[join] ",
-        EventKind::Call => "[call] ",
-        EventKind::Resource => "[resource] ",
         EventKind::Presence => "[presence] ",
-        EventKind::Receipt => "[receipt] ",
         EventKind::System => "[system] ",
     };
-    let badge = tier_badge(&e.tier);
-    // Prompt the reader to ack messages that asked for one.
-    let ack_hint = if matches!(e.kind, EventKind::Chat)
-        && e.tier >= Tier::NeedsAck
-        && e.msg_id.is_some()
-    {
-        format!("  \u{2190} ack {}", e.seq)
-    } else {
-        String::new()
-    };
-    println!("{badge}{tag}{}: {}{ack_hint}", e.nick, e.text);
+    println!("{tag}{}: {}", e.nick, e.text);
 }
 
 /// Run a user hook for an event: the event fields are exported as environment
@@ -259,16 +173,6 @@ fn run_hook(cmd: &str, e: &Event) {
         .env("GROUPCHAT_EVENT_NICK", &e.nick)
         .env("GROUPCHAT_EVENT_ID", &e.id)
         .env("GROUPCHAT_EVENT_TEXT", &e.text)
-        .env("GROUPCHAT_EVENT_DIRECT", if e.direct { "true" } else { "false" })
-        .env("GROUPCHAT_EVENT_TIER", tier_str(&e.tier))
-        .env(
-            "GROUPCHAT_EVENT_PREEMPT",
-            if e.tier >= Tier::Interrupt { "true" } else { "false" },
-        )
-        .env(
-            "GROUPCHAT_EVENT_MSG_ID",
-            e.msg_id.map(|m| m.to_string()).unwrap_or_default(),
-        )
         .env("GROUPCHAT_EVENT_TS", e.ts.to_string())
         .stdin(Stdio::piped())
         .spawn();
@@ -306,27 +210,22 @@ fn desktop_notify(e: &Event) {
     }
 }
 
-/// Foreground notification runner: block on `chat_wait`, print each event, and
-/// for matching events run a hook command and/or raise a desktop notification.
+/// Foreground notification runner: block on `wait`, print each event, and for
+/// each event optionally run a hook command and/or raise a desktop notification.
 /// Loops forever (Ctrl-C to stop), reconnecting if the daemon restarts.
-#[allow(clippy::too_many_arguments)]
 pub async fn watch(
     home: &Path,
     since: Option<u64>,
-    direct_only: bool,
-    min_tier: Option<Tier>,
     exec: Option<String>,
-    on_interrupt: Option<String>,
     notify: bool,
     timeout_ms: u64,
 ) -> Result<()> {
     ensure_daemon(home).await?;
-    let sock = socket_path(home);
 
     // Default: start from "now" so we don't replay the whole backlog.
     let mut cursor = match since {
         Some(n) => n,
-        None => match request(&sock, &Request::Log { since: 0 }).await? {
+        None => match request(home, &Request::Log { since: 0 }).await? {
             Response::Events { last, .. } => last,
             _ => 0,
         },
@@ -334,7 +233,7 @@ pub async fn watch(
     eprintln!("watching from seq {cursor} (Ctrl-C to stop)\u{2026}");
 
     loop {
-        let resp = match request(&sock, &Request::Wait { since: cursor, timeout_ms }).await {
+        let resp = match request(home, &Request::Wait { since: cursor, timeout_ms }).await {
             Ok(r) => r,
             Err(e) => {
                 // Daemon may have restarted; re-ensure and keep going.
@@ -347,22 +246,11 @@ pub async fn watch(
         if let Response::Events { events, last } = resp {
             for e in &events {
                 print_event(e);
-                // The preemption hook fires only for interrupt-tier ("notify
-                // anyway") events — independent of the direct/min-tier gate.
-                if e.tier >= Tier::Interrupt {
-                    if let Some(cmd) = &on_interrupt {
-                        run_hook(cmd, e);
-                    }
+                if let Some(cmd) = &exec {
+                    run_hook(cmd, e);
                 }
-                let passes = !direct_only && min_tier.map(|m| e.tier >= m).unwrap_or(true)
-                    || direct_only && e.direct;
-                if passes {
-                    if let Some(cmd) = &exec {
-                        run_hook(cmd, e);
-                    }
-                    if notify {
-                        desktop_notify(e);
-                    }
+                if notify {
+                    desktop_notify(e);
                 }
             }
             cursor = last.max(cursor);
