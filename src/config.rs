@@ -336,7 +336,7 @@ mod tests {
         // Long per-agent home (longer username) that would blow past macOS's
         // 104-byte sun_path limit — must fall back to a short, bindable path.
         let long = PathBuf::from(
-            "/Users/savannahmoongoldstein/Library/Application Support/\
+            "/Users/maximiliana.rosencrantz-hutchinson/Library/Application Support/\
              dev.nixi.lait/agents/agent-6c8502",
         );
         assert!(
