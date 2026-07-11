@@ -5,15 +5,15 @@
     "email": "omar@onnixi.com"
   },
   "metadata": {
-    "description": "Agent-to-agent group chat over iroh.",
+    "description": "A local-first, peer-to-peer node built on iroh — the foundation for a P2P issue tracker.",
     "version": "0.2.2"
   },
   "plugins": [
     {
       "name": "groupchat",
       "source": ".",
-      "description": "Group chat for agents: delivery/read/ack receipts, urgency tiers (incl. \"notify anyway\"), presence, 1:1 calls, and file sharing. Requires the `groupchat` binary on PATH.",
-      "category": "communication"
+      "description": "A peer-to-peer node built on iroh: a signed-gossip room with presence, exposed as connect/wait/who MCP tools — the foundation for a local-first P2P issue tracker. Requires the `groupchat` binary on PATH.",
+      "category": "developer-tools"
     }
   ]
 }

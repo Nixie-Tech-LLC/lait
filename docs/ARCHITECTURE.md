@@ -269,6 +269,22 @@ Multiple seeds are fine; **none is authoritative** — they can neither read nor
 full encrypted-history replica is always reachable for backfill, which also mitigates the
 "offline across a compaction boundary can't merge" risk.
 
+**Seed = a headless role of the same portable node, capable of client-side rooting.** A
+seed is *not* a separate server product: it is the ordinary `groupchat` binary run headless,
+so it inherits the client's cross-platform portability (the control channel is a Unix socket
+on unix / a named pipe on Windows; TLS is the portable `ring` backend) and **any client node
+can be promoted to a seed**. Because it is a full node, it can *root* other clients: it is
+the always-on peer whose address rides in the workspace ticket (the bootstrap anchor), it
+holds and serves the genesis + signed ACL graph and the (P2+ encrypted) CRDT history for
+cold-start backfill, so a brand-new client can establish the whole workspace from nothing but
+a ticket. Crucially, "rooting" is **bootstrap + backfill, not trust authority**: the client
+still validates every signed op against the genesis keys carried in its ticket ([§6](#6-git-backed-store--trust-root)),
+so a seed can neither read (P2+) nor forge. This is what turns the always-on availability an
+async tracker needs into a *portable, promotable peer role* rather than a mandatory central
+server — and is why the seed belongs at **P1** (it is the bootstrap/backfill anchor two
+rarely-co-online peers converge through), even though its *encrypted* blind-relay duties
+still land at P2.
+
 **Forward-compatibility.** Because P1's wire format already frames updates as
 per-`(peerId, counter)`-range blobs (§8), P2/P3 add the ciphertext-chunking + sedimentree
 envelope *around* those blobs without reshaping the P1 sync protocol. The E2EE envelope is
@@ -347,6 +363,18 @@ No P1 wire rework is needed at P2/P3: formats are forward-compatible from the st
   and is not a shared central truth; the membership graph syncs over iroh and is merely
   persisted in git, authenticated back to the genesis keys carried by the invite (§6). Not
   git-bug; issues are Loro docs propagated over iroh.
+- **Seed is a promotable client role, not a server** — the seed is the portable `groupchat`
+  binary run headless; any client can be one. It *roots* cold clients (ticket-advertised
+  bootstrap + genesis/ACL/history backfill) so a new node needs only a ticket, while trust
+  stays anchored in the genesis keys, never in the seed. Its always-on availability is what
+  two rarely-co-online peers converge through, so it lands at P1; only its *encrypted*
+  blind-relay duties defer to P2 (§10).
+- **Portable transport substrate** — iroh stays, but the package's portability is preserved
+  by keeping non-iroh plumbing cross-platform: the daemon control channel is a Unix socket on
+  unix / a named pipe on Windows (via `interprocess`), the single-instance guard is a
+  cross-platform advisory lock (`fs2`, not raw `flock(2)`), and TLS is the portable `ring`
+  rustls backend (never `aws-lc-rs`). CI builds + tests on Linux, macOS, and Windows to keep
+  it that way.
 - **Functionality-first sequencing** — prove the DX-critical core (data model + catalog +
   TUI + git-backed store) before networking, and networking before the hard, research-grade
   security layer.
