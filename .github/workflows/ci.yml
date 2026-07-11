@@ -56,6 +56,19 @@ jobs:
       - name: Test
         run: cargo test --locked --all-targets
 
+      # `--all-targets` skips doctests; run them explicitly so documented
+      # examples (and the DTO/parity doc examples) can't rot.
+      - name: Doctests
+        run: cargo test --locked --doc
+
+      # Portability guard: the control channel + single-instance lock MUST stay
+      # cross-platform. Fail if a unix-only primitive is named outside an
+      # explicit #[cfg(unix)] island in those paths. The Windows job compiling is
+      # the primary gate; this catches a regression at review time on any OS.
+      - name: Portability guard (no unix-only APIs in control/lock path)
+        shell: bash
+        run: bash ci/portability-guard.sh
+
       # Smoke-run the actual binary (no network): mint an identity and print it.
       # Proves the built binary launches and its local IPC/config paths work on
       # this OS. Grows per phase (P1: two nodes converge; P3: non-member sees
@@ -110,3 +123,26 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  # Release dry-run: `dist plan` must succeed for every configured target
+  # (including the Windows target added now that the control channel is
+  # portable). This gates release-engineering drift on every PR, long before a
+  # tag is pushed. It only PLANS — it never builds or publishes.
+  release-dry-run:
+    name: release dry-run (dist plan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dist
+        shell: bash
+        run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh
+      - name: dist plan (all targets, incl. Windows)
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist plan --output-format=json > plan.json
+          cat plan.json
+          # Assert the Windows target is present in the plan so it can't silently
+          # regress back out of the release matrix.
+          grep -q 'x86_64-pc-windows-msvc' plan.json \
+            || { echo "::error::Windows target missing from dist plan"; exit 1; }

@@ -7,14 +7,22 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
-# The installers to generate for each app. (Homebrew was dropped: it required a
-# HOMEBREW_TAP_TOKEN secret to push to a separate tap repo. install.sh + the
-# self-updater cover upgrades.)
-installers = ["shell"]
-# Target platforms to build apps for (Rust target-triple syntax).
-# Windows is intentionally omitted: the daemon's control channel is a Unix
-# domain socket, which doesn't exist on Windows.
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# The installers to generate for each app. `shell` for unix, `powershell` for
+# Windows (now that the control channel is a portable named pipe, not a Unix
+# socket). install.sh / install.ps1 + the self-updater cover upgrades.
+installers = ["shell", "powershell"]
+# Target platforms to build apps for (Rust target-triple syntax). Windows is
+# now included: the daemon's control channel is a cross-platform local IPC
+# channel (named pipe on Windows via `interprocess`), and the single-instance
+# lock is a portable advisory lock (`fs2`), so the binary builds and runs on
+# Windows the same as unix.
+targets = [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Where to host releases
