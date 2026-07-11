@@ -250,8 +250,14 @@ pub enum MembersCmd {
 /// default, which turns a closed downstream pipe (`groupchat board | head`,
 /// `| grep -q`, `| less` then quit) into a panic on the next stdout write
 /// (`failed printing to stdout: Broken pipe`) instead of a clean exit. Resetting
-/// to `SIG_DFL` makes the process terminate normally when the reader goes away,
-/// which is the expected CLI behavior. No-op on Windows (no `SIGPIPE`).
+/// to `SIG_DFL` makes the process terminate normally when the reader goes away —
+/// the expected CLI behavior. No-op on Windows (no `SIGPIPE`).
+///
+/// **Only for short-lived, output-printing CLI commands.** The `daemon` and the
+/// `mcp` stdio server must NOT reset it: they are long-running and do network /
+/// socket I/O (iroh, tokio), which relies on `SIGPIPE` staying ignored so a write
+/// to a closed socket returns `EPIPE` instead of *killing the process*. Resetting
+/// it there makes a dropped relay/socket write terminate the daemon.
 #[cfg(unix)]
 fn reset_sigpipe() {
     // SAFETY: setting a signal handler to the default disposition is async-signal
@@ -263,9 +269,17 @@ fn reset_sigpipe() {
 #[cfg(not(unix))]
 fn reset_sigpipe() {}
 
+/// Long-running service commands that must keep Rust's default (SIGPIPE ignored)
+/// so networked/stdio I/O returns EPIPE instead of dying on a signal.
+fn is_service_command(cmd: &Command) -> bool {
+    matches!(cmd, Command::Daemon | Command::Mcp)
+}
+
 pub async fn run() -> Result<()> {
-    reset_sigpipe();
     let args = Cli::parse();
+    if !is_service_command(&args.command) {
+        reset_sigpipe();
+    }
     let out = Out {
         json: args.json,
         color: !args.no_color,

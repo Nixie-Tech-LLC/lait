@@ -81,24 +81,29 @@ jobs:
           set -euo pipefail
           export GROUPCHAT_HOME="$(mktemp -d)"
           export GROUPCHAT_IDLE_SECS=0
+          # Capture output into a variable rather than piping into `grep -q`: an
+          # early-closing reader (grep -q, head) would send SIGPIPE to the CLI —
+          # which now resets SIGPIPE to default for clean interactive piping — and
+          # under `pipefail` that races the smoke. Capturing drains stdout fully,
+          # so the assertions are deterministic regardless of buffering/timing.
           bin() { cargo run --locked --quiet -- "$@"; }
+          has() { case "$1" in *"$2"*) : ;; *) echo "::error::expected '$2' in:"; echo "$1"; exit 1 ;; esac; }
           # id is 64 lowercase hex chars
-          bin id | grep -Eq '^[0-9a-f]{64}$'
+          id_out="$(bin id)"
+          [[ "$id_out" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad id: $id_out"; exit 1; }
           bin projects new "Engineering" --key ENG
           bin new "fix login race" -p ENG -P high >/dev/null
           bin new "add dark mode"  -p ENG -P low  >/dev/null
           # board shows both issues in Backlog
-          bin board ENG | grep -q "fix login race"
-          bin board ENG | grep -q "add dark mode"
+          board="$(bin board ENG)"; has "$board" "fix login race"; has "$board" "add dark mode"
           # edit by KEY-n alias moves it to In Progress
           bin edit ENG-1 --status in_progress
-          bin board ENG | grep -A2 "In Progress" | grep -q "fix login race"
+          board="$(bin board ENG)"; has "$board" "In Progress"; has "$board" "fix login race"
           # completion removes it from the active board list into Done
           bin edit ENG-2 --status done
-          bin ls | grep -q "fix login race"
+          ls_out="$(bin ls)"; has "$ls_out" "fix login race"
           # activity feed records the transitions
-          bin activity | grep -q "created"
-          bin activity | grep -q "edited"
+          act="$(bin activity)"; has "$act" "created"; has "$act" "edited"
           bin stop || true
           echo "P0 smoke flow OK on ${{ matrix.os }}"
 
