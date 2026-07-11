@@ -9,8 +9,9 @@ alternative to Linear that runs as a native Rust node, built on
 > identity + presence + daemon skeleton** the tracker is built on — the iroh
 > foundation kept from the project's chat-app origins. The issue model (Loro
 > docs, the catalog, per-doc sync) is specified and being built on top of it.
-> See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and
-> [`docs/SCHEMA.md`](docs/SCHEMA.md) for the full plan.
+> See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
+> [`docs/SCHEMA.md`](docs/SCHEMA.md), and [`docs/UI.md`](docs/UI.md) for the full
+> plan.
 
 ## What it is (the plan)
 
@@ -27,7 +28,8 @@ built in provable layers:
 
 The full design, phase plan, and decision log live in
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); the concrete data shapes and
-authority model live in [`docs/SCHEMA.md`](docs/SCHEMA.md).
+authority model live in [`docs/SCHEMA.md`](docs/SCHEMA.md); the CLI and TUI
+surfaces live in [`docs/UI.md`](docs/UI.md).
 
 ## What runs today (the skeleton)
 

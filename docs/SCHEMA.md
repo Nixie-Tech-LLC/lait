@@ -40,13 +40,13 @@ of thing with one stability guarantee.
 | `UserId` | ed25519 public key | forever | **a member *is* a key.** Same bytes as the iroh `EndpointId`. Key of `assignees`, signer of ACL ops. |
 | iroh `EndpointId` | ed25519 public key | per identity | the node's transport identity; equals its `UserId`. |
 | Loro `PeerId` | `u64` | **per session** | internal to Loro's op addressing `(peerId, counter)`. **Never surfaced** as a user- or app-level id. A node may present many peerIds over its life. |
-| log `seq` | `u64` | per node, monotonic | ring-buffer cursor for `activity`/`wait`/`watch` (B§7). **Display/notification ordering only.** |
+| log `seq` | `u64` | **per daemon session**, monotonic | ring-buffer cursor for `activity`/`wait`/`watch`/`subscribe` (B§7). **Display/notification ordering only.** **Not durable** — resets to 0 on daemon restart; clients rebaseline via a `Reset` doorbell (B§7.5), never persist it. |
 | Lamport / `Frontiers` | Loro op ids | causal | authoritative *merge* ordering. Distinct from `seq`. |
 | `KEY-n` alias | e.g. `ENG-142` | advisory | human handle; Catalog-assigned, **may collide and disambiguate** (§5.4). |
 
 **Two orderings, never fused.** Merge and conflict reasoning use Lamport/`Frontiers`
 (causal, authoritative). Display, the activity feed, and notifications use wall-clock `ts`
-and the per-node `seq` (advisory). Any code that sorts issues for *merge* by wall-clock is
+and the per-session `seq` (advisory). Any code that sorts issues for *merge* by wall-clock is
 a bug; any code that renders the feed by Lamport is unreadable.
 
 **Identity is one key for P0. [DECISION]** A member is a single ed25519 key. This is
@@ -280,7 +280,7 @@ to P2/P3 (A§10–§11); only the shapes above exist at P0/P1.
 ## 7. Layer B — control protocol (`Request` / `Response` / `IssueEvent`)
 
 Newline-delimited JSON over the Unix socket, same transport as today. This is an
-**imperative façade over a declarative CRDT**; four consequences follow and are load-bearing.
+**imperative façade over a declarative CRDT**; five consequences follow and are load-bearing.
 
 ```rust
 // commands
@@ -297,8 +297,9 @@ enum Request {
   Board     { project: Ref },
   History   { reff: Ref },                           // derived from Loro op history
   ProjectNew{ name, key }, ProjectList, LabelNew{ name, color }, LabelList,
-  Activity  { since: u64 },                          // ex-Log
-  Wait      { since: u64, timeout_ms: u64 },         // kept verbatim
+  Activity  { since: u64 },                          // ex-Log; the feed is PULLED, §7.5
+  Wait      { since: u64, timeout_ms: u64 },         // kept verbatim (one-shot long-poll)
+  Subscribe { since: u64 },                          // §7.5 — streaming doorbells for the TUI
   // P1+: Invite, Join, Connect, Peers, Sync   // P3: MemberAdd/Remove, KeyRotate
   Status, Stop,
 }
@@ -310,6 +311,16 @@ enum Response {
   Issue(IssueView), List(Vec<Row>), Board(BoardView),
   Events { events: Vec<IssueEvent>, last: u64 },
   Error { message: String },
+}
+
+// streamed frame — the reply to `Subscribe`, written repeatedly (not a Response), §7.5
+struct Doorbell {
+  epoch: u64,                              // per-daemon-boot nonce; a change ⇒ restart ⇒ Reset
+  seq:   u64,                              // per-session cursor (§2)
+  reset: bool,                             // true ⇒ ignore the rest, rebaseline from a snapshot
+  dirty_by_project: Map<ProjectId, Vec<DocId>>,   // issue-row plane — re-read these rows
+  dirty_catalog:    Vec<CatalogScope>,     // structure plane: boards(proj)|projects|labels|workflow|acl
+  activity_advanced: bool,                 // new feed rows exist — pull via Activity{since}
 }
 ```
 
@@ -324,14 +335,39 @@ enum Response {
 3. **`Response --json` is a public, versioned contract** and simultaneously the shape MCP
    tools return (A§12). Define the DTOs once and **generate/check MCP tool schemas against
    them.** This is the concrete reason B must not track Layer A automatically (§1).
-4. **`IssueEvent` is a translation, not a passthrough.** The daemon translates Loro
-   `subscribe` diff events into semantic transitions:
+4. **`IssueEvent` is a translation, not a passthrough** — and, for a live client, a
+   **doorbell, not a delta.** The daemon translates Loro `subscribe`/`subscribe_root` diff
+   events (local *and* imported, A§9) into semantic transitions:
    ```
    IssueEvent { seq: u64, doc_id: DocId, reff: String,
-                change: { field, from, to }, actor: UserId, ts: u64 }
+                changes: [{ field, from, to }], actor: UserId, ts: u64 }   // note: a LIST
    ```
-   `seq` stays a per-node ring-buffer cursor (§2), **not** the CRDT version. The existing
-   `wait`/`watch`/hook/desktop-notify apparatus consumes these unchanged.
+   `changes` is a **list** so one Request = one commit = **one** activity row even when it
+   moved several fields (§7.1). But an `IssueEvent` is used two ways, and only the first is a
+   payload:
+   - **Activity feed (payload).** The feed renders the `changes`/`actor`/`ts` — a transition
+     you cannot reconstruct from current state. Pulled on demand via `Activity{since}` (never
+     force-streamed; a bulk import would flood it).
+   - **Live board model (doorbell).** A live client does **not** patch from `changes`. It
+     treats the event as "this `doc_id` is dirty," re-reads the authoritative `DocMeta` row
+     (§3.1 keeps it materialized and merge-correct), and repaints. No op-id, no embedded value
+     — the row *is* the LWW winner. This is why reconciliation needs no correlation.
+
+5. **Streaming (`Subscribe`) and `Reset`.** `Subscribe{since}` turns the one-shot control
+   handler into a stream of `Doorbell` frames (above) until the client disconnects — the TUI's
+   live channel; `Wait` remains the one-shot long-poll fallback. Doorbells are **batched and
+   project-keyed**: the daemon coalesces a whole sync-import transaction (+ a short local-edit
+   debounce) into one frame carrying a *dirty set*, so the ring buffer holds ~1000 *batches*,
+   not individual changes, and a client filters by visibility (re-reading only on-screen
+   projects). Project keying is free — every dirty doc's `projectId` is in hand during the
+   §3.1 `DocMeta` recompute. Because `seq` is per-session (§2) and the ring is bounded, the
+   daemon rings a **`Reset` doorbell** — as the first frame of every `Subscribe`, and whenever
+   a client's `since` is stale or has fallen off the ring — meaning *rebaseline from a fresh
+   `Board`/`List` snapshot*. A per-boot `epoch` lets a client detect a restart without a socket
+   drop. This is also the fix for the pre-existing `wait`/`watch` deafness across daemon
+   restarts. The write path is **validate-then-commit**: a `Response::Error` is returned
+   *before* any commit, so it guarantees nothing changed and no doorbell rang (there is no CAS,
+   §7.2), which is what makes an optimistic client's rollback race-free.
 
 `Ref` and `UserRef` are resolved daemon-side: a `Ref` accepts a short `DocId` prefix, a
 `KEY-n` alias, or a project key; a `UserRef` accepts `@me`, a nick, or a key.
@@ -385,3 +421,8 @@ after it ships — the old ops live forever. Rules:
   `DocMeta.projectId` as self-healing caches.
 - **§5.7** completion policy — **done issues leave `boards[proj]`, stay in `docs`** (agreed),
   rendering on the Done view via the append rule; bounded active board.
+- **§7.4** live events are **doorbells, not deltas** (agreed) — a live client re-reads the
+  materialized `DocMeta` row on a dirty-notice; `changes` is a list carried only for the
+  pulled activity feed. See `UI.md` §4.2–§4.3.
+- **§7.5** streaming `Subscribe` + batched, project-keyed doorbells + `Reset`/`epoch`
+  rebaseline; `seq` per-session, not durable (§2) (all agreed). See `UI.md` §4.1–§4.2.
