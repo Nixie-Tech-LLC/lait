@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.3.1 — durability & sync-liveness hardening
+## v0.3.2 — durability & sync-liveness hardening
 
 Follow-up hardening from a durability audit of the local-first / iroh
 distribution layer (tracked as the `DUR` project inside groupchat itself):
