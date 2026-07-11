@@ -5,13 +5,15 @@ alternative to Linear that runs as a native Rust node, built on
 [iroh](https://www.iroh.computer/) (P2P QUIC + NAT traversal) and
 [Loro](https://loro.dev/) CRDTs, with a git-backed durable store.
 
-> **Status: foundation stage.** The repo currently ships the **transport +
-> identity + presence + daemon skeleton** the tracker is built on — the iroh
-> foundation kept from the project's chat-app origins. The issue model (Loro
-> docs, the catalog, per-doc sync) is specified and being built on top of it.
-> See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
-> [`docs/SCHEMA.md`](docs/SCHEMA.md), and [`docs/UI.md`](docs/UI.md) for the full
-> plan.
+> **Status: P0 complete (single node).** A working, standalone, git-backed issue
+> tracker runs today: create/edit/move/assign/label/comment/close issues from a
+> CLI, a full-screen TUI, or an MCP agent, all driving one daemon that owns the
+> Loro documents. Live P2P sync (P1), the encrypted blind-relay seed (P2), and
+> E2EE membership/rotation (P3) are the next phases — the wire formats are
+> designed so they add on without reshaping P0. See
+> [`docs/ROADMAP.md`](docs/ROADMAP.md) for phase status and
+> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) /
+> [`docs/SCHEMA.md`](docs/SCHEMA.md) / [`docs/UI.md`](docs/UI.md) for the design.
 
 ## What it is (the plan)
 
@@ -31,20 +33,31 @@ The full design, phase plan, and decision log live in
 authority model live in [`docs/SCHEMA.md`](docs/SCHEMA.md); the CLI and TUI
 surfaces live in [`docs/UI.md`](docs/UI.md).
 
-## What runs today (the skeleton)
+## What runs today (P0)
 
-One binary, three roles, sharing one persistent node:
+One binary, four surfaces, sharing one persistent node:
 
-- `groupchat daemon` — the long-lived node: owns the iroh endpoint (an ed25519
-  `EndpointId` identity), a signed-gossip room for announce/presence, a
-  liveness-probe ALPN, and a local control channel. Auto-spawned on first use.
-- `groupchat <cmd>` — a CLI client that drives the daemon over a local IPC
-  channel.
-- `groupchat mcp` — an MCP (stdio) server exposing the actions as tools so an
-  agent can drive it natively.
+- `groupchat daemon` — the long-lived node: **owns the Loro documents** (a
+  per-workspace catalog + one doc per issue) over a **git-backed durable store**,
+  plus the iroh endpoint (an ed25519 `EndpointId` identity), a signed-gossip room
+  for announce/presence, and a local control channel. Auto-spawned on first use.
+- `groupchat <cmd>` — the CLI: flat verbs act on issues (`new`, `edit`, `move`,
+  `assign`, `label`, `comment`, `show`, `ls`, `board`, `history`), plural nouns
+  manage registries (`projects`, `labels`). `--json` emits a stable, versioned
+  DTO for scripts and agents.
+- `groupchat tui` — a full-screen [ratatui](https://ratatui.rs) board client that
+  stays live off a doorbell event stream and echoes edits optimistically.
+- `groupchat mcp` — an MCP (stdio) server exposing the same commands as tools, so
+  an agent files and drives issues natively (returning the same versioned DTO).
 
-State lives under `$GROUPCHAT_HOME` (or the platform config dir): `secret.key`
-and `profile.json`.
+Issues are addressed by a short, git-style `iss_` handle (collision-free) with a
+friendly `KEY-n` alias (`ENG-142`). Refs resolve daemon-side; an ambiguous ref
+returns a candidate list, not an error. Boards render from the catalog cache
+(no per-issue loads), so a large workspace still paints instantly.
+
+State lives under `$GROUPCHAT_HOME` (or the platform config dir): `secret.key`,
+`profile.json`, and a `repo/` git store (`genesis.json`, `catalog.loro`,
+`docs/<id>.loro`). Only public keys and Loro snapshots are stored — never secrets.
 
 ### How it maps to iroh
 
@@ -63,7 +76,8 @@ all three on every change. The daemon's control channel is a Unix-domain socket
 on unix and a named pipe on Windows (via `interprocess`); the single-instance
 guard is a cross-platform advisory lock (`fs2`); TLS uses the portable `ring`
 rustls backend (CI fails if `aws-lc-rs` ever enters the tree). Prebuilt release
-binaries are currently produced for macOS and Linux; Windows builds from source.
+binaries are produced for macOS, Linux, **and Windows** (with a PowerShell
+installer), and the per-OS CI smoke drives the real tracker flow on each.
 
 ## Build (from source)
 
@@ -85,38 +99,60 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Nixie-Tech-LLC/groupcha
 The installer places `groupchat` in `~/.cargo/bin`. Upgrade in place with
 `groupchat-update`.
 
-## Quickstart (two nodes)
+## Quickstart (the tracker)
 
 ```bash
-# --- host ---
-groupchat invite                      # prints a ticket; send it to your peer
+groupchat projects new "Engineering" --key ENG   # create a project
+groupchat new "fix login race" -p ENG -P high     # → prints iss_… (and ENG-1)
+groupchat new "add dark mode"  -p ENG -P low
+groupchat board ENG                               # workflow columns × ordered rows
+groupchat edit ENG-1 --status in_progress         # refer by KEY-n or iss_ prefix
+groupchat assign ENG-1 @me
+groupchat comment ENG-1 "looking into it"
+groupchat show ENG-1                              # full issue: body, comments, meta
+groupchat ls --mine                               # your open issues
+groupchat activity                                # workspace transition feed
+groupchat tui                                     # full-screen interactive board
+```
 
-# --- peer (cold machine — no init needed) ---
-groupchat connect <TICKET> --nick bob # joins the room and goes live
+Scripts capture the resolved handle from `--json`:
 
-# then
-groupchat who                         # ● online  ○ offline
-groupchat wait                        # block until the next event (presence/join/system)
+```bash
+id=$(groupchat new "fix login" -p ENG --json | jq -r .reff)
 ```
 
 ## CLI reference
 
+Issue verbs (act on one issue by `<ref>` — a short `iss_` handle or a `KEY-n` alias):
+
 | Command | Description |
 |---|---|
-| `init [--nick N] [--room R]` | Create identity + settings |
-| `id` | Print your endpoint id |
-| `status` | Node + room status |
-| `invite` | Print a base32 room ticket to share |
-| `join <ticket>` | Join a room and announce a join request |
-| `connect <ticket> [--nick N]` | One step: join + go live |
-| `log [--since N]` | Print presence/system events (returns immediately) |
-| `wait [--since N] [--timeout-ms M]` | Block until a new event arrives, then print it |
-| `watch [--since N] [--exec CMD] [--notify]` | Follow events; run a hook / desktop-notify per event |
-| `who` | List peers with online status |
+| `new <title> [-p PROJ] [-a USER…] [-P PRIO] [-l LABEL…] [-b BODY]` | Create an issue |
+| `ls [-p PROJ] [--mine] [--status S] [--label L] [--all]` | List rows from the catalog cache |
+| `board <PROJ>` | Render the project's board |
+| `show <ref>` | Full issue (lazily loads the issue doc) |
+| `edit <ref> [--title T] [--status S] [--priority P]` | Patch LWW fields (one activity row) |
+| `move <ref> [-p PROJ] [--top\|--bottom\|--before R\|--after R]` | Set project and/or board order |
+| `assign <ref> <userref…> [--remove]` | Add/remove assignees |
+| `label <ref> [+LABEL…] [-LABEL…]` | Add/remove labels |
+| `comment <ref> [BODY]` | Append a comment (no BODY → stdin) |
+| `delete <ref>` | Tombstone an issue (stays in history) |
+| `history <ref>` | The issue's derived activity feed |
+
+Registries + node:
+
+| Command | Description |
+|---|---|
+| `projects [new <name> --key KEY \| ls]` | Manage the project registry |
+| `labels [new <name> --color C \| ls]` | Manage the label registry |
+| `activity [--since N]` | Workspace-wide recent transitions |
+| `tui` | Launch the full-screen board |
+| `status` · `id` · `stop` | Node/workspace status · endpoint id · stop daemon |
+| `invite` · `join` · `connect` · `who` · `wait` · `watch` | P2P transport (P1 surface) |
 | `agents` / `resume <name>` | Manage per-session identities |
-| `daemon` | Run the node in the foreground |
-| `mcp` | Run the MCP server over stdio |
-| `stop` | Stop the daemon |
+
+Global flags: `--home DIR`, `--json`, `--no-color`. Exit codes: `0` ok · `1`
+usage/error · `2` ref not found / ambiguous · `3` daemon unreachable.
 
 ## Use from an AI agent (MCP)
 
@@ -145,9 +181,12 @@ Or add it to `.mcp.json` by hand:
 }
 ```
 
-Tools exposed today: `status`, `my_id`, `invite_ticket`, `join_room`, `connect`,
-`poll`, `wait`, `who`. The issue-tracker tools (file/update/watch/close an issue)
-arrive as the Loro model lands.
+Tools exposed: the full tracker surface — `issue_new`, `issue_edit`,
+`issue_move`, `assign`, `label`, `comment`, `issue_delete`, `issue_view`, `list`,
+`board`, `history`, `project_new`, `project_list`, `label_new`, `label_list`,
+`activity` — plus transport (`status`, `my_id`, `invite_ticket`, `join_room`,
+`connect`, `who`). Each returns the **same versioned JSON DTO** the CLI `--json`
+emits; a build-gate parity test keeps the agent and human surfaces in lock-step.
 
 ## Running several nodes on one machine
 
