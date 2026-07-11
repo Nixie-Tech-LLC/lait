@@ -67,7 +67,10 @@ fn server_entry() -> Result<Value> {
     entry.insert("command".into(), json!(exe.to_string_lossy()));
     entry.insert("args".into(), json!(["mcp"]));
     if let Some(h) = std::env::var_os("GROUPCHAT_HOME") {
-        entry.insert("env".into(), json!({ "GROUPCHAT_HOME": h.to_string_lossy() }));
+        entry.insert(
+            "env".into(),
+            json!({ "GROUPCHAT_HOME": h.to_string_lossy() }),
+        );
     }
     Ok(Value::Object(entry))
 }

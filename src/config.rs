@@ -171,8 +171,8 @@ pub struct DaemonLock {
 pub fn acquire_daemon_lock(home: &Path) -> Result<DaemonLock> {
     use fs2::FileExt;
     let path = lock_path(home);
-    let file = fs::File::create(&path)
-        .with_context(|| format!("create lock file {}", path.display()))?;
+    let file =
+        fs::File::create(&path).with_context(|| format!("create lock file {}", path.display()))?;
     // Exclusive, non-blocking advisory lock held by this open file handle. The
     // OS releases it when the handle closes (process exit or crash), so the lock
     // can never go stale. A second daemon for the same home gets a would-block
@@ -296,7 +296,7 @@ impl Profile {
             return Ok(p);
         }
         let data = fs::read_to_string(&path).context("read profile")?;
-        Ok(serde_json::from_str(&data).context("parse profile")?)
+        serde_json::from_str(&data).context("parse profile")
     }
 
     pub fn save(&self, home: &Path) -> Result<()> {

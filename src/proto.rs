@@ -67,7 +67,9 @@ impl SignedMessage {
 
     /// Sign and encode a payload for broadcast.
     pub fn sign_and_encode(secret_key: &SecretKey, payload: &Payload) -> Result<Bytes> {
-        let data: Bytes = postcard::to_stdvec(payload).context("encode payload")?.into();
+        let data: Bytes = postcard::to_stdvec(payload)
+            .context("encode payload")?
+            .into();
         let signature = secret_key.sign(&data);
         let signed = Self {
             from: secret_key.public(),

@@ -1,7 +1,8 @@
-# Cross-platform CI: builds and tests groupchat on Linux, macOS, and Windows so
-# the daemon's control channel + single-instance lock stay portable. The Windows
-# job is load-bearing — it fails the moment anyone reintroduces a unix-only API
-# (a Unix-domain socket, flock(2), os::fd, …) into the control/lock path.
+# Cross-platform CI + supply-chain gate. Builds, lints, and tests groupchat on
+# Linux, macOS, and Windows so the daemon's control channel + single-instance
+# lock stay portable. The Windows job is load-bearing — it fails the moment
+# anyone reintroduces a unix-only API (a Unix-domain socket, flock(2), os::fd, …)
+# into the control/lock path.
 name: CI
 
 on:
@@ -9,33 +10,43 @@ on:
     branches: [main]
   pull_request:
 
-# Cancel superseded runs on the same ref.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
 
 jobs:
-  # Build + test on every supported OS. This is the portability gate: the crate
-  # must compile and its tests must pass on all three, not just unix.
-  build-and-test:
-    name: build & test (${{ matrix.os }})
+  # Build, lint (fmt + clippy), test, doctest, smoke-run, and the TLS-backend
+  # guard on every supported OS. This is the portability gate: everything must
+  # be green on all three, not just unix. clippy runs per-OS so the cfg-gated
+  # control channel (unix socket vs named pipe) is linted on both.
+  check:
+    name: check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      RUSTFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable)
+      - name: Install Rust (stable + rustfmt + clippy)
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       # --locked pins the committed Cargo.lock, so the portable dependency set
       # (interprocess, fs2, and the `ring` TLS backend) can't drift under CI.
@@ -43,36 +54,59 @@ jobs:
         run: cargo build --locked --all-targets
 
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked --all-targets
 
-  # Portability guard: keep the *portable* rustls backend. `ring` builds cleanly
-  # across all targets; `aws-lc-rs`/`aws-lc-sys` drag in cmake + a C toolchain
-  # (and NASM on Windows), which would break the single-binary, easy-cross-compile
-  # story. Fail if either enters the dependency graph on any platform.
-  portable-tls-backend:
-    name: portable TLS backend (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Assert ring backend (no aws-lc-rs)
+      # Smoke-run the actual binary (no network): mint an identity and print it.
+      # Proves the built binary launches and its local IPC/config paths work on
+      # this OS. Grows per phase (P1: two nodes converge; P3: non-member sees
+      # only ciphertext).
+      - name: Smoke run
+        shell: bash
+        run: |
+          set -euo pipefail
+          export GROUPCHAT_HOME="$(mktemp -d)"
+          out="$(cargo run --locked --quiet -- id)"
+          echo "id: $out"
+          # An endpoint id is 64 lowercase hex chars.
+          echo "$out" | grep -Eq '^[0-9a-f]{64}$'
+
+      # Defense-in-depth beyond the cargo-deny ban: fail if the aws-lc-* rustls
+      # backend is selected on THIS platform (a backend swap can be per-target).
+      - name: Assert portable TLS backend (no aws-lc-*)
         shell: bash
         run: |
           set -euo pipefail
           bad=0
           for crate in aws-lc-rs aws-lc-sys aws-lc-fips-sys; do
-            # `cargo tree -i <crate>` exits non-zero when the crate is absent.
             if cargo tree --locked -e no-dev -i "$crate" >/dev/null 2>&1; then
-              echo "::error::$crate is in the dependency tree — the build must use the portable 'ring' rustls backend, not aws-lc-*."
-              cargo tree --locked -e no-dev -i "$crate" || true
+              echo "::error::$crate is in the dependency tree — the build must use the portable 'ring' rustls backend."
               bad=1
             fi
           done
-          if [ "$bad" -eq 0 ]; then
-            echo "OK: no aws-lc-* in the tree; portable 'ring' backend preserved."
-          fi
           exit "$bad"
+
+  # Verify the MSRV floor holds. The floor is driven by iroh 1.0.0-rc.1 (rustc
+  # 1.91). If this breaks, either the floor moved or a dep raised its MSRV.
+  msrv:
+    name: msrv (1.91)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.91
+        uses: dtolnay/rust-toolchain@1.91.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Check on MSRV
+        run: cargo check --locked --all-targets
+
+  # Supply-chain gate: advisories + licenses + bans + sources (deny.toml). The
+  # bans list forbids the aws-lc-* backends so the portable `ring` backend can't
+  # drift in transitively.
+  supply-chain:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

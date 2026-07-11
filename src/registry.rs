@@ -205,7 +205,10 @@ mod tests {
         std::fs::create_dir_all(base.join("not-an-identity")).unwrap();
 
         let reg = Registry::new(base.clone());
-        assert_eq!(reg.list(), vec!["backend".to_string(), "research".to_string()]);
+        assert_eq!(
+            reg.list(),
+            vec!["backend".to_string(), "research".to_string()]
+        );
         assert!(reg.exists("backend"));
         assert!(!reg.exists("not-an-identity"));
         assert_eq!(reg.home_for("backend"), base.join("backend"));

@@ -69,8 +69,7 @@ binaries are currently produced for macOS and Linux; Windows builds from source.
 cargo build --release
 ```
 
-Requires a recent stable Rust toolchain (the dependency set uses `edition2024`,
-so **Rust 1.85+**).
+Requires **Rust 1.91+** (the floor is driven by iroh 1.0.0-rc.1).
 
 ## Install (prebuilt, macOS/Linux)
 

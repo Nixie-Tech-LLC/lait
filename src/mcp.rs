@@ -5,12 +5,14 @@
 //! use). This is the transport/presence skeleton; the issue-tracker tools
 //! (file/update/watch/close an issue) are layered on as the model lands.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo},
+    model::{
+        CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
+    },
     schemars, tool, tool_handler, tool_router,
     transport::stdio,
     ErrorData as McpError, ServerHandler, ServiceExt,
@@ -100,29 +102,47 @@ impl GroupchatMcp {
         self.run(Request::Id).await
     }
 
-    #[tool(description = "Produce a base32 room ticket. Send it to a coworker so they can join with join_room or connect.")]
+    #[tool(
+        description = "Produce a base32 room ticket. Send it to a coworker so they can join with join_room or connect."
+    )]
     async fn invite_ticket(&self) -> Result<CallToolResult, McpError> {
         self.run(Request::Invite).await
     }
 
     #[tool(description = "Join a room from a ticket and broadcast a request to be added.")]
-    async fn join_room(&self, Parameters(a): Parameters<JoinArgs>) -> Result<CallToolResult, McpError> {
+    async fn join_room(
+        &self,
+        Parameters(a): Parameters<JoinArgs>,
+    ) -> Result<CallToolResult, McpError> {
         self.run(Request::Join { ticket: a.ticket }).await
     }
 
-    #[tool(description = "One-step onboarding: connect to a coworker's room from their ticket (joins and goes live). Use this instead of join_room when you have a ticket.")]
-    async fn connect(&self, Parameters(a): Parameters<ConnectArgs>) -> Result<CallToolResult, McpError> {
+    #[tool(
+        description = "One-step onboarding: connect to a coworker's room from their ticket (joins and goes live). Use this instead of join_room when you have a ticket."
+    )]
+    async fn connect(
+        &self,
+        Parameters(a): Parameters<ConnectArgs>,
+    ) -> Result<CallToolResult, McpError> {
         self.run(Request::Connect { ticket: a.ticket }).await
     }
 
-    #[tool(description = "Poll for new presence/system events. Returns events plus a `last` sequence cursor to pass next time.")]
+    #[tool(
+        description = "Poll for new presence/system events. Returns events plus a `last` sequence cursor to pass next time."
+    )]
     async fn poll(&self, Parameters(a): Parameters<PollArgs>) -> Result<CallToolResult, McpError> {
         self.run(Request::Log { since: a.since }).await
     }
 
-    #[tool(description = "Event-based read: BLOCK until a new event (seq > since) arrives, then return it immediately — or return empty after timeout_ms (default 30s). `kind` is join|presence|system. Loop on this passing back `last` to follow events without busy-polling.")]
+    #[tool(
+        description = "Event-based read: BLOCK until a new event (seq > since) arrives, then return it immediately — or return empty after timeout_ms (default 30s). `kind` is join|presence|system. Loop on this passing back `last` to follow events without busy-polling."
+    )]
     async fn wait(&self, Parameters(a): Parameters<WaitArgs>) -> Result<CallToolResult, McpError> {
-        self.run(Request::Wait { since: a.since, timeout_ms: a.timeout_ms }).await
+        self.run(Request::Wait {
+            since: a.since,
+            timeout_ms: a.timeout_ms,
+        })
+        .await
     }
 
     #[tool(description = "List known peers and whether they are online.")]
@@ -149,8 +169,8 @@ impl ServerHandler for GroupchatMcp {
 }
 
 /// Run the MCP server over stdio until the client disconnects.
-pub async fn run_mcp(home: &PathBuf) -> Result<()> {
-    let service = GroupchatMcp::new(home.clone()).serve(stdio()).await?;
+pub async fn run_mcp(home: &Path) -> Result<()> {
+    let service = GroupchatMcp::new(home.to_path_buf()).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }

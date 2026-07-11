@@ -194,10 +194,7 @@ fn run_hook(cmd: &str, e: &Event) {
 fn desktop_notify(e: &Event) {
     let title = format!("groupchat: {}", e.nick);
     if cfg!(target_os = "macos") {
-        let script = format!(
-            "display notification {:?} with title {:?}",
-            e.text, title
-        );
+        let script = format!("display notification {:?} with title {:?}", e.text, title);
         let _ = std::process::Command::new("osascript")
             .arg("-e")
             .arg(script)
@@ -233,7 +230,15 @@ pub async fn watch(
     eprintln!("watching from seq {cursor} (Ctrl-C to stop)\u{2026}");
 
     loop {
-        let resp = match request(home, &Request::Wait { since: cursor, timeout_ms }).await {
+        let resp = match request(
+            home,
+            &Request::Wait {
+                since: cursor,
+                timeout_ms,
+            },
+        )
+        .await
+        {
             Ok(r) => r,
             Err(e) => {
                 // Daemon may have restarted; re-ensure and keep going.

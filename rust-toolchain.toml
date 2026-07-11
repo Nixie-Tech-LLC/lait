@@ -1,0 +1,6 @@
+# Pin the toolchain channel so local dev and CI agree. The effective floor is
+# Rust 1.91+ (driven by iroh 1.0.0-rc.1) — declared as `rust-version` in
+# Cargo.toml and verified by the MSRV job in CI.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

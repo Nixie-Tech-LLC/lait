@@ -114,9 +114,7 @@ pub struct StatusInfo {
 /// Send one request to the daemon and read one response.
 pub async fn request(home: &Path, req: &Request) -> Result<Response> {
     let name = control_name(home)?;
-    let stream = Stream::connect(name)
-        .await
-        .context("connect to daemon")?;
+    let stream = Stream::connect(name).await.context("connect to daemon")?;
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut line = serde_json::to_string(req).context("encode request")?;
     line.push('\n');
@@ -132,7 +130,6 @@ pub async fn request(home: &Path, req: &Request) -> Result<Response> {
         .read_line(&mut resp_line)
         .await
         .context("read response")?;
-    let resp: Response =
-        serde_json::from_str(resp_line.trim()).context("decode response")?;
+    let resp: Response = serde_json::from_str(resp_line.trim()).context("decode response")?;
     Ok(resp)
 }

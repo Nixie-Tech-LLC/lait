@@ -28,7 +28,11 @@ use crate::{
 };
 
 #[derive(Parser, Debug)]
-#[command(name = "groupchat", version, about = "A peer-to-peer node built on iroh")]
+#[command(
+    name = "groupchat",
+    version,
+    about = "A peer-to-peer node built on iroh"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

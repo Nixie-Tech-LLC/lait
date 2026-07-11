@@ -37,7 +37,10 @@ pub struct PeerState {
 impl PeerState {
     /// A peer first seen alive (NeighborUp or any received traffic).
     pub fn new_online(_now: Instant) -> Self {
-        PeerState { state: Presence::Online, suspect_since: None }
+        PeerState {
+            state: Presence::Online,
+            suspect_since: None,
+        }
     }
 
     /// Any positive liveness signal (NeighborUp or a received message). Returns
@@ -120,7 +123,10 @@ mod tests {
         let t0 = Instant::now();
         let p = PeerState::new_online(t0);
         assert!(p.is_online());
-        assert!(!p.should_reap(at(t0, 300)), "a connected peer must never be reaped on a timer");
+        assert!(
+            !p.should_reap(at(t0, 300)),
+            "a connected peer must never be reaped on a timer"
+        );
     }
 
     #[test]
@@ -128,9 +134,15 @@ mod tests {
         let t0 = Instant::now();
         let mut p = PeerState::new_online(t0);
         let became_suspect = p.neighbor_down(at(t0, 10));
-        assert!(became_suspect, "online -> NeighborDown should become Suspect");
+        assert!(
+            became_suspect,
+            "online -> NeighborDown should become Suspect"
+        );
         assert_eq!(p.state, Presence::Suspect);
-        assert!(p.is_online(), "suspect is still shown online until confirmed");
+        assert!(
+            p.is_online(),
+            "suspect is still shown online until confirmed"
+        );
     }
 
     #[test]
@@ -140,7 +152,10 @@ mod tests {
         p.neighbor_down(at(t0, 10));
         let transition = p.probe_result(true, at(t0, 11));
         assert_eq!(p.state, Presence::Online);
-        assert_eq!(transition, None, "suspect->online via probe is not a visible flap");
+        assert_eq!(
+            transition, None,
+            "suspect->online via probe is not a visible flap"
+        );
     }
 
     #[test]
@@ -150,7 +165,11 @@ mod tests {
         p.neighbor_down(at(t0, 10));
         let transition = p.probe_result(false, at(t0, 11));
         assert_eq!(p.state, Presence::Offline);
-        assert_eq!(transition, Some(false), "a dead probe is a visible went-offline");
+        assert_eq!(
+            transition,
+            Some(false),
+            "a dead probe is a visible went-offline"
+        );
         assert!(!p.is_online());
     }
 
@@ -174,7 +193,10 @@ mod tests {
         assert_eq!(p.state, Presence::Suspect);
         let came_online = p.seen(at(t0, 12));
         assert_eq!(p.state, Presence::Online);
-        assert!(!came_online, "was already shown online (suspect), so no new online notice");
+        assert!(
+            !came_online,
+            "was already shown online (suspect), so no new online notice"
+        );
     }
 
     #[test]
@@ -193,6 +215,9 @@ mod tests {
         let t0 = Instant::now();
         let mut p = PeerState::new_online(t0);
         assert!(p.force_offline(), "online -> offline is visible");
-        assert!(!p.force_offline(), "offline -> offline is not visible again");
+        assert!(
+            !p.force_offline(),
+            "offline -> offline is not visible again"
+        );
     }
 }

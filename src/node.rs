@@ -270,18 +270,16 @@ impl Node {
     /// handshake means it is alive and reachable regardless of the gossip tree
     /// state; a failure within the timeout means it is gone.
     async fn probe_peer(self: Arc<Self>, id: EndpointId) {
-        let alive = match tokio::time::timeout(
-            PROBE_TIMEOUT,
-            self.endpoint.connect(id, PRESENCE_ALPN),
-        )
-        .await
-        {
-            Ok(Ok(conn)) => {
-                conn.close(0u32.into(), b"probe");
-                true
-            }
-            _ => false,
-        };
+        let alive =
+            match tokio::time::timeout(PROBE_TIMEOUT, self.endpoint.connect(id, PRESENCE_ALPN))
+                .await
+            {
+                Ok(Ok(conn)) => {
+                    conn.close(0u32.into(), b"probe");
+                    true
+                }
+                _ => false,
+            };
         let transition = {
             let mut p = self.shared.presence.lock().unwrap();
             p.get_mut(&id)
@@ -344,11 +342,9 @@ impl Node {
             for id in stale {
                 self.mark_offline(id, false);
             }
-            self.shared
-                .presence
-                .lock()
-                .unwrap()
-                .retain(|_, peer| peer.presence.is_online() || peer.last_seen.elapsed() < PRUNE_WINDOW);
+            self.shared.presence.lock().unwrap().retain(|_, peer| {
+                peer.presence.is_online() || peer.last_seen.elapsed() < PRUNE_WINDOW
+            });
         }
     }
 
@@ -423,7 +419,8 @@ impl Node {
             match receiver.try_next().await {
                 Ok(Some(event)) => match event {
                     Event::Received(msg) => {
-                        if let Ok((from, payload)) = SignedMessage::verify_and_decode(&msg.content) {
+                        if let Ok((from, payload)) = SignedMessage::verify_and_decode(&msg.content)
+                        {
                             self.handle_payload(from, payload).await;
                         }
                     }
@@ -626,8 +623,9 @@ impl Node {
                 message: format!("bad request: {e}"),
             },
         };
-        let mut out = serde_json::to_string(&resp)
-            .unwrap_or_else(|_| "{\"status\":\"error\",\"message\":\"encode failure\"}".to_string());
+        let mut out = serde_json::to_string(&resp).unwrap_or_else(|_| {
+            "{\"status\":\"error\",\"message\":\"encode failure\"}".to_string()
+        });
         out.push('\n');
         let _ = write_half.write_all(out.as_bytes()).await;
         let _ = write_half.flush().await;
@@ -718,7 +716,10 @@ pub async fn run_daemon(home: PathBuf) -> Result<()> {
         .create_tokio()
         .context("bind control channel")?;
 
-    tracing::info!("groupchat daemon online as {my_id} in room '{}'", profile.room);
+    tracing::info!(
+        "groupchat daemon online as {my_id} in room '{}'",
+        profile.room
+    );
 
     let shutdown = node.shutdown.clone();
     loop {
@@ -766,6 +767,10 @@ mod tests {
         // a client is connected → never shut down, however long
         assert!(!should_idle_shutdown(1, Duration::from_secs(600), w));
         // zero window disables idle shutdown
-        assert!(!should_idle_shutdown(0, Duration::from_secs(600), Duration::ZERO));
+        assert!(!should_idle_shutdown(
+            0,
+            Duration::from_secs(600),
+            Duration::ZERO
+        ));
     }
 }
