@@ -36,10 +36,30 @@ multi-node over real iroh on Linux, macOS, and Windows.
 - Builds and runs on **Linux, macOS, and Windows**; the hardened CI gate (build +
   test with `-D warnings`, fmt, clippy, doctests, MSRV 1.91, `cargo-deny`,
   portability guard, DTO/MCP parity, a per-OS end-to-end smoke, and a release
-  dry-run) is green on all three.
-- Prebuilt binaries for macOS (arm64 + x86), Linux (arm64 + x86), and **Windows
-  (x64)**, with shell + PowerShell installers, per-target self-updater, and
-  SHA-256 checksums.
+  dry-run) covers all three. The gate reproduces green on Windows and Linux
+  (the latter incl. real-iroh multi-host convergence); the earlier macOS smoke
+  regression (a broken-pipe panic) is fixed.
+- Release binaries for macOS (arm64 + x86), Linux (arm64 + x86), and **Windows
+  (x64)** are produced by the cargo-dist pipeline on a version tag, with shell +
+  PowerShell installers, per-target self-updater, and SHA-256 checksums. The
+  Windows and Linux binaries have been built and run natively; the macOS targets
+  build via the release pipeline.
+
+### Validation & fixes (this candidate)
+
+An independent validation pass (adversarial security + CRDT review, real
+multi-host P2P on separate Linux hosts, and scaling measurement) hardened the
+candidate:
+
+- **Revocation is now sound.** The signed-ACL op signature binds its causal
+  `parents` and the workspace id, closing a bypass where an evicted member could
+  re-parent an admin's still-valid `AddMember` op past their removal. ACL replay
+  is also fully deterministic (Kahn topological sort), so every node computes the
+  same membership and seals each epoch key to the same set.
+- **Issue bodies sync across real networks.** A connection-teardown race that
+  truncated the trailing document frames (only catalog rows converged, bodies
+  stayed provisional) is fixed; a cross-node body-sync assertion guards it.
+- **Piping CLI output no longer panics** (`groupchat board | head`).
 
 Install (once released):
 
@@ -62,6 +82,18 @@ Upgrade in place with `groupchat-update`.
   its GC is deferred — encrypted sync already makes the seed a blind relay.
 - Deferred: RIBLT scale escape-hatch, account-aggregates-devices identity, and a
   CGKA (BeeKEM) key-agreement upgrade over the current sealed-box distribution.
+- **Write throughput is not yet optimized.** Each issue create/edit rewrites the
+  whole catalog snapshot, rebuilds the alias table, and makes a git commit, so
+  bulk authoring is super-linear in workspace size (per-issue interactive latency
+  is fine at hundreds of issues, noticeable at thousands). Board/list reads and
+  cold-load remain catalog-only. Incremental persistence (append `export(updates)`
+  + batched commits) is the planned fix.
+- **Catalog-first sync assumes bidirectional gossip.** The changed-doc set is
+  derived from the LWW-merged catalog head; under strictly one-directional
+  connectivity a puller whose own head write out-ranks the provider's can defer a
+  fetch until a reverse pull re-stamps it. It self-heals under the normal
+  gossip-both-ways mode; deriving the changed set from the catalog op-diff is the
+  planned hardening.
 
 Foundation preserved from the earlier chat-oriented releases: the iroh endpoint +
 ed25519 identity, signed-gossip room, presence, daemon + cross-platform control
