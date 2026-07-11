@@ -60,7 +60,31 @@ fn find_store_dir(start: &Path) -> Option<PathBuf> {
 /// path (the control channel + single-instance lock are keyed on it). Falls back
 /// to the input if canonicalization fails (e.g. the dir was just created).
 fn canonical(p: &Path) -> PathBuf {
-    fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    match fs::canonicalize(p) {
+        Ok(c) => strip_extended_prefix(c),
+        Err(_) => p.to_path_buf(),
+    }
+}
+
+/// On Windows, `fs::canonicalize` returns an extended-length `\\?\C:\…` path.
+/// That prefix breaks a lot of tooling and Windows APIs (and would flow into the
+/// daemon we spawn), so strip it for ordinary drive paths — leaving genuine UNC
+/// (`\\?\UNC\…`) paths untouched. No-op on unix.
+#[cfg(windows)]
+fn strip_extended_prefix(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        // Only unwrap plain `X:\…` drive paths, not `\\?\UNC\server\share`.
+        let b = rest.as_bytes();
+        if b.len() >= 2 && b[1] == b':' {
+            return PathBuf::from(rest);
+        }
+    }
+    p
+}
+#[cfg(not(windows))]
+fn strip_extended_prefix(p: PathBuf) -> PathBuf {
+    p
 }
 
 /// Drop a `.gitignore` into a fresh store so the parent repo never accidentally
@@ -152,6 +176,20 @@ pub fn identity_dir() -> Result<PathBuf> {
         return Ok(dir);
     }
     config_root()
+}
+
+/// The store this invocation WOULD bind if it already exists — WITHOUT creating
+/// one. For commands like `update` that must not spawn a stray `.groupchat/` just
+/// to look for a running daemon.
+pub fn existing_home() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("GROUPCHAT_HOME") {
+        return Some(PathBuf::from(p));
+    }
+    if let Some(p) = std::env::var_os("GROUPCHAT_STORE") {
+        return Some(canonical(&PathBuf::from(p)));
+    }
+    let cwd = std::env::current_dir().ok()?;
+    find_store_dir(&cwd).map(|s| canonical(&s))
 }
 
 /// Names of all registered identities.
