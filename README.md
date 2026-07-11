@@ -156,3 +156,5 @@ Set a distinct `GROUPCHAT_HOME` per node:
 GROUPCHAT_HOME=/tmp/alice groupchat init --nick alice --room demo
 GROUPCHAT_HOME=/tmp/bob   groupchat init --nick bob   --room demo
 ```
+
+<!-- qadi smoke test: verifying the hosted reviewer end-to-end; safe to close -->
