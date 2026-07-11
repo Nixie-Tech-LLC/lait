@@ -176,6 +176,14 @@ pub enum Command {
     Invite,
     /// Join a workspace from a ticket and announce a join request.
     Join { ticket: String },
+    /// Manage pinned always-on **seed** peers — the P2P "remote". A seed is a
+    /// sticky bootstrap + backfill anchor your node always dials, so you converge
+    /// even when no laptop peer is online. It is not a trust authority (genesis/
+    /// ACL still gate every op, A§10). Set one up with `daemon --seed` on the box.
+    Seed {
+        #[command(subcommand)]
+        cmd: SeedCmd,
+    },
     /// One-step onboarding: connect to a workspace from a ticket.
     Connect {
         ticket: String,
@@ -233,6 +241,24 @@ pub enum LabelsCmd {
         color: Option<String>,
     },
     Ls,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SeedCmd {
+    /// Pin a seed and adopt its workspace. Accepts a room ticket (from
+    /// `groupchat invite` on the seed — adopts + backfills) or a bare endpoint id
+    /// (pin only, for a workspace you already share).
+    Add {
+        /// A room ticket or an endpoint id.
+        target: String,
+    },
+    /// List pinned seeds and whether each is currently reachable.
+    Ls,
+    /// Unpin a seed by endpoint id (or id-prefix) or nick.
+    Rm {
+        /// Endpoint id (or prefix) or nick to unpin.
+        who: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -519,6 +545,15 @@ pub async fn run() -> Result<()> {
         Command::Status => crate::cli::run(&home, Request::Status, out).await?,
         Command::Invite => crate::cli::run_invite(&home, out).await?,
         Command::Join { ticket } => crate::cli::run(&home, Request::Join { ticket }, out).await?,
+        Command::Seed { cmd } => match cmd {
+            SeedCmd::Add { target } => {
+                crate::cli::run(&home, Request::SeedAdd { arg: target }, out).await?
+            }
+            SeedCmd::Ls => crate::cli::run(&home, Request::SeedList, out).await?,
+            SeedCmd::Rm { who } => {
+                crate::cli::run(&home, Request::SeedRemove { who }, out).await?
+            }
+        },
         Command::Connect { ticket, nick } => {
             if let Some(n) = nick {
                 let mut profile = Profile::load(&home)?;
