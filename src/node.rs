@@ -170,6 +170,16 @@ impl DoorbellRing {
     }
 }
 
+/// Whether a Subscribe stream must emit a `Reset` and rebaseline: the client's
+/// `cursor` has fallen off the back of the ring, so the next frame it needs
+/// (`cursor + 1`) is older than the oldest one still retained. When
+/// `cursor + 1 == oldest` the ring still holds the exact next frame, so no reset
+/// (S§7.5, UI.md §4.1). Pure and side-effect-free so the ring-overrun invariant
+/// is unit-testable without driving the async socket loop.
+fn subscribe_should_reset(cursor: u64, oldest: u64) -> bool {
+    cursor + 1 < oldest
+}
+
 /// Cheaply-cloneable shared presence state.
 #[derive(Debug, Clone)]
 pub struct Shared {
@@ -710,7 +720,7 @@ impl Node {
                     d.ring.iter().filter(|f| f.seq > cursor).cloned().collect();
                 (frames, d.oldest(), d.seq)
             };
-            if cursor + 1 < oldest {
+            if subscribe_should_reset(cursor, oldest) {
                 let reset = Doorbell {
                     epoch,
                     seq: latest_seq,
@@ -887,5 +897,30 @@ mod tests {
             Duration::from_secs(600),
             Duration::ZERO
         ));
+    }
+
+    // Doorbell/Reset control-plane invariant (S§7.5, UI.md §4.1): a Subscribe
+    // stream rebaselines with a `Reset` exactly when its cursor has fallen off
+    // the back of the ring, and never otherwise.
+    #[test]
+    fn subscribe_resets_only_on_ring_overrun() {
+        // Fresh cursor against a fresh/empty ring: `oldest()` collapses to the
+        // (zero) seq, so cursor 0 vs oldest 0 → no reset. A brand-new subscriber
+        // is rebaselined by the *first-frame* Reset, not by this path.
+        let fresh = DoorbellRing::new(7);
+        assert_eq!(fresh.oldest(), 0);
+        assert!(!subscribe_should_reset(0, fresh.oldest()));
+
+        // Cursor far behind the oldest retained frame → the gap is unrecoverable,
+        // so the stream must Reset and rebaseline.
+        assert!(subscribe_should_reset(5, 100));
+
+        // Boundary: cursor == oldest - 1 means the ring still holds the exact
+        // next frame (`cursor + 1 == oldest`), so no reset — the drain path can
+        // deliver every missed frame contiguously.
+        let oldest = 42;
+        assert!(!subscribe_should_reset(oldest - 1, oldest));
+        // One older than the boundary (a genuine one-frame gap) → reset.
+        assert!(subscribe_should_reset(oldest - 2, oldest));
     }
 }
