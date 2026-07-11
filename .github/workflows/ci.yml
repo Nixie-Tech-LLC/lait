@@ -69,19 +69,38 @@ jobs:
         shell: bash
         run: bash ci/portability-guard.sh
 
-      # Smoke-run the actual binary (no network): mint an identity and print it.
-      # Proves the built binary launches and its local IPC/config paths work on
-      # this OS. Grows per phase (P1: two nodes converge; P3: non-member sees
-      # only ciphertext).
-      - name: Smoke run
+      # End-to-end smoke against the REAL binary (no network): drive the P0
+      # tracker flow — create a project + issues, render the board, edit an
+      # issue, and read the activity feed — asserting on observed output. Proves
+      # the daemon + control channel + Loro store + CLI all work on this OS.
+      # Grows per phase (P1: two nodes converge + a TUI client rebaselines on
+      # Reset; P3: a non-member sees only ciphertext).
+      - name: Smoke run (P0 tracker flow)
         shell: bash
         run: |
           set -euo pipefail
           export GROUPCHAT_HOME="$(mktemp -d)"
-          out="$(cargo run --locked --quiet -- id)"
-          echo "id: $out"
-          # An endpoint id is 64 lowercase hex chars.
-          echo "$out" | grep -Eq '^[0-9a-f]{64}$'
+          export GROUPCHAT_IDLE_SECS=0
+          bin() { cargo run --locked --quiet -- "$@"; }
+          # id is 64 lowercase hex chars
+          bin id | grep -Eq '^[0-9a-f]{64}$'
+          bin projects new "Engineering" --key ENG
+          bin new "fix login race" -p ENG -P high >/dev/null
+          bin new "add dark mode"  -p ENG -P low  >/dev/null
+          # board shows both issues in Backlog
+          bin board ENG | grep -q "fix login race"
+          bin board ENG | grep -q "add dark mode"
+          # edit by KEY-n alias moves it to In Progress
+          bin edit ENG-1 --status in_progress
+          bin board ENG | grep -A2 "In Progress" | grep -q "fix login race"
+          # completion removes it from the active board list into Done
+          bin edit ENG-2 --status done
+          bin ls | grep -q "fix login race"
+          # activity feed records the transitions
+          bin activity | grep -q "created"
+          bin activity | grep -q "edited"
+          bin stop || true
+          echo "P0 smoke flow OK on ${{ matrix.os }}"
 
       # Defense-in-depth beyond the cargo-deny ban: fail if the aws-lc-* rustls
       # backend is selected on THIS platform (a backend swap can be per-target).

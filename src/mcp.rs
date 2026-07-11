@@ -1,9 +1,10 @@
-//! MCP server (stdio) exposing the groupchat actions as agent tools.
+//! MCP server (stdio) exposing the groupchat tracker as agent tools (A§12).
 //!
-//! Each tool is a thin wrapper over the same control protocol the CLI uses, so
-//! an agent gets native tools that drive the local daemon (auto-spawned on first
-//! use). This is the transport/presence skeleton; the issue-tracker tools
-//! (file/update/watch/close an issue) are layered on as the model lands.
+//! Each tool is a thin wrapper over the **same** Layer-B `Request`/`Response`
+//! the CLI uses (UI.md §1), so an agent drives the local daemon natively and
+//! gets back the **same versioned DTO** the CLI `--json` emits (S§7.3). The tool
+//! set is checked against the tracker command surface by `tests/mcp_parity.rs`
+//! so the agent and human surfaces never drift.
 
 use std::path::{Path, PathBuf};
 
@@ -21,51 +22,213 @@ use serde::Deserialize;
 
 use crate::{
     cli::client,
-    control::{Request, Response},
+    control::{BoardPos, Filter, Request, Response},
 };
 
+/// The tracker command tags (`Request` serde `cmd` values) an agent must be able
+/// to drive. `tests/mcp_parity.rs` asserts every one has a tool below, so adding
+/// a `Request` without an MCP tool fails the build gate (S§1/§7.3 parity).
+pub const REQUIRED_TRACKER_COMMANDS: &[&str] = &[
+    "issue_new",
+    "issue_edit",
+    "issue_move",
+    "assign",
+    "label",
+    "comment",
+    "issue_delete",
+    "issue_view",
+    "list",
+    "board",
+    "history",
+    "project_new",
+    "project_list",
+    "label_new",
+    "label_list",
+    "activity",
+];
+
+/// The set of MCP tool names this server exposes (kept beside the `#[tool]`
+/// methods; the parity test cross-checks it covers `REQUIRED_TRACKER_COMMANDS`).
+pub const MCP_TOOL_NAMES: &[&str] = &[
+    // tracker
+    "issue_new",
+    "issue_edit",
+    "issue_move",
+    "assign",
+    "label",
+    "comment",
+    "issue_delete",
+    "issue_view",
+    "list",
+    "board",
+    "history",
+    "project_new",
+    "project_list",
+    "label_new",
+    "label_list",
+    "activity",
+    // transport / presence
+    "status",
+    "my_id",
+    "invite_ticket",
+    "join_room",
+    "connect",
+    "who",
+];
+
+// ---- tool argument schemas ----
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct PollArgs {
-    /// Only return events with sequence number greater than this. Pass 0 to
-    /// get the whole log, then pass back the `last` value you received.
+pub struct IssueNewArgs {
+    /// Issue title.
+    pub title: String,
+    /// Project ref (key like `ENG` or a `prj_` id). Optional if there is one.
     #[serde(default)]
-    pub since: u64,
+    pub project: Option<String>,
+    /// Assignee refs (`@me`, or a 64-hex key).
+    #[serde(default)]
+    pub assignees: Vec<String>,
+    /// Priority: none|low|medium|high|urgent.
+    #[serde(default)]
+    pub priority: Option<String>,
+    /// Label refs (name or `lbl_` id).
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// Optional body/description.
+    #[serde(default)]
+    pub body: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct WaitArgs {
-    /// Block until an event with sequence greater than this arrives. Pass back
-    /// the `last` cursor from the previous call to keep following events.
-    #[serde(default)]
-    pub since: u64,
-    /// Max milliseconds to block before returning (possibly with no new events).
-    /// Defaults to 30000. Capped at 300000.
-    #[serde(default = "default_wait_timeout")]
-    pub timeout_ms: u64,
+pub struct RefArg {
+    /// An issue ref: short `iss_` handle, or a `KEY-n` alias like `ENG-142`.
+    pub reff: String,
 }
 
-fn default_wait_timeout() -> u64 {
-    30_000
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct IssueEditArgs {
+    pub reff: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub priority: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct IssueMoveArgs {
+    pub reff: String,
+    /// New project (writes membership truth, S§5.5).
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Board position: top | bottom | before:<ref> | after:<ref>.
+    #[serde(default)]
+    pub position: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AssignArgs {
+    pub reff: String,
+    /// User refs to add/remove (`@me` or key).
+    pub who: Vec<String>,
+    /// Remove instead of add.
+    #[serde(default)]
+    pub remove: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LabelArgs {
+    pub reff: String,
+    #[serde(default)]
+    pub add: Vec<String>,
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CommentArgs {
+    pub reff: String,
+    pub body: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListArgs {
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub mine: bool,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Include done + tombstoned issues.
+    #[serde(default)]
+    pub all: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BoardArgs {
+    /// Project ref (key or `prj_` id).
+    pub project: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectNewArgs {
+    pub name: String,
+    /// Short key (the `ENG` in `ENG-142`).
+    pub key: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LabelNewArgs {
+    pub name: String,
+    #[serde(default)]
+    pub color: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ActivityArgs {
+    /// Only transitions with seq greater than this (pass back the `last`).
+    #[serde(default)]
+    pub since: u64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct JoinArgs {
-    /// A base32 room ticket from `invite_ticket`.
+    /// A base32 workspace ticket from `invite_ticket`.
     pub ticket: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ConnectArgs {
-    /// A base32 room ticket from a coworker's `invite_ticket`.
+    /// A base32 workspace ticket from a coworker's `invite_ticket`.
     pub ticket: String,
 }
 
 #[derive(Clone)]
 pub struct GroupchatMcp {
     home: PathBuf,
-    // Read by the `#[tool_handler]`-generated code, not by hand.
     #[allow(dead_code)]
     tool_router: ToolRouter<GroupchatMcp>,
+}
+
+fn parse_position(s: &str) -> Option<BoardPos> {
+    match s {
+        "top" => Some(BoardPos::Top),
+        "bottom" => Some(BoardPos::Bottom),
+        other => {
+            if let Some(r) = other.strip_prefix("before:") {
+                Some(BoardPos::Before {
+                    reff: r.to_string(),
+                })
+            } else {
+                other.strip_prefix("after:").map(|r| BoardPos::After {
+                    reff: r.to_string(),
+                })
+            }
+        }
+    }
 }
 
 #[tool_router]
@@ -77,7 +240,8 @@ impl GroupchatMcp {
         }
     }
 
-    /// Drive the daemon and return its response as JSON text.
+    /// Drive the daemon and return its `Response` as JSON text (the same
+    /// versioned DTO the CLI `--json` emits).
     async fn run(&self, req: Request) -> Result<CallToolResult, McpError> {
         match client(&self.home, req).await {
             Ok(resp) => {
@@ -92,7 +256,181 @@ impl GroupchatMcp {
         }
     }
 
-    #[tool(description = "Show this node's status: our id, nickname, room, and online peer count.")]
+    // ---- tracker tools ----
+
+    #[tool(description = "Create an issue. Returns the resolved canonical handle.")]
+    async fn issue_new(
+        &self,
+        Parameters(a): Parameters<IssueNewArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::IssueNew {
+            title: a.title,
+            project: a.project,
+            assignees: a.assignees,
+            priority: a.priority,
+            labels: a.labels,
+            body: a.body,
+        })
+        .await
+    }
+
+    #[tool(description = "Edit an issue's title/status/priority (one commit = one activity row).")]
+    async fn issue_edit(
+        &self,
+        Parameters(a): Parameters<IssueEditArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::IssueEdit {
+            reff: a.reff,
+            title: a.title,
+            status: a.status,
+            priority: a.priority,
+        })
+        .await
+    }
+
+    #[tool(description = "Move an issue to another project and/or board position.")]
+    async fn issue_move(
+        &self,
+        Parameters(a): Parameters<IssueMoveArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::IssueMove {
+            reff: a.reff,
+            project: a.project,
+            pos: a.position.as_deref().and_then(parse_position),
+        })
+        .await
+    }
+
+    #[tool(description = "Add or remove issue assignees (present-key set).")]
+    async fn assign(
+        &self,
+        Parameters(a): Parameters<AssignArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::Assign {
+            reff: a.reff,
+            who: a.who,
+            add: !a.remove,
+        })
+        .await
+    }
+
+    #[tool(description = "Add and/or remove labels on an issue.")]
+    async fn label(
+        &self,
+        Parameters(a): Parameters<LabelArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::Label {
+            reff: a.reff,
+            add: a.add,
+            remove: a.remove,
+        })
+        .await
+    }
+
+    #[tool(description = "Append a comment to an issue (immutable body).")]
+    async fn comment(
+        &self,
+        Parameters(a): Parameters<CommentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::Comment {
+            reff: a.reff,
+            body: a.body,
+        })
+        .await
+    }
+
+    #[tool(description = "Delete (tombstone) an issue. It stays in history for backfill.")]
+    async fn issue_delete(
+        &self,
+        Parameters(a): Parameters<RefArg>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::IssueDelete { reff: a.reff }).await
+    }
+
+    #[tool(
+        description = "Show a full issue (lazily loads the issue doc): body, comments, metadata."
+    )]
+    async fn issue_view(
+        &self,
+        Parameters(a): Parameters<RefArg>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::IssueView { reff: a.reff }).await
+    }
+
+    #[tool(description = "List issue rows from the catalog cache (no issue-doc loads).")]
+    async fn list(&self, Parameters(a): Parameters<ListArgs>) -> Result<CallToolResult, McpError> {
+        self.run(Request::List {
+            project: a.project,
+            filter: Filter {
+                mine: a.mine,
+                status: a.status,
+                label: a.label,
+                all: a.all,
+            },
+        })
+        .await
+    }
+
+    #[tool(description = "Render a project's board (workflow columns x ordered rows).")]
+    async fn board(
+        &self,
+        Parameters(a): Parameters<BoardArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::Board { project: a.project }).await
+    }
+
+    #[tool(description = "An issue's derived activity/time-travel feed.")]
+    async fn history(&self, Parameters(a): Parameters<RefArg>) -> Result<CallToolResult, McpError> {
+        self.run(Request::History { reff: a.reff }).await
+    }
+
+    #[tool(description = "Create a project registry entry.")]
+    async fn project_new(
+        &self,
+        Parameters(a): Parameters<ProjectNewArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::ProjectNew {
+            name: a.name,
+            key: a.key,
+        })
+        .await
+    }
+
+    #[tool(description = "List projects.")]
+    async fn project_list(&self) -> Result<CallToolResult, McpError> {
+        self.run(Request::ProjectList).await
+    }
+
+    #[tool(description = "Create a label registry entry.")]
+    async fn label_new(
+        &self,
+        Parameters(a): Parameters<LabelNewArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::LabelNew {
+            name: a.name,
+            color: a.color,
+        })
+        .await
+    }
+
+    #[tool(description = "List labels.")]
+    async fn label_list(&self) -> Result<CallToolResult, McpError> {
+        self.run(Request::LabelList).await
+    }
+
+    #[tool(description = "Workspace-wide recent transitions (the pulled activity feed).")]
+    async fn activity(
+        &self,
+        Parameters(a): Parameters<ActivityArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::Activity { since: a.since }).await
+    }
+
+    // ---- transport / presence ----
+
+    #[tool(
+        description = "Show node + workspace status: id, nick, workspace, issue/project counts."
+    )]
     async fn status(&self) -> Result<CallToolResult, McpError> {
         self.run(Request::Status).await
     }
@@ -103,13 +441,13 @@ impl GroupchatMcp {
     }
 
     #[tool(
-        description = "Produce a base32 room ticket. Send it to a coworker so they can join with join_room or connect."
+        description = "Produce a base32 workspace ticket to share so a coworker can join/connect."
     )]
     async fn invite_ticket(&self) -> Result<CallToolResult, McpError> {
         self.run(Request::Invite).await
     }
 
-    #[tool(description = "Join a room from a ticket and broadcast a request to be added.")]
+    #[tool(description = "Join a workspace from a ticket and broadcast a request to be added.")]
     async fn join_room(
         &self,
         Parameters(a): Parameters<JoinArgs>,
@@ -118,31 +456,13 @@ impl GroupchatMcp {
     }
 
     #[tool(
-        description = "One-step onboarding: connect to a coworker's room from their ticket (joins and goes live). Use this instead of join_room when you have a ticket."
+        description = "One-step onboarding: connect to a workspace from a ticket (joins + live)."
     )]
     async fn connect(
         &self,
         Parameters(a): Parameters<ConnectArgs>,
     ) -> Result<CallToolResult, McpError> {
         self.run(Request::Connect { ticket: a.ticket }).await
-    }
-
-    #[tool(
-        description = "Poll for new presence/system events. Returns events plus a `last` sequence cursor to pass next time."
-    )]
-    async fn poll(&self, Parameters(a): Parameters<PollArgs>) -> Result<CallToolResult, McpError> {
-        self.run(Request::Log { since: a.since }).await
-    }
-
-    #[tool(
-        description = "Event-based read: BLOCK until a new event (seq > since) arrives, then return it immediately — or return empty after timeout_ms (default 30s). `kind` is join|presence|system. Loop on this passing back `last` to follow events without busy-polling."
-    )]
-    async fn wait(&self, Parameters(a): Parameters<WaitArgs>) -> Result<CallToolResult, McpError> {
-        self.run(Request::Wait {
-            since: a.since,
-            timeout_ms: a.timeout_ms,
-        })
-        .await
     }
 
     #[tool(description = "List known peers and whether they are online.")]
@@ -158,11 +478,12 @@ impl ServerHandler for GroupchatMcp {
             .with_server_info(Implementation::from_build_env())
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions(
-                "A peer-to-peer node built on iroh. Onboarding is one step: the host calls \
-                 invite_ticket and shares the ticket; the other side calls connect (joins and \
-                 goes live). Then follow events with wait (it BLOCKS until something happens, \
-                 passing back the `last` cursor) — `kind` is join|presence|system. Use who for a \
-                 presence snapshot. Presence is kept accurate automatically."
+                "A local-first, peer-to-peer issue tracker. File and drive issues natively: \
+                 create with issue_new, edit with issue_edit, move/assign/label/comment, read \
+                 with list/board/issue_view, and follow work with activity. Refs are a short \
+                 iss_ handle or a KEY-n alias (ENG-142); @me is you. Onboarding across nodes is \
+                 one step: the host calls invite_ticket and shares it; the other side calls \
+                 connect. Every tool returns the same versioned JSON DTO the CLI --json emits."
                     .to_string(),
             )
     }

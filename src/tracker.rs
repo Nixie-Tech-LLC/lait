@@ -1067,4 +1067,341 @@ impl Tracker {
     pub fn activity_high_water(&self) -> u64 {
         self.activity_seq
     }
+
+    // ---- test/inspection helpers (used by integration invariant tests) ----
+
+    /// Read a `DocMeta` row's cached head (the sync digest) for a ref, if any.
+    #[doc(hidden)]
+    pub fn row_head_for(&self, reff: &str) -> Option<Vec<u8>> {
+        match index::resolve_ref(&self.catalog, &self.aliases, reff) {
+            RefResolution::One(id) => self.catalog.row(&id).map(|r| r.head),
+            _ => None,
+        }
+    }
+
+    /// The live head of a loaded issue doc for a ref (for the load-time
+    /// recompute invariant test).
+    #[doc(hidden)]
+    pub fn issue_head_for(&mut self, reff: &str) -> Option<Vec<u8>> {
+        let id = match index::resolve_ref(&self.catalog, &self.aliases, reff) {
+            RefResolution::One(id) => id,
+            _ => return None,
+        };
+        self.issue(&id)
+            .ok()
+            .flatten()
+            .map(|i| crate::catalog::head_hash(&i.head()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::CatalogScope;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Deterministic, Send+Sync clock/entropy: fixed ms, monotonic entropy so
+    /// minted ids are distinct (and canonical handles unique) without wall-clock
+    /// or RNG flakiness.
+    struct FakeClock {
+        ms: u64,
+        ctr: AtomicU64,
+    }
+    impl FakeClock {
+        fn new(ms: u64) -> Self {
+            Self {
+                ms,
+                ctr: AtomicU64::new(1),
+            }
+        }
+    }
+    impl UlidSource for FakeClock {
+        fn now_ms(&self) -> u64 {
+            self.ms
+        }
+        fn rand80(&self) -> u128 {
+            self.ctr.fetch_add(1, Ordering::SeqCst) as u128
+        }
+    }
+
+    fn me() -> UserId {
+        UserId::from_key_string("a".repeat(64))
+    }
+
+    struct TestNode {
+        tracker: Tracker,
+        home: std::path::PathBuf,
+    }
+    impl Drop for TestNode {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
+
+    fn new_node() -> TestNode {
+        let home = std::env::temp_dir().join(format!(
+            "gc-trk-{}-{}",
+            std::process::id(),
+            DocId::mint(&crate::ids::SystemUlidSource)
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let store = Store::open(&home).unwrap();
+        let tracker = Tracker::open(
+            store,
+            me(),
+            "tester".into(),
+            Box::new(FakeClock::new(1_000_000)),
+        )
+        .unwrap();
+        TestNode { tracker, home }
+    }
+
+    /// Create a project + return its key.
+    fn with_project(t: &mut Tracker) -> String {
+        let (resp, _) = t.handle(Request::ProjectNew {
+            name: "Engineering".into(),
+            key: "ENG".into(),
+        });
+        assert!(matches!(resp, Response::Ref { .. }), "{resp:?}");
+        "ENG".to_string()
+    }
+
+    fn new_issue(t: &mut Tracker, title: &str) -> String {
+        let (resp, dirty) = t.handle(Request::IssueNew {
+            title: title.into(),
+            project: Some("ENG".into()),
+            assignees: vec![],
+            priority: None,
+            labels: vec![],
+            body: None,
+        });
+        assert!(dirty.is_some(), "a create must ring a doorbell");
+        match resp {
+            Response::Ref { reff } => reff,
+            other => panic!("expected Ref, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_then_commit_rejects_before_any_change() {
+        // A rejected write returns Error, rings NO doorbell, and changes nothing
+        // (UI.md §4.3 — makes an optimistic rollback race-free).
+        let mut n = new_node();
+        with_project(&mut n.tracker);
+        let reff = new_issue(&mut n.tracker, "fix login");
+        let before_head = n.tracker.row_head_for(&reff);
+
+        // bad status → Error, no dirty-set (no doorbell), state untouched.
+        let (resp, dirty) = n.tracker.handle(Request::IssueEdit {
+            reff: reff.clone(),
+            title: None,
+            status: Some("nonsense_status".into()),
+            priority: None,
+        });
+        assert!(matches!(resp, Response::Error { .. }), "{resp:?}");
+        assert!(dirty.is_none(), "a rejected write must ring no doorbell");
+        assert_eq!(
+            n.tracker.row_head_for(&reff),
+            before_head,
+            "a rejected write must not move the issue head"
+        );
+
+        // an unknown ref also errors with no doorbell.
+        let (resp, dirty) = n.tracker.handle(Request::IssueEdit {
+            reff: "iss_zzzzzzz".into(),
+            title: Some("x".into()),
+            status: None,
+            priority: None,
+        });
+        assert!(matches!(resp, Response::Error { .. }));
+        assert!(dirty.is_none());
+    }
+
+    #[test]
+    fn one_request_is_one_activity_row_even_multi_field() {
+        // S§7.1: a single IssueEdit moving several fields is ONE activity row.
+        let mut n = new_node();
+        with_project(&mut n.tracker);
+        let reff = new_issue(&mut n.tracker, "t");
+        let before = n.tracker.activity_high_water();
+        let (resp, _) = n.tracker.handle(Request::IssueEdit {
+            reff: reff.clone(),
+            title: Some("t2".into()),
+            status: Some("in_progress".into()),
+            priority: Some("high".into()),
+        });
+        assert!(matches!(resp, Response::Ref { .. }));
+        assert_eq!(
+            n.tracker.activity_high_water() - before,
+            1,
+            "multi-field edit is one commit is one activity row"
+        );
+        // and that row carries all three field changes.
+        if let Response::Activity { events, .. } = n.tracker.handle(Request::History { reff }).0 {
+            let last = events.last().unwrap();
+            assert_eq!(last.changes.len(), 3);
+        } else {
+            panic!("expected activity");
+        }
+    }
+
+    #[test]
+    fn writer_direction_row_follows_issue_doc() {
+        // S§3.1: the DocMeta row is recomputed from the issue doc on every edit.
+        let mut n = new_node();
+        with_project(&mut n.tracker);
+        let reff = new_issue(&mut n.tracker, "orig");
+        n.tracker.handle(Request::IssueEdit {
+            reff: reff.clone(),
+            title: Some("changed".into()),
+            status: Some("in_progress".into()),
+            priority: None,
+        });
+        let rows = match n
+            .tracker
+            .handle(Request::List {
+                project: Some("ENG".into()),
+                filter: Filter::default(),
+            })
+            .0
+        {
+            Response::List { rows } => rows,
+            other => panic!("{other:?}"),
+        };
+        let row = rows.iter().find(|r| r.reff == reff).unwrap();
+        assert_eq!(row.title, "changed");
+        assert_eq!(row.status, "in_progress");
+    }
+
+    #[test]
+    fn load_time_head_recompute_self_heals_stale_row() {
+        // S§3.2: a crash between the issue commit and the head mirror leaves a
+        // stale head; on reopen the tracker recomputes it from the real issue
+        // frontiers. Simulate by editing the issue doc + saving it WITHOUT
+        // updating the catalog row, then reopening.
+        let mut n = new_node();
+        with_project(&mut n.tracker);
+        let reff = new_issue(&mut n.tracker, "heal me");
+        let stale_head = n.tracker.row_head_for(&reff).unwrap();
+
+        // Reach into the store: mutate the issue doc and save it, but do NOT
+        // touch the catalog (the "crash between two docs" window).
+        let store = Store::open(&n.home).unwrap();
+        let ids = store.issue_doc_ids();
+        let issue = store.load_issue(&ids[0]).unwrap().unwrap();
+        issue.set_title("healed on disk").unwrap();
+        issue.commit();
+        store.save_issue(&issue).unwrap();
+        let real_head = crate::catalog::head_hash(&issue.head());
+        assert_ne!(real_head, stale_head, "precondition: the head moved");
+
+        // Reopen the tracker — recompute_all_rows must reconcile the row.
+        let store2 = Store::open(&n.home).unwrap();
+        let mut t2 = Tracker::open(
+            store2,
+            me(),
+            "tester".into(),
+            Box::new(FakeClock::new(1_000_000)),
+        )
+        .unwrap();
+        assert_eq!(
+            t2.row_head_for(&reff),
+            Some(real_head),
+            "load-time recompute must heal the stale head"
+        );
+        assert_eq!(t2.issue_head_for(&reff), t2.row_head_for(&reff));
+    }
+
+    #[test]
+    fn project_move_is_single_membership_with_self_healing_boards() {
+        // S§5.5: Issue.projectId is the single source of membership; board lists
+        // self-heal. Moving A from ENG to OPS leaves it in exactly one board.
+        let mut n = new_node();
+        with_project(&mut n.tracker);
+        n.tracker.handle(Request::ProjectNew {
+            name: "Operations".into(),
+            key: "OPS".into(),
+        });
+        let reff = new_issue(&mut n.tracker, "movable");
+
+        let (resp, dirty) = n.tracker.handle(Request::IssueMove {
+            reff: reff.clone(),
+            project: Some("OPS".into()),
+            pos: None,
+        });
+        assert!(matches!(resp, Response::Ref { .. }), "{resp:?}");
+        // the doorbell dirties BOTH boards (old + new).
+        let scopes = dirty.unwrap().dirty_catalog;
+        assert!(
+            scopes
+                .iter()
+                .filter(|s| matches!(s, CatalogScope::Boards { .. }))
+                .count()
+                >= 2,
+            "a cross-project move dirties both boards: {scopes:?}"
+        );
+
+        // ENG board no longer lists it; OPS board does; exactly one membership.
+        let eng = board_reffs(&mut n.tracker, "ENG");
+        let ops = board_reffs(&mut n.tracker, "OPS");
+        assert!(!eng.contains(&reff), "old project board must drop it");
+        assert!(ops.contains(&reff), "new project board must list it");
+    }
+
+    fn board_reffs(t: &mut Tracker, project: &str) -> Vec<String> {
+        match t
+            .handle(Request::Board {
+                project: project.into(),
+            })
+            .0
+        {
+            Response::Board(b) => b
+                .columns
+                .iter()
+                .flat_map(|c| c.rows.iter().map(|r| r.reff.clone()))
+                .collect(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn completion_leaves_board_list_but_stays_in_docs() {
+        // S§5.7: a done issue is removed from boards[proj] but stays in docs and
+        // renders in the Done column via the append rule.
+        let mut n = new_node();
+        with_project(&mut n.tracker);
+        let reff = new_issue(&mut n.tracker, "finish me");
+        let board_len = |t: &Tracker| {
+            let pid = t.catalog().project_by_key("ENG").unwrap().id;
+            t.catalog().board_order(&pid).len()
+        };
+        assert_eq!(board_len(&n.tracker), 1);
+        n.tracker.handle(Request::IssueEdit {
+            reff: reff.clone(),
+            title: None,
+            status: Some("done".into()),
+            priority: None,
+        });
+        // board movable list is now empty (bounded to the active set)...
+        assert_eq!(board_len(&n.tracker), 0);
+        // ...but the issue still renders in the Done column.
+        let done_present = match n
+            .tracker
+            .handle(Request::Board {
+                project: "ENG".into(),
+            })
+            .0
+        {
+            Response::Board(b) => b
+                .columns
+                .iter()
+                .find(|c| c.state.id == "done")
+                .map(|c| c.rows.iter().any(|r| r.reff == reff))
+                .unwrap_or(false),
+            _ => false,
+        };
+        assert!(done_present, "done issue renders in the Done column");
+        // and it is still counted as an existing issue.
+        assert_eq!(n.tracker.issue_count(), 1);
+    }
 }
