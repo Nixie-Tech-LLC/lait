@@ -105,6 +105,7 @@ fn base_issue() -> IssueDoc {
 const STATUSES: [&str; 4] = ["backlog", "in_progress", "in_review", "done"];
 
 #[derive(Debug, Clone)]
+#[allow(clippy::enum_variant_names)] // Set* reads clearly as "set this field"
 enum LwwOp {
     SetTitle(String),
     SetStatus(usize),
