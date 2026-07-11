@@ -19,6 +19,7 @@
 //! `export(updates)` is a deferred optimization).
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -207,14 +208,46 @@ impl Store {
     }
 }
 
-/// Write bytes durably: write to a temp file then rename over the target so a
-/// crash mid-write never truncates the durable copy.
+/// Write bytes durably: write to a temp file, `fsync` it, then rename over the
+/// target and `fsync` the parent directory. Atomicity (via rename) means a crash
+/// mid-write never truncates the durable copy; the two `fsync`s add crash *and*
+/// power-loss durability — without them the OS may report success while the data
+/// (or the rename itself) still sits in the page cache and is lost on power loss
+/// (the classic rename-without-fsync hole).
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
+    // Write and flush the temp file's *contents* to disk before we rename, so
+    // the rename can never publish a file whose bytes aren't durable yet.
+    {
+        let mut f = fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(bytes)
+            .with_context(|| format!("write {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync {}", tmp.display()))?;
+    }
     fs::rename(&tmp, path).with_context(|| format!("rename into {}", path.display()))?;
+    // Persist the directory entry created by the rename. On unix this is the only
+    // way to make the rename itself survive power loss; on Windows a directory
+    // handle can't be fsynced this way and MoveFileEx durability is handled by
+    // the filesystem, so it's a no-op there.
+    fsync_parent_dir(path);
     Ok(())
 }
+
+/// Best-effort `fsync` of a path's parent directory so a just-created/renamed
+/// entry is durable. Unix only — directory `fsync` has no portable Windows
+/// equivalent. Errors are ignored: the data file is already synced, and a failed
+/// directory sync is rare and non-fatal to correctness.
+#[cfg(unix)]
+fn fsync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+}
+#[cfg(not(unix))]
+fn fsync_parent_dir(_path: &Path) {}
 
 fn git_available() -> bool {
     Command::new("git")

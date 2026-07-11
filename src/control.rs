@@ -178,6 +178,18 @@ pub enum Request {
     Connect {
         ticket: String,
     },
+    /// Pin an always-on seed peer (A§10). `arg` is a room ticket (adopt the
+    /// workspace + backfill) or a bare endpoint id (pin only). Sticky across
+    /// restarts; grants no trust.
+    SeedAdd {
+        arg: String,
+    },
+    /// List pinned seeds and their current reachability.
+    SeedList,
+    /// Unpin a seed by endpoint id (or id-prefix) or nick.
+    SeedRemove {
+        who: String,
+    },
     /// Presence/system event log (P1 transport surface).
     Log {
         since: u64,

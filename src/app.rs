@@ -148,7 +148,15 @@ pub enum Command {
     /// Print our endpoint id (the handle others use to reach us).
     Id,
     /// Run the node daemon in the foreground.
-    Daemon,
+    Daemon {
+        /// Run as an always-on seed: never idle-shut-down, so the node stays
+        /// reachable to serve sync and backfill history to peers even with no
+        /// local client attached and no peer currently online (DUR-4). Add it to
+        /// the workspace with `members add <its-id>` so it can decrypt and hold
+        /// the full history peers pull from.
+        #[arg(long)]
+        seed: bool,
+    },
     /// Run the MCP server over stdio (for agents).
     Mcp,
     /// Register groupchat's MCP server with an agent's config.
@@ -168,6 +176,14 @@ pub enum Command {
     Invite,
     /// Join a workspace from a ticket and announce a join request.
     Join { ticket: String },
+    /// Manage pinned always-on **seed** peers — the P2P "remote". A seed is a
+    /// sticky bootstrap + backfill anchor your node always dials, so you converge
+    /// even when no laptop peer is online. It is not a trust authority (genesis/
+    /// ACL still gate every op, A§10). Set one up with `daemon --seed` on the box.
+    Seed {
+        #[command(subcommand)]
+        cmd: SeedCmd,
+    },
     /// One-step onboarding: connect to a workspace from a ticket.
     Connect {
         ticket: String,
@@ -228,6 +244,24 @@ pub enum LabelsCmd {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum SeedCmd {
+    /// Pin a seed and adopt its workspace. Accepts a room ticket (from
+    /// `groupchat invite` on the seed — adopts + backfills) or a bare endpoint id
+    /// (pin only, for a workspace you already share).
+    Add {
+        /// A room ticket or an endpoint id.
+        target: String,
+    },
+    /// List pinned seeds and whether each is currently reachable.
+    Ls,
+    /// Unpin a seed by endpoint id (or id-prefix) or nick.
+    Rm {
+        /// Endpoint id (or prefix) or nick to unpin.
+        who: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum MembersCmd {
     /// Add a member (admin-only). Seals the workspace key to them.
     Add {
@@ -272,7 +306,7 @@ fn reset_sigpipe() {}
 /// Long-running service commands that must keep Rust's default (SIGPIPE ignored)
 /// so networked/stdio I/O returns EPIPE instead of dying on a signal.
 fn is_service_command(cmd: &Command) -> bool {
-    matches!(cmd, Command::Daemon | Command::Mcp)
+    matches!(cmd, Command::Daemon { .. } | Command::Mcp)
 }
 
 pub async fn run() -> Result<()> {
@@ -300,6 +334,10 @@ pub async fn run() -> Result<()> {
         }
         Command::Resume { name } => {
             let home = config::bind_session(name)?;
+            // A named identity is a self-contained home: pin it as GROUPCHAT_HOME
+            // so the daemon we spawn uses it for both identity and store, not the
+            // global identity + repo-discovered store (DUR-5).
+            std::env::set_var("GROUPCHAT_HOME", &home);
             load_or_create_identity(&home)?;
             println!("resumed identity '{name}'");
             return crate::cli::run(&home, Request::Status, out).await;
@@ -315,7 +353,7 @@ pub async fn run() -> Result<()> {
 
     match args.command {
         Command::Init { nick, room } => {
-            let key = load_or_create_identity(&home)?;
+            let key = load_or_create_identity(&config::identity_dir()?)?;
             let mut profile = Profile::load(&home)?;
             if let Some(n) = nick {
                 profile.nick = n;
@@ -484,17 +522,17 @@ pub async fn run() -> Result<()> {
         }
         Command::Tui => crate::tui::run(&home).await?,
         Command::Id => {
-            let key = load_or_create_identity(&home)?;
+            let key = load_or_create_identity(&config::identity_dir()?)?;
             println!("{}", key.public());
         }
-        Command::Daemon => {
+        Command::Daemon { seed } => {
             tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()
                         .unwrap_or_else(|_| "groupchat=info,warn".into()),
                 )
                 .init();
-            node::run_daemon(home).await?;
+            node::run_daemon(home, seed).await?;
         }
         Command::Mcp => {
             mcp::run_mcp(&home).await?;
@@ -511,6 +549,13 @@ pub async fn run() -> Result<()> {
         Command::Status => crate::cli::run(&home, Request::Status, out).await?,
         Command::Invite => crate::cli::run_invite(&home, out).await?,
         Command::Join { ticket } => crate::cli::run(&home, Request::Join { ticket }, out).await?,
+        Command::Seed { cmd } => match cmd {
+            SeedCmd::Add { target } => {
+                crate::cli::run(&home, Request::SeedAdd { arg: target }, out).await?
+            }
+            SeedCmd::Ls => crate::cli::run(&home, Request::SeedList, out).await?,
+            SeedCmd::Rm { who } => crate::cli::run(&home, Request::SeedRemove { who }, out).await?,
+        },
         Command::Connect { ticket, nick } => {
             if let Some(n) = nick {
                 let mut profile = Profile::load(&home)?;

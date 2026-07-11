@@ -285,6 +285,20 @@ server — and is why the seed belongs at **P1** (it is the bootstrap/backfill a
 rarely-co-online peers converge through), even though its *encrypted* blind-relay duties
 still land at P2.
 
+**Setting up a seed (CLI).** The seed role has two client-native halves, no separate server
+product. On the always-on box: `groupchat daemon --seed` — the ordinary daemon with
+idle-shutdown disabled (DUR-4) so it stays reachable to serve sync/backfill with no local
+client attached. On a client: `groupchat seed add <ticket|endpoint-id>` — pins that peer into
+a **sticky `seeds.json` registry**, distinct from the opportunistic `peers.json` bootstrap
+cache (DUR-1). A ticket form also *adopts* the workspace and backfills (a fresh client
+establishes the whole workspace from the ticket alone); a bare id form pins a peer whose
+workspace you already share. Pins are **unioned into the gossip bootstrap set and eagerly
+pulled on every daemon start**, so a client redials and reconverges through its seed even when
+no laptop peer is online. `seed ls` shows pins + reachability; `seed rm <id|nick>` unpins.
+Crucially a pin is **bootstrap + backfill, not trust**: the seed can neither read (P2+) nor
+forge, because every op is still validated against the genesis keys in the ticket (§6) — the
+pin only decides *who this node dials for history*, never *what it believes*.
+
 **Forward-compatibility.** Because P1's wire format already frames updates as
 per-`(peerId, counter)`-range blobs (§8), P2/P3 add the ciphertext-chunking + sedimentree
 envelope *around* those blobs without reshaping the P1 sync protocol. The E2EE envelope is

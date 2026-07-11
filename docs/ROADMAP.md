@@ -77,7 +77,13 @@ Remaining: promotable seed role hardening, TUI peers panel, RIBLT escape-hatch (
   debounce) into **one** project-keyed frame; TUI visibility-filters (U§4.2). Wire the
   TUI sync indicator + peers panel (U§8).
 - Seed: pull the always-on, promotable seed role forward — ticket-advertised bootstrap +
-  backfill so a new client establishes the workspace from a ticket alone (A§10).
+  backfill so a new client establishes the workspace from a ticket alone (A§10). Run-mode:
+  `groupchat daemon --seed` (idle-shutdown disabled, DUR-4). Client onboarding: `groupchat
+  seed add <ticket|id>` pins the seed into a sticky `seeds.json` registry (distinct from the
+  opportunistic `peers.json`), unioned into the gossip bootstrap and eagerly pulled on every
+  start so a client redials and backfills through its seed even with no other peer online;
+  `seed ls` / `seed rm` manage pins. A pin is bootstrap+backfill, never trust (genesis/ACL
+  still gate every op).
 - Presence → three-state (online/away/offline, input-driven): a `postcard` wire bump
   (`Payload::Presence{ nick, state }`), all nodes upgrade together (U§4.5).
 - Tests: two nodes converge (real binaries); a TUI client rebaselines on Reset after a

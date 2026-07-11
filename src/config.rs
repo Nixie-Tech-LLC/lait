@@ -1,7 +1,11 @@
 //! On-disk state: identity and room/profile settings.
 //!
-//! Everything lives under one home directory, resolved from `$GROUPCHAT_HOME`
-//! (handy for running several nodes on one machine) or the platform config dir.
+//! Two locations (DUR-5): a **global identity** (the `secret.key`, under the
+//! platform config dir) and a **per-repo workspace store** (the `.groupchat/`
+//! dir discovered git-style by walking up from the cwd). One identity spans every
+//! repo-bound store, like a single `git` `user.email` across many repos.
+//! `$GROUPCHAT_HOME` collapses both into one self-contained dir (tests, `--home`,
+//! advanced setups).
 
 use std::{
     fs,
@@ -12,7 +16,7 @@ use anyhow::{anyhow, Context, Result};
 use iroh::SecretKey;
 use serde::{Deserialize, Serialize};
 
-use crate::registry::{agents_base, select, Registry, Selection, SessionMap};
+use crate::registry::{agents_base, Registry, SessionMap};
 
 /// The base config directory (ignoring `$GROUPCHAT_HOME`) — where the named
 /// identity registry (`agents/`) and the session map live.
@@ -36,67 +40,118 @@ pub fn registry() -> Result<(Registry, PathBuf)> {
     Ok((Registry::new(base), root.join("sessions.json")))
 }
 
-/// Mint a fresh per-session identity name, unique within the registry.
-fn mint_name(reg: &Registry, session_id: &str) -> String {
-    let short = &session_id[..session_id.len().min(6)];
-    let mut name = format!("agent-{short}");
-    let mut n = 2;
-    while reg.exists(&name) {
-        name = format!("agent-{short}-{n}");
-        n += 1;
+/// The per-repo workspace store directory name, discovered git-style.
+const STORE_DIR: &str = ".groupchat";
+
+/// Walk up from `start` for an existing `.groupchat/` workspace store, so a
+/// command run anywhere inside a repo binds that repo's store (like `git`
+/// finding `.git`). Returns the store dir, or `None` if none exists above `start`.
+fn find_store_dir(start: &Path) -> Option<PathBuf> {
+    for dir in start.ancestors() {
+        let candidate = dir.join(STORE_DIR);
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
     }
-    name
+    None
 }
 
-/// Resolve which identity's home directory this invocation should use, and
-/// return it (created on demand). Order:
-///   1. `$GROUPCHAT_HOME` — explicit override (advanced / the spawned daemon).
-///   2. an explicit `--as <name>` — use/create that named identity.
-///   3. a session already mapped to an existing identity — recall it (0-step).
-///   4. otherwise (model B) mint a fresh per-session identity, so each new
-///      agent/tab is private by default; without a session id, fall back to the
-///      single identity, or require `--as` when there are several.
+/// Canonicalize a path so the CLI and the daemon it spawns hash the *same* store
+/// path (the control channel + single-instance lock are keyed on it). Falls back
+/// to the input if canonicalization fails (e.g. the dir was just created).
+fn canonical(p: &Path) -> PathBuf {
+    fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Drop a `.gitignore` into a fresh store so the parent repo never accidentally
+/// commits this node's local workspace replica + daemon state — it syncs over
+/// P2P, and (like `.git/`) is per-node, not source. No-op if one already exists.
+fn ensure_store_gitignore(store: &Path) {
+    let p = store.join(".gitignore");
+    if !p.exists() {
+        let _ = fs::write(
+            &p,
+            "# groupchat local store — per-node, synced over P2P, do not commit\n*\n",
+        );
+    }
+}
+
+/// Seed a freshly-created repo store's profile so distinct repos default to
+/// distinct gossip rooms (the repo directory name) instead of all sharing
+/// `"default"` and colliding on one topic. No-op if a profile already exists.
+fn seed_repo_profile(store: &Path) {
+    if store.join("profile.json").exists() {
+        return;
+    }
+    let mut p = Profile::default();
+    if let Some(name) = store
+        .parent()
+        .and_then(|d| d.file_name())
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+    {
+        p.room = name.to_string();
+    }
+    let _ = p.save(store);
+}
+
+/// Resolve the **workspace store** directory for this invocation (the per-repo
+/// `.groupchat/`). Precedence:
+///   1. an explicit named identity (`resume`/`--as`) — a self-contained home
+///      under the identity registry.
+///   2. `$GROUPCHAT_HOME` — explicit, self-contained override (identity + store
+///      in one dir): `--home`, tests, advanced setups.
+///   3. `$GROUPCHAT_STORE` — internal pin passed to the daemon we spawn so it
+///      binds the exact store the CLI resolved, independent of its cwd.
+///   4. git-style discovery: walk up from the cwd for a `.groupchat/` and use it;
+///      otherwise auto-create `.groupchat/` in the cwd.
+///
+/// The identity key is resolved separately ([`identity_dir`]) — global by
+/// default, so one identity spans every repo-bound store.
 pub fn resolve_home(explicit: Option<&str>) -> Result<PathBuf> {
+    if let Some(name) = explicit {
+        let (reg, _) = registry()?;
+        let home = reg.home_for(name);
+        fs::create_dir_all(&home)?;
+        return Ok(home);
+    }
     if let Some(p) = std::env::var_os("GROUPCHAT_HOME") {
         let dir = PathBuf::from(p);
         fs::create_dir_all(&dir)?;
         return Ok(dir);
     }
-
-    let (reg, sessions_path) = registry()?;
-    let mut map = SessionMap::load(sessions_path);
-    let sid = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
-
-    let name = if let Some(name) = explicit {
-        name.to_string()
-    } else if let Some(s) = sid.as_deref() {
-        // Model B: recall this session's identity if mapped, else mint a FRESH
-        // per-session identity. Never auto-attach to another session's identity.
-        match map.get(s) {
-            Some(n) if reg.exists(n) => n.to_string(),
-            _ => mint_name(&reg, s),
-        }
+    let store = if let Some(p) = std::env::var_os("GROUPCHAT_STORE") {
+        let dir = PathBuf::from(p);
+        fs::create_dir_all(&dir)?;
+        canonical(&dir)
     } else {
-        // No session anchor (e.g. plain shell): fall back to the never-guess
-        // selection — attach only when there's exactly one identity.
-        match select(reg.list(), None) {
-            Selection::Attach(n) => n,
-            Selection::Empty => "default".to_string(),
-            Selection::Choose(opts) => {
-                return Err(anyhow!(
-                    "multiple identities — choose one with --as <name>: {}",
-                    opts.join(", ")
-                ))
+        let cwd = std::env::current_dir().context("get current dir")?;
+        let dir = match find_store_dir(&cwd) {
+            Some(s) => s,
+            None => {
+                let s = cwd.join(STORE_DIR);
+                fs::create_dir_all(&s)?;
+                s
             }
-        }
+        };
+        canonical(&dir)
     };
+    seed_repo_profile(&store);
+    ensure_store_gitignore(&store);
+    Ok(store)
+}
 
-    if let Some(s) = sid.as_deref() {
-        let _ = map.set(s, &name);
+/// The directory holding this node's identity `secret.key`. A self-contained
+/// home (`$GROUPCHAT_HOME`) keeps the key beside its store; otherwise the key is
+/// **global** (under [`config_root`]) so one identity spans every repo-bound
+/// store — like one `git` `user.email` across many repos.
+pub fn identity_dir() -> Result<PathBuf> {
+    if let Some(p) = std::env::var_os("GROUPCHAT_HOME") {
+        let dir = PathBuf::from(p);
+        fs::create_dir_all(&dir)?;
+        return Ok(dir);
     }
-    let home = reg.home_for(&name);
-    fs::create_dir_all(&home)?;
-    Ok(home)
+    config_root()
 }
 
 /// Names of all registered identities.
@@ -190,6 +245,27 @@ pub fn acquire_daemon_lock(home: &Path) -> Result<DaemonLock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_store_dir_walks_up_to_the_nearest_groupchat() {
+        let root = std::env::temp_dir().join(format!("gc-disc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let nested = repo.join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        // No `.groupchat/` anywhere above `nested`.
+        assert_eq!(find_store_dir(&nested), None);
+
+        // Create the store at the repo root; discovery from a deep subdir and
+        // from the root itself both bind it (git-style walk-up).
+        let store = repo.join(STORE_DIR);
+        std::fs::create_dir_all(&store).unwrap();
+        assert_eq!(find_store_dir(&nested), Some(store.clone()));
+        assert_eq!(find_store_dir(&repo), Some(store));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn second_daemon_lock_fails_while_first_is_held() {

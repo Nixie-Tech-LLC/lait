@@ -37,9 +37,13 @@ pub async fn ensure_daemon(home: &Path) -> Result<()> {
         return Ok(());
     }
     let exe = std::env::current_exe().context("locate own executable")?;
+    // Pin the resolved store for the spawned daemon so it binds the exact same
+    // store regardless of its cwd (DUR-5). GROUPCHAT_HOME, when set (self-
+    // contained / --home / resume), is inherited from our env and takes
+    // precedence, so this is a no-op in that mode.
     std::process::Command::new(exe)
         .arg("daemon")
-        .env("GROUPCHAT_HOME", home)
+        .env("GROUPCHAT_STORE", home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
