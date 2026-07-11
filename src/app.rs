@@ -246,7 +246,25 @@ pub enum MembersCmd {
 }
 
 /// Parse arguments and run.
+/// Restore the default `SIGPIPE` disposition on unix. Rust ignores `SIGPIPE` by
+/// default, which turns a closed downstream pipe (`groupchat board | head`,
+/// `| grep -q`, `| less` then quit) into a panic on the next stdout write
+/// (`failed printing to stdout: Broken pipe`) instead of a clean exit. Resetting
+/// to `SIG_DFL` makes the process terminate normally when the reader goes away,
+/// which is the expected CLI behavior. No-op on Windows (no `SIGPIPE`).
+#[cfg(unix)]
+fn reset_sigpipe() {
+    // SAFETY: setting a signal handler to the default disposition is async-signal
+    // -safe and is the standard fix for Rust CLIs (see rust-lang/rust#46016).
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+#[cfg(not(unix))]
+fn reset_sigpipe() {}
+
 pub async fn run() -> Result<()> {
+    reset_sigpipe();
     let args = Cli::parse();
     let out = Out {
         json: args.json,

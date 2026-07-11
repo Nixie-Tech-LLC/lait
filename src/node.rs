@@ -128,9 +128,18 @@ impl std::fmt::Debug for SyncHandler {
 
 impl ProtocolHandler for SyncHandler {
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
+        // `serve` finishes its send stream but `send.finish()` only queues the
+        // FIN — it does NOT wait for the data to be delivered. If we returned
+        // here the `Connection` would drop and send CONNECTION_CLOSE, truncating
+        // the trailing `DocUpdate`/`EndDocs` frames before the puller drains them
+        // (issue-doc bodies would silently never sync). Keep the connection alive
+        // until the puller has read everything and closes it — same as the
+        // presence handler above.
+        let keepalive = connection.clone();
         if let Err(e) = crate::sync::serve(connection, &self.tracker).await {
             tracing::debug!("sync serve error: {e:#}");
         }
+        keepalive.closed().await;
         Ok(())
     }
 }

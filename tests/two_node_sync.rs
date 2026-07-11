@@ -112,6 +112,41 @@ fn poll_title(home: &Path, needle: &str, tries: u32) -> bool {
     false
 }
 
+/// Resolve the canonical ref for the row with `title` on this node.
+fn row_ref(home: &Path, title: &str) -> Option<String> {
+    match req(
+        home,
+        Request::List {
+            project: None,
+            filter: Filter::default(),
+        },
+    ) {
+        Response::List { rows } => rows.into_iter().find(|r| r.title == title).map(|r| r.reff),
+        _ => None,
+    }
+}
+
+/// Poll until the issue DOC (not just the catalog row) has synced — i.e. its
+/// `description`/body is present and the view is no longer provisional. This is
+/// the assertion the catalog-only `list_titles` check cannot make: the body
+/// lives ONLY in the issue doc, so it proves the doc transferred.
+fn poll_body(home: &Path, reff: &str, needle: &str, tries: u32) -> bool {
+    for _ in 0..tries {
+        std::thread::sleep(Duration::from_secs(2));
+        if let Response::Issue(v) = req(
+            home,
+            Request::IssueView {
+                reff: reff.to_string(),
+            },
+        ) {
+            if !v.provisional && v.description.contains(needle) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[test]
 fn two_nodes_converge_over_iroh() {
     let a_home = tmp_home("a");
@@ -143,7 +178,10 @@ fn two_nodes_converge_over_iroh() {
                     assignees: vec![],
                     priority: Some("high".into()),
                     labels: vec![],
-                    body: None,
+                    // A body lives ONLY in the issue doc (never in the catalog
+                    // row) — so asserting B receives it proves the issue DOCUMENT
+                    // synced, not just the catalog cache.
+                    body: Some("BODY_A: only-in-the-issue-doc contents".into()),
                 }
             ),
             Response::Ref { .. }
@@ -198,6 +236,16 @@ fn two_nodes_converge_over_iroh() {
     assert!(
         poll_title(&b.home, "shared from A", 40),
         "A→B: B did not converge to A's issue over encrypted P2P sync"
+    );
+
+    // Regression (validation-found): the catalog row above can converge from the
+    // catalog cache alone while the issue DOCUMENT never transfers. Assert B also
+    // receives the issue doc BODY — this fails if the sync connection is torn down
+    // before the trailing DocUpdate/EndDocs frames drain (see node.rs SyncHandler).
+    let a_ref = row_ref(&b.home, "shared from A").expect("B has a row for A's issue");
+    assert!(
+        poll_body(&b.home, &a_ref, "BODY_A", 30),
+        "A→B: catalog row converged but the issue-doc BODY never synced (doc-frame truncation)"
     );
 
     // B -> A: a fresh issue on B propagates back to A.

@@ -1347,6 +1347,7 @@ impl Tracker {
                 role,
             },
             self.membership.heads(),
+            &self.workspace_id,
         );
         if let Err(e) = self.member_apply(op, |t| {
             let epochs: Vec<(u32, WorkspaceKey)> =
@@ -1383,6 +1384,7 @@ impl Tracker {
             &self.seed,
             &AclOp::RemoveMember { key: user.clone() },
             self.membership.heads(),
+            &self.workspace_id,
         );
         if let Err(e) = self.member_apply(op, |t| t.rotate_key()) {
             return (Response::err(format!("{e:#}")), None);
@@ -1726,6 +1728,112 @@ mod tests {
             Response::Ref { reff } => reff,
             other => panic!("expected Ref, got {other:?}"),
         }
+    }
+
+    /// Perf harness (run: `GC_PERF_N=5000 cargo test --release -p groupchat --lib
+    /// perf_seed_and_cold_load -- --ignored --nocapture`). Proves/refutes the
+    /// scaling claims: cold-load is O(issues) (loads every doc), board/list reads
+    /// are O(catalog) (must stay flat as issue count grows).
+    #[test]
+    #[ignore]
+    fn perf_seed_and_cold_load() {
+        use std::time::Instant;
+        let n: usize = std::env::var("GC_PERF_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5000);
+        let home = std::env::temp_dir().join(format!(
+            "gc-perf-{}-{}",
+            std::process::id(),
+            DocId::mint(&crate::ids::SystemUlidSource)
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+
+        // --- seed N issues through the real Request path ---
+        let t0 = Instant::now();
+        {
+            let store = Store::open(&home).unwrap();
+            let clock = FakeClock::new(1_000_000);
+            let mut t =
+                Tracker::open(store, me(), "perf".into(), ME_SEED, Box::new(clock)).unwrap();
+            with_project(&mut t);
+            for i in 0..n {
+                let (resp, dirty) = t.handle(Request::IssueNew {
+                    title: format!("issue {i}"),
+                    project: Some("ENG".into()),
+                    assignees: vec![],
+                    priority: None,
+                    labels: vec![],
+                    body: None,
+                });
+                assert!(matches!(resp, Response::Ref { .. }), "{resp:?}");
+                assert!(dirty.is_some());
+            }
+        }
+        let seed = t0.elapsed();
+        let store_bytes = fs_dir_size(&home);
+
+        // --- cold-load: reopen the store (recompute_all_rows loads every doc) ---
+        let t1 = Instant::now();
+        let store = Store::open(&home).unwrap();
+        let clock = FakeClock::new(1_000_000);
+        let mut t = Tracker::open(store, me(), "perf".into(), ME_SEED, Box::new(clock)).unwrap();
+        let cold_load = t1.elapsed();
+        assert_eq!(t.issue_count(), n, "all seeded issues must be present");
+
+        // --- board latency (catalog-only read; must be flat vs n) ---
+        let k = 50u32;
+        let tb = Instant::now();
+        for _ in 0..k {
+            let (r, _) = t.handle(Request::Board {
+                project: "ENG".into(),
+            });
+            assert!(matches!(r, Response::Board(_)), "{r:?}");
+        }
+        let board_avg = tb.elapsed() / k;
+
+        // --- list latency (catalog-only read) ---
+        let tl = Instant::now();
+        for _ in 0..k {
+            let (r, _) = t.handle(Request::List {
+                project: Some("ENG".into()),
+                filter: Filter::default(),
+            });
+            assert!(matches!(r, Response::List { .. }), "{r:?}");
+        }
+        let list_avg = tl.elapsed() / k;
+
+        // --- catalog VV-diff export cost (sync phase-1 whole-catalog cost) ---
+        let empty_vv: Vec<u8> = vec![];
+        let tc = Instant::now();
+        let cat_diff = t.export_catalog_from(&empty_vv).unwrap();
+        let catalog_export = tc.elapsed();
+
+        println!(
+            "PERF n={n} seed={seed:?} store={store_kb}KB cold_load={cold_load:?} \
+             board_avg={board_avg:?} list_avg={list_avg:?} \
+             catalog_full_export={catalog_export:?} catalog_bytes={cat_bytes}",
+            store_kb = store_bytes / 1024,
+            cat_bytes = cat_diff.len(),
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    fn fs_dir_size(p: &std::path::Path) -> u64 {
+        let mut total = 0;
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for e in rd.flatten() {
+                let md = e.metadata();
+                if let Ok(md) = md {
+                    if md.is_dir() {
+                        total += fs_dir_size(&e.path());
+                    } else {
+                        total += md.len();
+                    }
+                }
+            }
+        }
+        total
     }
 
     #[test]

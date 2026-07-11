@@ -80,6 +80,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # mcp server (stdio)
 rmcp = { version = "1.7", features = ["server", "macros", "transport-io"] }
 
+# unix-only: reset SIGPIPE to default so piping CLI output to head/less/grep
+# exits cleanly instead of panicking (Rust ignores SIGPIPE by default). Already
+# present transitively (tokio); declared directly for the startup reset in app.rs.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # property-based convergence testing (random op sequences across N peers).
 proptest = "1"

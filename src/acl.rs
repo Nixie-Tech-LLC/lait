@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-use crate::ids::UserId;
+use crate::ids::{UserId, WorkspaceId};
 use crate::store::Genesis;
 
 /// A member role.
@@ -49,13 +49,36 @@ impl AclOp {
 }
 
 /// A signed op with its causal parents (S§6). `op` is the canonical `AclOp`
-/// bytes; `sig` is ed25519 over `op` by `author`; `parents` are op hashes.
+/// bytes; `sig` is ed25519 by `author` over a payload that binds the op bytes,
+/// the author, the (sorted) `parents`, **and** the workspace id — so a valid
+/// signature cannot be re-parented (which would defeat remove-wins revocation)
+/// or replayed into another workspace. `parents` are op hashes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedOp {
     pub op: Vec<u8>,
     pub author: UserId,
     pub sig: Vec<u8>,
     pub parents: Vec<String>,
+}
+
+/// The canonical bytes an op's signature covers: domain ‖ op ‖ author ‖
+/// sorted(parents) ‖ workspaceId. Binding `parents` closes the revocation
+/// bypass (a re-parented copy of a valid op no longer verifies); binding the
+/// workspace id prevents cross-workspace op replay. `workspace_id` is supplied
+/// by context (the signer's / genesis's workspace) and is not transmitted in
+/// `SignedOp`, so this does not change the op's wire shape.
+fn signing_payload(op: &[u8], author: &UserId, parents: &[String], workspace_id: &str) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"groupchat/aclop/1");
+    h.update(op);
+    h.update(author.as_str().as_bytes());
+    let mut ps = parents.to_vec();
+    ps.sort();
+    for p in &ps {
+        h.update(p.as_bytes());
+    }
+    h.update(workspace_id.as_bytes());
+    *h.finalize().as_bytes()
 }
 
 impl SignedOp {
@@ -74,7 +97,10 @@ impl SignedOp {
     fn decode_op(&self) -> Option<AclOp> {
         postcard::from_bytes(&self.op).ok()
     }
-    fn verify_sig(&self) -> bool {
+    /// Verify the signature against the canonical payload (op ‖ author ‖
+    /// sorted(parents) ‖ `workspace_id`). Fails if the op was re-parented,
+    /// re-authored, or lifted from another workspace.
+    fn verify_sig(&self, workspace_id: &str) -> bool {
         let Some(pk_bytes) = hex32(self.author.as_str()) else {
             return false;
         };
@@ -84,18 +110,27 @@ impl SignedOp {
         let Ok(sig) = Signature::from_slice(&self.sig) else {
             return false;
         };
-        vk.verify(&self.op, &sig).is_ok()
+        let payload = signing_payload(&self.op, &self.author, &self.parents, workspace_id);
+        vk.verify(&payload, &sig).is_ok()
     }
 }
 
 /// Sign an [`AclOp`] with the author's ed25519 seed, given the current heads as
-/// parents (S§6). The author is derived from the seed.
-pub fn sign_op(seed: &[u8; 32], op: &AclOp, parents: Vec<String>) -> SignedOp {
+/// parents and the workspace id (S§6). The signature binds all of them, so a
+/// valid op cannot be re-parented or replayed across workspaces. The author is
+/// derived from the seed.
+pub fn sign_op(
+    seed: &[u8; 32],
+    op: &AclOp,
+    parents: Vec<String>,
+    workspace_id: &WorkspaceId,
+) -> SignedOp {
     let sk = SigningKey::from_bytes(seed);
     let author =
         UserId::from_key_string(data_encoding::HEXLOWER.encode(sk.verifying_key().as_bytes()));
     let op_bytes = op.encode();
-    let sig: Signature = sk.sign(&op_bytes);
+    let payload = signing_payload(&op_bytes, &author, &parents, workspace_id.as_str());
+    let sig: Signature = sk.sign(&payload);
     SignedOp {
         op: op_bytes,
         author,
@@ -150,8 +185,9 @@ fn hex32(s: &str) -> Option<[u8; 32]> {
 pub fn replay(genesis: &Genesis, ops: &[SignedOp]) -> AclState {
     // Index valid-signed ops by hash.
     let mut by_hash: HashMap<String, (&SignedOp, AclOp)> = HashMap::new();
+    let ws = genesis.workspace_id.as_str();
     for so in ops {
-        if !so.verify_sig() {
+        if !so.verify_sig(ws) {
             continue;
         }
         if let Some(op) = so.decode_op() {
@@ -162,9 +198,12 @@ pub fn replay(genesis: &Genesis, ops: &[SignedOp]) -> AclState {
     // Transitive causal ancestors of each op (over present parents only).
     let ancestors = compute_ancestors(&by_hash);
 
-    // Topological order (ancestors before descendants; ties by hash for
-    // determinism).
-    let order = topo_order(&by_hash, &ancestors);
+    // Topological order (ancestors before descendants; concurrent ops ordered by
+    // hash). Deterministic and independent of `by_hash`'s (randomized) iteration
+    // order, so every honest node computes the same membership from the same op
+    // set — required for E2EE (all nodes must seal the next epoch key to the same
+    // recipient set).
+    let order = topo_order(&by_hash);
 
     // Founding admins are the trust root.
     let mut admins: BTreeSet<UserId> = genesis.founding_admins.iter().cloned().collect();
@@ -265,21 +304,57 @@ fn compute_ancestors(
     out
 }
 
-fn topo_order(
-    by_hash: &HashMap<String, (&SignedOp, AclOp)>,
-    ancestors: &HashMap<String, HashSet<String>>,
-) -> Vec<String> {
-    let mut order: Vec<String> = by_hash.keys().cloned().collect();
-    // Sort so ancestors precede descendants; break ties by hash (determinism).
-    order.sort_by(|a, b| {
-        let a_before_b = ancestors.get(b).map(|s| s.contains(a)).unwrap_or(false);
-        let b_before_a = ancestors.get(a).map(|s| s.contains(b)).unwrap_or(false);
-        match (a_before_b, b_before_a) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.cmp(b),
+/// Deterministic topological sort (Kahn's algorithm) over the present-parent
+/// DAG. Ready nodes are emitted in hash order, so the result is a total order
+/// that depends only on the op set — never on `by_hash`'s randomized iteration
+/// order. A previous `sort_by` comparator here was non-transitive on mixed
+/// ancestry/hash pairs, which — combined with the HashMap-seeded input order —
+/// let two honest nodes derive different orders (and thus different membership).
+fn topo_order(by_hash: &HashMap<String, (&SignedOp, AclOp)>) -> Vec<String> {
+    // Indegree over PRESENT parents only; children adjacency for decrement.
+    let mut indeg: HashMap<String, usize> = by_hash.keys().map(|h| (h.clone(), 0)).collect();
+    let mut children: HashMap<String, Vec<String>> = HashMap::new();
+    for (h, (so, _)) in by_hash {
+        for p in &so.parents {
+            if by_hash.contains_key(p) {
+                *indeg.get_mut(h).unwrap() += 1;
+                children.entry(p.clone()).or_default().push(h.clone());
+            }
         }
-    });
+    }
+    // Ready set kept sorted by hash (BTreeSet) for a deterministic tie-break.
+    let mut ready: BTreeSet<String> = indeg
+        .iter()
+        .filter(|(_, d)| **d == 0)
+        .map(|(h, _)| h.clone())
+        .collect();
+    let mut order: Vec<String> = Vec::with_capacity(by_hash.len());
+    while let Some(h) = ready.iter().next().cloned() {
+        ready.remove(&h);
+        order.push(h.clone());
+        if let Some(cs) = children.get(&h) {
+            let mut cs = cs.clone();
+            cs.sort();
+            for c in cs {
+                let d = indeg.get_mut(&c).unwrap();
+                *d -= 1;
+                if *d == 0 {
+                    ready.insert(c);
+                }
+            }
+        }
+    }
+    // Any remaining nodes sit on a parent-cycle (malformed input); append them in
+    // hash order so the result stays deterministic and total.
+    if order.len() < by_hash.len() {
+        let mut rest: Vec<String> = by_hash
+            .keys()
+            .filter(|h| !order.contains(*h))
+            .cloned()
+            .collect();
+        rest.sort();
+        order.extend(rest);
+    }
     order
 }
 
@@ -311,6 +386,7 @@ mod tests {
                 role: Role::Member,
             },
             vec![],
+            &g.workspace_id,
         );
         let st = replay(&g, &[add]);
         assert!(st.is_admin(&user(1)));
@@ -330,6 +406,7 @@ mod tests {
                 role: Role::Admin,
             },
             vec![],
+            &g.workspace_id,
         );
         let st = replay(&g, &[forged]);
         assert!(
@@ -349,6 +426,7 @@ mod tests {
                 role: Role::Member,
             },
             vec![],
+            &g.workspace_id,
         );
         op.sig[0] ^= 0xff; // tamper
         let st = replay(&g, &[op]);
@@ -368,12 +446,14 @@ mod tests {
                 role: Role::Member,
             },
             vec![],
+            &g.workspace_id,
         );
         let h1 = op1.hash();
         let rm = sign_op(
             &seed(1),
             &AclOp::RemoveMember { key: user(2) },
             vec![h1.clone()],
+            &g.workspace_id,
         );
         let add2 = sign_op(
             &seed(1),
@@ -382,6 +462,7 @@ mod tests {
                 role: Role::Member,
             },
             vec![h1.clone()],
+            &g.workspace_id,
         );
         let st = replay(&g, &[op1, rm, add2]);
         assert!(!st.is_member(&user(2)), "remove-wins over a concurrent add");
@@ -398,11 +479,13 @@ mod tests {
                 role: Role::Member,
             },
             vec![],
+            &g.workspace_id,
         );
         let rm = sign_op(
             &seed(1),
             &AclOp::RemoveMember { key: user(2) },
             vec![op1.hash()],
+            &g.workspace_id,
         );
         let readd = sign_op(
             &seed(1),
@@ -411,11 +494,84 @@ mod tests {
                 role: Role::Member,
             },
             vec![rm.hash()],
+            &g.workspace_id,
         );
         let st = replay(&g, &[op1, rm, readd]);
         assert!(
             st.is_member(&user(2)),
             "a causally-later re-add restores membership"
+        );
+    }
+
+    #[test]
+    fn revocation_holds_against_reparented_signed_add() {
+        // Regression for the validation-found CRITICAL: an evicted member (no
+        // admin key) tries to defeat remove-wins by lifting the admin's still-
+        // valid signed AddMember op and re-parenting the copy to descend from the
+        // removal. Because the signature now binds `parents` (+ workspace id), the
+        // re-parented copy fails verification and is dropped by replay.
+        let g = genesis(&[1]); // user1 = founding admin
+        let add_orig = sign_op(
+            &seed(1),
+            &AclOp::AddMember {
+                key: user(2),
+                role: Role::Member,
+            },
+            vec![],
+            &g.workspace_id,
+        );
+        let rm = sign_op(
+            &seed(1),
+            &AclOp::RemoveMember { key: user(2) },
+            vec![add_orig.hash()],
+            &g.workspace_id,
+        );
+        // Baseline: after add + remove, B is correctly gone.
+        let base = replay(&g, &[add_orig.clone(), rm.clone()]);
+        assert!(!base.is_member(&user(2)), "baseline: B removed");
+
+        // ATTACK — reuse the admin's op bytes/author/sig verbatim; only mutate the
+        // `parents` to point AFTER the removal.
+        let add_replay = SignedOp {
+            op: add_orig.op.clone(),
+            author: add_orig.author.clone(),
+            sig: add_orig.sig.clone(),
+            parents: vec![rm.hash()],
+        };
+        assert!(
+            !add_replay.verify_sig(g.workspace_id.as_str()),
+            "re-parented copy must FAIL signature verification (sig binds parents)"
+        );
+        let st = replay(&g, &[add_orig, rm, add_replay]);
+        assert!(
+            !st.is_member(&user(2)),
+            "revocation must hold: the re-parented op is rejected and B stays removed"
+        );
+    }
+
+    #[test]
+    fn op_from_another_workspace_is_rejected() {
+        // Regression: a valid op signed for workspace A must not be honored when
+        // replayed against workspace B's genesis (the signature binds the ws id).
+        let g_a = genesis(&[1]);
+        let mut g_b = genesis(&[1]);
+        // Distinct workspace id, same founding admin key.
+        while g_b.workspace_id == g_a.workspace_id {
+            g_b.workspace_id = crate::ids::WorkspaceId::mint(&crate::ids::SystemUlidSource);
+        }
+        let op = sign_op(
+            &seed(1),
+            &AclOp::AddMember {
+                key: user(2),
+                role: Role::Admin,
+            },
+            vec![],
+            &g_a.workspace_id, // signed for A
+        );
+        let st_b = replay(&g_b, &[op]);
+        assert!(
+            !st_b.is_member(&user(2)),
+            "an op signed for workspace A must not take effect in workspace B"
         );
     }
 
@@ -429,6 +585,7 @@ mod tests {
                 role: Role::Admin,
             },
             vec![],
+            &g.workspace_id,
         );
         let op2 = sign_op(
             &seed(2), // user 2 is now an admin
@@ -437,6 +594,7 @@ mod tests {
                 role: Role::Member,
             },
             vec![op1.hash()],
+            &g.workspace_id,
         );
         let a = replay(&g, &[op1.clone(), op2.clone()]);
         let b = replay(&g, &[op2, op1]);

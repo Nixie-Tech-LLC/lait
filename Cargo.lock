@@ -1492,6 +1492,7 @@ dependencies = [
  "iroh",
  "iroh-base",
  "iroh-gossip",
+ "libc",
  "loro",
  "n0-future",
  "postcard",

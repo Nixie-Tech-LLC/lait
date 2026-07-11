@@ -205,7 +205,8 @@ mod tests {
 
     #[test]
     fn ops_grow_only_and_heads_track_frontier() {
-        let m = MembershipDoc::create(&ws()).unwrap();
+        let w = ws();
+        let m = MembershipDoc::create(&w).unwrap();
         let op1 = sign_op(
             &[1; 32],
             &AclOp::AddMember {
@@ -213,6 +214,7 @@ mod tests {
                 role: Role::Member,
             },
             vec![],
+            &w,
         );
         m.add_op(&op1).unwrap();
         m.add_op(&op1).unwrap(); // idempotent
@@ -223,6 +225,7 @@ mod tests {
             &[1; 32],
             &AclOp::RemoveMember { key: user(2) },
             vec![op1.hash()],
+            &w,
         );
         m.add_op(&op2).unwrap();
         m.doc().commit();
@@ -253,7 +256,8 @@ mod tests {
 
     #[test]
     fn snapshot_roundtrip_preserves_membership() {
-        let m = MembershipDoc::create(&ws()).unwrap();
+        let w = ws();
+        let m = MembershipDoc::create(&w).unwrap();
         let op = sign_op(
             &[1; 32],
             &AclOp::AddMember {
@@ -261,6 +265,7 @@ mod tests {
                 role: Role::Admin,
             },
             vec![],
+            &w,
         );
         m.add_op(&op).unwrap();
         m.put_sealed(0, &user(2), b"k").unwrap();
