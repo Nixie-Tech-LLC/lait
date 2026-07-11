@@ -8,7 +8,9 @@
 //! Layer-B `Request` (S§7), which keeps one command = one commit = one activity
 //! row (S§7.1).
 
-use anyhow::Result;
+use std::path::PathBuf;
+
+use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 
 use crate::{
@@ -219,6 +221,8 @@ pub enum Command {
     Agents,
     /// Resume (or create) a named identity for this session.
     Resume { name: String },
+    /// Update groupchat in place via the bundled self-updater (`groupchat-update`).
+    Update,
     /// Stop the running daemon.
     Stop,
 }
@@ -309,6 +313,54 @@ fn is_service_command(cmd: &Command) -> bool {
     matches!(cmd, Command::Daemon { .. } | Command::Mcp)
 }
 
+/// Locate the bundled self-updater binary (`groupchat-update`) next to our own
+/// executable, where the cargo-dist installer places it. `None` if it isn't
+/// there (e.g. a `cargo install` build, which ships no updater).
+fn locate_updater() -> Option<PathBuf> {
+    let name = if cfg!(windows) {
+        "groupchat-update.exe"
+    } else {
+        "groupchat-update"
+    };
+    let exe = std::env::current_exe().ok()?;
+    let candidate = exe.parent()?.join(name);
+    candidate.exists().then_some(candidate)
+}
+
+/// `groupchat update`: run the bundled self-updater in place. Best-effort stops a
+/// running daemon first (so it isn't left on stale code, and — on Windows — isn't
+/// holding the binary open), then runs `groupchat-update`, which self-replaces the
+/// installed binary from the latest GitHub release.
+async fn run_update() -> Result<()> {
+    if let Some(home) = config::existing_home() {
+        if crate::control::request(&home, &Request::Stop).await.is_ok() {
+            println!("stopped the running daemon");
+            // let the OS release the file handle before the binary is swapped
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        }
+    }
+
+    let mut cmd = match locate_updater() {
+        Some(path) => std::process::Command::new(path),
+        None => std::process::Command::new("groupchat-update"),
+    };
+    match cmd.status() {
+        Ok(status) if status.success() => {
+            println!(
+                "groupchat updated. run any groupchat command to start the daemon on the new version."
+            );
+            Ok(())
+        }
+        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(anyhow!(
+            "self-updater `groupchat-update` not found — it ships with the install \
+             script, not with `cargo install`. Reinstall via the installer (see the \
+             releases page) to enable in-place updates."
+        )),
+        Err(e) => Err(anyhow!("failed to run groupchat-update: {e:#}")),
+    }
+}
+
 pub async fn run() -> Result<()> {
     let args = Cli::parse();
     if !is_service_command(&args.command) {
@@ -348,6 +400,10 @@ pub async fn run() -> Result<()> {
     // Home resolution honours an explicit --home over the session registry.
     if let Some(h) = &args.home {
         std::env::set_var("GROUPCHAT_HOME", h);
+    }
+    // `update` swaps the binary; it must not resolve/create a workspace store.
+    if matches!(args.command, Command::Update) {
+        return run_update().await;
     }
     let home = config::resolve_home(None)?;
 
@@ -575,7 +631,9 @@ pub async fn run() -> Result<()> {
             timeout_ms,
         } => crate::cli::watch(&home, since, exec, notify, timeout_ms).await?,
         Command::Who => crate::cli::run(&home, Request::Who, out).await?,
-        Command::Agents | Command::Resume { .. } => unreachable!("handled before resolution"),
+        Command::Agents | Command::Resume { .. } | Command::Update => {
+            unreachable!("handled before resolution")
+        }
         Command::Stop => crate::cli::run(&home, Request::Stop, out).await?,
     }
 

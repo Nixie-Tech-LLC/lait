@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.3.1 — durability & sync-liveness hardening
+## v0.3.2 — durability & sync-liveness hardening
 
 Follow-up hardening from a durability audit of the local-first / iroh
 distribution layer (tracked as the `DUR` project inside groupchat itself):
@@ -33,7 +33,13 @@ distribution layer (tracked as the `DUR` project inside groupchat itself):
   `secret.key` under the config dir) so one identity spans every repo, like a
   single `git` `user.email`. `$GROUPCHAT_HOME` still collapses both into one
   self-contained dir; a `.gitignore` is dropped in each store so it is never
-  committed.
+  committed. (Windows: the extended-length `\\?\` prefix is now stripped from
+  resolved store paths, which several Windows tools/APIs choke on.)
+- **In-place updates — `groupchat update`.** Runs the bundled cargo-dist
+  self-updater (`groupchat-update`) from one entry point, stopping a running
+  daemon first so the binary can be swapped (notably on Windows, where a live
+  daemon holds a lock on the exe). Falls back to clear guidance when the updater
+  isn't installed (e.g. a `cargo install` build).
 
 Still open (tracked in `DUR`): the blind encrypted relay — a ciphertext-only,
 untrusted-host seed (DUR-6).
