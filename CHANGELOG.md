@@ -20,11 +20,23 @@ distribution layer (tracked as the `DUR` project inside groupchat itself):
   never-meshed node (auto-spawned for a one-off command) still idles out.
 - **Always-on seed (DUR-4).** `groupchat daemon --seed` runs a node that never
   idles — once added to the workspace with `members add`, it holds full history
-  and serves offline-to-offline handoff and GC-boundary backfill. The privacy-
-  preserving blind relay (ciphertext-only, untrusted host) is tracked separately.
+  and serves offline-to-offline handoff and GC-boundary backfill.
+- **Pinned seed peers — the P2P "remote".** `groupchat seed add <ticket|id>`,
+  `seed ls`, `seed rm` pin an always-on seed your node always dials and eagerly
+  backfills from on startup, so a cold or long-offline client converges through
+  its seed even when no ordinary peer is online. Pins grant no trust (genesis/ACL
+  still gate every op).
+- **Repo-bound stores (DUR-5).** The workspace store is discovered git-style:
+  `groupchat` walks up from the cwd for a `.groupchat/` and binds it, else auto-
+  creates one in the cwd — so each repo gets its own workspace, daemon, and room
+  (defaulted to the repo directory name). Identity is now **global** (one
+  `secret.key` under the config dir) so one identity spans every repo, like a
+  single `git` `user.email`. `$GROUPCHAT_HOME` still collapses both into one
+  self-contained dir; a `.gitignore` is dropped in each store so it is never
+  committed.
 
-Still open (tracked in `DUR`): repo-bound stores (git-style `.groupchat`
-discovery) and the blind encrypted relay.
+Still open (tracked in `DUR`): the blind encrypted relay — a ciphertext-only,
+untrusted-host seed (DUR-6).
 
 ## v0.3.0 — the P2P, E2EE issue tracker (release candidate)
 

@@ -733,7 +733,11 @@ impl Node {
             return Ok(Response::Ok {
                 message: Some(format!(
                     "{} seed {id}",
-                    if newly { "pinned" } else { "already pinned; refreshed" }
+                    if newly {
+                        "pinned"
+                    } else {
+                        "already pinned; refreshed"
+                    }
                 )),
             });
         }
@@ -929,8 +933,9 @@ impl Node {
                 let seeds = load_seeds(&self.home);
                 if seeds.is_empty() {
                     return Ok(Response::Text {
-                        text: "(no pinned seeds \u{2014} add one with `groupchat seed add <ticket>`)"
-                            .to_string(),
+                        text:
+                            "(no pinned seeds \u{2014} add one with `groupchat seed add <ticket>`)"
+                                .to_string(),
                     });
                 }
                 let presence = self.shared.presence.lock().unwrap();
@@ -1194,7 +1199,9 @@ async fn write_line_half<T: serde::Serialize>(
 pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     let _daemon_lock = acquire_daemon_lock(&home)?;
 
-    let secret_key = load_or_create_identity(&home)?;
+    // Identity is global by default (DUR-5); store (profile/repo/lock/socket) is
+    // this per-repo home. `$GROUPCHAT_HOME` collapses both back into `home`.
+    let secret_key = load_or_create_identity(&crate::config::identity_dir()?)?;
     let profile = Profile::load(&home)?;
 
     // Tracker core (P0): open the git-backed store and load/create the workspace.
@@ -1463,7 +1470,10 @@ mod tests {
         ));
         // Bootstrap ids list both, but filter out our own id when we are `a`.
         assert_eq!(seed_ids(&dir, b).len(), 1);
-        assert_eq!(seed_ids(&dir, SecretKey::from_bytes(&[9u8; 32]).public()).len(), 2);
+        assert_eq!(
+            seed_ids(&dir, SecretKey::from_bytes(&[9u8; 32]).public()).len(),
+            2
+        );
 
         // Remove by nick, then by full id.
         assert_eq!(remove_seed(&dir, "nas2"), 1);

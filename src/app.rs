@@ -334,6 +334,10 @@ pub async fn run() -> Result<()> {
         }
         Command::Resume { name } => {
             let home = config::bind_session(name)?;
+            // A named identity is a self-contained home: pin it as GROUPCHAT_HOME
+            // so the daemon we spawn uses it for both identity and store, not the
+            // global identity + repo-discovered store (DUR-5).
+            std::env::set_var("GROUPCHAT_HOME", &home);
             load_or_create_identity(&home)?;
             println!("resumed identity '{name}'");
             return crate::cli::run(&home, Request::Status, out).await;
@@ -349,7 +353,7 @@ pub async fn run() -> Result<()> {
 
     match args.command {
         Command::Init { nick, room } => {
-            let key = load_or_create_identity(&home)?;
+            let key = load_or_create_identity(&config::identity_dir()?)?;
             let mut profile = Profile::load(&home)?;
             if let Some(n) = nick {
                 profile.nick = n;
@@ -518,7 +522,7 @@ pub async fn run() -> Result<()> {
         }
         Command::Tui => crate::tui::run(&home).await?,
         Command::Id => {
-            let key = load_or_create_identity(&home)?;
+            let key = load_or_create_identity(&config::identity_dir()?)?;
             println!("{}", key.public());
         }
         Command::Daemon { seed } => {
@@ -550,9 +554,7 @@ pub async fn run() -> Result<()> {
                 crate::cli::run(&home, Request::SeedAdd { arg: target }, out).await?
             }
             SeedCmd::Ls => crate::cli::run(&home, Request::SeedList, out).await?,
-            SeedCmd::Rm { who } => {
-                crate::cli::run(&home, Request::SeedRemove { who }, out).await?
-            }
+            SeedCmd::Rm { who } => crate::cli::run(&home, Request::SeedRemove { who }, out).await?,
         },
         Command::Connect { ticket, nick } => {
             if let Some(n) = nick {
