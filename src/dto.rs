@@ -267,6 +267,17 @@ pub struct Candidate {
     pub title: String,
 }
 
+/// A workspace member projection (P3 members view, UI.md §8). Roles come from the
+/// signed ACL graph — the only cryptographically-verified identity in the system.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberDto {
+    pub key: UserId,
+    /// "admin" | "member".
+    pub role: String,
+    /// Whether this is us.
+    pub me: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

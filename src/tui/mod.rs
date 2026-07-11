@@ -30,7 +30,7 @@ use ratatui::{
 
 use crate::cli::ensure_daemon;
 use crate::control::{request, Doorbell, Filter, Request, Response, Subscription};
-use crate::dto::{BoardView, IssueView, ProjectDto, Row};
+use crate::dto::{BoardView, IssueView, MemberDto, ProjectDto, Row};
 
 /// Which view is on the navigation stack top (UI.md §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +39,7 @@ enum View {
     List,
     Activity,
     Detail,
+    Members,
     Help,
 }
 
@@ -101,6 +102,7 @@ struct App {
     row_idx: usize,
     detail: Option<IssueView>,
     activity: Vec<String>,
+    members: Vec<MemberDto>,
     overlay: Overlay,
     modal: Option<Modal>,
     status: String,
@@ -123,6 +125,7 @@ impl App {
             row_idx: 0,
             detail: None,
             activity: Vec::new(),
+            members: Vec::new(),
             overlay: Overlay::default(),
             modal: None,
             status: String::new(),
@@ -217,6 +220,13 @@ impl App {
         Ok(())
     }
 
+    async fn reload_members(&mut self) -> Result<()> {
+        if let Response::Members { members } = self.req(Request::Members).await? {
+            self.members = members;
+        }
+        Ok(())
+    }
+
     fn clamp_selection(&mut self) {
         if let Some(b) = &self.board {
             if self.col_idx >= b.columns.len() {
@@ -239,6 +249,7 @@ impl App {
             View::Board => self.reload_board().await?,
             View::List => self.reload_list().await?,
             View::Activity => self.reload_activity().await?,
+            View::Members => self.reload_members().await?,
             View::Detail => {
                 if let Some(d) = &self.detail {
                     let reff = d.reff.clone();
@@ -373,6 +384,10 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
         KeyCode::Char('3') => {
             app.view = View::Activity;
             app.reload_activity().await?;
+        }
+        KeyCode::Char('4') => {
+            app.view = View::Members;
+            app.reload_members().await?;
         }
         KeyCode::Char('r') => app.refresh_current().await?,
         KeyCode::Char('p') if mods.contains(KeyModifiers::CONTROL) => {}
@@ -628,7 +643,7 @@ fn move_col(app: &mut App, delta: i32) {
 fn pop_view(app: &mut App) {
     match app.view {
         View::Detail | View::Help => app.view = app.prev_view,
-        View::List | View::Activity => app.view = View::Board,
+        View::List | View::Activity | View::Members => app.view = View::Board,
         View::Board => app.quit = true,
     }
 }
@@ -651,6 +666,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         View::Board => draw_board(f, app, chunks[1]),
         View::List => draw_list(f, app, chunks[1]),
         View::Activity => draw_activity(f, app, chunks[1]),
+        View::Members => draw_members(f, app, chunks[1]),
         View::Detail => draw_detail(f, app, chunks[1]),
         View::Help => draw_help(f, chunks[1]),
     }
@@ -670,6 +686,7 @@ fn draw_header(f: &mut ratatui::Frame, app: &App, area: Rect) {
         View::Board => "board",
         View::List => "list",
         View::Activity => "activity",
+        View::Members => "members",
         View::Detail => "detail",
         View::Help => "help",
     };
@@ -813,6 +830,29 @@ fn draw_activity(f: &mut ratatui::Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+fn draw_members(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+    if app.members.is_empty() {
+        lines.push(Line::from("(no members yet)"));
+    }
+    for m in &app.members {
+        let you = if m.me { "  (you)" } else { "" };
+        let style = if m.role == "admin" {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::styled(
+            format!("{:<7} {}{}", m.role, m.key.short(), you),
+            style,
+        ));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Members (signed ACL — verified identity) ");
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn draw_detail(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let Some(v) = &app.detail else {
         f.render_widget(Paragraph::new("(no issue)"), area);
@@ -872,7 +912,7 @@ fn draw_detail(f: &mut ratatui::Frame, app: &App, area: Rect) {
 fn draw_help(f: &mut ratatui::Frame, area: Rect) {
     let text = "\
  Keys
-   1/2/3     board / list / activity
+   1/2/3/4   board / list / activity / members
    j k       move within a column
    h l       move across columns
    H L       move issue to prev/next status

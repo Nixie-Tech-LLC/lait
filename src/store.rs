@@ -119,6 +119,30 @@ impl Store {
         Ok(())
     }
 
+    // ---- membership (plaintext ACL + sealed key envelopes, A§11) ----
+
+    fn membership_path(&self) -> PathBuf {
+        self.repo.join("membership.loro")
+    }
+
+    pub fn load_membership(&self) -> Result<Option<crate::membership::MembershipDoc>> {
+        let p = self.membership_path();
+        if !p.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&p).context("read membership.loro")?;
+        let doc = LoroDoc::new();
+        doc.import(&bytes)
+            .map_err(|e| anyhow!("import membership: {e}"))?;
+        Ok(Some(crate::membership::MembershipDoc::from_doc(doc)))
+    }
+
+    pub fn save_membership(&self, m: &crate::membership::MembershipDoc) -> Result<()> {
+        let bytes = m.snapshot()?;
+        write_atomic(&self.membership_path(), &bytes)?;
+        Ok(())
+    }
+
     // ---- issue docs ----
 
     pub fn issue_doc_ids(&self) -> Vec<DocId> {

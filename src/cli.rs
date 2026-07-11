@@ -155,6 +155,16 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
             }
             0
         }
+        Response::Members { members } => {
+            if members.is_empty() {
+                println!("(no members)");
+            }
+            for m in members {
+                let you = if m.me { "  (you)" } else { "" };
+                println!("{:<7} {}{}", m.role, m.key.short(), you);
+            }
+            0
+        }
         Response::Candidates { candidates } => {
             eprintln!("ambiguous ref — {} candidates:", candidates.len());
             for c in candidates {

@@ -92,6 +92,17 @@ impl CatalogDoc {
     pub fn from_doc(doc: LoroDoc) -> Self {
         Self { doc }
     }
+    /// A bare, uninitialized catalog — used by a JOINER (A§10). A joiner must NOT
+    /// `create()` its own containers: `create` mints peer-specific attached
+    /// child containers (`docs`/`projects`/…), and merging the founder's ops
+    /// would then LWW-resolve the root's child registers non-deterministically to
+    /// an empty local container. Starting empty and importing the founder's full
+    /// ops adopts the founder's exact container ids, so everything merges.
+    pub fn empty() -> Self {
+        Self {
+            doc: LoroDoc::new(),
+        }
+    }
     pub fn doc(&self) -> &LoroDoc {
         &self.doc
     }

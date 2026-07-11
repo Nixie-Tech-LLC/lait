@@ -133,6 +133,11 @@ pub enum Command {
         #[command(subcommand)]
         cmd: Option<LabelsCmd>,
     },
+    /// Manage workspace membership (the signed ACL, P3). `members` lists.
+    Members {
+        #[command(subcommand)]
+        cmd: Option<MembersCmd>,
+    },
     /// Workspace-wide recent transitions.
     Activity {
         #[arg(long, default_value_t = 0)]
@@ -219,6 +224,24 @@ pub enum LabelsCmd {
         #[arg(long)]
         color: Option<String>,
     },
+    Ls,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MembersCmd {
+    /// Add a member (admin-only). Seals the workspace key to them.
+    Add {
+        /// A user ref: @me or a 64-hex ed25519 key.
+        who: String,
+        #[arg(long)]
+        admin: bool,
+    },
+    /// Remove a member (admin-only) and rotate the workspace key.
+    Remove {
+        who: String,
+    },
+    /// Rotate the workspace key (admin-only).
+    RotateKey,
     Ls,
 }
 
@@ -413,6 +436,16 @@ pub async fn run() -> Result<()> {
                 crate::cli::run(&home, Request::LabelNew { name, color }, out).await?
             }
             _ => crate::cli::run(&home, Request::LabelList, out).await?,
+        },
+        Command::Members { cmd } => match cmd {
+            Some(MembersCmd::Add { who, admin }) => {
+                crate::cli::run(&home, Request::MemberAdd { who, admin }, out).await?
+            }
+            Some(MembersCmd::Remove { who }) => {
+                crate::cli::run(&home, Request::MemberRemove { who }, out).await?
+            }
+            Some(MembersCmd::RotateKey) => crate::cli::run(&home, Request::KeyRotate, out).await?,
+            _ => crate::cli::run(&home, Request::Members, out).await?,
         },
         Command::Activity { since } => {
             crate::cli::run(&home, Request::Activity { since }, out).await?

@@ -1,0 +1,206 @@
+//! E2EE primitives (P3, A§11). All pure-Rust (RustCrypto/dalek), no C toolchain,
+//! no `aws-lc` — respecting the portability + supply-chain bans.
+//!
+//! - **AEAD**: ChaCha20-Poly1305 with the 32-byte workspace symmetric key. Sync
+//!   payloads (catalog + issue-doc `export()` bytes) are sealed with this, so a
+//!   blind relay or a non-member sees only ciphertext (the "encryption *is* the
+//!   access control" posture, A§11).
+//! - **Sealed box**: an anonymous X25519 + AEAD box that distributes the
+//!   workspace key to a member addressed by their ed25519 `UserId`. The member's
+//!   ed25519 identity is converted to X25519 (libsodium's `*_to_curve25519`).
+//!
+//! > **Research-grade.** This implements a proven *design* by hand; it is
+//! > unaudited and must be independently reviewed before it carries truly
+//! > sensitive data (A§2, A§3 non-goal 1).
+
+use chacha20poly1305::{
+    aead::{Aead, KeyInit},
+    ChaCha20Poly1305, Nonce,
+};
+use curve25519_dalek::edwards::CompressedEdwardsY;
+use sha2::{Digest, Sha512};
+use x25519_dalek::{PublicKey as XPublic, StaticSecret};
+
+use crate::ids::UserId;
+
+/// The workspace symmetric key length (ChaCha20-Poly1305).
+pub const KEY_LEN: usize = 32;
+/// A workspace symmetric key.
+pub type WorkspaceKey = [u8; KEY_LEN];
+const NONCE_LEN: usize = 12;
+
+/// A fresh random 32-byte workspace key.
+pub fn random_key() -> WorkspaceKey {
+    let mut k = [0u8; KEY_LEN];
+    getrandom::fill(&mut k).expect("getrandom");
+    k
+}
+
+fn random_nonce() -> [u8; NONCE_LEN] {
+    let mut n = [0u8; NONCE_LEN];
+    getrandom::fill(&mut n).expect("getrandom");
+    n
+}
+
+/// AEAD-seal a payload with the workspace key. Output = `nonce(12) || ciphertext`.
+pub fn aead_encrypt(key: &WorkspaceKey, plaintext: &[u8]) -> Vec<u8> {
+    let cipher = ChaCha20Poly1305::new(key.into());
+    let nonce = random_nonce();
+    let ct = cipher
+        .encrypt(Nonce::from_slice(&nonce), plaintext)
+        .expect("aead encrypt");
+    let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    out
+}
+
+/// AEAD-open a payload; `None` if the key is wrong or the blob is malformed (the
+/// blind-relay property: without the key you get nothing).
+pub fn aead_decrypt(key: &WorkspaceKey, blob: &[u8]) -> Option<Vec<u8>> {
+    if blob.len() < NONCE_LEN {
+        return None;
+    }
+    let cipher = ChaCha20Poly1305::new(key.into());
+    let (nonce, ct) = blob.split_at(NONCE_LEN);
+    cipher.decrypt(Nonce::from_slice(nonce), ct).ok()
+}
+
+/// Parse a hex `UserId` into raw ed25519 public-key bytes.
+fn ed_pubkey_bytes(user: &UserId) -> Option<[u8; 32]> {
+    let s = user.as_str();
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// ed25519 public → X25519 public (Edwards-Y → Montgomery-u).
+fn ed_pk_to_x(ed_pub: &[u8; 32]) -> Option<XPublic> {
+    let ed = CompressedEdwardsY(*ed_pub).decompress()?;
+    Some(XPublic::from(ed.to_montgomery().to_bytes()))
+}
+
+/// ed25519 secret seed → X25519 static secret (libsodium `sk_to_curve25519`).
+fn ed_seed_to_x(seed: &[u8; 32]) -> StaticSecret {
+    let h = Sha512::digest(seed);
+    let mut s = [0u8; 32];
+    s.copy_from_slice(&h[..32]);
+    s[0] &= 248;
+    s[31] &= 127;
+    s[31] |= 64;
+    StaticSecret::from(s)
+}
+
+/// Seal `msg` to a member addressed by their ed25519 `UserId` (an anonymous
+/// sealed box). Output = `eph_x_pub(32) || nonce(12) || ciphertext`. Used to
+/// distribute the workspace key. Returns `None` if the recipient key is invalid.
+pub fn seal_to(recipient: &UserId, msg: &[u8]) -> Option<Vec<u8>> {
+    let recip_ed = ed_pubkey_bytes(recipient)?;
+    let recip_x = ed_pk_to_x(&recip_ed)?;
+    let mut eph_seed = [0u8; 32];
+    getrandom::fill(&mut eph_seed).expect("getrandom");
+    let eph = StaticSecret::from(eph_seed);
+    let eph_pub = XPublic::from(&eph);
+    let shared = eph.diffie_hellman(&recip_x);
+    let key = box_key(shared.as_bytes(), eph_pub.as_bytes(), recip_x.as_bytes());
+    let cipher = ChaCha20Poly1305::new((&key).into());
+    let nonce = random_nonce();
+    let ct = cipher.encrypt(Nonce::from_slice(&nonce), msg).ok()?;
+    let mut out = Vec::with_capacity(32 + NONCE_LEN + ct.len());
+    out.extend_from_slice(eph_pub.as_bytes());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    Some(out)
+}
+
+/// Open a sealed box addressed to us, given our ed25519 seed + `UserId`.
+pub fn open_sealed(my_seed: &[u8; 32], me: &UserId, sealed: &[u8]) -> Option<Vec<u8>> {
+    if sealed.len() < 32 + NONCE_LEN {
+        return None;
+    }
+    let eph_pub = XPublic::from(<[u8; 32]>::try_from(&sealed[..32]).ok()?);
+    let nonce = &sealed[32..32 + NONCE_LEN];
+    let ct = &sealed[32 + NONCE_LEN..];
+    let my_x = ed_seed_to_x(my_seed);
+    let my_ed = ed_pubkey_bytes(me)?;
+    let my_x_pub = ed_pk_to_x(&my_ed)?;
+    let shared = my_x.diffie_hellman(&eph_pub);
+    let key = box_key(shared.as_bytes(), eph_pub.as_bytes(), my_x_pub.as_bytes());
+    let cipher = ChaCha20Poly1305::new((&key).into());
+    cipher.decrypt(Nonce::from_slice(nonce), ct).ok()
+}
+
+/// Derive the box AEAD key from the DH shared secret + both public keys.
+fn box_key(shared: &[u8], eph_pub: &[u8], recip_pub: &[u8]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"groupchat/sealedbox/0");
+    h.update(shared);
+    h.update(eph_pub);
+    h.update(recip_pub);
+    *h.finalize().as_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    fn user_from_seed(seed: &[u8; 32]) -> UserId {
+        let pk = SigningKey::from_bytes(seed).verifying_key();
+        UserId::from_key_string(data_encoding::HEXLOWER.encode(pk.as_bytes()))
+    }
+
+    #[test]
+    fn aead_roundtrip_and_wrong_key_fails() {
+        let k = random_key();
+        let blob = aead_encrypt(&k, b"opaque loro export");
+        assert_eq!(
+            aead_decrypt(&k, &blob).as_deref(),
+            Some(&b"opaque loro export"[..])
+        );
+        // wrong key ⇒ None (a blind relay / non-member learns nothing).
+        assert!(aead_decrypt(&[0u8; 32], &blob).is_none());
+        assert!(aead_decrypt(&k, b"tooshort").is_none());
+    }
+
+    #[test]
+    fn iroh_key_seals_and_opens() {
+        // The daemon uses iroh's SecretKey: seed = to_bytes(), UserId =
+        // public().to_string(). The ed25519↔x25519 conversion must hold for it.
+        let sk = iroh::SecretKey::from_bytes(&[5u8; 32]);
+        let seed = sk.to_bytes();
+        let uid = UserId::from_key_string(sk.public().to_string());
+        // sanity: iroh's pubkey equals the ed25519-dalek verifying key of the seed.
+        let vk = SigningKey::from_bytes(&seed).verifying_key();
+        assert_eq!(
+            uid.as_str(),
+            data_encoding::HEXLOWER.encode(vk.as_bytes()),
+            "iroh seed/pubkey must be a standard ed25519 pair"
+        );
+        let key = random_key();
+        let sealed = seal_to(&uid, &key).expect("seal to iroh key");
+        assert_eq!(
+            open_sealed(&seed, &uid, &sealed).as_deref(),
+            Some(&key[..]),
+            "iroh-keyed sealed box must round-trip"
+        );
+    }
+
+    #[test]
+    fn sealed_box_only_opens_for_recipient() {
+        let seed = [7u8; 32];
+        let me = user_from_seed(&seed);
+        let key = random_key();
+        let sealed = seal_to(&me, &key).expect("seal");
+        assert_eq!(open_sealed(&seed, &me, &sealed).as_deref(), Some(&key[..]));
+        // a different member cannot open it.
+        let other_seed = [9u8; 32];
+        let other = user_from_seed(&other_seed);
+        assert!(open_sealed(&other_seed, &other, &sealed).is_none());
+    }
+}

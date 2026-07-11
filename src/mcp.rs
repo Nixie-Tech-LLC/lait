@@ -45,6 +45,10 @@ pub const REQUIRED_TRACKER_COMMANDS: &[&str] = &[
     "label_new",
     "label_list",
     "activity",
+    "member_add",
+    "member_remove",
+    "key_rotate",
+    "members",
 ];
 
 /// The set of MCP tool names this server exposes (kept beside the `#[tool]`
@@ -67,6 +71,10 @@ pub const MCP_TOOL_NAMES: &[&str] = &[
     "label_new",
     "label_list",
     "activity",
+    "member_add",
+    "member_remove",
+    "key_rotate",
+    "members",
     // transport / presence
     "status",
     "my_id",
@@ -192,6 +200,20 @@ pub struct ActivityArgs {
     /// Only transitions with seq greater than this (pass back the `last`).
     #[serde(default)]
     pub since: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemberAddArgs {
+    /// A user ref: `@me` or a 64-hex ed25519 key.
+    pub who: String,
+    /// Grant the admin role.
+    #[serde(default)]
+    pub admin: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemberRemoveArgs {
+    pub who: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -424,6 +446,40 @@ impl GroupchatMcp {
         Parameters(a): Parameters<ActivityArgs>,
     ) -> Result<CallToolResult, McpError> {
         self.run(Request::Activity { since: a.since }).await
+    }
+
+    // ---- membership / ACL (P3) ----
+
+    #[tool(description = "Add a workspace member (admin-only); seals them the workspace key.")]
+    async fn member_add(
+        &self,
+        Parameters(a): Parameters<MemberAddArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::MemberAdd {
+            who: a.who,
+            admin: a.admin,
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Remove a workspace member (admin-only) and rotate the key (lazy revocation)."
+    )]
+    async fn member_remove(
+        &self,
+        Parameters(a): Parameters<MemberRemoveArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::MemberRemove { who: a.who }).await
+    }
+
+    #[tool(description = "Rotate the workspace key (admin-only).")]
+    async fn key_rotate(&self) -> Result<CallToolResult, McpError> {
+        self.run(Request::KeyRotate).await
+    }
+
+    #[tool(description = "List workspace members and their roles (from the signed ACL).")]
+    async fn members(&self) -> Result<CallToolResult, McpError> {
+        self.run(Request::Members).await
     }
 
     // ---- transport / presence ----

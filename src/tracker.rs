@@ -14,12 +14,14 @@
 //! `DocMeta` row from the issue doc via [`CatalogDoc::upsert_row`] — the issue
 //! doc is always truth; the row is a one-directional cache.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use anyhow::{anyhow, Result};
 
+use crate::acl::{self, AclOp, AclState, Role, SignedOp};
 use crate::catalog::{CatalogDoc, RowMeta};
 use crate::control::{BoardPos, CatalogScope, Filter, Request, Response};
+use crate::crypto::{self, WorkspaceKey};
 use crate::dto::{
     ActivityEvent, BoardColumn, BoardView, CommentDto, FieldChange, IssueView, LabelDto, Priority,
     ProjectDto, Row, StatusCategory, SCHEMA_VERSION,
@@ -27,7 +29,23 @@ use crate::dto::{
 use crate::ids::{DocId, LabelId, ProjectId, UlidSource, UserId, WorkspaceId};
 use crate::index::{self, AliasTable, RefResolution};
 use crate::issue::{IssueDoc, NewIssue};
+use crate::membership::MembershipDoc;
 use crate::store::{Genesis, Store};
+
+/// A 4-byte big-endian epoch tag prefixed to every AEAD ciphertext so the reader
+/// selects the right key-epoch from its keyring (lazy revocation, A§11).
+fn epoch_prefix(epoch: u32, mut blob: Vec<u8>) -> Vec<u8> {
+    let mut out = epoch.to_be_bytes().to_vec();
+    out.append(&mut blob);
+    out
+}
+fn split_epoch(blob: &[u8]) -> Option<(u32, &[u8])> {
+    if blob.len() < 4 {
+        return None;
+    }
+    let (e, rest) = blob.split_at(4);
+    Some((u32::from_be_bytes([e[0], e[1], e[2], e[3]]), rest))
+}
 
 /// The batched, project-keyed dirty-set a mutation produces (UI.md §4.2). The
 /// node layer stamps it with an epoch + session `seq` to form a `Doorbell`.
@@ -121,6 +139,16 @@ pub struct Tracker {
     activity: VecDeque<ActivityEvent>,
     activity_seq: u64,
     clock: Box<dyn UlidSource + Send + Sync>,
+    // ---- P3 E2EE ----
+    /// The plaintext membership layer (signed ACL + sealed key envelopes).
+    membership: MembershipDoc,
+    /// The genesis trust root (workspace id + founding admin keys, S§6).
+    genesis: Genesis,
+    /// Our ed25519 secret seed — signs ACL ops and unseals key envelopes.
+    seed: [u8; 32],
+    /// Every key-epoch we can unseal (a keyring; older epochs stay decryptable —
+    /// lazy revocation). Empty ⇒ we are not a member and see only ciphertext.
+    keyring: BTreeMap<u32, WorkspaceKey>,
 }
 
 impl Tracker {
@@ -132,27 +160,50 @@ impl Tracker {
         store: Store,
         me: UserId,
         my_nick: String,
+        seed: [u8; 32],
         clock: Box<dyn UlidSource + Send + Sync>,
     ) -> Result<Self> {
-        let (catalog, workspace_id) = match store.load_catalog()? {
+        let existing = store.load_catalog()?;
+        let (catalog, workspace_id, membership, genesis, fresh) = match existing {
             Some(cat) => {
                 let ws = cat
                     .workspace_id()
                     .ok_or_else(|| anyhow!("catalog missing workspaceId"))?;
-                (cat, ws)
+                let membership = match store.load_membership()? {
+                    Some(m) => m,
+                    None => {
+                        let m = MembershipDoc::create(&ws)?;
+                        store.save_membership(&m)?;
+                        m
+                    }
+                };
+                let genesis = store.genesis()?.unwrap_or_else(|| Genesis {
+                    workspace_id: ws.clone(),
+                    founding_admins: vec![me.clone()],
+                });
+                (cat, ws, membership, genesis, false)
             }
             None => {
-                // fresh workspace
+                // fresh workspace — we are the founding admin (S§6). Mint the
+                // workspace key and seal it to ourselves at epoch 0.
                 let ws = WorkspaceId::mint(&*clock);
                 let cat = CatalogDoc::create(&ws)?;
                 cat.doc().commit();
-                store.write_genesis(&Genesis {
+                let genesis = Genesis {
                     workspace_id: ws.clone(),
                     founding_admins: vec![me.clone()],
-                })?;
+                };
+                store.write_genesis(&genesis)?;
                 store.save_catalog(&cat)?;
+                let membership = MembershipDoc::create(&ws)?;
+                let key = crypto::random_key();
+                if let Some(sealed) = crypto::seal_to(&me, &key) {
+                    membership.put_sealed(0, &me, &sealed)?;
+                }
+                membership.doc().commit();
+                store.save_membership(&membership)?;
                 store.commit("init workspace");
-                (cat, ws)
+                (cat, ws, membership, genesis, true)
             }
         };
 
@@ -167,10 +218,63 @@ impl Tracker {
             activity: VecDeque::new(),
             activity_seq: 0,
             clock,
+            membership,
+            genesis,
+            seed,
+            keyring: BTreeMap::new(),
         };
+        tracker.refresh_keyring();
+        if fresh {
+            debug_assert!(tracker.current_key().is_some(), "founder must hold the key");
+        }
         tracker.recompute_all_rows()?;
         tracker.rebuild_aliases();
         Ok(tracker)
+    }
+
+    /// Rebuild the keyring: unseal every epoch's envelope addressed to us (A§11
+    /// lazy revocation — we keep older epoch keys so already-synced content stays
+    /// readable). Called after any membership change/import.
+    fn refresh_keyring(&mut self) {
+        for epoch in 0..=self.membership.current_epoch() {
+            if self.keyring.contains_key(&epoch) {
+                continue;
+            }
+            if let Some(sealed) = self.membership.get_sealed(epoch, &self.me) {
+                if let Some(raw) = crypto::open_sealed(&self.seed, &self.me, &sealed) {
+                    if let Ok(key) = <WorkspaceKey>::try_from(raw.as_slice()) {
+                        self.keyring.insert(epoch, key);
+                    }
+                }
+            }
+        }
+    }
+
+    fn current_epoch(&self) -> u32 {
+        self.membership.current_epoch()
+    }
+    fn current_key(&self) -> Option<&WorkspaceKey> {
+        self.keyring.get(&self.current_epoch())
+    }
+
+    /// Encrypt a sync payload with the current-epoch key (epoch-tagged). If we
+    /// hold no key (shouldn't happen for a provider — it's a member), the payload
+    /// passes through in the clear so a single-node P0 workspace still works.
+    fn encrypt_payload(&self, plaintext: Vec<u8>) -> Vec<u8> {
+        match self.current_key() {
+            Some(key) => epoch_prefix(self.current_epoch(), crypto::aead_encrypt(key, &plaintext)),
+            None => plaintext,
+        }
+    }
+    /// Decrypt a sync payload using the epoch tag + our keyring. `None` if we
+    /// lack that epoch's key — the blind-relay / non-member outcome: a non-member
+    /// (empty keyring) or a removed member (missing the new epoch) learns nothing
+    /// and simply imports nothing (A§11). Every provider is a member and thus
+    /// always encrypts, so there is no plaintext-passthrough case.
+    fn decrypt_payload(&self, blob: &[u8]) -> Option<Vec<u8>> {
+        let (epoch, ct) = split_epoch(blob)?;
+        let key = self.keyring.get(&epoch)?;
+        crypto::aead_decrypt(key, ct)
     }
 
     /// Load-time invariant (S§3.2): recompute every head/row from the real issue
@@ -264,6 +368,10 @@ impl Tracker {
             Request::LabelNew { name, color } => self.label_new(name, color),
             Request::LabelList => Ok((self.label_list(), None)),
             Request::Activity { since } => Ok((self.activity_response(since), None)),
+            Request::MemberAdd { who, admin } => Ok(self.member_add_cmd(who, admin)),
+            Request::MemberRemove { who } => Ok(self.member_remove_cmd(who)),
+            Request::KeyRotate => Ok(self.key_rotate_cmd()),
+            Request::Members => Ok((self.members_response(), None)),
             other => Err(anyhow!("not a tracker request: {other:?}")),
         };
         match r {
@@ -1132,6 +1240,16 @@ impl Tracker {
         crate::catalog::head_hash(&self.catalog.head())
     }
 
+    /// A combined sync head over catalog + membership (the gossip announce
+    /// trigger). A membership-only change (e.g. `member add`, which doesn't touch
+    /// the catalog) still moves this head so peers pull and receive it (A§8/§11).
+    pub fn sync_head_bytes(&self) -> Vec<u8> {
+        let mut h = blake3::Hasher::new();
+        h.update(&self.catalog.head().encode());
+        h.update(&self.membership.head().encode());
+        h.finalize().as_bytes().to_vec()
+    }
+
     /// Whether this node's workspace is still empty (no projects, no docs) — a
     /// freshly-minted workspace that may adopt a peer's on join.
     pub fn is_empty_workspace(&self) -> bool {
@@ -1142,46 +1260,251 @@ impl Tracker {
     /// workspace onto the ticket's genesis so its catalog can then converge with
     /// the founder's over sync. Never clobbers a workspace that already holds
     /// real data. Returns whether an adoption happened.
-    pub fn adopt_workspace(&mut self, ws: &str) -> Result<bool> {
+    pub fn adopt_workspace(&mut self, ws: &str, founder: &str) -> Result<bool> {
         let Some(ws_id) = WorkspaceId::parse(ws) else {
             return Ok(false);
         };
         if ws_id == self.workspace_id || !self.is_empty_workspace() {
             return Ok(false);
         }
-        let catalog = CatalogDoc::create(&ws_id)?;
-        catalog.doc().commit();
-        self.store.write_genesis(&Genesis {
+        // The genesis trust root comes from the ticket: the founder (ticket host)
+        // is the founding admin whose signed ACL a joiner validates against (S§6).
+        let founding_admins = UserId::parse(founder).map(|u| vec![u]).unwrap_or_default();
+        let genesis = Genesis {
             workspace_id: ws_id.clone(),
-            founding_admins: vec![], // founder keys arrive with the P3 ACL graph
-        })?;
+            founding_admins,
+        };
+        // A joiner adopts EMPTY docs (not create()) so importing the founder's
+        // full catalog/membership yields identical container ids (see
+        // CatalogDoc::empty). Container init would otherwise conflict on merge.
+        let catalog = CatalogDoc::empty();
+        let membership = MembershipDoc::empty();
+        self.store.write_genesis(&genesis)?;
         self.store.save_catalog(&catalog)?;
+        self.store.save_membership(&membership)?;
         self.workspace_id = ws_id;
         self.catalog = catalog;
+        self.membership = membership;
+        self.genesis = genesis;
+        self.keyring.clear(); // not a member yet — no key until the founder adds us
         self.rebuild_aliases();
         self.store.commit("adopt workspace from ticket");
         Ok(true)
     }
 
-    /// **Provider side.** Export the catalog ops a puller at `peer_vv` lacks.
-    pub fn export_catalog_from(&self, peer_vv: &[u8]) -> Result<Vec<u8>> {
+    // ---- membership sync (plaintext, A§11 two-protocol split) ----
+
+    /// The membership doc's oplog VV, wire-encoded.
+    pub fn membership_vv_bytes(&self) -> Vec<u8> {
+        self.membership.oplog_vv().encode()
+    }
+    /// **Provider side.** Export the membership ops (plaintext) a puller lacks.
+    pub fn export_membership_from(&self, peer_vv: &[u8]) -> Result<Vec<u8>> {
         let vv = loro::VersionVector::decode(peer_vv).unwrap_or_default();
-        self.catalog.export_from(&vv)
+        self.membership.export_from(&vv)
+    }
+    /// **Puller side.** Import a membership update (plaintext), then refresh our
+    /// keyring — we may have just been added and can now decrypt the workspace.
+    pub fn import_membership(&mut self, update: &[u8]) -> Result<()> {
+        self.membership.import(update)?;
+        self.membership.doc().commit();
+        self.store.save_membership(&self.membership)?;
+        self.refresh_keyring();
+        Ok(())
     }
 
-    /// **Provider side.** Export a single issue doc's updates from `peer_vv`,
-    /// or `None` if we don't hold that doc.
+    // ---- membership / ACL operations (P3, S§6, A§11) ----
+
+    /// The materialized ACL state (deterministic replay from genesis, S§6).
+    pub fn acl_state(&self) -> AclState {
+        acl::replay(&self.genesis, &self.membership.ops())
+    }
+    pub fn is_member(&self, user: &UserId) -> bool {
+        self.acl_state().is_member(user)
+    }
+    /// Members (key, role, is_me) for the members view (UI.md §8).
+    pub fn members(&self) -> Vec<(UserId, Role, bool)> {
+        self.acl_state()
+            .members()
+            .into_iter()
+            .map(|(k, r)| {
+                let me = k == self.me;
+                (k, r, me)
+            })
+            .collect()
+    }
+
+    /// Add a member (signed AddMember op) and seal every key-epoch we hold to
+    /// them so they can read the workspace (S§6, A§11). Admin-only.
+    pub fn member_add(&mut self, user: &UserId, role: Role) -> (Response, Option<DirtySet>) {
+        if !self.acl_state().is_admin(&self.me) {
+            return (Response::err("only an admin can add members"), None);
+        }
+        let op = acl::sign_op(
+            &self.seed,
+            &AclOp::AddMember {
+                key: user.clone(),
+                role,
+            },
+            self.membership.heads(),
+        );
+        if let Err(e) = self.member_apply(op, |t| {
+            let epochs: Vec<(u32, WorkspaceKey)> =
+                t.keyring.iter().map(|(e, k)| (*e, *k)).collect();
+            for (epoch, key) in epochs {
+                if let Some(sealed) = crypto::seal_to(user, &key) {
+                    t.membership.put_sealed(epoch, user, &sealed)?;
+                }
+            }
+            Ok(())
+        }) {
+            return (Response::err(format!("{e:#}")), None);
+        }
+        self.push_activity(None, &user.short(), "member_added", vec![], &user.short());
+        (
+            Response::Ok {
+                message: Some(format!("added member {}", user.short())),
+            },
+            Some(DirtySet::catalog(CatalogScope::Acl)),
+        )
+    }
+
+    /// Remove a member (signed RemoveMember op) and **rotate the workspace key**
+    /// (lazy revocation, A§3 non-goal 2): a new epoch sealed only to the remaining
+    /// members, so the removed member cannot read *future* content. Admin-only.
+    pub fn member_remove(&mut self, user: &UserId) -> (Response, Option<DirtySet>) {
+        if !self.acl_state().is_admin(&self.me) {
+            return (Response::err("only an admin can remove members"), None);
+        }
+        if user == &self.me {
+            return (Response::err("refusing to remove yourself"), None);
+        }
+        let op = acl::sign_op(
+            &self.seed,
+            &AclOp::RemoveMember { key: user.clone() },
+            self.membership.heads(),
+        );
+        if let Err(e) = self.member_apply(op, |t| t.rotate_key()) {
+            return (Response::err(format!("{e:#}")), None);
+        }
+        self.push_activity(None, &user.short(), "member_removed", vec![], &user.short());
+        (
+            Response::Ok {
+                message: Some(format!(
+                    "removed member {} and rotated the key",
+                    user.short()
+                )),
+            },
+            Some(DirtySet::catalog(CatalogScope::Acl)),
+        )
+    }
+
+    /// Rotate the workspace key without a membership change (key hygiene).
+    pub fn key_rotate_cmd(&mut self) -> (Response, Option<DirtySet>) {
+        if !self.acl_state().is_admin(&self.me) {
+            return (Response::err("only an admin can rotate the key"), None);
+        }
+        match self.rotate_key() {
+            Ok(()) => {
+                if let Err(e) = self.persist_membership() {
+                    return (Response::err(format!("{e:#}")), None);
+                }
+                (
+                    Response::Ok {
+                        message: Some(format!("rotated to key epoch {}", self.current_epoch())),
+                    },
+                    Some(DirtySet::catalog(CatalogScope::Acl)),
+                )
+            }
+            Err(e) => (Response::err(format!("{e:#}")), None),
+        }
+    }
+
+    fn member_add_cmd(&mut self, who: String, admin: bool) -> (Response, Option<DirtySet>) {
+        let Some(user) = index::resolve_user(&who, &self.me) else {
+            return (Response::err(format!("no user matches '{who}'")), None);
+        };
+        let role = if admin { Role::Admin } else { Role::Member };
+        self.member_add(&user, role)
+    }
+    fn member_remove_cmd(&mut self, who: String) -> (Response, Option<DirtySet>) {
+        let Some(user) = index::resolve_user(&who, &self.me) else {
+            return (Response::err(format!("no user matches '{who}'")), None);
+        };
+        self.member_remove(&user)
+    }
+    fn members_response(&self) -> Response {
+        let members = self
+            .members()
+            .into_iter()
+            .map(|(key, role, me)| crate::dto::MemberDto {
+                key,
+                role: match role {
+                    Role::Admin => "admin".into(),
+                    Role::Member => "member".into(),
+                },
+                me,
+            })
+            .collect();
+        Response::Members { members }
+    }
+
+    /// Apply a signed op + an extra key-sealing step, then commit + persist.
+    fn member_apply(
+        &mut self,
+        op: SignedOp,
+        extra: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<()> {
+        self.membership.add_op(&op)?;
+        extra(self)?;
+        self.persist_membership()
+    }
+
+    fn persist_membership(&mut self) -> Result<()> {
+        self.membership.doc().commit();
+        self.store.save_membership(&self.membership)?;
+        self.store.commit("membership change");
+        self.refresh_keyring();
+        Ok(())
+    }
+
+    /// Mint a new key-epoch, sealed to every *current* member (computed AFTER any
+    /// just-applied remove op), and adopt it into our keyring.
+    fn rotate_key(&mut self) -> Result<()> {
+        let new_epoch = self.current_epoch() + 1;
+        let new_key = crypto::random_key();
+        self.membership.set_epoch(new_epoch)?;
+        for (member, _role) in self.acl_state().members() {
+            if let Some(sealed) = crypto::seal_to(&member, &new_key) {
+                self.membership.put_sealed(new_epoch, &member, &sealed)?;
+            }
+        }
+        self.keyring.insert(new_epoch, new_key);
+        Ok(())
+    }
+
+    /// **Provider side.** Export the catalog ops a puller at `peer_vv` lacks,
+    /// **encrypted** with the current workspace key (blind-relay envelope, A§11).
+    pub fn export_catalog_from(&self, peer_vv: &[u8]) -> Result<Vec<u8>> {
+        let vv = loro::VersionVector::decode(peer_vv).unwrap_or_default();
+        Ok(self.encrypt_payload(self.catalog.export_from(&vv)?))
+    }
+
+    /// **Provider side.** Export a single issue doc's updates from `peer_vv`
+    /// (encrypted), or `None` if we don't hold that doc.
     pub fn export_doc_from(&mut self, doc_id: &str, peer_vv: &[u8]) -> Result<Option<Vec<u8>>> {
         let Some(id) = DocId::parse(doc_id) else {
             return Ok(None);
         };
-        match self.issue(&id)? {
+        // Clone the epoch/key context before the issue borrow.
+        let plain = match self.issue(&id)? {
             Some(issue) => {
                 let vv = loro::VersionVector::decode(peer_vv).unwrap_or_default();
-                Ok(Some(issue.export_from(&vv)?))
+                issue.export_from(&vv)?
             }
-            None => Ok(None),
-        }
+            None => return Ok(None),
+        };
+        Ok(Some(self.encrypt_payload(plain)))
     }
 
     /// **Puller side.** Import the provider's catalog update, recompute rows for
@@ -1189,7 +1512,12 @@ impl Tracker {
     /// issue docs we must fetch: those we lack, or whose catalog `head` no longer
     /// matches our local issue-doc head (A§8 "the rows whose head moved").
     pub fn import_catalog_and_compute_needs(&mut self, update: &[u8]) -> Result<Vec<DocNeed>> {
-        self.catalog.import(update)?;
+        // Decrypt the blind-relay envelope (A§11). A non-member (no key) can't
+        // read the catalog and simply learns nothing — the E2EE outcome.
+        let Some(update) = self.decrypt_payload(update) else {
+            return Ok(Vec::new());
+        };
+        self.catalog.import(&update)?;
         self.catalog.doc().commit();
         let mut needs = Vec::new();
         let mut healed = false;
@@ -1242,17 +1570,21 @@ impl Tracker {
         let Some(id) = DocId::parse(doc_id) else {
             return Ok(None);
         };
+        // Decrypt the blind-relay envelope (A§11); a non-member can't read it.
+        let Some(bytes) = self.decrypt_payload(bytes) else {
+            return Ok(None);
+        };
         // ensure a doc exists to import into (new docs arrive as a snapshot).
         if !self.issues.contains_key(&id) {
             let doc = loro::LoroDoc::new();
-            doc.import(bytes)
+            doc.import(&bytes)
                 .map_err(|e| anyhow!("import new issue doc: {e}"))?;
             self.issues.insert(id.clone(), IssueDoc::from_doc(doc));
         } else {
             self.issues
                 .get(&id)
                 .unwrap()
-                .import(bytes)
+                .import(&bytes)
                 .map_err(|e| anyhow!("import issue update: {e}"))?;
         }
         // persist + recompute the row from the issue doc (disjoint field borrows).
@@ -1328,8 +1660,11 @@ mod tests {
         }
     }
 
+    const ME_SEED: [u8; 32] = [7u8; 32];
     fn me() -> UserId {
-        UserId::from_key_string("a".repeat(64))
+        // A real ed25519 key (so the founder can seal the workspace key to itself).
+        let pk = ed25519_dalek::SigningKey::from_bytes(&ME_SEED).verifying_key();
+        UserId::from_key_string(data_encoding::HEXLOWER.encode(pk.as_bytes()))
     }
 
     struct TestNode {
@@ -1343,6 +1678,15 @@ mod tests {
     }
 
     fn new_node() -> TestNode {
+        new_node_as(me(), ME_SEED)
+    }
+
+    fn user_from_seed(seed: [u8; 32]) -> UserId {
+        let pk = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+        UserId::from_key_string(data_encoding::HEXLOWER.encode(pk.as_bytes()))
+    }
+
+    fn new_node_as(user: UserId, seed: [u8; 32]) -> TestNode {
         let home = std::env::temp_dir().join(format!(
             "gc-trk-{}-{}",
             std::process::id(),
@@ -1350,13 +1694,11 @@ mod tests {
         ));
         std::fs::create_dir_all(&home).unwrap();
         let store = Store::open(&home).unwrap();
-        let tracker = Tracker::open(
-            store,
-            me(),
-            "tester".into(),
-            Box::new(FakeClock::new(1_000_000)),
-        )
-        .unwrap();
+        // Distinct clock per node (seed-derived ms) so two nodes mint DIFFERENT
+        // workspace ids — otherwise the deterministic clock collides them and
+        // adoption (which requires a differing ws id) would no-op.
+        let clock = FakeClock::new(1_000_000 + seed[0] as u64 * 100_000);
+        let tracker = Tracker::open(store, user, "tester".into(), seed, Box::new(clock)).unwrap();
         TestNode { tracker, home }
     }
 
@@ -1505,6 +1847,7 @@ mod tests {
             store2,
             me(),
             "tester".into(),
+            ME_SEED,
             Box::new(FakeClock::new(1_000_000)),
         )
         .unwrap();
@@ -1566,6 +1909,83 @@ mod tests {
                 .collect(),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// In-process E2EE: a non-member can't decrypt; after `member_add` + a
+    /// membership sync the added member unseals the key and decrypts the catalog
+    /// + issue docs; after `member_remove` + rotation new content is unreadable.
+    fn sync_membership(from: &mut Tracker, to: &mut Tracker) {
+        let vv = to.membership_vv_bytes();
+        let upd = from.export_membership_from(&vv).unwrap();
+        to.import_membership(&upd).unwrap();
+    }
+    fn sync_all(from: &mut Tracker, to: &mut Tracker) {
+        sync_membership(from, to);
+        let cvv = to.catalog_vv_bytes();
+        let cupd = from.export_catalog_from(&cvv).unwrap();
+        let needs = to.import_catalog_and_compute_needs(&cupd).unwrap();
+        for need in needs {
+            if let Ok(Some(bytes)) = from.export_doc_from(&need.doc_id, &need.vv) {
+                to.import_doc(&need.doc_id, &bytes).unwrap();
+            }
+        }
+    }
+    fn titles(t: &mut Tracker) -> Vec<String> {
+        match t
+            .handle(Request::List {
+                project: None,
+                filter: Filter::default(),
+            })
+            .0
+        {
+            Response::List { rows } => rows.into_iter().map(|r| r.title).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn e2ee_membership_gates_decryption() {
+        let mut a = new_node(); // founder + admin
+        with_project(&mut a.tracker);
+        new_issue(&mut a.tracker, "secret issue");
+
+        let b_seed = [8u8; 32];
+        let b_user = user_from_seed(b_seed);
+        let mut b = new_node_as(b_user.clone(), b_seed);
+        let a_ws = a.tracker.workspace_str();
+        assert!(
+            b.tracker.adopt_workspace(&a_ws, me().as_str()).unwrap(),
+            "B adopts A's workspace"
+        );
+
+        // Before add: B syncs but cannot decrypt — sees only ciphertext.
+        sync_all(&mut a.tracker, &mut b.tracker);
+        assert!(
+            titles(&mut b.tracker).is_empty(),
+            "non-member decrypts nothing"
+        );
+        assert!(!b.tracker.is_member(&b_user));
+
+        // A adds B → B syncs membership, unseals the key, decrypts everything.
+        let (resp, _) = a.tracker.member_add(&b_user, Role::Member);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        sync_all(&mut a.tracker, &mut b.tracker);
+        assert!(b.tracker.is_member(&b_user), "B is now a member");
+        assert_eq!(
+            titles(&mut b.tracker),
+            vec!["secret issue".to_string()],
+            "B decrypts"
+        );
+
+        // A removes B + rotates; new content is encrypted under an epoch B lacks.
+        let (resp, _) = a.tracker.member_remove(&b_user);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        new_issue(&mut a.tracker, "post-removal");
+        sync_all(&mut a.tracker, &mut b.tracker);
+        assert!(
+            !titles(&mut b.tracker).iter().any(|t| t == "post-removal"),
+            "lazy revocation: removed member can't read post-removal content"
+        );
     }
 
     #[test]

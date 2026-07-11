@@ -29,13 +29,17 @@ pub const SYNC_ALPN: &[u8] = b"groupchat/sync/0";
 /// A single sync frame. Postcard-encoded, length-prefixed on the stream.
 #[derive(Debug, Serialize, Deserialize)]
 enum Msg {
-    /// Dialer → accepter (first frame): "pull me up to date; here is my catalog
-    /// version so you can send only what I lack."
+    /// Dialer → accepter (first frame): "pull me up to date; here are my
+    /// membership + catalog versions so you can send only what I lack."
     Pull {
         workspace: String,
+        membership_vv: Vec<u8>,
         catalog_vv: Vec<u8>,
     },
-    /// Accepter → dialer: the catalog update-diff.
+    /// Accepter → dialer: the plaintext membership update-diff (signed ACL +
+    /// sealed key envelopes), sent *before* the encrypted catalog (A§11).
+    Membership { update: Vec<u8> },
+    /// Accepter → dialer: the (encrypted) catalog update-diff.
     Catalog { update: Vec<u8> },
     /// Dialer → accepter (repeated): "send me this doc's updates from my VV."
     DocRequest { doc_id: String, vv: Vec<u8> },
@@ -84,22 +88,40 @@ async fn read_msg(recv: &mut RecvStream) -> Result<Option<Msg>> {
 pub async fn pull(conn: &Connection, tracker: &Mutex<Tracker>) -> Result<DirtySet> {
     let (mut send, mut recv) = conn.open_bi().await.context("open sync stream")?;
 
-    // 1. send our catalog VV.
-    let (workspace, catalog_vv) = {
+    // 1. send our membership + catalog VVs.
+    let (workspace, membership_vv, catalog_vv) = {
         let t = tracker.lock().unwrap();
-        (t.workspace_str(), t.catalog_vv_bytes())
+        (
+            t.workspace_str(),
+            t.membership_vv_bytes(),
+            t.catalog_vv_bytes(),
+        )
     };
     write_msg(
         &mut send,
         &Msg::Pull {
             workspace,
+            membership_vv,
             catalog_vv,
         },
     )
     .await?;
 
-    // 2. read the catalog update, import it, compute which docs we need.
+    // 2a. read the plaintext membership diff first (A§11) and import it — we may
+    // have just been added and can now decrypt the catalog/docs below.
     let mut dirty = DirtySet::default();
+    match read_msg(&mut recv).await? {
+        Some(Msg::Membership { update }) => {
+            if !update.is_empty() {
+                let mut t = tracker.lock().unwrap();
+                t.import_membership(&update)?;
+                dirty.merge(DirtySet::catalog_structure());
+            }
+        }
+        other => return Err(anyhow!("expected Membership, got {other:?}")),
+    }
+
+    // 2b. read the encrypted catalog diff, decrypt+import, compute needed docs.
     let needs = match read_msg(&mut recv).await? {
         Some(Msg::Catalog { update }) => {
             let changed = !update.is_empty();
@@ -156,23 +178,32 @@ pub async fn serve(conn: Connection, tracker: &Mutex<Tracker>) -> Result<()> {
     let (mut send, mut recv) = conn.accept_bi().await.context("accept sync stream")?;
 
     // 1. read the Pull; guard the workspace.
-    let peer_vv = match read_msg(&mut recv).await? {
+    let (membership_vv, catalog_vv) = match read_msg(&mut recv).await? {
         Some(Msg::Pull {
             workspace,
+            membership_vv,
             catalog_vv,
         }) => {
             let mine = tracker.lock().unwrap().workspace_str();
             if workspace != mine {
                 return Err(anyhow!("workspace mismatch: {workspace} != {mine}"));
             }
-            catalog_vv
+            (membership_vv, catalog_vv)
         }
         other => return Err(anyhow!("expected Pull, got {other:?}")),
     };
 
-    // 2. send the catalog update-diff.
-    let update = tracker.lock().unwrap().export_catalog_from(&peer_vv)?;
-    write_msg(&mut send, &Msg::Catalog { update }).await?;
+    // 2a. send the plaintext membership diff (signed ACL + sealed keys), then
+    // 2b. the encrypted catalog diff.
+    let (membership, catalog) = {
+        let t = tracker.lock().unwrap();
+        (
+            t.export_membership_from(&membership_vv)?,
+            t.export_catalog_from(&catalog_vv)?,
+        )
+    };
+    write_msg(&mut send, &Msg::Membership { update: membership }).await?;
+    write_msg(&mut send, &Msg::Catalog { update: catalog }).await?;
 
     // 3. answer doc requests until EndRequests.
     loop {

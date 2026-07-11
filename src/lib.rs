@@ -18,11 +18,13 @@
 //!   * **Layer C — wire/sync** ([`proto`], and P1 `sync`): opaque Loro bytes plus
 //!     the minimum framing to route them over iroh.
 
+pub mod acl;
 pub mod app;
 pub mod catalog;
 pub mod cli;
 pub mod config;
 pub mod control;
+pub mod crypto;
 pub mod dto;
 pub mod ids;
 pub mod index;
@@ -30,6 +32,7 @@ pub mod install;
 pub mod issue;
 pub mod loro_ext;
 pub mod mcp;
+pub mod membership;
 pub mod node;
 pub mod presence;
 pub mod proto;

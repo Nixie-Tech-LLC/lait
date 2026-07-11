@@ -97,19 +97,40 @@ Remaining: promotable seed role hardening, TUI peers panel, RIBLT escape-hatch (
 - Tests: relay reconciles + GCs without decrypting; backfill converges an offline peer
   across a compaction boundary.
 
-## P3 — E2EE access control — **todo**
+## P3 — E2EE access control — **done (core)**
 
-- Signed ed25519 membership/ACL op-graph in `Catalog.acl` (`{op_bytes, sig, parents}`),
-  trust computed by deterministic **replay** from genesis keys, **remove-wins**
-  revocation (S§6). Loro moves bytes; app adjudicates trust.
-- Workspace symmetric key distribution + rotation on removal (lazy revocation);
-  two-protocol split (sync ACL → derive key → sync encrypted Loro updates).
-- TUI members view over `Catalog.acl` (read-only until the signed-op grammar lands),
-  then `MemberAdd/Remove`, `KeyRotate` (U§8).
-- Tests (adversarial): ACL replay + remove-wins property tests; a non-member sees only
-  ciphertext (e2e); key rotation gates future content.
+- **done** Signed ed25519 ACL op-graph (`acl.rs`): `AddMember/RemoveMember/SetRole`,
+  content-addressed hash-DAG, deterministic replay from genesis, **remove-wins**
+  over the causal ancestor closure, authority checked against the admin set.
+- **done** Pure-Rust crypto (`crypto.rs`): ChaCha20-Poly1305 AEAD for sync
+  payloads; X25519 sealed-box (ed25519→x25519 conversion) distributing the
+  workspace key to a member addressed by their `UserId`. No C toolchain / no
+  aws-lc (respects the bans).
+- **done** Plaintext membership layer (`membership.rs`) synced *before* the
+  encrypted catalog/docs (A§11 two-protocol split): the signed ACL + per-epoch
+  sealed key envelopes. Encrypted sync payloads (epoch-tagged) = a blind relay /
+  non-member sees only ciphertext.
+- **done** Key epochs + **lazy revocation**: `member remove` rotates to a new
+  epoch sealed only to remaining members; a keyring keeps old epochs decryptable.
+  `members add/remove/rotate-key/ls` on CLI + MCP; TUI members view (view 4).
+- **done, verified end-to-end (real iroh, `tests/two_node_sync.rs`)**: a
+  non-member sees ciphertext; `member add` grants decryption; encrypted
+  convergence both ways; `member remove` + rotation blocks the removed member from
+  post-removal content. Plus in-process `e2ee_membership_gates_decryption` and the
+  `acl.rs` replay/remove-wins/forged-sig/authority tests.
+- Fixed en route: a joiner must adopt **empty** catalog/membership docs and import
+  the founder's full state, else independently-`create()`d attached child
+  containers make the root child-registers LWW-resolve to empty non-deterministically
+  (also hardened P1's merge from luck-based to deterministic).
+- Deferred (logged): RIBLT scale escape-hatch; account-aggregates-devices; CGKA
+  (BeeKEM) for key agreement — the simpler sealed-box distribution is used.
 
-## P4 — Agent/MCP hardening + release engineering — **todo (MCP surface + parity done)**
+> Deviation from the S§6 sketch: the ACL + sealed key envelopes live in a
+> **separate plaintext membership doc**, not `Catalog.acl` — the catalog is
+> encrypted on the wire, so the ACL/keys must be readable to bootstrap decryption
+> (recorded here + in the code).
+
+## P4 — Agent/MCP hardening + release engineering — **in progress (MCP surface + parity done)**
 
 - MCP hardening + multi-seed + security review + TUI polish (themes/resize/wide-table
   scroll).

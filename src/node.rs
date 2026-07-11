@@ -425,7 +425,7 @@ impl Node {
                 self.touch(from, None);
                 let (our_ws, our_head) = {
                     let t = self.tracker.lock().unwrap();
-                    (t.workspace_str(), t.catalog_head_bytes())
+                    (t.workspace_str(), t.sync_head_bytes())
                 };
                 // Only pull when the peer's catalog head differs from ours — the
                 // A§8 trigger. Same head ⇒ nothing to do (storm suppression).
@@ -476,7 +476,7 @@ impl Node {
     async fn broadcast_announce(&self) -> Result<()> {
         let (workspace, catalog_head) = {
             let t = self.tracker.lock().unwrap();
-            (t.workspace_str(), t.catalog_head_bytes())
+            (t.workspace_str(), t.sync_head_bytes())
         };
         self.broadcast(Payload::Announce {
             workspace,
@@ -525,11 +525,12 @@ impl Node {
     /// topic, announce, and eagerly pull from the host to backfill.
     async fn adopt_and_join(self: &Arc<Self>, ticket: &RoomTicket) -> Result<()> {
         if !ticket.workspace.is_empty() {
+            let founder = ticket.host.to_string();
             let _ = self
                 .tracker
                 .lock()
                 .unwrap()
-                .adopt_workspace(&ticket.workspace);
+                .adopt_workspace(&ticket.workspace, &founder);
         }
         self.join_topic(ticket.topic(), vec![ticket.host]).await?;
         self.broadcast(Payload::JoinRequest {
@@ -646,7 +647,11 @@ impl Node {
             | Request::ProjectList
             | Request::LabelNew { .. }
             | Request::LabelList
-            | Request::Activity { .. } => {
+            | Request::Activity { .. }
+            | Request::MemberAdd { .. }
+            | Request::MemberRemove { .. }
+            | Request::KeyRotate
+            | Request::Members => {
                 let (resp, changed) = self.dispatch_tracker(req);
                 if changed {
                     // our catalog head moved — announce so peers pull (A§8).
@@ -930,7 +935,14 @@ pub async fn run_daemon(home: PathBuf) -> Result<()> {
     // Tracker core (P0): open the git-backed store and load/create the workspace.
     let store = Store::open(&home)?;
     let me = UserId::from_key_string(secret_key.public().to_string());
-    let tracker = Tracker::open(store, me, profile.nick.clone(), Box::new(SystemUlidSource))?;
+    let seed = secret_key.to_bytes();
+    let tracker = Tracker::open(
+        store,
+        me,
+        profile.nick.clone(),
+        seed,
+        Box::new(SystemUlidSource),
+    )?;
     let tracker = Arc::new(Mutex::new(tracker));
 
     let memory_lookup = MemoryLookup::new();

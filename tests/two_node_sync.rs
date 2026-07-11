@@ -165,10 +165,39 @@ fn two_nodes_converge_over_iroh() {
         "B: connect"
     );
 
-    // A -> B: B adopts the workspace and backfills A's issue over sync.
+    // Workspace data is E2EE (P3): B can't read until A adds it to the ACL and
+    // seals it the workspace key. Give the membership a moment to sync, then
+    // confirm B sees only ciphertext (no decryptable issues) — the E2EE outcome.
+    std::thread::sleep(Duration::from_secs(6));
+    assert!(
+        list_titles(&b.home).is_empty(),
+        "a non-member must see only ciphertext (no readable issues) before being added"
+    );
+
+    // Grant B membership by its endpoint id.
+    let b_id = match req(&b.home, Request::Id) {
+        Response::Text { text } => text.trim().to_string(),
+        other => panic!("B: id returned {other:?}"),
+    };
+    assert!(
+        matches!(
+            req(
+                &a.home,
+                Request::MemberAdd {
+                    who: b_id,
+                    admin: false
+                }
+            ),
+            Response::Ok { .. }
+        ),
+        "A: member add B"
+    );
+
+    // A -> B: B backfills the membership (unseals the key), then decrypts A's
+    // issue over the encrypted sync.
     assert!(
         poll_title(&b.home, "shared from A", 40),
-        "A→B: B did not converge to A's issue over P2P sync"
+        "A→B: B did not converge to A's issue over encrypted P2P sync"
     );
 
     // B -> A: a fresh issue on B propagates back to A.
@@ -192,6 +221,46 @@ fn two_nodes_converge_over_iroh() {
     assert!(
         poll_title(&a.home, "reply from B", 30),
         "B→A: A did not converge to B's issue over P2P sync"
+    );
+
+    // Lazy revocation (P3): A removes B (rotating the key), then files new
+    // content. B keeps what it already synced but must NOT be able to read the
+    // post-removal issue (encrypted under an epoch key B never receives).
+    let b_id2 = match req(&b.home, Request::Id) {
+        Response::Text { text } => text.trim().to_string(),
+        _ => String::new(),
+    };
+    assert!(
+        matches!(
+            req(&a.home, Request::MemberRemove { who: b_id2 }),
+            Response::Ok { .. }
+        ),
+        "A: member remove B"
+    );
+    assert!(
+        matches!(
+            req(
+                &a.home,
+                Request::IssueNew {
+                    title: "post-removal secret".into(),
+                    project: Some("ENG".into()),
+                    assignees: vec![],
+                    priority: None,
+                    labels: vec![],
+                    body: None,
+                }
+            ),
+            Response::Ref { .. }
+        ),
+        "A: post-removal issue"
+    );
+    // give sync ample time; B must still not see it.
+    std::thread::sleep(Duration::from_secs(10));
+    assert!(
+        !list_titles(&b.home)
+            .iter()
+            .any(|t| t == "post-removal secret"),
+        "lazy revocation: a removed member must not read post-removal content"
     );
 
     drop(a);

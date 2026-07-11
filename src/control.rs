@@ -19,7 +19,9 @@ use interprocess::local_socket::{
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::dto::{ActivityEvent, BoardView, Candidate, IssueView, LabelDto, ProjectDto, Row};
+use crate::dto::{
+    ActivityEvent, BoardView, Candidate, IssueView, LabelDto, MemberDto, ProjectDto, Row,
+};
 
 /// The OS name of the control channel for a home (unix socket / Windows named
 /// pipe). Daemon and clients derive it from the same home so they agree.
@@ -148,6 +150,17 @@ pub enum Request {
         #[serde(default)]
         since: u64,
     },
+    // ---- membership / ACL (P3, S§6) ----
+    MemberAdd {
+        who: String,
+        #[serde(default)]
+        admin: bool,
+    },
+    MemberRemove {
+        who: String,
+    },
+    KeyRotate,
+    Members,
     /// Streaming doorbells for the TUI (S§7.5). Turns the one-shot handler into a
     /// stream of [`Doorbell`] frames until the client disconnects.
     Subscribe {
@@ -209,6 +222,9 @@ pub enum Response {
     },
     Labels {
         labels: Vec<LabelDto>,
+    },
+    Members {
+        members: Vec<MemberDto>,
     },
     /// A ref resolved to many candidates — a first-class outcome (UI.md §3.2).
     Candidates {
