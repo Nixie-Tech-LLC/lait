@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.4.4 — crates.io + winget publishing
+
+- **All channels live.** Adds automated **crates.io** publishing
+  (`publish-crates.yml`, same `workflow_run` trigger — `cargo install lait` +
+  docs.rs) and enables **winget** submission. With Homebrew, Scoop, `cargo
+  binstall`, and the GitHub Release, a single version tag now publishes to every
+  supported channel automatically.
+
 ## v0.4.3 — fully automatic release publishing
 
 - **One release run publishes everywhere.** The Homebrew, Scoop, and winget
