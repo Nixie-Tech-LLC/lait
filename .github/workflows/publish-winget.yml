@@ -32,8 +32,11 @@ jobs:
     runs-on: ubuntu-latest
     env:
       WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+      # `inputs.plan` is the declared workflow_call input (empty on dispatch).
+      # Read the dispatch tag from the event payload — `inputs.tag` would be an
+      # undeclared-input reference under workflow_call and fail workflow validation.
       PLAN: ${{ inputs.plan }}
-      DISPATCH_TAG: ${{ inputs.tag }}
+      DISPATCH_TAG: ${{ github.event.inputs.tag }}
     steps:
       - name: Resolve tag + gate on token
         id: gate
