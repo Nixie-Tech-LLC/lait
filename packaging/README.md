@@ -86,12 +86,14 @@ Publishing also gives docs.rs API docs for free.
   *structurally* on every PR — JSON/YAML parse, required fields, canonical URLs,
   and a single consistent winget identifier. It deliberately does **not** check
   the version/hash (those don't exist until a release builds them).
-- **CD** is fully automatic: the three publishers are cargo-dist **custom publish
-  jobs** (`publish-jobs = ["./publish-homebrew", "./publish-scoop",
-  "./publish-winget"]` in `dist-workspace.toml`). The release run invokes each as a
-  reusable `workflow_call` after it hosts the release, passing the cargo-dist `plan`
-  (which carries the tag) with `secrets: inherit` — so pushing a version tag builds,
-  releases, and publishes end to end, in one run, with no manual dispatch.
+- **CD** is fully automatic: the three publishers trigger on the **Release workflow
+  completing** (`on: workflow_run: workflows: ["Release"]`). That fires even though
+  cargo-dist creates the GitHub Release with the default `GITHUB_TOKEN` — a
+  `release:` trigger would be suppressed in that case, which is why they don't use
+  one. By the time Release completes, the release + assets already exist (created in
+  its `host` job), so pushing a version tag builds, releases, and publishes end to
+  end with no manual dispatch. Each derives the tag from the completed run
+  (`head_branch`, falling back to the newest release).
   - Homebrew — `publish-homebrew.yml` downloads the `lait.rb` release asset and
     commits it to `homebrew-tap/Formula/lait.rb`.
   - Scoop — `publish-scoop.yml` stamps `lait.json` with the version + SHA256 and

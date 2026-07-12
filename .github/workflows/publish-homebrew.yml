@@ -1,10 +1,11 @@
-# CD: push the cargo-dist-generated Homebrew formula (lait.rb, a release asset)
-# to the org tap so `brew install nixie-tech-llc/tap/lait` picks up the release.
+# CD: push the cargo-dist-generated Homebrew formula (lait.rb, a release asset) to
+# the org tap so `brew install nixie-tech-llc/tap/lait` picks up the release.
 #
-# Wired as a cargo-dist *custom publish job* (`publish-jobs = ["./publish-homebrew"]`
-# in dist-workspace.toml): the release run calls this via `workflow_call` after it
-# hosts the release, passing the `plan` (which carries the tag) with `secrets:
-# inherit`. `workflow_dispatch` is kept for manual re-runs.
+# Triggered on the **Release** workflow completing (`workflow_run`) — which fires
+# even though cargo-dist creates the release with the default GITHUB_TOKEN (a
+# `release:` trigger would be suppressed). By completion the release + assets
+# already exist (created in the Release `host` job). `workflow_dispatch` is kept
+# for manual re-runs.
 #
 # Auth is a short-lived token minted from the org GitHub App (integration-runners)
 # scoped to just homebrew-tap — no long-lived PAT. App creds live in the repo
@@ -12,11 +13,9 @@
 name: Publish Homebrew formula
 
 on:
-  workflow_call:
-    inputs:
-      plan:
-        required: true
-        type: string
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       tag:
@@ -30,24 +29,29 @@ jobs:
   homebrew:
     name: push formula to tap
     runs-on: ubuntu-latest
+    # Only a manual dispatch, or a successful Release run for a version tag.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
     env:
       APP_ID: ${{ secrets.RUNNERS_APP_ID }}
-      # `inputs.plan` is the declared workflow_call input (empty on dispatch).
-      # Read the dispatch tag from the event payload — `inputs.tag` would be an
-      # undeclared-input reference under workflow_call and fail workflow validation.
-      PLAN: ${{ inputs.plan }}
-      DISPATCH_TAG: ${{ github.event.inputs.tag }}
     steps:
       - name: Resolve tag + gate on app credentials
         id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISPATCH_TAG: ${{ github.event.inputs.tag }}
+          RUN_TAG: ${{ github.event.workflow_run.head_branch }}
         shell: bash
         run: |
           set -euo pipefail
-          tag="${DISPATCH_TAG:-}"
-          if [ -z "$tag" ] && [ -n "${PLAN:-}" ]; then
-            tag="$(printf '%s' "$PLAN" | jq -r '.announcement_tag // empty')"
+          tag="${DISPATCH_TAG:-${RUN_TAG:-}}"
+          # Fallback: the Release just created a GitHub release — use its tag.
+          if [ -z "$tag" ] || [ "${tag#v}" = "$tag" ]; then
+            tag="$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')"
           fi
-          [ -n "$tag" ] || { echo "::error::no tag from dispatch input or plan"; exit 1; }
+          [ -n "$tag" ] || { echo "::error::could not resolve a release tag"; exit 1; }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           if [ -n "${APP_ID:-}" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"
           else echo "::notice::RUNNERS_APP_ID not set — skipping Homebrew publish."; echo "ok=false" >> "$GITHUB_OUTPUT"; fi
