@@ -94,6 +94,23 @@ fn should_idle_shutdown(
     !window.is_zero() && !mesh_member && active_conns == 0 && idle_for >= window
 }
 
+/// The presence/announce heartbeat interval. Configurable via `LAIT_HEARTBEAT_SECS`
+/// (default [`HEARTBEAT`] = 10s). Convergence is event-driven (a live announce
+/// triggers an immediate pull), so the heartbeat is only a catch-up safety net —
+/// but *absence* proofs (e.g. lazy-revocation) must wait a full heartbeat, and 10s
+/// dominates multi-node test wall-clock. Letting the test pipeline set a 1s clock
+/// cuts that without weakening the assertion. A zero/unparseable value falls back
+/// to the default; the interval must be non-zero (tokio panics on a 0 period).
+fn heartbeat_from_env() -> Duration {
+    match std::env::var("LAIT_HEARTBEAT_SECS") {
+        Ok(s) => match s.trim().parse::<u64>() {
+            Ok(n) if n > 0 => Duration::from_secs(n),
+            _ => HEARTBEAT,
+        },
+        Err(_) => HEARTBEAT,
+    }
+}
+
 fn idle_window_from_env() -> Duration {
     match std::env::var("LAIT_IDLE_SECS") {
         Ok(s) => s
@@ -841,7 +858,7 @@ impl Node {
     }
 
     async fn heartbeat_loop(self: Arc<Self>) {
-        let mut interval = tokio::time::interval(HEARTBEAT);
+        let mut interval = tokio::time::interval(heartbeat_from_env());
         loop {
             interval.tick().await;
             if let Err(e) = self

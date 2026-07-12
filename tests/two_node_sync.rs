@@ -20,6 +20,11 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_lait")
 }
 
+/// The heartbeat the spawned daemons run on (via `LAIT_HEARTBEAT_SECS`). Absence-
+/// proof settling windows are expressed as multiples of this, so they stay sound
+/// if the test clock changes. The single source of truth for both.
+const TEST_HEARTBEAT: Duration = Duration::from_secs(1);
+
 /// A current-thread runtime: each `req` is a single control-channel round trip, so
 /// building the default multi-thread runtime (worker-thread pool) per call — often
 /// hundreds of times over a tight poll — is pure churn. Far cheaper to build.
@@ -80,6 +85,9 @@ fn spawn_daemon(home: &Path) -> Daemon {
         .arg("daemon")
         .env("LAIT_HOME", home)
         .env("LAIT_IDLE_SECS", "0")
+        // Run the protocol on a fast heartbeat so catch-up/absence windows are
+        // seconds, not the 10s production default — the pipeline's biggest lever.
+        .env("LAIT_HEARTBEAT_SECS", TEST_HEARTBEAT.as_secs().to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -331,9 +339,12 @@ fn two_nodes_converge_over_iroh() {
     );
     // Intentional settling window (not a pollable condition): this is an
     // *absence* proof — a removed member must never read post-removal content — so
-    // there is no positive signal to wait on. Give sync ample time across several
-    // announce cycles, then assert B still cannot see it.
-    std::thread::sleep(Duration::from_secs(10));
+    // there is no positive signal to wait on. A already announced the write live
+    // (event-driven), so B has had its immediate chance; wait several fast-heartbeat
+    // catch-up cycles (LAIT_HEARTBEAT_SECS=1) as belt-and-suspenders, then assert B
+    // still cannot see it. Scales with the heartbeat, so it stays sound if the clock
+    // changes.
+    std::thread::sleep(3 * TEST_HEARTBEAT);
     assert!(
         !list_titles(&b.home)
             .iter()

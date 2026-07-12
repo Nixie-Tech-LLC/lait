@@ -94,6 +94,9 @@ fn spawn(home: &Path, seed: bool) -> Proc {
     let child = cmd
         .env("LAIT_HOME", home)
         .env("LAIT_IDLE_SECS", "0")
+        // Run the protocol on a fast heartbeat so catch-up/absence windows are
+        // seconds, not the 10s production default — the pipeline's biggest lever.
+        .env("LAIT_HEARTBEAT_SECS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
