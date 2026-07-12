@@ -53,7 +53,9 @@ use crate::{
         control_name, Doorbell, Event as LogEvent, EventKind, PresenceEntry, Request, Response,
         StatusInfo,
     },
+    dto::{Candidate, JoinRequestDto, SeedDto},
     ids::{SystemUlidSource, UserId},
+    index::{resolve_user_dir, KnownUser, UserResolution},
     presence::PeerState,
     proto::{topic_for_room, Payload, RoomTicket, SignedMessage},
     store::Store,
@@ -203,6 +205,21 @@ fn remove_seed(home: &Path, needle: &str) -> usize {
         save_seeds(home, &seeds);
     }
     removed
+}
+
+/// Map ambiguous user matches into the shared [`Candidate`] shape so the CLI and
+/// `--json` render them through the same disambiguation path as issue refs
+/// (UI.md §3.2): `reff` = short key, `key_alias` = nick (if any), `title` = full
+/// key so the caller can copy an unambiguous value.
+fn user_candidates(cands: &[KnownUser]) -> Vec<Candidate> {
+    cands
+        .iter()
+        .map(|c| Candidate {
+            reff: c.key.short(),
+            key_alias: (!c.nick.is_empty()).then(|| c.nick.clone()),
+            title: c.key.as_str().to_string(),
+        })
+        .collect()
 }
 
 /// A peer we have heard from on the gossip topic.
@@ -819,6 +836,158 @@ impl Node {
         self.doorbell_notify.notify_waiters();
     }
 
+    /// Our own key as a [`UserId`] (the endpoint id is the ed25519 key, S§2).
+    fn my_userid(&self) -> UserId {
+        UserId::from_key_string(self.shared.my_id.to_string())
+    }
+
+    /// Assemble the user-ref resolution directory (UI.md §3.1) from every place a
+    /// key↔nick pairing is known: our own profile, the live presence map, recent
+    /// join requests in the event log, and the signed ACL members. Deduped by
+    /// key, preferring a non-empty nick. This is what turns `members add alice`
+    /// and `assign ENG-1 c3ab21` into real keys.
+    fn user_directory(&self) -> Vec<KnownUser> {
+        fn add(map: &mut HashMap<UserId, String>, key: UserId, nick: String) {
+            let e = map.entry(key).or_default();
+            if e.is_empty() && !nick.is_empty() {
+                *e = nick;
+            }
+        }
+        let mut map: HashMap<UserId, String> = HashMap::new();
+        add(&mut map, self.my_userid(), self.shared.nick.clone());
+        {
+            let presence = self.shared.presence.lock().unwrap();
+            for (id, peer) in presence.iter() {
+                add(
+                    &mut map,
+                    UserId::from_key_string(id.to_string()),
+                    peer.nick.clone(),
+                );
+            }
+        }
+        {
+            let (events, _) = self.shared.events.lock().unwrap().since(0);
+            for e in &events {
+                if e.kind == EventKind::Join {
+                    add(
+                        &mut map,
+                        UserId::from_key_string(e.id.clone()),
+                        e.nick.clone(),
+                    );
+                }
+            }
+        }
+        {
+            for (key, _role, _me) in self.tracker.lock().unwrap().members() {
+                add(&mut map, key, String::new());
+            }
+        }
+        map.into_iter()
+            .map(|(key, nick)| KnownUser { key, nick })
+            .collect()
+    }
+
+    /// Pending join requests: announced joiners (`EventKind::Join`) who are not
+    /// yet ACL members. Newest-first, deduped by key. Ephemeral — bounded by the
+    /// event ring, never persisted (UI.md §8).
+    fn pending_join_requests(&self) -> Vec<JoinRequestDto> {
+        let members: HashSet<String> = self
+            .tracker
+            .lock()
+            .unwrap()
+            .members()
+            .into_iter()
+            .map(|(k, _r, _me)| k.as_str().to_string())
+            .collect();
+        let (events, _) = self.shared.events.lock().unwrap().since(0);
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out = Vec::new();
+        for e in events.iter().rev() {
+            if e.kind != EventKind::Join {
+                continue;
+            }
+            if members.contains(&e.id) || !seen.insert(e.id.clone()) {
+                continue;
+            }
+            out.push(JoinRequestDto {
+                key: e.id.clone(),
+                nick: e.nick.clone(),
+                ts: e.ts,
+            });
+        }
+        out
+    }
+
+    /// Resolve the user-refs carried by a request (nick / id-prefix → full key)
+    /// against the presence-fed directory, before the tracker sees them. Returns
+    /// the rewritten request, or an early `Response` (not-found / ambiguous) to
+    /// send back verbatim. Only the ref-bearing requests are touched; everything
+    /// else passes through untouched (and without building the directory).
+    fn resolve_refs_in(&self, req: Request) -> std::result::Result<Request, Response> {
+        if !matches!(
+            req,
+            Request::MemberAdd { .. }
+                | Request::MemberRemove { .. }
+                | Request::Assign { .. }
+                | Request::IssueNew { .. }
+        ) {
+            return Ok(req);
+        }
+        let dir = self.user_directory();
+        let me = self.my_userid();
+        let resolve = |who: &str| -> std::result::Result<String, Response> {
+            match resolve_user_dir(who, &me, &dir) {
+                UserResolution::One(u) => Ok(u.as_str().to_string()),
+                UserResolution::Zero => Err(Response::err(format!("no user matches '{who}'"))),
+                UserResolution::Many(c) => Err(Response::Candidates {
+                    candidates: user_candidates(&c),
+                }),
+            }
+        };
+        Ok(match req {
+            Request::MemberAdd { who, admin } => Request::MemberAdd {
+                who: resolve(&who)?,
+                admin,
+            },
+            Request::MemberRemove { who } => Request::MemberRemove {
+                who: resolve(&who)?,
+            },
+            Request::Assign { reff, who, add } => {
+                let mut out = Vec::with_capacity(who.len());
+                for w in &who {
+                    out.push(resolve(w)?);
+                }
+                Request::Assign {
+                    reff,
+                    who: out,
+                    add,
+                }
+            }
+            Request::IssueNew {
+                title,
+                project,
+                assignees,
+                priority,
+                labels,
+                body,
+            } => {
+                let mut out = Vec::with_capacity(assignees.len());
+                for a in &assignees {
+                    out.push(resolve(a)?);
+                }
+                Request::IssueNew {
+                    title,
+                    project,
+                    assignees: out,
+                    priority,
+                    labels,
+                    body,
+                }
+            }
+            other => other,
+        })
+    }
+
     /// Dispatch a tracker request against the Loro core, ringing a doorbell for
     /// any resulting dirty-set. The lock is held only for the synchronous handle
     /// (never across an await).
@@ -838,6 +1007,12 @@ impl Node {
     }
 
     async fn dispatch(self: Arc<Self>, req: Request) -> Result<Response> {
+        // Resolve nick / id-prefix user-refs to full keys before the tracker sees
+        // them; a not-found / ambiguous ref short-circuits with its own response.
+        let req = match self.resolve_refs_in(req) {
+            Ok(r) => r,
+            Err(resp) => return Ok(resp),
+        };
         match req {
             // ---- tracker (P0) ----
             Request::IssueNew { .. }
@@ -867,6 +1042,45 @@ impl Node {
                     tokio::spawn(async move { me.broadcast_announce().await.ok() });
                 }
                 Ok(resp)
+            }
+
+            // ---- join-request approval (built on the ACL member ops) ----
+            Request::MemberRequests => Ok(Response::JoinRequests {
+                requests: self.pending_join_requests(),
+            }),
+            Request::MemberApprove { who } => {
+                let pending = self.pending_join_requests();
+                if pending.is_empty() {
+                    return Ok(Response::err("no pending join requests to approve"));
+                }
+                // Resolve strictly against the pending set — approving is scoped to
+                // people who actually asked in.
+                let dir: Vec<KnownUser> = pending
+                    .iter()
+                    .map(|r| KnownUser {
+                        key: UserId::from_key_string(r.key.clone()),
+                        nick: r.nick.clone(),
+                    })
+                    .collect();
+                match resolve_user_dir(who.trim(), &self.my_userid(), &dir) {
+                    UserResolution::One(u) => {
+                        let (resp, changed) = self.dispatch_tracker(Request::MemberAdd {
+                            who: u.as_str().to_string(),
+                            admin: false,
+                        });
+                        if changed {
+                            let me = self.clone();
+                            tokio::spawn(async move { me.broadcast_announce().await.ok() });
+                        }
+                        Ok(resp)
+                    }
+                    UserResolution::Zero => Ok(Response::err(format!(
+                        "no pending join request matches '{who}'"
+                    ))),
+                    UserResolution::Many(c) => Ok(Response::Candidates {
+                        candidates: user_candidates(&c),
+                    }),
+                }
             }
 
             // Subscribe is handled by the streaming path, not here.
@@ -931,33 +1145,26 @@ impl Node {
             Request::SeedAdd { arg } => self.seed_add(arg.trim()).await,
             Request::SeedList => {
                 let seeds = load_seeds(&self.home);
-                if seeds.is_empty() {
-                    return Ok(Response::Text {
-                        text: "(no pinned seeds \u{2014} add one with `lait seed add <ticket>`)"
-                            .to_string(),
-                    });
-                }
                 let presence = self.shared.presence.lock().unwrap();
-                let lines: Vec<String> = seeds
-                    .iter()
+                let seeds: Vec<SeedDto> = seeds
+                    .into_iter()
                     .map(|s| {
-                        let state = match presence.get(&s.id) {
+                        let (state, online) = match presence.get(&s.id) {
                             Some(p) if p.presence.is_online() => {
-                                if p.away {
-                                    "away"
-                                } else {
-                                    "online"
-                                }
+                                (if p.away { "away" } else { "online" }, true)
                             }
-                            _ => "offline",
+                            _ => ("offline", false),
                         };
-                        let nick = if s.nick.is_empty() { "seed" } else { &s.nick };
-                        format!("{}  {:<12}  {}", s.id, nick, state)
+                        SeedDto {
+                            id: s.id.to_string(),
+                            nick: s.nick,
+                            workspace: s.workspace,
+                            state: state.to_string(),
+                            online,
+                        }
                     })
                     .collect();
-                Ok(Response::Text {
-                    text: lines.join("\n"),
-                })
+                Ok(Response::Seeds { seeds })
             }
             Request::SeedRemove { who } => {
                 let n = remove_seed(&self.home, who.trim());

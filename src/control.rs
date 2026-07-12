@@ -20,7 +20,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::dto::{
-    ActivityEvent, BoardView, Candidate, IssueView, LabelDto, MemberDto, ProjectDto, Row,
+    ActivityEvent, BoardView, Candidate, IssueView, JoinRequestDto, LabelDto, MemberDto,
+    ProjectDto, Row, SeedDto,
 };
 
 /// The OS name of the control channel for a home (unix socket / Windows named
@@ -161,6 +162,13 @@ pub enum Request {
     },
     KeyRotate,
     Members,
+    /// List pending join requests (announced joiners not yet members, UI.md §8).
+    MemberRequests,
+    /// Approve a pending join request by nick / id-prefix / key — sugar over
+    /// `MemberAdd` scoped to the pending set.
+    MemberApprove {
+        who: String,
+    },
     /// Streaming doorbells for the TUI (S§7.5). Turns the one-shot handler into a
     /// stream of [`Doorbell`] frames until the client disconnects.
     Subscribe {
@@ -238,6 +246,14 @@ pub enum Response {
     Members {
         members: Vec<MemberDto>,
     },
+    /// Pending join requests (announced joiners not yet members, UI.md §8).
+    JoinRequests {
+        requests: Vec<JoinRequestDto>,
+    },
+    /// Pinned seeds ("remotes") and their reachability (A§10).
+    Seeds {
+        seeds: Vec<SeedDto>,
+    },
     /// A ref resolved to many candidates — a first-class outcome (UI.md §3.2).
     Candidates {
         candidates: Vec<Candidate>,
@@ -310,7 +326,7 @@ pub struct Event {
     pub ts: u64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
     Join,

@@ -463,7 +463,10 @@ grammar**. Where each lands:
 - **P3 — membership UI.** A **members view** over `Catalog.acl` (S§6): roles, add/remove,
   key rotation — read-only until the signed-op grammar lands, then `MemberAdd/Remove`,
   `KeyRotate` (S§7). The ACL is the only signed structure, so this view is the only one
-  showing verified identity.
+  showing verified identity. Join-request approval rides on the same op-graph: `members
+  requests` lists announced joiners (§3.1 `<userref>` resolves them by nick/prefix from the
+  presence directory) and `members approve <userref>` signs the `AddMember` op — the CLI
+  teeth for the "someone asked to join" flow, no id-copying required.
 - **P4 — MCP parity & polish.** The MCP tool set (A§12) is generated from / checked against
   the **same `Response` DTOs** the CLI `--json` emits (S§7.3), so agent and human surfaces
   never drift. TUI polish (themes, resize, wide-table horizontal scroll) is P4.

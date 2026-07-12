@@ -222,14 +222,99 @@ pub fn resolve_project(catalog: &CatalogDoc, input: &str) -> Option<ProjectDto> 
     catalog.project_by_key(input)
 }
 
-/// Resolve a `<userref>`: `@me`, or a full ed25519 key. (Nick resolution is a
-/// P1+ presence-fed feature; at P0 single-node only `@me`/key resolve.)
+/// Resolve a `<userref>`: `@me`, or a full ed25519 key. (Nick/prefix resolution
+/// is presence-fed and lives in [`resolve_user_dir`], which the daemon calls with
+/// a directory it assembles from members + presence + join requests. This 2-arg
+/// form is the directory-free fallback used inside the tracker, where a ref has
+/// already been resolved to `@me`/a full key by the node layer.)
 pub fn resolve_user(input: &str, me: &UserId) -> Option<UserId> {
     let input = input.trim();
     if input == "@me" || input == "me" {
         return Some(me.clone());
     }
     UserId::parse(input)
+}
+
+/// A known identity for user-ref resolution: an ed25519 key plus its advisory
+/// nick (from live presence, a join request, or our own profile). The nick may be
+/// empty when only the key is known — e.g. an ACL member we've never seen online;
+/// such an entry is still resolvable by key or id-prefix, just not by nick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownUser {
+    pub key: UserId,
+    pub nick: String,
+}
+
+/// Outcome of resolving a `<userref>` against the presence-fed directory — the
+/// user-plane twin of [`RefResolution`]. Ambiguity is first-class (UI.md §3.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserResolution {
+    One(UserId),
+    Zero,
+    Many(Vec<KnownUser>),
+}
+
+/// Minimum hex chars accepted as a key id-prefix (short enough to type, long
+/// enough to rarely collide across a workspace's handful of members).
+const USER_PREFIX_MIN: usize = 4;
+
+/// Resolve a `<userref>` (UI.md §3.1) against a directory: `@me`/`me`; a full
+/// 64-hex ed25519 key; an advisory **nick** (case-insensitive, exact); or a
+/// **key id-prefix** (≥ [`USER_PREFIX_MIN`] hex chars). Nick and prefix are
+/// matched against `dir` (members + live presence + recent join requests). A
+/// full key always resolves even when absent from `dir`. Multiple distinct hits
+/// return `Many` so the caller can show a candidate list (UI.md §3.2). Nick is
+/// tried before prefix; the first stage to hit wins.
+pub fn resolve_user_dir(input: &str, me: &UserId, dir: &[KnownUser]) -> UserResolution {
+    let input = input.trim();
+    if input.is_empty() {
+        return UserResolution::Zero;
+    }
+    if input == "@me" || input == "me" {
+        return UserResolution::One(me.clone());
+    }
+    // A full key is unambiguous and resolves without the directory.
+    if let Some(u) = UserId::parse(input) {
+        return UserResolution::One(u);
+    }
+
+    // Exact nick match (case-insensitive), deduped by key.
+    let mut nick_hits: Vec<KnownUser> = Vec::new();
+    for k in dir {
+        if !k.nick.is_empty()
+            && k.nick.eq_ignore_ascii_case(input)
+            && !nick_hits.iter().any(|h| h.key == k.key)
+        {
+            nick_hits.push(k.clone());
+        }
+    }
+    match nick_hits.len() {
+        1 => return UserResolution::One(nick_hits.remove(0).key),
+        n if n > 1 => return UserResolution::Many(nick_hits),
+        _ => {}
+    }
+
+    // Key id-prefix (hex, ≥ USER_PREFIX_MIN chars) against known keys.
+    let lower = input.to_ascii_lowercase();
+    let is_hex_prefix =
+        lower.len() >= USER_PREFIX_MIN && lower.bytes().all(|b| b.is_ascii_hexdigit());
+    if is_hex_prefix {
+        let mut pfx_hits: Vec<KnownUser> = Vec::new();
+        for k in dir {
+            if k.key.as_str().to_ascii_lowercase().starts_with(&lower)
+                && !pfx_hits.iter().any(|h| h.key == k.key)
+            {
+                pfx_hits.push(k.clone());
+            }
+        }
+        match pfx_hits.len() {
+            1 => return UserResolution::One(pfx_hits.remove(0).key),
+            n if n > 1 => return UserResolution::Many(pfx_hits),
+            _ => {}
+        }
+    }
+
+    UserResolution::Zero
 }
 
 /// A `Row`-ready view: whether a row should be hidden by default (done or
@@ -366,5 +451,77 @@ mod tests {
             Some(UserId::from_key_string("b".repeat(64)))
         );
         assert_eq!(resolve_user("nick", &me), None);
+    }
+
+    fn ku(hex: char, nick: &str) -> KnownUser {
+        KnownUser {
+            key: UserId::from_key_string(hex.to_string().repeat(64)),
+            nick: nick.into(),
+        }
+    }
+
+    #[test]
+    fn resolve_user_dir_by_me_and_full_key() {
+        let me = UserId::from_key_string("a".repeat(64));
+        let dir = vec![ku('b', "alice")];
+        assert_eq!(
+            resolve_user_dir("@me", &me, &dir),
+            UserResolution::One(me.clone())
+        );
+        assert_eq!(
+            resolve_user_dir("me", &me, &dir),
+            UserResolution::One(me.clone())
+        );
+        // a full key resolves even when not in the directory
+        let c = UserId::from_key_string("c".repeat(64));
+        assert_eq!(
+            resolve_user_dir(&"c".repeat(64), &me, &dir),
+            UserResolution::One(c)
+        );
+    }
+
+    #[test]
+    fn resolve_user_dir_by_nick_case_insensitive() {
+        let me = UserId::from_key_string("a".repeat(64));
+        let dir = vec![ku('b', "Alice"), ku('c', "bob")];
+        assert_eq!(
+            resolve_user_dir("alice", &me, &dir),
+            UserResolution::One(UserId::from_key_string("b".repeat(64)))
+        );
+        assert_eq!(
+            resolve_user_dir("BOB", &me, &dir),
+            UserResolution::One(UserId::from_key_string("c".repeat(64)))
+        );
+    }
+
+    #[test]
+    fn resolve_user_dir_by_id_prefix() {
+        let me = UserId::from_key_string("a".repeat(64));
+        // one key starts with bbbb, another with cccc
+        let dir = vec![ku('b', ""), ku('c', "carol")];
+        assert_eq!(
+            resolve_user_dir("bbbb", &me, &dir),
+            UserResolution::One(UserId::from_key_string("b".repeat(64)))
+        );
+        // too short (< USER_PREFIX_MIN) is not treated as a prefix
+        assert_eq!(resolve_user_dir("bb", &me, &dir), UserResolution::Zero);
+    }
+
+    #[test]
+    fn resolve_user_dir_ambiguous_nick_is_many() {
+        let me = UserId::from_key_string("a".repeat(64));
+        let dir = vec![ku('b', "sam"), ku('c', "sam")];
+        match resolve_user_dir("sam", &me, &dir) {
+            UserResolution::Many(c) => assert_eq!(c.len(), 2),
+            other => panic!("expected Many, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_user_dir_unknown_is_zero() {
+        let me = UserId::from_key_string("a".repeat(64));
+        let dir = vec![ku('b', "alice")];
+        assert_eq!(resolve_user_dir("nobody", &me, &dir), UserResolution::Zero);
+        assert_eq!(resolve_user_dir("", &me, &dir), UserResolution::Zero);
     }
 }

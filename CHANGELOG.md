@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased — invite & remote ergonomics
+
+- **User-refs resolve by nick and id-prefix.** `<userref>` now accepts a nick or a
+  key id-prefix (≥4 hex) in addition to `@me` / a full 64-hex key, resolved daemon
+  -side against a presence-fed directory (members + live presence + recent join
+  requests). Ambiguity returns a candidate list (UI.md §3.2). This lands the nick
+  resolution UI.md §3.1 / SCHEMA §7 already specified. Applies to `members
+  add/remove`, `assign`, and `new -a`.
+- **Join-request approval.** `lait members requests` lists people who ran
+  `connect`/`join` but aren't members yet (nick + short key); `lait members approve
+  <nick|prefix|key>` seals them the workspace key — no more copying a 64-hex id out
+  of `who --json`. The joiner's short key is now also shown on `lait log` join
+  lines. Both surface as MCP tools (`member_requests`, `member_approve`).
+- **`remote` alias for `seed`.** `lait remote add/ls/rm` is a git-like alias of the
+  seed registry. `seed ls` / `remote ls` now emit a structured DTO (id, nick,
+  workspace, state, online) so `--json` is scriptable.
+- **`lait invite` papercuts.** Clipboard copy now works on Windows (`clip`, with a
+  PowerShell fallback). `--qr` renders a scannable terminal QR of the invite link;
+  `--email <addr>` opens your OS mail client with a prefilled invite (mailto — no
+  SMTP, no credentials).
+
 ## v0.4.1 — native in-place updater
 
 - **Native in-place updater.** `lait update` now self-updates in-process from the

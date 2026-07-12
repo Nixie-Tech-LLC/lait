@@ -278,6 +278,35 @@ pub struct MemberDto {
     pub me: bool,
 }
 
+/// A pending join request: someone who announced a join (via `connect`/`join`)
+/// and is not yet a member. Derived from the presence event log, not persisted —
+/// the request survives only as long as the daemon's event ring (UI.md §8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinRequestDto {
+    /// The requester's ed25519 key (64-hex) — feed straight to `members approve`.
+    pub key: String,
+    /// Advisory display nick they announced.
+    pub nick: String,
+    /// When the request was last seen (unix seconds).
+    pub ts: u64,
+}
+
+/// A pinned seed ("remote") projection for `seed ls` / `remote ls` (A§10). A seed
+/// is a bootstrap + backfill anchor, never a trust authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeedDto {
+    /// The seed's endpoint id (== its ed25519 key, 64-hex).
+    pub id: String,
+    /// Advisory nick (empty when pinned by bare id).
+    pub nick: String,
+    /// The workspace id the seed serves.
+    pub workspace: String,
+    /// "online" | "away" | "offline" from the live presence map.
+    pub state: String,
+    /// Whether the seed is currently reachable.
+    pub online: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -173,13 +173,22 @@ pub enum Command {
     /// Show node and workspace status.
     Status,
     /// Print a base32 ticket others use to join your workspace.
-    Invite,
+    Invite {
+        /// Also render a scannable QR code of the invite link in the terminal.
+        #[arg(long)]
+        qr: bool,
+        /// Open your mail client with a prefilled invite to this address (uses the
+        /// OS default mailto handler; lait sends nothing itself).
+        #[arg(long)]
+        email: Option<String>,
+    },
     /// Join a workspace from a ticket and announce a join request.
     Join { ticket: String },
     /// Manage pinned always-on **seed** peers — the P2P "remote". A seed is a
     /// sticky bootstrap + backfill anchor your node always dials, so you converge
     /// even when no laptop peer is online. It is not a trust authority (genesis/
     /// ACL still gate every op, A§10). Set one up with `daemon --seed` on the box.
+    #[command(visible_alias = "remote")]
     Seed {
         #[command(subcommand)]
         cmd: SeedCmd,
@@ -267,13 +276,21 @@ pub enum SeedCmd {
 pub enum MembersCmd {
     /// Add a member (admin-only). Seals the workspace key to them.
     Add {
-        /// A user ref: @me or a 64-hex ed25519 key.
+        /// A user ref: @me, a nick, a key id-prefix, or a full 64-hex key.
         who: String,
         #[arg(long)]
         admin: bool,
     },
     /// Remove a member (admin-only) and rotate the workspace key.
     Remove {
+        /// A user ref: @me, a nick, a key id-prefix, or a full 64-hex key.
+        who: String,
+    },
+    /// List pending join requests (people who ran `connect`/`join`, not yet added).
+    Requests,
+    /// Approve a pending join request by nick / id-prefix / key (admin-only).
+    Approve {
+        /// A pending requester: a nick, a key id-prefix, or a full key.
         who: String,
     },
     /// Rotate the workspace key (admin-only).
@@ -565,6 +582,12 @@ pub async fn run() -> Result<()> {
             Some(MembersCmd::Remove { who }) => {
                 crate::cli::run(&home, Request::MemberRemove { who }, out).await?
             }
+            Some(MembersCmd::Requests) => {
+                crate::cli::run(&home, Request::MemberRequests, out).await?
+            }
+            Some(MembersCmd::Approve { who }) => {
+                crate::cli::run(&home, Request::MemberApprove { who }, out).await?
+            }
             Some(MembersCmd::RotateKey) => crate::cli::run(&home, Request::KeyRotate, out).await?,
             _ => crate::cli::run(&home, Request::Members, out).await?,
         },
@@ -598,7 +621,7 @@ pub async fn run() -> Result<()> {
             println!("{out}");
         }
         Command::Status => crate::cli::run(&home, Request::Status, out).await?,
-        Command::Invite => crate::cli::run_invite(&home, out).await?,
+        Command::Invite { qr, email } => crate::cli::run_invite(&home, qr, email, out).await?,
         Command::Join { ticket } => crate::cli::run(&home, Request::Join { ticket }, out).await?,
         Command::Seed { cmd } => match cmd {
             SeedCmd::Add { target } => {

@@ -75,6 +75,8 @@ pub const MCP_TOOL_NAMES: &[&str] = &[
     "member_remove",
     "key_rotate",
     "members",
+    "member_requests",
+    "member_approve",
     // transport / presence
     "status",
     "my_id",
@@ -213,6 +215,12 @@ pub struct MemberAddArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MemberRemoveArgs {
+    pub who: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemberApproveArgs {
+    /// A pending requester: a nick, a key id-prefix, or a full 64-hex key.
     pub who: String,
 }
 
@@ -480,6 +488,21 @@ impl LaitMcp {
     #[tool(description = "List workspace members and their roles (from the signed ACL).")]
     async fn members(&self) -> Result<CallToolResult, McpError> {
         self.run(Request::Members).await
+    }
+
+    #[tool(description = "List pending join requests (announced joiners not yet added).")]
+    async fn member_requests(&self) -> Result<CallToolResult, McpError> {
+        self.run(Request::MemberRequests).await
+    }
+
+    #[tool(
+        description = "Approve a pending join request by nick / id-prefix / key (admin-only); seals them the workspace key."
+    )]
+    async fn member_approve(
+        &self,
+        Parameters(a): Parameters<MemberApproveArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::MemberApprove { who: a.who }).await
     }
 
     // ---- transport / presence ----
