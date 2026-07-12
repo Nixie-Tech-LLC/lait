@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — renamed `groupchat` → `lait`
+## v0.4.0 — renamed `groupchat` → `lait`
 
 Project rename. The binary, library, package, MCP server, and all identifiers are
 now `lait`. This is a **clean break** (pre-1.0): env vars are `LAIT_*` (was
