@@ -248,3 +248,171 @@ fn approve_join_request_key_first_and_seed_list_is_structured() {
     drop(a);
     drop(b);
 }
+
+/// End-to-end alias-spoofing defense: a joiner's **self-asserted** nick must never
+/// resolve to their key at any trust boundary — not for `add`, not for `approve`,
+/// and not even after they're a member. Only a **local alias** the admin chooses
+/// resolves, and it stays glued to the authenticated key the admin approved.
+#[test]
+fn self_asserted_nick_never_resolves_only_admin_chosen_alias_does() {
+    let a_home = tmp_home("spoof-a");
+    let b_home = tmp_home("spoof-b");
+    // Give B a distinct, deterministic self-asserted nick "bob" (otherwise A and B
+    // share the same OS-username default nick on one machine). This is exactly the
+    // spoofable wire nick whose resolution we're proving is disabled.
+    std::fs::write(
+        b_home.join("profile.json"),
+        r#"{"nick":"bob","room":"default"}"#,
+    )
+    .unwrap();
+    let a = spawn_daemon(&a_home);
+    let b = spawn_daemon(&b_home);
+
+    // A founds a workspace; B connects, announcing the self-asserted nick "bob".
+    assert!(matches!(
+        req(
+            &a.home,
+            Request::ProjectNew {
+                name: "Engineering".into(),
+                key: "ENG".into(),
+            }
+        ),
+        Response::Ref { .. }
+    ));
+    let ticket = match req(&a.home, Request::Invite) {
+        Response::Text { text } => text.trim().to_string(),
+        other => panic!("A: invite returned {other:?}"),
+    };
+    assert!(
+        matches!(
+            req(&b.home, Request::Connect { ticket }),
+            Response::Ok { .. }
+        ),
+        "B: connect"
+    );
+    let b_id = match req(&b.home, Request::Id) {
+        Response::Text { text } => text.trim().to_string(),
+        other => panic!("B: id returned {other:?}"),
+    };
+
+    // Wait until A sees the pending request carrying the claimed nick "bob".
+    let mut saw = false;
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_secs(1));
+        if let Response::JoinRequests { requests } = req(&a.home, Request::MemberRequests) {
+            if requests.iter().any(|r| r.key == b_id && r.nick == "bob") {
+                saw = true;
+                break;
+            }
+        }
+    }
+    assert!(saw, "A never saw B's claimed-nick join request");
+
+    // SPOOF DEFENSE 1 — the self-asserted nick is not a resolvable ref: neither
+    // `add` nor `approve` by "bob" can select B's key.
+    assert!(
+        matches!(
+            req(
+                &a.home,
+                Request::MemberAdd {
+                    who: "bob".into(),
+                    admin: false,
+                    as_name: None,
+                }
+            ),
+            Response::Error { .. }
+        ),
+        "adding a member by the self-asserted wire nick must be rejected"
+    );
+    assert!(
+        matches!(
+            req(
+                &a.home,
+                Request::MemberApprove {
+                    who: "bob".into(),
+                    as_name: None,
+                }
+            ),
+            Response::Error { .. }
+        ),
+        "approving by the self-asserted wire nick must be rejected"
+    );
+
+    // Approve key-first, but deliberately assign a DIFFERENT local alias ("eve")
+    // than the nick B announced ("bob") — the admin owns the name↔key binding.
+    assert!(
+        matches!(
+            req(
+                &a.home,
+                Request::MemberApprove {
+                    who: b_id.clone(),
+                    as_name: Some("eve".into()),
+                }
+            ),
+            Response::Ok { .. }
+        ),
+        "A: approve B by key with the admin-chosen alias 'eve'"
+    );
+
+    // The member carries the admin-chosen alias, not the claimed nick. (A's ACL
+    // add and the alias write both complete synchronously before `approve`
+    // returns, so A's own view is immediately consistent — no wait needed.)
+    match req(&a.home, Request::Members) {
+        Response::Members { members } => assert!(
+            members
+                .iter()
+                .any(|m| m.key.as_str() == b_id && m.alias == "eve"),
+            "approved member should carry the admin-chosen alias 'eve', not 'bob'"
+        ),
+        other => panic!("A: members returned {other:?}"),
+    }
+
+    // SPOOF DEFENSE 2 — post-approval the split still holds: the admin-chosen alias
+    // resolves to B's key, but the joiner's self-asserted nick still resolves to
+    // nobody. Prove both via `assign` (which runs the same ref resolver).
+    let iss = match req(
+        &a.home,
+        Request::IssueNew {
+            title: "spoof check".into(),
+            project: Some("ENG".into()),
+            assignees: vec![],
+            priority: None,
+            labels: vec![],
+            body: None,
+        },
+    ) {
+        Response::Ref { reff } => reff,
+        other => panic!("A: issue new returned {other:?}"),
+    };
+    assert!(
+        matches!(
+            req(
+                &a.home,
+                Request::Assign {
+                    reff: iss.clone(),
+                    who: vec!["eve".into()],
+                    add: true,
+                }
+            ),
+            Response::Ref { .. }
+        ),
+        "assigning by the admin-chosen alias 'eve' must resolve to B's key"
+    );
+    assert!(
+        matches!(
+            req(
+                &a.home,
+                Request::Assign {
+                    reff: iss,
+                    who: vec!["bob".into()],
+                    add: true,
+                }
+            ),
+            Response::Error { .. }
+        ),
+        "assigning by the self-asserted wire nick 'bob' must be rejected"
+    );
+
+    drop(a);
+    drop(b);
+}

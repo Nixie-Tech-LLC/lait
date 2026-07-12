@@ -528,4 +528,50 @@ mod tests {
         assert_eq!(resolve_user_dir("nobody", &me, &dir), UserResolution::Zero);
         assert_eq!(resolve_user_dir("", &me, &dir), UserResolution::Zero);
     }
+
+    // ---- alias-spoofing defenses ----
+    //
+    // The node builds the directory's `nick` field ONLY from the local alias store;
+    // a self-asserted wire nick reaches the resolver as an empty nick. These tests
+    // pin the resolver contract that makes that safe: a name resolves only when a
+    // *local* alias binds it to a key, so an impersonator's display name can't
+    // stand in for an identity.
+
+    #[test]
+    fn spoofed_name_without_a_local_alias_resolves_to_nobody() {
+        // An impersonator announced nick "alice" but we never aliased their key —
+        // so it arrives with an empty nick and the claimed name resolves to Zero.
+        let me = UserId::from_key_string("a".repeat(64));
+        let impostor = ku('b', ""); // known key, no local alias
+        let dir = vec![impostor];
+        assert_eq!(resolve_user_dir("alice", &me, &dir), UserResolution::Zero);
+    }
+
+    #[test]
+    fn local_alias_binds_a_name_to_the_intended_key_not_a_spoofer() {
+        // We aliased the REAL alice's key -> "alice". A spoofer with a different key
+        // and no alias also sits in the directory. Resolving "alice" must land on
+        // the aliased key, never the spoofer.
+        let me = UserId::from_key_string("a".repeat(64));
+        let real = ku('b', "alice");
+        let spoofer = ku('c', ""); // different key, self-asserted nick was dropped
+        let dir = vec![spoofer, real.clone()];
+        assert_eq!(
+            resolve_user_dir("alice", &me, &dir),
+            UserResolution::One(real.key)
+        );
+    }
+
+    #[test]
+    fn spoofer_reusing_an_existing_alias_forces_disambiguation() {
+        // Defense-in-depth: even if the operator later aliases a SECOND key to the
+        // same name (e.g. tricked into re-using "alice"), resolution returns Many
+        // rather than silently picking one — no wrong-key-by-default.
+        let me = UserId::from_key_string("a".repeat(64));
+        let dir = vec![ku('b', "alice"), ku('c', "alice")];
+        match resolve_user_dir("alice", &me, &dir) {
+            UserResolution::Many(c) => assert_eq!(c.len(), 2),
+            other => panic!("expected Many, got {other:?}"),
+        }
+    }
 }
