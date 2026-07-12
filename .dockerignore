@@ -1,0 +1,20 @@
+# Keep the build context small and the layer cache stable.
+target/
+.git/
+.github/
+.githooks/
+.claude/
+.claude-plugin/
+viewer/
+docs/
+skills/
+hooks/
+ci/
+packaging/
+.lait/
+.groupchat/
+*.md
+!README.md
+Dockerfile
+docker-compose.yml
+.dockerignore

@@ -7,12 +7,42 @@ rust-version = "1.91"
 description = "A local-first, peer-to-peer, end-to-end-encrypted issue tracker built on iroh + Loro CRDTs"
 authors = ["onnixi <omar@onnixi.com>"]
 license = "MIT OR Apache-2.0"
-# Release host (cargo-dist builds/publishes binaries here). Source of record is the homepage.
+# GitHub is the canonical home: source of record, release host, and issue tracker.
 repository = "https://github.com/Nixie-Tech-LLC/lait"
-homepage = "https://gitlab.com/onnixi/lait"
+homepage = "https://github.com/Nixie-Tech-LLC/lait"
 readme = "README.md"
 keywords = ["iroh", "p2p", "gossip", "crdt", "issue-tracker"]
 categories = ["command-line-utilities", "network-programming"]
+# Keep the published crate lean: ship the crate sources, docs, and licenses;
+# drop the web viewer, packaging scaffolding, CI, and editor/agent tooling that
+# only matter in the repo. (`target/` and `.git/` are always excluded by cargo.)
+exclude = [
+    "viewer/",
+    "packaging/",
+    "ci/",
+    "hooks/",
+    "skills/",
+    ".github/",
+    ".githooks/",
+    ".claude/",
+    ".claude-plugin/",
+    "dist-workspace.toml",
+    "Dockerfile",
+    "docker-compose.yml",
+    ".dockerignore",
+]
+
+# `cargo binstall lait` — fetch the prebuilt cargo-dist release archive from
+# GitHub instead of compiling. The URL/layout below matches what cargo-dist
+# publishes: `lait-<target>.tar.gz` (unix) / `.zip` (windows), a FLAT archive
+# with the binary at its root (verified against `dist build` output).
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.{ archive-format }"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
 
 [lib]
 name = "lait"
@@ -54,6 +84,11 @@ n0-future = "0.3"
 
 # cli
 clap = { version = "4", features = ["derive"] }
+# `lait completions <shell>` and `lait man` — generated at runtime from the same
+# clap command tree, so packagers (Homebrew/Scoop/etc.) can emit shell
+# completions and a man page during install with no separate spec to drift.
+clap_complete = "4"
+clap_mangen = "0.2"
 
 # serialization: serde_json for state/control protocol, postcard for wire messages
 serde = { version = "1", features = ["derive"] }

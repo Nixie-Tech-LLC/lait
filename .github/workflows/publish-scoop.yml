@@ -1,0 +1,89 @@
+# CD: stamp the Scoop manifest with a published release's version + SHA256 and
+# push it to the org Scoop bucket (github.com/Nixie-Tech-LLC/scoop-bucket), so
+# `scoop install lait` picks up the new version.
+#
+# Homebrew is handled by cargo-dist in release.yml; this covers the Windows
+# Scoop path. Needs a `SCOOP_BUCKET_TOKEN` secret (a PAT with contents:write on
+# the bucket repo). Without it the job soft-skips, so it never blocks a release.
+name: Publish Scoop manifest
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.4.1)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  scoop:
+    name: update scoop-bucket
+    runs-on: ubuntu-latest
+    env:
+      BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag + version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.release.tag_name || inputs.tag }}"
+          [ -n "$tag" ] || { echo "::error::no release tag available"; exit 1; }
+          echo "tag=$tag"           >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}"   >> "$GITHUB_OUTPUT"
+
+      - name: Fetch the Windows zip SHA256 from the release
+        id: hash
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          asset="lait-x86_64-pc-windows-msvc.zip.sha256"
+          gh release download "${{ steps.ver.outputs.tag }}" \
+            --repo "${{ github.repository }}" --pattern "$asset" --output sha.txt
+          hash=$(awk 'NR==1{print $1}' sha.txt)
+          [ -n "$hash" ] || { echo "::error::empty SHA256 for $asset"; exit 1; }
+          echo "sha256=$hash" >> "$GITHUB_OUTPUT"
+
+      - name: Stamp packaging/scoop/lait.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=packaging/scoop/lait.json
+          v="${{ steps.ver.outputs.version }}"; h="${{ steps.hash.outputs.sha256 }}"
+          tmp=$(mktemp)
+          jq --arg v "$v" --arg h "$h" '
+            .version = $v
+            | .architecture."64bit".url = "https://github.com/Nixie-Tech-LLC/lait/releases/download/v\($v)/lait-x86_64-pc-windows-msvc.zip"
+            | .architecture."64bit".hash = $h
+          ' "$f" > "$tmp" && mv "$tmp" "$f"
+          jq empty "$f" && cat "$f"
+
+      - name: Push to scoop-bucket
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${BUCKET_TOKEN:-}" ]; then
+            echo "::notice::SCOOP_BUCKET_TOKEN not set — skipping Scoop publish."
+            exit 0
+          fi
+          git clone --depth 1 \
+            "https://x-access-token:${BUCKET_TOKEN}@github.com/Nixie-Tech-LLC/scoop-bucket" bucket
+          mkdir -p bucket/bucket
+          cp packaging/scoop/lait.json bucket/bucket/lait.json
+          cd bucket
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bucket/lait.json
+          if git diff --cached --quiet; then
+            echo "manifest already up to date"; exit 0
+          fi
+          git commit -m "lait ${{ steps.ver.outputs.version }}"
+          git push

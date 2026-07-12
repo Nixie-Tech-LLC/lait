@@ -177,3 +177,54 @@ jobs:
           # regress back out of the release matrix.
           grep -q 'x86_64-pc-windows-msvc' plan.json \
             || { echo "::error::Windows target missing from dist plan"; exit 1; }
+
+  # Packaging manifests (Scoop + winget) are hand-maintained templates that the
+  # release CD (publish-scoop / publish-winget) stamps with each release's real
+  # version + hash. CI can't check the version/hash (they don't exist until a
+  # release builds them), so it gates *structure* only: the manifests must parse
+  # and carry the identifiers/URLs the CD relies on, so a typo can't reach main
+  # and silently break a publish job weeks later at release time.
+  packaging:
+    name: packaging manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Scoop manifest (JSON + required keys)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=packaging/scoop/lait.json
+          jq empty "$f"
+          # Required fields the bucket + autoupdate rely on.
+          for path in '.version' '.architecture."64bit".url' '.architecture."64bit".bin' \
+                      '.checkver' '.autoupdate.architecture."64bit".url' '.autoupdate.hash.url'; do
+            v=$(jq -er "$path" "$f") \
+              || { echo "::error file=$f::missing Scoop field $path"; exit 1; }
+          done
+          # The download host must be the canonical GitHub release path.
+          jq -er '.architecture."64bit".url' "$f" | grep -q 'github.com/Nixie-Tech-LLC/lait/releases' \
+            || { echo "::error file=$f::Scoop url is not a Nixie-Tech-LLC/lait GitHub release"; exit 1; }
+          echo "Scoop manifest OK"
+
+      - name: Validate winget manifests (YAML + cross-file identifier)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet "PyYAML>=6"
+          python3 - <<'PY'
+          import glob, sys, yaml
+          files = sorted(glob.glob("packaging/winget/*.yaml"))
+          assert files, "no winget manifests found"
+          ids, types = set(), set()
+          for f in files:
+              doc = yaml.safe_load(open(f, encoding="utf-8"))
+              assert doc.get("PackageIdentifier"), f"{f}: missing PackageIdentifier"
+              assert doc.get("PackageVersion"), f"{f}: missing PackageVersion"
+              ids.add(doc["PackageIdentifier"])
+              types.add(doc.get("ManifestType"))
+          assert len(ids) == 1, f"PackageIdentifier differs across manifests: {ids}"
+          for req in ("version", "installer", "defaultLocale"):
+              assert req in types, f"missing a '{req}' manifest (have {types})"
+          print(f"winget manifests OK — {sorted(ids)[0]}, {len(files)} files")
+          PY

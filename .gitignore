@@ -1,1 +1,10 @@
 target
+
+# Local node state (per-repo workspace stores) — never commit.
+.lait/
+.groupchat/
+
+# Web viewer (Vite) build + deps
+viewer/node_modules/
+viewer/dist/
+*.tsbuildinfo

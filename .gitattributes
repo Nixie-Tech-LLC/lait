@@ -2,3 +2,5 @@
 # on macOS/Linux (and Git for Windows runs hooks through sh).
 .githooks/** text eol=lf
 *.sh text eol=lf
+# The Dockerfile is run on Linux; a CRLF can break RUN lines / shebangs.
+Dockerfile text eol=lf

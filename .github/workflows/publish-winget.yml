@@ -1,0 +1,47 @@
+# CD: submit lait to the winget community repo (microsoft/winget-pkgs) on each
+# published release. Uses winget-releaser, which builds the manifest from the
+# release's Windows zip and opens the PR for you.
+#
+# Needs a `WINGET_TOKEN` secret: a classic PAT with `public_repo` scope, from an
+# account that has forked microsoft/winget-pkgs. Without it the job soft-skips,
+# so a missing secret never blocks a release.
+name: Publish to winget
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.4.1)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  winget:
+    name: submit to winget-pkgs
+    runs-on: ubuntu-latest
+    env:
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    steps:
+      - name: Gate on token
+        id: gate
+        shell: bash
+        run: |
+          if [ -n "${WINGET_TOKEN:-}" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::WINGET_TOKEN not set — skipping winget submission."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Submit manifest
+        if: steps.gate.outputs.ok == 'true'
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: NixieTechLLC.Lait
+          release-tag: ${{ github.event.release.tag_name || inputs.tag }}
+          installers-regex: 'x86_64-pc-windows-msvc\.zip$'
+          token: ${{ secrets.WINGET_TOKEN }}

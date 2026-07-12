@@ -96,18 +96,38 @@ bypass with `git push --no-verify`):
 git config core.hooksPath .githooks
 ```
 
-## Install (prebuilt, macOS/Linux)
+## Install
 
-`lait` is a single self-contained binary. Every tag is built for macOS
-(arm64 + x86) and Linux (arm64 + x86) and published as a GitHub Release.
+`lait` is a single self-contained binary, built for **macOS, Linux, and Windows**
+(arm64 + x86_64) and published as a GitHub Release on every tag. Pick a channel —
+they all land the same `lait`. Full matrix + verification in
+[`docs/INSTALL.md`](docs/INSTALL.md).
 
 ```bash
+# macOS / Linux — shell installer (places lait in ~/.cargo/bin)
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Nixie-Tech-LLC/lait/releases/latest/download/lait-installer.sh | sh
+
+# Homebrew (macOS / Linux)
+brew install nixie-tech-llc/tap/lait
+
+# prebuilt binary via Cargo, no compile
+cargo binstall lait
+
+# from source (Rust 1.91+)
+cargo install lait --locked
 ```
 
-The installer places `lait` in `~/.cargo/bin`. Upgrade in place with
-`lait update` — a native self-updater that pulls the latest release and
-swaps the binary (stopping a running daemon first).
+```powershell
+# Windows — PowerShell installer
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/Nixie-Tech-LLC/lait/releases/latest/download/lait-installer.ps1 | iex"
+# …or:  scoop install lait   ·   winget install NixieTechLLC.Lait
+```
+
+Upgrade any install in place with `lait update` — a native self-updater that pulls
+the latest release and swaps the binary (stopping a running daemon first). Shell
+completions and a man page come from the binary itself
+(`lait completions <shell>`, `lait man`). For an always-on **seed node**, see the
+[Docker setup](docker-compose.yml).
 
 ## Quickstart (the tracker)
 

@@ -7,8 +7,8 @@
     "name": "onnixi",
     "email": "omar@onnixi.com"
   },
-  "homepage": "https://gitlab.com/onnixi/lait",
-  "repository": "https://github.com/ItsOhmar/lait",
+  "homepage": "https://github.com/Nixie-Tech-LLC/lait",
+  "repository": "https://github.com/Nixie-Tech-LLC/lait",
   "license": "MIT OR Apache-2.0",
   "keywords": ["mcp", "p2p", "iroh", "gossip", "issue-tracker"],
   "mcpServers": {

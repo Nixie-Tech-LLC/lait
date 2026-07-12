@@ -9,8 +9,15 @@ cargo-dist-version = "0.32.0"
 ci = "github"
 # The installers to generate for each app. `shell` for unix, `powershell` for
 # Windows (now that the control channel is a portable named pipe, not a Unix
-# socket). install.sh / install.ps1 + the self-updater cover upgrades.
-installers = ["shell", "powershell"]
+# socket), and `homebrew` (formula pushed to the tap below) for the standard
+# macOS/Linux path. install.sh / install.ps1 + the self-updater cover upgrades.
+installers = ["shell", "powershell", "homebrew"]
+# Homebrew tap the generated formula is published to: `brew install
+# nixie-tech-llc/tap/lait`. The tap is a separate GitHub repo (github.com/
+# Nixie-Tech-LLC/homebrew-tap); releasing needs a token with write access to it
+# exposed to CI as the `HOMEBREW_TAP_TOKEN` secret.
+tap = "Nixie-Tech-LLC/homebrew-tap"
+publish-jobs = ["homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax). Windows is
 # now included: the daemon's control channel is a cross-platform local IPC
 # channel (named pipe on Windows via `interprocess`), and the single-instance

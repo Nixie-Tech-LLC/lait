@@ -9,7 +9,8 @@
 //! row (S§7.1).
 
 use anyhow::{anyhow, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 
 use crate::{
     cli::Out,
@@ -223,6 +224,14 @@ pub enum Command {
     Update,
     /// Stop the running daemon.
     Stop,
+    /// Print shell completions to stdout for the given shell (bash, zsh, fish,
+    /// powershell, elvish). E.g. `lait completions bash > ~/.local/share/bash-completion/completions/lait`.
+    Completions {
+        #[arg(value_enum)]
+        shell: Shell,
+    },
+    /// Render the lait(1) man page (roff) to stdout.
+    Man,
 }
 
 #[derive(Subcommand, Debug)]
@@ -365,6 +374,22 @@ pub async fn run() -> Result<()> {
         json: args.json,
         color: !args.no_color,
     };
+
+    // Stateless commands that need neither an identity nor a workspace store:
+    // emit generated shell completions / a man page and exit.
+    match &args.command {
+        Command::Completions { shell } => {
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            generate(*shell, &mut cmd, name, &mut std::io::stdout());
+            return Ok(());
+        }
+        Command::Man => {
+            clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
+            return Ok(());
+        }
+        _ => {}
+    }
 
     // Registry-level commands that operate across identities.
     match &args.command {
@@ -626,7 +651,11 @@ pub async fn run() -> Result<()> {
             timeout_ms,
         } => crate::cli::watch(&home, since, exec, notify, timeout_ms).await?,
         Command::Who => crate::cli::run(&home, Request::Who, out).await?,
-        Command::Agents | Command::Resume { .. } | Command::Update => {
+        Command::Agents
+        | Command::Resume { .. }
+        | Command::Update
+        | Command::Completions { .. }
+        | Command::Man => {
             unreachable!("handled before resolution")
         }
         Command::Stop => crate::cli::run(&home, Request::Stop, out).await?,
