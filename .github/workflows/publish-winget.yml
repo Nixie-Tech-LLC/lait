@@ -60,4 +60,7 @@ jobs:
           identifier: NixieTechLLC.Lait
           release-tag: ${{ steps.gate.outputs.tag }}
           installers-regex: 'x86_64-pc-windows-msvc\.zip$'
+          # The fork + WINGET_TOKEN live under omarbinyounes, not the repo org, so
+          # override the default fork-user (which is the repository owner).
+          fork-user: omarbinyounes
           token: ${{ secrets.WINGET_TOKEN }}
