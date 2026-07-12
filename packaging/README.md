@@ -71,14 +71,18 @@ uppercased contents of the `.zip.sha256`).
 
 `Cargo.toml` metadata is publish-ready (`description`, `license`, `repository`,
 `homepage`, `readme`, `keywords`, `categories`, and an `exclude` that drops the
-viewer/CI/tooling from the crate). To publish:
+viewer/CI/tooling from the crate). Publishing is automated by `publish-crates.yml`
+(same `workflow_run` trigger as the others): on each release it checks out the
+tagged commit and runs `cargo publish --locked`, soft-skipping without
+`CARGO_REGISTRY_TOKEN`. Publishing also gives docs.rs API docs for free.
+
+The **first** publish claims the `lait` name, so the token must carry the
+`publish-new` scope (later versions only need `publish-update`). To publish by hand:
 
 ```sh
 cargo publish --locked --dry-run   # verify the package
 cargo publish --locked             # needs a crates.io token
 ```
-
-Publishing also gives docs.rs API docs for free.
 
 ## CI / CD
 
@@ -86,8 +90,9 @@ Publishing also gives docs.rs API docs for free.
   *structurally* on every PR — JSON/YAML parse, required fields, canonical URLs,
   and a single consistent winget identifier. It deliberately does **not** check
   the version/hash (those don't exist until a release builds them).
-- **CD** is fully automatic: the three publishers trigger on the **Release workflow
-  completing** (`on: workflow_run: workflows: ["Release"]`). That fires even though
+- **CD** is fully automatic: the four publishers (Homebrew, Scoop, winget,
+  crates.io) trigger on the **Release workflow completing**
+  (`on: workflow_run: workflows: ["Release"]`). That fires even though
   cargo-dist creates the GitHub Release with the default `GITHUB_TOKEN` — a
   `release:` trigger would be suppressed in that case, which is why they don't use
   one. By the time Release completes, the release + assets already exist (created in
@@ -100,6 +105,8 @@ Publishing also gives docs.rs API docs for free.
     pushes it to `scoop-bucket/bucket/lait.json`.
   - winget — `publish-winget.yml` submits to `microsoft/winget-pkgs` via
     `winget-releaser`.
+  - crates.io — `publish-crates.yml` checks out the tagged commit and runs
+    `cargo publish --locked` (also yields docs.rs).
   - Each job **soft-skips** if its credentials are unset, so a release never goes
     red before they are configured. Each also keeps a `workflow_dispatch`
     (`-f tag=vX.Y.Z`) for manual re-runs.
@@ -116,6 +123,7 @@ stored once as repo secrets:
 | `RUNNERS_APP_ID` | `publish-homebrew.yml`, `publish-scoop.yml` | the `integration-runners` GitHub App id (from OpenBao `secret/github-app-arc`) |
 | `RUNNERS_APP_PRIVATE_KEY` | same | that app's PEM private key |
 | `WINGET_TOKEN` | `publish-winget.yml` | classic PAT with `public_repo`, from an account that forked `microsoft/winget-pkgs` (winget can't use the org app — it needs a user-namespace fork) |
+| `CARGO_REGISTRY_TOKEN` | `publish-crates.yml` | crates.io API token; `publish-new` scope for the first publish, then `publish-update` |
 
 The `integration-runners` app needs **`contents: write`** on the org for the tap /
 bucket pushes (in addition to its runner permissions).

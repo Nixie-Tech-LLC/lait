@@ -1,0 +1,64 @@
+# CD: publish the crate to crates.io (which also gives docs.rs API docs) so
+# `cargo install lait` works.
+#
+# Triggered on the **Release** workflow completing (`workflow_run`), like the other
+# publishers, and checks out the exact commit that release built from. Soft-skips
+# if `CARGO_REGISTRY_TOKEN` is unset. `cargo publish` is idempotent-ish: it errors
+# if the version already exists, so re-running a published version is a no-op-ish
+# failure, not a double publish.
+#
+# Note: the *first* publish claims the `lait` name and needs the token to carry the
+# `publish-new` scope (later versions only need `publish-update`).
+name: Publish to crates.io
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag or commit to publish (e.g. v0.4.4)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  crates:
+    name: cargo publish
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - name: Gate on token + resolve ref
+        id: gate
+        env:
+          DISPATCH_REF: ${{ github.event.inputs.ref }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ref=${DISPATCH_REF:-$RUN_SHA}" >> "$GITHUB_OUTPUT"
+          if [ -n "${CARGO_REGISTRY_TOKEN:-}" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"
+          else echo "::notice::CARGO_REGISTRY_TOKEN not set — skipping crates.io publish."; echo "ok=false" >> "$GITHUB_OUTPUT"; fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.ok == 'true'
+        with:
+          ref: ${{ steps.gate.outputs.ref }}
+          persist-credentials: false
+
+      - name: Install Rust (MSRV 1.91, matching rust-toolchain.toml)
+        if: steps.gate.outputs.ok == 'true'
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91"
+
+      - name: cargo publish
+        if: steps.gate.outputs.ok == 'true'
+        run: cargo publish --locked
