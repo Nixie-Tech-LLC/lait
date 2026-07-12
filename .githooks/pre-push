@@ -1,0 +1,25 @@
+#!/bin/sh
+# Pre-push guard: run the same formatting check CI enforces, so a `cargo fmt`
+# reflow never reaches CI (and never blocks a merge after the fact). This is the
+# cheap, deterministic half of the CI gate; the full build/clippy/test matrix
+# still runs in CI. Enable once per clone with:
+#
+#     git config core.hooksPath .githooks
+#
+# Bypass a single push (e.g. a docs-only branch on a machine without cargo) with:
+#
+#     git push --no-verify
+
+# No Rust toolchain present (docs-only checkout, CI image, etc.) — don't block.
+if ! command -v cargo >/dev/null 2>&1; then
+    exit 0
+fi
+
+echo "pre-push: cargo fmt --all --check"
+if ! cargo fmt --all --check; then
+    echo >&2
+    echo "pre-push: formatting check FAILED." >&2
+    echo "pre-push: run 'cargo fmt --all', re-commit, and push again." >&2
+    echo "pre-push: (bypass with 'git push --no-verify')" >&2
+    exit 1
+fi
