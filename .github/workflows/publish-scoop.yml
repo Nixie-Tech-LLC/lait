@@ -1,6 +1,11 @@
-# CD: stamp the Scoop manifest with a published release's version + SHA256 and
-# push it to the org Scoop bucket (github.com/Nixie-Tech-LLC/scoop-bucket), so
-# `scoop install lait` picks up the new version.
+# CD: stamp the Scoop manifest with a released version + SHA256 and push it to the
+# org Scoop bucket (github.com/Nixie-Tech-LLC/scoop-bucket), so `scoop install lait`
+# picks up the new version.
+#
+# Wired as a cargo-dist *custom publish job* (`publish-jobs = ["./publish-scoop"]`):
+# the release run calls this via `workflow_call` after hosting, passing the `plan`
+# (which carries the tag) with `secrets: inherit`. `workflow_dispatch` is kept for
+# manual re-runs.
 #
 # Auth is a short-lived token minted from the org GitHub App (integration-runners)
 # scoped to just scoop-bucket — no long-lived PAT. App creds live in the repo
@@ -8,12 +13,15 @@
 name: Publish Scoop manifest
 
 on:
-  release:
-    types: [published]
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish (e.g. v0.4.2)"
+        description: "Release tag to publish (e.g. v0.4.3)"
         required: true
 
 permissions:
@@ -25,26 +33,25 @@ jobs:
     runs-on: ubuntu-latest
     env:
       APP_ID: ${{ secrets.RUNNERS_APP_ID }}
+      PLAN: ${{ inputs.plan }}
+      DISPATCH_TAG: ${{ inputs.tag }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Gate on app credentials
+      - name: Resolve tag + gate on app credentials
         id: gate
         shell: bash
         run: |
-          if [ -n "${APP_ID:-}" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"
-          else echo "::notice::RUNNERS_APP_ID not set — skipping Scoop publish."; echo "ok=false" >> "$GITHUB_OUTPUT"; fi
-
-      - name: Resolve tag + version
-        id: ver
-        if: steps.gate.outputs.ok == 'true'
-        shell: bash
-        run: |
           set -euo pipefail
-          tag="${{ github.event.release.tag_name || inputs.tag }}"
-          [ -n "$tag" ] || { echo "::error::no release tag available"; exit 1; }
+          tag="${DISPATCH_TAG:-}"
+          if [ -z "$tag" ] && [ -n "${PLAN:-}" ]; then
+            tag="$(printf '%s' "$PLAN" | jq -r '.announcement_tag // empty')"
+          fi
+          [ -n "$tag" ] || { echo "::error::no tag from dispatch input or plan"; exit 1; }
           echo "tag=$tag"         >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          if [ -n "${APP_ID:-}" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"
+          else echo "::notice::RUNNERS_APP_ID not set — skipping Scoop publish."; echo "ok=false" >> "$GITHUB_OUTPUT"; fi
 
       - name: Fetch the Windows zip SHA256 from the release
         id: hash
@@ -52,11 +59,11 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.gate.outputs.tag }}
         run: |
           set -euo pipefail
           asset="lait-x86_64-pc-windows-msvc.zip.sha256"
-          gh release download "${{ steps.ver.outputs.tag }}" \
-            --repo "${{ github.repository }}" --pattern "$asset" --output sha.txt
+          gh release download "$TAG" --repo "${{ github.repository }}" --pattern "$asset" --output sha.txt
           hash=$(awk 'NR==1{print $1}' sha.txt)
           [ -n "$hash" ] || { echo "::error::empty SHA256 for $asset"; exit 1; }
           echo "sha256=$hash" >> "$GITHUB_OUTPUT"
@@ -67,7 +74,7 @@ jobs:
         run: |
           set -euo pipefail
           f=packaging/scoop/lait.json
-          v="${{ steps.ver.outputs.version }}"; h="${{ steps.hash.outputs.sha256 }}"
+          v="${{ steps.gate.outputs.version }}"; h="${{ steps.hash.outputs.sha256 }}"
           tmp=$(mktemp)
           jq --arg v "$v" --arg h "$h" '
             .version = $v
@@ -90,6 +97,7 @@ jobs:
         if: steps.gate.outputs.ok == 'true'
         env:
           BUCKET_TOKEN: ${{ steps.token.outputs.token }}
+          VERSION: ${{ steps.gate.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -102,5 +110,5 @@ jobs:
           git config user.email "integration-runners[bot]@users.noreply.github.com"
           git add bucket/lait.json
           if git diff --cached --quiet; then echo "manifest already up to date"; exit 0; fi
-          git commit -m "lait ${{ steps.ver.outputs.version }}"
+          git commit -m "lait $VERSION"
           git push

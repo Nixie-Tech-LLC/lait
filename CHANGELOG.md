@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.4.3 — fully automatic release publishing
+
+- **One release run publishes everywhere.** The Homebrew, Scoop, and winget
+  publishers are now cargo-dist **custom publish jobs** (`publish-jobs` →
+  reusable `workflow_call` workflows), invoked by the release run itself after it
+  hosts the release. No more manual `workflow_dispatch` after each tag — pushing a
+  version tag builds, releases, and pushes to the tap + bucket end to end. Each job
+  still mints its own short-lived token from the org GitHub App and soft-skips if
+  its credentials are absent.
+
 ## v0.4.2 — distribution: one command on every platform
 
 - **GitHub is the canonical home.** Removed the GitLab CI + `homepage` split-brain

@@ -18,6 +18,12 @@ installers = ["shell", "powershell", "homebrew"]
 # Homebrew tap the formula targets: `brew install nixie-tech-llc/tap/lait`
 # (github.com/Nixie-Tech-LLC/homebrew-tap).
 tap = "Nixie-Tech-LLC/homebrew-tap"
+# Custom publish jobs (local reusable workflows). The release run invokes each via
+# `workflow_call` after it hosts the release, passing the `plan` + `secrets:
+# inherit` — so Homebrew/Scoop/winget publish automatically, no manual dispatch.
+# Each mints its own short-lived token (app token for tap/bucket; PAT for winget)
+# and soft-skips if its credentials are absent.
+publish-jobs = ["./publish-homebrew", "./publish-scoop", "./publish-winget"]
 # Target platforms to build apps for (Rust target-triple syntax). Windows is
 # now included: the daemon's control channel is a cross-platform local IPC
 # channel (named pipe on Windows via `interprocess`), and the single-instance

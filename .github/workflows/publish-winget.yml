@@ -1,19 +1,26 @@
 # CD: submit lait to the winget community repo (microsoft/winget-pkgs) on each
-# published release. Uses winget-releaser, which builds the manifest from the
-# release's Windows zip and opens the PR for you.
+# release. Uses winget-releaser, which builds the manifest from the release's
+# Windows zip and opens the PR.
 #
-# Needs a `WINGET_TOKEN` secret: a classic PAT with `public_repo` scope, from an
-# account that has forked microsoft/winget-pkgs. Without it the job soft-skips,
-# so a missing secret never blocks a release.
+# Wired as a cargo-dist *custom publish job* (`publish-jobs = ["./publish-winget"]`):
+# the release run calls this via `workflow_call` after hosting, passing the `plan`
+# (which carries the tag). `workflow_dispatch` is kept for manual re-runs.
+#
+# Needs a `WINGET_TOKEN` secret: a classic PAT with `public_repo`, from an account
+# that has forked microsoft/winget-pkgs (the org GitHub App can't provide a
+# user-namespace fork). Without it the job soft-skips, so it never blocks a release.
 name: Publish to winget
 
 on:
-  release:
-    types: [published]
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish (e.g. v0.4.1)"
+        description: "Release tag to publish (e.g. v0.4.3)"
         required: true
 
 permissions:
@@ -25,23 +32,28 @@ jobs:
     runs-on: ubuntu-latest
     env:
       WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+      PLAN: ${{ inputs.plan }}
+      DISPATCH_TAG: ${{ inputs.tag }}
     steps:
-      - name: Gate on token
+      - name: Resolve tag + gate on token
         id: gate
         shell: bash
         run: |
-          if [ -n "${WINGET_TOKEN:-}" ]; then
-            echo "ok=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::WINGET_TOKEN not set — skipping winget submission."
-            echo "ok=false" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          tag="${DISPATCH_TAG:-}"
+          if [ -z "$tag" ] && [ -n "${PLAN:-}" ]; then
+            tag="$(printf '%s' "$PLAN" | jq -r '.announcement_tag // empty')"
           fi
+          [ -n "$tag" ] || { echo "::error::no tag from dispatch input or plan"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ -n "${WINGET_TOKEN:-}" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"
+          else echo "::notice::WINGET_TOKEN not set — skipping winget submission."; echo "ok=false" >> "$GITHUB_OUTPUT"; fi
 
       - name: Submit manifest
         if: steps.gate.outputs.ok == 'true'
         uses: vedantmgoyal9/winget-releaser@v2
         with:
           identifier: NixieTechLLC.Lait
-          release-tag: ${{ github.event.release.tag_name || inputs.tag }}
+          release-tag: ${{ steps.gate.outputs.tag }}
           installers-regex: 'x86_64-pc-windows-msvc\.zip$'
           token: ${{ secrets.WINGET_TOKEN }}

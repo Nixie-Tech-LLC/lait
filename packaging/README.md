@@ -86,15 +86,21 @@ Publishing also gives docs.rs API docs for free.
   *structurally* on every PR — JSON/YAML parse, required fields, canonical URLs,
   and a single consistent winget identifier. It deliberately does **not** check
   the version/hash (those don't exist until a release builds them).
-- **CD** runs on `release: published`:
-  - Homebrew — `publish-homebrew.yml` downloads the cargo-dist-generated `lait.rb`
-    release asset and commits it to `homebrew-tap/Formula/lait.rb`.
-  - Scoop — `publish-scoop.yml` stamps `lait.json` with the release version +
-    SHA256 and pushes it to `scoop-bucket/bucket/lait.json`.
+- **CD** is fully automatic: the three publishers are cargo-dist **custom publish
+  jobs** (`publish-jobs = ["./publish-homebrew", "./publish-scoop",
+  "./publish-winget"]` in `dist-workspace.toml`). The release run invokes each as a
+  reusable `workflow_call` after it hosts the release, passing the cargo-dist `plan`
+  (which carries the tag) with `secrets: inherit` — so pushing a version tag builds,
+  releases, and publishes end to end, in one run, with no manual dispatch.
+  - Homebrew — `publish-homebrew.yml` downloads the `lait.rb` release asset and
+    commits it to `homebrew-tap/Formula/lait.rb`.
+  - Scoop — `publish-scoop.yml` stamps `lait.json` with the version + SHA256 and
+    pushes it to `scoop-bucket/bucket/lait.json`.
   - winget — `publish-winget.yml` submits to `microsoft/winget-pkgs` via
     `winget-releaser`.
-  - Each CD job **soft-skips** if its credentials are unset, so a release never
-    goes red before they are configured.
+  - Each job **soft-skips** if its credentials are unset, so a release never goes
+    red before they are configured. Each also keeps a `workflow_dispatch`
+    (`-f tag=vX.Y.Z`) for manual re-runs.
 
 ### Auth model
 
