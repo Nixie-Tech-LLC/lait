@@ -1,0 +1,13 @@
+# nextest runs test binaries in parallel — the main lever for the multi-node
+# integration suite, which `cargo test` ran serially. This config keeps that fast
+# path reliable.
+[profile.default]
+# The multi-node tests do real P2P over iroh; a relay/discovery hiccup can fail a
+# run that a retry clears. One retry trades a little time on a rare flake for a
+# stable pipeline (a test that fails deterministically still fails).
+retries = 1
+
+# Surface a wedged test (e.g. a daemon that never bound its control channel)
+# instead of hanging the job: warn at 30s, terminate after 3 periods (90s). The
+# slowest real test is ~8s, so this is a wide margin, not a tuning knob.
+slow-timeout = { period = "30s", terminate-after = 3 }

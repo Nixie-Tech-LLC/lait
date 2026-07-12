@@ -42,6 +42,12 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 
+      # nextest runs test binaries in PARALLEL; `cargo test` runs them serially, so
+      # the multi-node integration suite paid the sum of per-binary times. Prebuilt
+      # binary install — no compile cost.
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Format check
         run: cargo fmt --all --check
 
@@ -53,11 +59,13 @@ jobs:
       - name: Build
         run: cargo build --locked --all-targets
 
+      # nextest parallelizes across test binaries (the `Build` step above already
+      # compiled `--all-targets`, so examples/bins are covered there).
       - name: Test
-        run: cargo test --locked --all-targets
+        run: cargo nextest run --locked
 
-      # `--all-targets` skips doctests; run them explicitly so documented
-      # examples (and the DTO/parity doc examples) can't rot.
+      # nextest does not run doctests; run them explicitly so documented examples
+      # (and the DTO/parity doc examples) can't rot.
       - name: Doctests
         run: cargo test --locked --doc
 
