@@ -1,6 +1,17 @@
 # nextest runs test binaries in parallel — the main lever for the multi-node
 # integration suite, which `cargo test` ran serially. This config keeps that fast
-# path reliable.
+# path both quick and reliable.
+
+# Bound how many network-heavy tests run at once. Each integration test spawns
+# real daemons doing P2P over iroh (endpoint + relay); nextest otherwise scales
+# concurrency to num-cpus, so on a high-core SELF-HOSTED runner it would fire many
+# at once — dozens of daemons hammering the relay — trading speed for flakiness.
+# Capping at a fixed, core-independent number keeps contention sane. The suite's
+# long pole is a single ~8s test, so this barely costs wall-clock; raise it if the
+# integration suite grows and the runners can take the load.
+[test-groups]
+network = { max-threads = 4 }
+
 [profile.default]
 # The multi-node tests do real P2P over iroh; a relay/discovery hiccup can fail a
 # run that a retry clears. One retry trades a little time on a rare flake for a
@@ -11,3 +22,10 @@ retries = 1
 # instead of hanging the job: warn at 30s, terminate after 3 periods (90s). The
 # slowest real test is ~8s, so this is a wide margin, not a tuning knob.
 slow-timeout = { period = "30s", terminate-after = 3 }
+
+# All integration tests (the `tests/` dir, target kind `test`) spawn daemons, so
+# cap their concurrency via the `network` group; the lib/unit tests are CPU-bound
+# and stay unbounded. New integration tests join the cap automatically.
+[[profile.default.overrides]]
+filter = 'kind(test)'
+test-group = 'network'
