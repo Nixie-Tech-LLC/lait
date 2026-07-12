@@ -8,8 +8,6 @@
 //! Layer-B `Request` (S§7), which keeps one command = one commit = one activity
 //! row (S§7.1).
 
-use std::path::PathBuf;
-
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 
@@ -221,7 +219,7 @@ pub enum Command {
     Agents,
     /// Resume (or create) a named identity for this session.
     Resume { name: String },
-    /// Update lait in place via the bundled self-updater (`lait-update`).
+    /// Update lait in place from the latest GitHub release (native self-update).
     Update,
     /// Stop the running daemon.
     Stop,
@@ -313,24 +311,13 @@ fn is_service_command(cmd: &Command) -> bool {
     matches!(cmd, Command::Daemon { .. } | Command::Mcp)
 }
 
-/// Locate the bundled self-updater binary (`lait-update`) next to our own
-/// executable, where the cargo-dist installer places it. `None` if it isn't
-/// there (e.g. a `cargo install` build, which ships no updater).
-fn locate_updater() -> Option<PathBuf> {
-    let name = if cfg!(windows) {
-        "lait-update.exe"
-    } else {
-        "lait-update"
-    };
-    let exe = std::env::current_exe().ok()?;
-    let candidate = exe.parent()?.join(name);
-    candidate.exists().then_some(candidate)
-}
-
-/// `lait update`: run the bundled self-updater in place. Best-effort stops a
-/// running daemon first (so it isn't left on stale code, and — on Windows — isn't
-/// holding the binary open), then runs `lait-update`, which self-replaces the
-/// installed binary from the latest GitHub release.
+/// `lait update`: update the installed binary in place from the latest GitHub
+/// release — natively, in-process, with no external updater binary. Best-effort
+/// stops a running daemon first, so it isn't left on stale code and — on Windows —
+/// isn't holding the executable open while it is swapped. Then it queries the
+/// `Nixie-Tech-LLC/lait` releases, downloads this platform's asset, verifies it,
+/// and self-replaces the running executable (all pure-Rust: `ureq` + rustls,
+/// gzip/zip extraction, atomic self-replace).
 async fn run_update() -> Result<()> {
     if let Some(home) = config::existing_home() {
         if crate::control::request(&home, &Request::Stop).await.is_ok() {
@@ -340,23 +327,33 @@ async fn run_update() -> Result<()> {
         }
     }
 
-    let mut cmd = match locate_updater() {
-        Some(path) => std::process::Command::new(path),
-        None => std::process::Command::new("lait-update"),
-    };
-    match cmd.status() {
-        Ok(status) if status.success() => {
-            println!("lait updated. run any lait command to start the daemon on the new version.");
-            Ok(())
-        }
-        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(anyhow!(
-            "self-updater `lait-update` not found — it ships with the install \
-             script, not with `cargo install`. Reinstall via the installer (see the \
-             releases page) to enable in-place updates."
-        )),
-        Err(e) => Err(anyhow!("failed to run lait-update: {e:#}")),
+    // The update is blocking (HTTP + archive extract + file swap); run it off the
+    // async runtime so it doesn't stall the reactor.
+    let status = tokio::task::spawn_blocking(|| {
+        self_update::backends::github::Update::configure()
+            .repo_owner("Nixie-Tech-LLC")
+            .repo_name("lait")
+            .bin_name("lait")
+            .current_version(env!("CARGO_PKG_VERSION"))
+            .show_download_progress(true)
+            .no_confirm(true)
+            .build()
+            .and_then(|updater| updater.update())
+    })
+    .await
+    .map_err(|e| anyhow!("update task panicked: {e}"))?
+    .map_err(|e| anyhow!("self-update failed: {e}"))?;
+
+    if status.updated() {
+        println!(
+            "updated {} -> v{}. run any lait command to start the daemon on the new version.",
+            env!("CARGO_PKG_VERSION"),
+            status.version()
+        );
+    } else {
+        println!("already up to date (v{})", status.version());
     }
+    Ok(())
 }
 
 pub async fn run() -> Result<()> {

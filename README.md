@@ -106,7 +106,8 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Nixie-Tech-LLC/lait/rel
 ```
 
 The installer places `lait` in `~/.cargo/bin`. Upgrade in place with
-`lait-update`.
+`lait update` — a native self-updater that pulls the latest release and
+swaps the binary (stopping a running daemon first).
 
 ## Quickstart (the tracker)
 
