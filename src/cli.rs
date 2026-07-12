@@ -346,10 +346,11 @@ fn print_issue(v: &IssueView, _out: Out) {
     }
 }
 
-/// `invite` display: bare token + link, best-effort clipboard, and the optional
-/// `--qr` (terminal QR of the link) / `--email <addr>` (open the OS mail client
-/// with a prefilled invite) ergonomics.
-pub async fn run_invite(home: &Path, qr: bool, email: Option<String>, out: Out) -> Result<()> {
+/// `invite` display: bare token + link + a scannable terminal QR of the link,
+/// best-effort clipboard, and the optional `--email <addr>` (open the OS mail
+/// client with a prefilled invite). The QR always renders in human output; it is
+/// suppressed only under `--json` so scripts get clean, parseable output.
+pub async fn run_invite(home: &Path, email: Option<String>, out: Out) -> Result<()> {
     let resp = client(home, Request::Invite).await?;
     let token = match resp {
         Response::Text { text } => text.trim().to_string(),
@@ -364,7 +365,7 @@ pub async fn run_invite(home: &Path, qr: bool, email: Option<String>, out: Out) 
         .unwrap_or_else(|_| format!("lait://join/{token}"));
     println!("{token}");
     println!("{link}");
-    if qr && !out.json {
+    if !out.json {
         match render_qr(&link) {
             Ok(q) => println!("\n{q}"),
             Err(e) => eprintln!("(qr unavailable: {e:#})"),

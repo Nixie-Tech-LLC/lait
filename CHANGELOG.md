@@ -16,10 +16,11 @@
 - **`remote` alias for `seed`.** `lait remote add/ls/rm` is a git-like alias of the
   seed registry. `seed ls` / `remote ls` now emit a structured DTO (id, nick,
   workspace, state, online) so `--json` is scriptable.
-- **`lait invite` papercuts.** Clipboard copy now works on Windows (`clip`, with a
-  PowerShell fallback). `--qr` renders a scannable terminal QR of the invite link;
-  `--email <addr>` opens your OS mail client with a prefilled invite (mailto — no
-  SMTP, no credentials).
+- **`lait invite` papercuts.** `invite` now always renders a scannable terminal QR
+  of the invite link (suppressed under `--json` so scripts stay parseable).
+  Clipboard copy works on Windows (`clip`, with a PowerShell fallback). `--email
+  <addr>` opens your OS mail client with a prefilled invite (mailto — no SMTP, no
+  credentials).
 
 ## v0.4.1 — native in-place updater
 

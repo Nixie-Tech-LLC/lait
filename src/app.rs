@@ -172,11 +172,9 @@ pub enum Command {
     },
     /// Show node and workspace status.
     Status,
-    /// Print a base32 ticket others use to join your workspace.
+    /// Print a base32 ticket (+ a scannable QR of the invite link) others use to
+    /// join your workspace.
     Invite {
-        /// Also render a scannable QR code of the invite link in the terminal.
-        #[arg(long)]
-        qr: bool,
         /// Open your mail client with a prefilled invite to this address (uses the
         /// OS default mailto handler; lait sends nothing itself).
         #[arg(long)]
@@ -621,7 +619,7 @@ pub async fn run() -> Result<()> {
             println!("{out}");
         }
         Command::Status => crate::cli::run(&home, Request::Status, out).await?,
-        Command::Invite { qr, email } => crate::cli::run_invite(&home, qr, email, out).await?,
+        Command::Invite { email } => crate::cli::run_invite(&home, email, out).await?,
         Command::Join { ticket } => crate::cli::run(&home, Request::Join { ticket }, out).await?,
         Command::Seed { cmd } => match cmd {
             SeedCmd::Add { target } => {
