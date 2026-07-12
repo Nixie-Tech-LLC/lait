@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.1 — native in-place updater
 
 - **Native in-place updater.** `lait update` now self-updates in-process from the
   latest GitHub release — no external `lait-update` companion binary. It stops a
