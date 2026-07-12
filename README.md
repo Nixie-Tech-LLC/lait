@@ -88,6 +88,14 @@ cargo build --release
 
 Requires **Rust 1.91+** (the floor is driven by iroh 1.0.0-rc.1).
 
+To catch formatting issues before they reach CI, enable the pre-push hook once
+per clone (it runs `cargo fmt --all --check` and blocks the push if it fails;
+bypass with `git push --no-verify`):
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ## Install (prebuilt, macOS/Linux)
 
 `lait` is a single self-contained binary. Every tag is built for macOS
