@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lait::control::{request, Filter, Request, Response};
 
@@ -16,8 +16,15 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_lait")
 }
 
+/// A current-thread runtime: each `req` is a single control-channel round trip, so
+/// spinning up the default multi-thread runtime (and its worker-thread pool) per
+/// call — hundreds of times over a tight poll — is pure churn. This is far cheaper
+/// to build and tear down.
 fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Runtime::new().unwrap()
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
 }
 
 fn tmp_home(tag: &str) -> PathBuf {
@@ -59,21 +66,36 @@ fn spawn_daemon(home: &Path) -> Daemon {
         .spawn()
         .expect("spawn daemon");
     let rt = rt();
-    for _ in 0..60 {
-        std::thread::sleep(Duration::from_millis(500));
-        if rt
-            .block_on(async { request(home, &Request::Status).await })
-            .is_ok()
-        {
-            return Daemon {
-                child,
-                home: home.to_path_buf(),
-            };
-        }
+    let online = poll_until(Duration::from_secs(30), || {
+        rt.block_on(async { request(home, &Request::Status).await })
+            .ok()
+    });
+    if online.is_some() {
+        return Daemon {
+            child,
+            home: home.to_path_buf(),
+        };
     }
     let _ = child.kill();
     let _ = child.wait();
     panic!("daemon for {} never came online", home.display());
+}
+
+/// Poll `check` immediately, then every 50 ms, until it yields `Some` or `timeout`
+/// elapses (returns `None`). Returning the instant the condition holds keeps a
+/// fast-converging case in the millisecond range instead of burning whole poll
+/// ticks — the generous deadline is only a slow-CI backstop.
+fn poll_until<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> Option<T> {
+    let start = Instant::now();
+    loop {
+        if let Some(v) = check() {
+            return Some(v);
+        }
+        if start.elapsed() >= timeout {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn req(home: &Path, r: Request) -> Response {
@@ -96,14 +118,11 @@ fn list_titles(home: &Path) -> Vec<String> {
     }
 }
 
-fn poll_title(home: &Path, needle: &str, tries: u32) -> bool {
-    for _ in 0..tries {
-        std::thread::sleep(Duration::from_secs(2));
-        if list_titles(home).iter().any(|t| t == needle) {
-            return true;
-        }
-    }
-    false
+fn poll_title(home: &Path, needle: &str, timeout: Duration) -> bool {
+    poll_until(timeout, || {
+        list_titles(home).iter().any(|t| t == needle).then_some(())
+    })
+    .is_some()
 }
 
 #[test]
@@ -171,21 +190,21 @@ fn approve_join_request_key_first_and_seed_list_is_structured() {
     };
 
     // WS2: A sees B in `members requests`, carrying B's key AND nick.
-    let mut saw = false;
-    for _ in 0..30 {
-        std::thread::sleep(Duration::from_secs(1));
-        if let Response::JoinRequests { requests } = req(&a.home, Request::MemberRequests) {
-            if requests.iter().any(|r| r.key == b_id) {
-                assert!(
-                    requests.iter().any(|r| r.nick == "bob"),
-                    "the join request should carry B's announced nick"
-                );
-                saw = true;
-                break;
-            }
-        }
-    }
-    assert!(saw, "A never saw B's join request in `members requests`");
+    let claimed_nick = poll_until(Duration::from_secs(30), || match req(
+        &a.home,
+        Request::MemberRequests,
+    ) {
+        Response::JoinRequests { requests } => requests
+            .into_iter()
+            .find(|r| r.key == b_id)
+            .map(|r| r.nick),
+        _ => None,
+    });
+    assert_eq!(
+        claimed_nick.as_deref(),
+        Some("bob"),
+        "A never saw B's join request carrying the announced nick"
+    );
 
     // Security: the joiner's self-asserted nick is NOT a valid approval ref — an
     // unauthenticated name must never select who gets sealed the workspace key.
@@ -221,7 +240,7 @@ fn approve_join_request_key_first_and_seed_list_is_structured() {
 
     // B converges (decrypts A's issue) — proves the approval actually added B.
     assert!(
-        poll_title(&b.home, "shared from A", 40),
+        poll_title(&b.home, "shared from A", Duration::from_secs(30)),
         "B did not converge after approval (membership never sealed?)"
     );
 
@@ -296,17 +315,18 @@ fn self_asserted_nick_never_resolves_only_admin_chosen_alias_does() {
     };
 
     // Wait until A sees the pending request carrying the claimed nick "bob".
-    let mut saw = false;
-    for _ in 0..30 {
-        std::thread::sleep(Duration::from_secs(1));
-        if let Response::JoinRequests { requests } = req(&a.home, Request::MemberRequests) {
-            if requests.iter().any(|r| r.key == b_id && r.nick == "bob") {
-                saw = true;
-                break;
-            }
+    let saw = poll_until(Duration::from_secs(30), || match req(
+        &a.home,
+        Request::MemberRequests,
+    ) {
+        Response::JoinRequests { requests }
+            if requests.iter().any(|r| r.key == b_id && r.nick == "bob") =>
+        {
+            Some(())
         }
-    }
-    assert!(saw, "A never saw B's claimed-nick join request");
+        _ => None,
+    });
+    assert!(saw.is_some(), "A never saw B's claimed-nick join request");
 
     // SPOOF DEFENSE 1 — the self-asserted nick is not a resolvable ref: neither
     // `add` nor `approve` by "bob" can select B's key.
