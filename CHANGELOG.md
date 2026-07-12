@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- **Native in-place updater.** `lait update` now self-updates in-process from the
+  latest GitHub release — no external `lait-update` companion binary. It stops a
+  running daemon first (so the swap isn't blocked by a held file handle on
+  Windows), then downloads this platform's release asset and atomically replaces
+  the running executable. Pure-Rust throughout (`ureq` + rustls for HTTP,
+  gzip/zip extraction, atomic self-replace), consistent with the no-C-deps ethos.
+  Unix release archives switch from `.tar.xz` to `.tar.gz` so extraction needs no
+  liblzma; the cargo-dist external updater is no longer shipped (`install-updater
+  = false`).
+
 ## v0.4.0 — renamed `groupchat` → `lait`
 
 Project rename. The binary, library, package, MCP server, and all identifiers are

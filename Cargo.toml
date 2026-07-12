@@ -79,6 +79,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # mcp server (stdio)
 rmcp = { version = "1.7", features = ["server", "macros", "transport-io"] }
+# Native `lait update`: GitHub-release self-updater. `ureq` backend + `rustls`
+# keeps it pure-Rust (no reqwest/native-tls/OpenSSL C dep); gzip/zip extraction
+# only (no xz), matching the `.tar.gz` release archives.
+self_update = { version = "0.44.0", default-features = false, features = ["ureq", "rustls", "archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate"] }
 
 # unix-only: reset SIGPIPE to default so piping CLI output to head/less/grep
 # exits cleanly instead of panicking (Rust ignores SIGPIPE by default). Already

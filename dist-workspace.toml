@@ -27,5 +27,9 @@ targets = [
 install-path = "CARGO_HOME"
 # Where to host releases
 hosting = "github"
-# Whether to install an updater program
-install-updater = true
+# Ship no external updater: `lait update` is a native, in-process self-updater
+# (src/app.rs) that pulls the latest release itself.
+install-updater = false
+# Use gzip (not xz) for unix archives so the native updater can extract release
+# assets with pure-Rust inflate (no liblzma/C dependency). Windows stays .zip.
+unix-archive = ".tar.gz"
