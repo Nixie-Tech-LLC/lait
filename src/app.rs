@@ -437,18 +437,12 @@ async fn run_update() -> Result<()> {
 
     // The update is blocking (HTTP + archive extract + file swap); run it off the
     // async runtime so it doesn't stall the reactor.
-    let status = tokio::task::spawn_blocking(|| {
+    let status = tokio::task::spawn_blocking(move || {
         self_update::backends::github::Update::configure()
             .repo_owner("Nixie-Tech-LLC")
             .repo_name("lait")
             .bin_name("lait")
-            // cargo-dist nests the binary inside a `lait-<target-triple>/`
-            // directory in the release archive (e.g. `lait-aarch64-apple-darwin/lait`).
-            // Without this, `self_update` looks for a bare `lait` at the archive
-            // root and fails with "Could not find the required path in the archive".
-            // `{{ target }}` expands to the build target triple (matching the dir
-            // name) and `{{ bin }}` to the bin name (with `.exe` on Windows).
-            .bin_path_in_archive("lait-{{ target }}/{{ bin }}")
+            .bin_path_in_archive(update_bin_path_in_archive())
             .current_version(env!("CARGO_PKG_VERSION"))
             .show_download_progress(true)
             .no_confirm(true)
@@ -469,6 +463,26 @@ async fn run_update() -> Result<()> {
         println!("already up to date (v{})", status.version());
     }
     Ok(())
+}
+
+/// The in-archive path to the `lait` binary for `self_update`, matching
+/// cargo-dist's **per-OS** release layout (verified against the published
+/// assets): the unix `.tar.gz` archives nest the binary under a
+/// `lait-<target-triple>/` directory, while the Windows `.zip` is flat with
+/// `lait.exe` at the archive root. `{{ target }}`/`{{ bin }}` are expanded by
+/// self_update; the Windows path needs the explicit `.exe` that `{{ bin }}`
+/// does not add. Getting this wrong fails extraction with "specified file not
+/// found in archive" — which is exactly what a single nested template did on
+/// Windows (it only worked on unix, where it was tested).
+fn update_bin_path_in_archive() -> &'static str {
+    #[cfg(windows)]
+    {
+        "{{ bin }}.exe"
+    }
+    #[cfg(not(windows))]
+    {
+        "lait-{{ target }}/{{ bin }}"
+    }
 }
 
 /// Pull the first `KEY-n` token (letters `-` digits) out of a string and
@@ -953,7 +967,28 @@ pub async fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_key_n;
+    use super::{parse_key_n, update_bin_path_in_archive};
+
+    #[test]
+    fn update_bin_path_matches_cargo_dist_per_os_layout() {
+        // Regression guard: cargo-dist nests the binary under `lait-<target>/` in
+        // the unix tarballs but ships a FLAT Windows zip with `lait.exe` at the
+        // root. A single nested template silently broke every Windows self-update
+        // ("specified file not found in archive"). Pin the per-OS contract.
+        let path = update_bin_path_in_archive();
+        if cfg!(windows) {
+            // flat + explicit `.exe`; never nested under a target dir on Windows.
+            assert_eq!(path, "{{ bin }}.exe");
+            assert!(!path.contains('/'), "Windows zip is flat: {path}");
+        } else {
+            // nested under the per-target directory cargo-dist emits.
+            assert_eq!(path, "lait-{{ target }}/{{ bin }}");
+            assert!(
+                path.contains("{{ target }}"),
+                "unix archive is nested: {path}"
+            );
+        }
+    }
 
     #[test]
     fn key_n_inference_from_branch_names() {
