@@ -165,7 +165,42 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
             }
             for m in members {
                 let you = if m.me { "  (you)" } else { "" };
-                println!("{:<7} {}{}", m.role, m.key.short(), you);
+                let name = if m.alias.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {}", m.alias)
+                };
+                println!("{:<7} {}{}{}", m.role, m.key.short(), name, you);
+            }
+            0
+        }
+        Response::JoinRequests { requests } => {
+            if requests.is_empty() {
+                println!("(no pending join requests)");
+            } else {
+                // The key is authenticated; the nick is a self-asserted claim.
+                // Approve BY KEY after confirming the short id out-of-band.
+                eprintln!("approve by key/prefix — nick is an unverified claim:");
+            }
+            for r in requests {
+                let short: String = r.key.chars().take(12).collect();
+                let claim = if r.nick.is_empty() {
+                    String::new()
+                } else {
+                    format!("  (claims \"{}\")", r.nick)
+                };
+                println!("{}{}", short, claim);
+            }
+            0
+        }
+        Response::Seeds { seeds } => {
+            if seeds.is_empty() {
+                println!("(no pinned remotes — add one: `lait remote add <ticket>`)");
+            }
+            for s in seeds {
+                let nick = if s.nick.is_empty() { "remote" } else { &s.nick };
+                let short: String = s.id.chars().take(12).collect();
+                println!("{}  {:<12}  {}", short, nick, s.state);
             }
             0
         }
@@ -320,8 +355,11 @@ fn print_issue(v: &IssueView, _out: Out) {
     }
 }
 
-/// `invite` display: bare token + link + best-effort clipboard.
-pub async fn run_invite(home: &Path, out: Out) -> Result<()> {
+/// `invite` display: bare token + link + a scannable terminal QR of the link,
+/// best-effort clipboard, and the optional `--email <addr>` (open the OS mail
+/// client with a prefilled invite). The QR always renders in human output; it is
+/// suppressed only under `--json` so scripts get clean, parseable output.
+pub async fn run_invite(home: &Path, email: Option<String>, out: Out) -> Result<()> {
     let resp = client(home, Request::Invite).await?;
     let token = match resp {
         Response::Text { text } => text.trim().to_string(),
@@ -334,24 +372,50 @@ pub async fn run_invite(home: &Path, out: Out) -> Result<()> {
         .parse::<RoomTicket>()
         .map(|t| t.link())
         .unwrap_or_else(|_| format!("lait://join/{token}"));
-    let copied = copy_to_clipboard(&token);
     println!("{token}");
     println!("{link}");
-    if copied {
+    if !out.json {
+        match render_qr(&link) {
+            Ok(q) => println!("\n{q}"),
+            Err(e) => eprintln!("(qr unavailable: {e:#})"),
+        }
+    }
+    if copy_to_clipboard(&token) && !out.json {
         println!("(copied to clipboard — paste into `lait connect`)");
+    }
+    if let Some(addr) = email {
+        match open_mail_invite(&addr, &link) {
+            Ok(()) => {
+                if !out.json {
+                    println!("(opening your mail client to {addr}…)");
+                }
+            }
+            Err(e) => eprintln!("(could not open mail client: {e:#})"),
+        }
     }
     Ok(())
 }
 
+/// Copy `s` to the system clipboard, best-effort, using the platform's native
+/// tool: `clip` (Windows), `pbcopy` (macOS), or `wl-copy`/`xclip` (Linux).
 fn copy_to_clipboard(s: &str) -> bool {
-    let candidates: [(&str, &[&str]); 3] = [
-        ("pbcopy", &[]),
-        ("wl-copy", &[]),
-        ("xclip", &["-selection", "clipboard"]),
+    #[cfg(target_os = "windows")]
+    let candidates: &[(&str, &[&str])] = &[
+        ("clip", &[]),
+        (
+            "powershell",
+            &["-NoProfile", "-Command", "$input | Set-Clipboard"],
+        ),
     ];
+    #[cfg(target_os = "macos")]
+    let candidates: &[(&str, &[&str])] = &[("pbcopy", &[])];
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let candidates: &[(&str, &[&str])] =
+        &[("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])];
+
     for (cmd, args) in candidates {
         let Ok(mut child) = std::process::Command::new(cmd)
-            .args(args)
+            .args(*args)
             .stdin(Stdio::piped())
             .spawn()
         else {
@@ -367,6 +431,85 @@ fn copy_to_clipboard(s: &str) -> bool {
     false
 }
 
+/// Render a scannable QR of the invite link as terminal half-block glyphs.
+fn render_qr(data: &str) -> Result<String> {
+    use qrcode::{render::unicode, QrCode};
+    let code = QrCode::new(data.as_bytes()).context("build QR code")?;
+    Ok(code
+        .render::<unicode::Dense1x2>()
+        .dark_color(unicode::Dense1x2::Light)
+        .light_color(unicode::Dense1x2::Dark)
+        .quiet_zone(true)
+        .build())
+}
+
+/// Open the OS default mail client with a prefilled invite (mailto). lait sends
+/// nothing itself — it just hands the URL to the platform handler.
+fn open_mail_invite(addr: &str, link: &str) -> Result<()> {
+    let subject = "Invitation to my lait workspace";
+    let body = format!(
+        "You're invited to my lait workspace.\n\n\
+         1. Install lait\n   \
+         macOS/Linux:  curl --proto '=https' --tlsv1.2 -LsSf \
+         https://github.com/Nixie-Tech-LLC/lait/releases/latest/download/lait-installer.sh | sh\n   \
+         Windows:      powershell -c \"irm \
+         https://github.com/Nixie-Tech-LLC/lait/releases/latest/download/lait-installer.ps1 | iex\"\n\n\
+         2. Join the workspace\n   lait connect {link}\n\n\
+         That announces a join request; I'll approve you and your device gets the \
+         workspace key automatically. lait is local-first and end-to-end encrypted.\n"
+    );
+    let mailto = format!(
+        "mailto:{}?subject={}&body={}",
+        addr,
+        percent_encode(subject),
+        percent_encode(&body)
+    );
+    open_url(&mailto)
+}
+
+/// Minimal RFC-3986 percent-encoding for mailto query components (unreserved set
+/// passes through; everything else is `%XX`). Avoids a url-crate dependency.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Hand a URL to the OS default handler. Uses `rundll32 …FileProtocolHandler` on
+/// Windows (robust with `&` in mailto query strings, unlike `cmd start`).
+fn open_url(url: &str) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("rundll32");
+        c.args(["url.dll,FileProtocolHandler", url]);
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg(url);
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    cmd.stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("launch OS url handler")?;
+    Ok(())
+}
+
 fn kind_str(k: &EventKind) -> &'static str {
     match k {
         EventKind::Join => "join",
@@ -376,12 +519,16 @@ fn kind_str(k: &EventKind) -> &'static str {
 }
 
 fn print_event(e: &Event) {
-    let tag = match e.kind {
-        EventKind::Join => "[join] ",
-        EventKind::Presence => "[presence] ",
-        EventKind::System => "[system] ",
-    };
-    println!("{tag}{}: {}", e.nick, e.text);
+    match e.kind {
+        // Surface the joiner's short key so an admin can approve them straight from
+        // the log (`lait members approve <that-prefix>`), not just `--json`.
+        EventKind::Join => {
+            let short: String = e.id.chars().take(8).collect();
+            println!("[join] {} ({}): {}", e.nick, short, e.text);
+        }
+        EventKind::Presence => println!("[presence] {}: {}", e.nick, e.text),
+        EventKind::System => println!("[system] {}: {}", e.nick, e.text),
+    }
 }
 
 fn run_hook(cmd: &str, e: &Event) {

@@ -122,8 +122,11 @@ All three surfaces accept the **same** ref grammar (S§2, S§7). Resolution happ
   (`iss_3f9`, git-style — the *canonical*, collision-free handle, S§5.4); a **`KEY-n`
   alias** (`ENG-142`, advisory, may disambiguate); or — only where a project is expected
   (`ls`/`board`) — a **project key** (`ENG`).
-- **`<userref>`** (a member) accepts: **`@me`** (this node's `UserId`); a **nick**
-  (profile display name, advisory); or a full **ed25519 key** (S§2 — a member *is* a key).
+- **`<userref>`** (a member) accepts: **`@me`** (this node's `UserId`); a **local
+  alias** (a petname *you* assigned to a key, stored locally, never synced); a **key
+  id-prefix** (≥4 hex); or a full **ed25519 key** (S§2 — a member *is* a key). A
+  self-asserted wire nick is **not** accepted: only a locally-trusted alias resolves
+  to a key, so an unauthenticated name can never stand in for an identity.
 
 ### 3.2 Ambiguity is a first-class outcome
 
@@ -463,7 +466,13 @@ grammar**. Where each lands:
 - **P3 — membership UI.** A **members view** over `Catalog.acl` (S§6): roles, add/remove,
   key rotation — read-only until the signed-op grammar lands, then `MemberAdd/Remove`,
   `KeyRotate` (S§7). The ACL is the only signed structure, so this view is the only one
-  showing verified identity.
+  showing verified identity. Join-request approval rides on the same op-graph: `members
+  requests` lists announced joiners (authenticated key + an *unverified* nick claim) and
+  `members approve <prefix|key> [--as <name>]` signs the `AddMember` op — resolving
+  **key-first**, never by the self-asserted nick (an unauthenticated name must not select
+  who is sealed the workspace key). Friendly names are **local aliases** (petnames): a key
+  is the identity, and `<userref>` (§3.1) resolves an alias/prefix against your own alias
+  store — never a wire nick.
 - **P4 — MCP parity & polish.** The MCP tool set (A§12) is generated from / checked against
   the **same `Response` DTOs** the CLI `--json` emits (S§7.3), so agent and human surfaces
   never drift. TUI polish (themes, resize, wide-table horizontal scroll) is P4.

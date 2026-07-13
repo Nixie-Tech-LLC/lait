@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lait::control::{request, Filter, Request, Response};
 
@@ -20,8 +20,35 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_lait")
 }
 
+/// The heartbeat the spawned daemons run on (via `LAIT_HEARTBEAT_SECS`). Absence-
+/// proof settling windows are expressed as multiples of this, so they stay sound
+/// if the test clock changes. The single source of truth for both.
+const TEST_HEARTBEAT: Duration = Duration::from_secs(1);
+
+/// A current-thread runtime: each `req` is a single control-channel round trip, so
+/// building the default multi-thread runtime (worker-thread pool) per call — often
+/// hundreds of times over a tight poll — is pure churn. Far cheaper to build.
 fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Runtime::new().unwrap()
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+/// Poll `check` immediately, then every 50 ms, until it yields `Some` or `timeout`
+/// elapses (returns `None`). Returning the instant the condition holds keeps a
+/// fast-converging case in the millisecond range instead of burning whole ticks.
+fn poll_until<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> Option<T> {
+    let start = Instant::now();
+    loop {
+        if let Some(v) = check() {
+            return Some(v);
+        }
+        if start.elapsed() >= timeout {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn tmp_home(tag: &str) -> PathBuf {
@@ -58,6 +85,9 @@ fn spawn_daemon(home: &Path) -> Daemon {
         .arg("daemon")
         .env("LAIT_HOME", home)
         .env("LAIT_IDLE_SECS", "0")
+        // Run the protocol on a fast heartbeat so catch-up/absence windows are
+        // seconds, not the 10s production default — the pipeline's biggest lever.
+        .env("LAIT_HEARTBEAT_SECS", TEST_HEARTBEAT.as_secs().to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -65,17 +95,15 @@ fn spawn_daemon(home: &Path) -> Daemon {
         .expect("spawn daemon");
     // wait up to ~30s for the daemon to bind its control channel + come online.
     let rt = rt();
-    for _ in 0..60 {
-        std::thread::sleep(Duration::from_millis(500));
-        if rt
-            .block_on(async { request(home, &Request::Status).await })
-            .is_ok()
-        {
-            return Daemon {
-                child,
-                home: home.to_path_buf(),
-            };
-        }
+    let online = poll_until(Duration::from_secs(30), || {
+        rt.block_on(async { request(home, &Request::Status).await })
+            .ok()
+    });
+    if online.is_some() {
+        return Daemon {
+            child,
+            home: home.to_path_buf(),
+        };
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -102,14 +130,11 @@ fn list_titles(home: &Path) -> Vec<String> {
     }
 }
 
-fn poll_title(home: &Path, needle: &str, tries: u32) -> bool {
-    for _ in 0..tries {
-        std::thread::sleep(Duration::from_secs(2));
-        if list_titles(home).iter().any(|t| t == needle) {
-            return true;
-        }
-    }
-    false
+fn poll_title(home: &Path, needle: &str, timeout: Duration) -> bool {
+    poll_until(timeout, || {
+        list_titles(home).iter().any(|t| t == needle).then_some(())
+    })
+    .is_some()
 }
 
 /// Resolve the canonical ref for the row with `title` on this node.
@@ -130,21 +155,19 @@ fn row_ref(home: &Path, title: &str) -> Option<String> {
 /// `description`/body is present and the view is no longer provisional. This is
 /// the assertion the catalog-only `list_titles` check cannot make: the body
 /// lives ONLY in the issue doc, so it proves the doc transferred.
-fn poll_body(home: &Path, reff: &str, needle: &str, tries: u32) -> bool {
-    for _ in 0..tries {
-        std::thread::sleep(Duration::from_secs(2));
-        if let Response::Issue(v) = req(
+fn poll_body(home: &Path, reff: &str, needle: &str, timeout: Duration) -> bool {
+    poll_until(timeout, || {
+        match req(
             home,
             Request::IssueView {
                 reff: reff.to_string(),
             },
         ) {
-            if !v.provisional && v.description.contains(needle) {
-                return true;
-            }
+            Response::Issue(v) if !v.provisional && v.description.contains(needle) => Some(()),
+            _ => None,
         }
-    }
-    false
+    })
+    .is_some()
 }
 
 #[test]
@@ -204,9 +227,21 @@ fn two_nodes_converge_over_iroh() {
     );
 
     // Workspace data is E2EE (P3): B can't read until A adds it to the ACL and
-    // seals it the workspace key. Give the membership a moment to sync, then
-    // confirm B sees only ciphertext (no decryptable issues) — the E2EE outcome.
-    std::thread::sleep(Duration::from_secs(6));
+    // seals it the workspace key. Rather than blind-sleep, wait until B has
+    // actually connected to A (a real sync opportunity) — a positive proxy that's
+    // both faster and more rigorous than a fixed pause — plus a small settling
+    // margin for the pull to complete, then confirm B still sees only ciphertext.
+    let connected = poll_until(Duration::from_secs(30), || {
+        match req(&b.home, Request::Status) {
+            Response::Status(s) if s.online_peers >= 1 => Some(()),
+            _ => None,
+        }
+    });
+    assert!(
+        connected.is_some(),
+        "B never connected to A — cannot make a meaningful pre-add E2EE assertion"
+    );
+    std::thread::sleep(Duration::from_secs(2));
     assert!(
         list_titles(&b.home).is_empty(),
         "a non-member must see only ciphertext (no readable issues) before being added"
@@ -223,7 +258,8 @@ fn two_nodes_converge_over_iroh() {
                 &a.home,
                 Request::MemberAdd {
                     who: b_id,
-                    admin: false
+                    admin: false,
+                    as_name: None
                 }
             ),
             Response::Ok { .. }
@@ -234,7 +270,7 @@ fn two_nodes_converge_over_iroh() {
     // A -> B: B backfills the membership (unseals the key), then decrypts A's
     // issue over the encrypted sync.
     assert!(
-        poll_title(&b.home, "shared from A", 40),
+        poll_title(&b.home, "shared from A", Duration::from_secs(80)),
         "A→B: B did not converge to A's issue over encrypted P2P sync"
     );
 
@@ -244,7 +280,7 @@ fn two_nodes_converge_over_iroh() {
     // before the trailing DocUpdate/EndDocs frames drain (see node.rs SyncHandler).
     let a_ref = row_ref(&b.home, "shared from A").expect("B has a row for A's issue");
     assert!(
-        poll_body(&b.home, &a_ref, "BODY_A", 30),
+        poll_body(&b.home, &a_ref, "BODY_A", Duration::from_secs(60)),
         "A→B: catalog row converged but the issue-doc BODY never synced (doc-frame truncation)"
     );
 
@@ -267,7 +303,7 @@ fn two_nodes_converge_over_iroh() {
         "B: new"
     );
     assert!(
-        poll_title(&a.home, "reply from B", 30),
+        poll_title(&a.home, "reply from B", Duration::from_secs(60)),
         "B→A: A did not converge to B's issue over P2P sync"
     );
 
@@ -302,8 +338,14 @@ fn two_nodes_converge_over_iroh() {
         ),
         "A: post-removal issue"
     );
-    // give sync ample time; B must still not see it.
-    std::thread::sleep(Duration::from_secs(10));
+    // Intentional settling window (not a pollable condition): this is an
+    // *absence* proof — a removed member must never read post-removal content — so
+    // there is no positive signal to wait on. A already announced the write live
+    // (event-driven), so B has had its immediate chance; wait several fast-heartbeat
+    // catch-up cycles (LAIT_HEARTBEAT_SECS=1) as belt-and-suspenders, then assert B
+    // still cannot see it. Scales with the heartbeat, so it stays sound if the clock
+    // changes.
+    std::thread::sleep(3 * TEST_HEARTBEAT);
     assert!(
         !list_titles(&b.home)
             .iter()

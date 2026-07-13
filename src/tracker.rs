@@ -368,7 +368,9 @@ impl Tracker {
             Request::LabelNew { name, color } => self.label_new(name, color),
             Request::LabelList => Ok((self.label_list(), None)),
             Request::Activity { since } => Ok((self.activity_response(since), None)),
-            Request::MemberAdd { who, admin } => Ok(self.member_add_cmd(who, admin)),
+            // `as_name` is a node-layer local-petname concern; the tracker only
+            // seals the ACL op, so it ignores it here.
+            Request::MemberAdd { who, admin, .. } => Ok(self.member_add_cmd(who, admin)),
             Request::MemberRemove { who } => Ok(self.member_remove_cmd(who)),
             Request::KeyRotate => Ok(self.key_rotate_cmd()),
             Request::Members => Ok((self.members_response(), None)),
@@ -1446,6 +1448,9 @@ impl Tracker {
                     Role::Member => "member".into(),
                 },
                 me,
+                // Local petnames live outside the tracker (never synced); the node
+                // layer overlays them onto this projection after the fact.
+                alias: String::new(),
             })
             .collect();
         Response::Members { members }

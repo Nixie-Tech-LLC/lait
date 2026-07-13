@@ -173,14 +173,21 @@ pub enum Command {
     },
     /// Show node and workspace status.
     Status,
-    /// Print a base32 ticket others use to join your workspace.
-    Invite,
+    /// Print a base32 ticket (+ a scannable QR of the invite link) others use to
+    /// join your workspace.
+    Invite {
+        /// Open your mail client with a prefilled invite to this address (uses the
+        /// OS default mailto handler; lait sends nothing itself).
+        #[arg(long)]
+        email: Option<String>,
+    },
     /// Join a workspace from a ticket and announce a join request.
     Join { ticket: String },
     /// Manage pinned always-on **seed** peers — the P2P "remote". A seed is a
     /// sticky bootstrap + backfill anchor your node always dials, so you converge
     /// even when no laptop peer is online. It is not a trust authority (genesis/
     /// ACL still gate every op, A§10). Set one up with `daemon --seed` on the box.
+    #[command(visible_alias = "remote")]
     Seed {
         #[command(subcommand)]
         cmd: SeedCmd,
@@ -276,14 +283,41 @@ pub enum SeedCmd {
 pub enum MembersCmd {
     /// Add a member (admin-only). Seals the workspace key to them.
     Add {
-        /// A user ref: @me or a 64-hex ed25519 key.
+        /// A user ref: @me, a local alias you've set, a key id-prefix, or a full
+        /// 64-hex key. (A self-asserted wire nick is NOT accepted — name people
+        /// yourself with `--as` / `members alias`.)
         who: String,
         #[arg(long)]
         admin: bool,
+        /// Attach a local petname to this key as you add them (never synced).
+        #[arg(long = "as", value_name = "NAME")]
+        as_name: Option<String>,
     },
     /// Remove a member (admin-only) and rotate the workspace key.
     Remove {
+        /// A user ref: @me, a local alias, a key id-prefix, or a full 64-hex key.
         who: String,
+    },
+    /// List pending join requests (people who ran `connect`/`join`, not yet added).
+    Requests,
+    /// Approve a pending join request **by id-prefix / key** (admin-only). The
+    /// joiner's advertised nick is shown only as an unverified hint — confirm the
+    /// short key out-of-band, then approve it and name them with `--as`.
+    Approve {
+        /// A pending requester: a key id-prefix or a full 64-hex key.
+        who: String,
+        /// Attach a local petname to this key as you approve them (never synced).
+        #[arg(long = "as", value_name = "NAME")]
+        as_name: Option<String>,
+    },
+    /// Set (or clear, with an empty name) a local petname for a member/key. Local
+    /// to this device, never broadcast, never part of the signed ACL.
+    Alias {
+        /// A user ref: a key id-prefix, a full key, or an existing alias.
+        who: String,
+        /// The petname to assign (omit or pass "" to clear).
+        #[arg(default_value = "")]
+        name: String,
     },
     /// Rotate the workspace key (admin-only).
     RotateKey,
@@ -584,11 +618,33 @@ pub async fn run() -> Result<()> {
             _ => crate::cli::run(&home, Request::LabelList, out).await?,
         },
         Command::Members { cmd } => match cmd {
-            Some(MembersCmd::Add { who, admin }) => {
-                crate::cli::run(&home, Request::MemberAdd { who, admin }, out).await?
+            Some(MembersCmd::Add {
+                who,
+                admin,
+                as_name,
+            }) => {
+                crate::cli::run(
+                    &home,
+                    Request::MemberAdd {
+                        who,
+                        admin,
+                        as_name,
+                    },
+                    out,
+                )
+                .await?
             }
             Some(MembersCmd::Remove { who }) => {
                 crate::cli::run(&home, Request::MemberRemove { who }, out).await?
+            }
+            Some(MembersCmd::Requests) => {
+                crate::cli::run(&home, Request::MemberRequests, out).await?
+            }
+            Some(MembersCmd::Approve { who, as_name }) => {
+                crate::cli::run(&home, Request::MemberApprove { who, as_name }, out).await?
+            }
+            Some(MembersCmd::Alias { who, name }) => {
+                crate::cli::run(&home, Request::MemberAlias { who, name }, out).await?
             }
             Some(MembersCmd::RotateKey) => crate::cli::run(&home, Request::KeyRotate, out).await?,
             _ => crate::cli::run(&home, Request::Members, out).await?,
@@ -623,7 +679,7 @@ pub async fn run() -> Result<()> {
             println!("{out}");
         }
         Command::Status => crate::cli::run(&home, Request::Status, out).await?,
-        Command::Invite => crate::cli::run_invite(&home, out).await?,
+        Command::Invite { email } => crate::cli::run_invite(&home, email, out).await?,
         Command::Join { ticket } => crate::cli::run(&home, Request::Join { ticket }, out).await?,
         Command::Seed { cmd } => match cmd {
             SeedCmd::Add { target } => {

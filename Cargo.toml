@@ -84,6 +84,9 @@ n0-future = "0.3"
 
 # cli
 clap = { version = "4", features = ["derive"] }
+# terminal QR for `lait invite --qr`. Pure-Rust; default features off to avoid
+# pulling the `image` crate (we only render unicode half-blocks).
+qrcode = { version = "0.14", default-features = false }
 # `lait completions <shell>` and `lait man` — generated at runtime from the same
 # clap command tree, so packagers (Homebrew/Scoop/etc.) can emit shell
 # completions and a man page during install with no separate spec to drift.

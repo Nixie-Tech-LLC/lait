@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lait::control::{request, Filter, Request, Response};
 
@@ -25,8 +25,30 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_lait")
 }
 
+/// A current-thread runtime: each `req` is a single control-channel round trip, so
+/// building the default multi-thread runtime (worker-thread pool) per call — often
+/// hundreds of times over a tight poll — is pure churn. Far cheaper to build.
 fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Runtime::new().unwrap()
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+/// Poll `check` immediately, then every 50 ms, until it yields `Some` or `timeout`
+/// elapses (returns `None`). Returning the instant the condition holds keeps a
+/// fast-converging case in the millisecond range instead of burning whole ticks.
+fn poll_until<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> Option<T> {
+    let start = Instant::now();
+    loop {
+        if let Some(v) = check() {
+            return Some(v);
+        }
+        if start.elapsed() >= timeout {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn tmp_home(tag: &str) -> PathBuf {
@@ -72,20 +94,21 @@ fn spawn(home: &Path) -> Proc {
         .env("LAIT_HOME", home)
         // Disable idle shutdown so the restart, not a timer, is what we test.
         .env("LAIT_IDLE_SECS", "0")
+        // Run the protocol on a fast heartbeat so catch-up/absence windows are
+        // seconds, not the 10s production default — the pipeline's biggest lever.
+        .env("LAIT_HEARTBEAT_SECS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn daemon");
     let rt = rt();
-    for _ in 0..60 {
-        std::thread::sleep(Duration::from_millis(500));
-        if rt
-            .block_on(async { request(home, &Request::Status).await })
-            .is_ok()
-        {
-            return Proc(Some(child));
-        }
+    let online = poll_until(Duration::from_secs(30), || {
+        rt.block_on(async { request(home, &Request::Status).await })
+            .ok()
+    });
+    if online.is_some() {
+        return Proc(Some(child));
     }
     let mut c = child;
     let _ = c.kill();
@@ -120,27 +143,23 @@ fn list_titles(home: &Path) -> Vec<String> {
     }
 }
 
-fn poll_title(home: &Path, needle: &str, tries: u32) -> bool {
-    for _ in 0..tries {
-        std::thread::sleep(Duration::from_secs(2));
-        if list_titles(home).iter().any(|t| t == needle) {
-            return true;
-        }
-    }
-    false
+fn poll_title(home: &Path, needle: &str, timeout: Duration) -> bool {
+    poll_until(timeout, || {
+        list_titles(home).iter().any(|t| t == needle).then_some(())
+    })
+    .is_some()
 }
 
 /// Poll until `peers.json` under `home` records `id` (written when the mesh forms
 /// / on the first successful pull — DUR-1).
-fn poll_peer_persisted(home: &Path, id: &str, tries: u32) -> bool {
-    for _ in 0..tries {
-        let j = std::fs::read_to_string(home.join("peers.json")).unwrap_or_default();
-        if j.contains(id) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-    false
+fn poll_peer_persisted(home: &Path, id: &str, timeout: Duration) -> bool {
+    poll_until(timeout, || {
+        std::fs::read_to_string(home.join("peers.json"))
+            .unwrap_or_default()
+            .contains(id)
+            .then_some(())
+    })
+    .is_some()
 }
 
 fn new_issue(home: &Path, title: &str) -> Response {
@@ -202,7 +221,8 @@ fn restarted_daemon_rejoins_from_persisted_peers() {
                 &a_home,
                 Request::MemberAdd {
                     who: b_id,
-                    admin: false
+                    admin: false,
+                    as_name: None
                 }
             ),
             Response::Ok { .. }
@@ -212,14 +232,14 @@ fn restarted_daemon_rejoins_from_persisted_peers() {
 
     // Prove the mesh formed and B synced A's first issue.
     assert!(
-        poll_title(&b_home, "before restart", 40),
+        poll_title(&b_home, "before restart", Duration::from_secs(80)),
         "pre-restart: B did not converge to A's first issue"
     );
 
     // DUR-1 precondition: B persisted A's endpoint as a bootstrap peer.
     let a_id = id_of(&a_home);
     assert!(
-        poll_peer_persisted(&b_home, &a_id, 20),
+        poll_peer_persisted(&b_home, &a_id, Duration::from_secs(20)),
         "B should persist A ({a_id}) in peers.json for restart bootstrap"
     );
 
@@ -237,7 +257,7 @@ fn restarted_daemon_rejoins_from_persisted_peers() {
     // to and never converge here.
     b = spawn(&b_home);
     assert!(
-        poll_title(&b_home, "after B restart", 45),
+        poll_title(&b_home, "after B restart", Duration::from_secs(90)),
         "post-restart: B did not rejoin the mesh from persisted peers and converge"
     );
 

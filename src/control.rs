@@ -20,7 +20,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::dto::{
-    ActivityEvent, BoardView, Candidate, IssueView, LabelDto, MemberDto, ProjectDto, Row,
+    ActivityEvent, BoardView, Candidate, IssueView, JoinRequestDto, LabelDto, MemberDto,
+    ProjectDto, Row, SeedDto,
 };
 
 /// The OS name of the control channel for a home (unix socket / Windows named
@@ -155,12 +156,32 @@ pub enum Request {
         who: String,
         #[serde(default)]
         admin: bool,
+        /// Optional local petname to attach to the resolved key (never synced).
+        #[serde(default)]
+        as_name: Option<String>,
     },
     MemberRemove {
         who: String,
     },
     KeyRotate,
     Members,
+    /// List pending join requests (announced joiners not yet members, UI.md §8).
+    MemberRequests,
+    /// Approve a pending join request **by id-prefix / key** — sugar over
+    /// `MemberAdd` scoped to the pending set. The joiner's self-asserted nick is
+    /// deliberately not a resolution input (it is unauthenticated); `as_name`
+    /// lets the approver attach a trusted local petname at the same time.
+    MemberApprove {
+        who: String,
+        #[serde(default)]
+        as_name: Option<String>,
+    },
+    /// Set (or clear, with an empty name) a **local petname** for a key. Local to
+    /// this node, never broadcast, never part of the signed ACL.
+    MemberAlias {
+        who: String,
+        name: String,
+    },
     /// Streaming doorbells for the TUI (S§7.5). Turns the one-shot handler into a
     /// stream of [`Doorbell`] frames until the client disconnects.
     Subscribe {
@@ -238,6 +259,14 @@ pub enum Response {
     Members {
         members: Vec<MemberDto>,
     },
+    /// Pending join requests (announced joiners not yet members, UI.md §8).
+    JoinRequests {
+        requests: Vec<JoinRequestDto>,
+    },
+    /// Pinned seeds ("remotes") and their reachability (A§10).
+    Seeds {
+        seeds: Vec<SeedDto>,
+    },
     /// A ref resolved to many candidates — a first-class outcome (UI.md §3.2).
     Candidates {
         candidates: Vec<Candidate>,
@@ -310,7 +339,7 @@ pub struct Event {
     pub ts: u64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
     Join,

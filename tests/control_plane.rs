@@ -71,6 +71,8 @@ impl Daemon {
             .arg("daemon")
             .env("LAIT_HOME", home)
             .env("LAIT_IDLE_SECS", "0")
+            // Fast heartbeat: keep presence/announce catch-up snappy in tests.
+            .env("LAIT_HEARTBEAT_SECS", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
