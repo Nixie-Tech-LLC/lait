@@ -66,6 +66,12 @@ const PRESENCE_ALPN: &[u8] = b"lait/presence/0";
 const HEARTBEAT: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const REAP_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often the daemon coalesces pending durable-store mutations into a single
+/// git commit (A§6). git is inspectability, not durability (every write is
+/// fsync'd), so a slow cadence keeps `git add -A` off the edit hot path while
+/// still snapshotting history within a few seconds.
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 const PRUNE_WINDOW: Duration = Duration::from_secs(600);
 const IDLE_SHUTDOWN: Duration = Duration::from_secs(30 * 60);
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
@@ -918,6 +924,23 @@ impl Node {
             // Persist the peers we currently know so the next start bootstraps
             // from them instead of waiting to be re-announced to (DUR-1).
             self.persist_known_peers();
+        }
+    }
+
+    /// Periodically coalesce pending durable-store mutations into a single git
+    /// commit, keeping `git add -A` (a subprocess whose cost grows with the
+    /// tree) off every edit's hot path (A§6). git is inspectability only —
+    /// durability is the per-write fsync — so a late or missed checkpoint never
+    /// risks data; at worst the working tree is briefly uncommitted and the next
+    /// tick tidies it.
+    async fn checkpoint_loop(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(CHECKPOINT_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if self.tracker.lock().unwrap().checkpoint() {
+                tracing::debug!("store checkpoint committed");
+            }
         }
     }
 
@@ -1803,6 +1826,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     tokio::spawn(node.clone().recv_loop(receiver, 1));
     tokio::spawn(node.clone().heartbeat_loop());
     tokio::spawn(node.clone().reaper_loop());
+    tokio::spawn(node.clone().checkpoint_loop());
     tokio::spawn(node.clone().idle_shutdown_loop());
 
     node.broadcast(Payload::Hello {
@@ -1845,6 +1869,10 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     }
 
     node.persist_known_peers();
+    // Flush any mutations marked since the last checkpoint tick, so a clean
+    // shutdown (e.g. idle-out) leaves the git history current rather than a few
+    // seconds behind (the data itself is already fsync-durable regardless).
+    node.tracker.lock().unwrap().checkpoint();
     node.broadcast(Payload::Bye {
         nick: node.shared.nick.clone(),
     })

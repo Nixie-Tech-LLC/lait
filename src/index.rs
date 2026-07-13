@@ -9,7 +9,8 @@
 //! - Resolution can return **zero, one, or many** — ambiguity is a first-class
 //!   outcome with a candidate list (UI.md §3.2), never a crash.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::ops::Bound::{Excluded, Unbounded};
 
 use crate::catalog::{CatalogDoc, RowMeta};
 use crate::dto::{Candidate, ProjectDto};
@@ -30,7 +31,16 @@ pub fn canonical_reff(doc_id: &DocId) -> String {
 /// The `KEY-n` alias table + canonical-handle table, built from the Catalog.
 /// Handles `KEY-n` collisions with a deterministic suffix, and computes each
 /// doc's **shortest-unique** canonical `iss_` prefix (S§5.4, git-style).
-#[derive(Debug, Default, Clone)]
+///
+/// **Incremental (A§9 "Linear-grade devex").** The externally-observed outputs
+/// (`by_doc`/`by_alias`/`canonical`) are a pure function of `{DocId set, each
+/// doc's projectId, each doc's seq}` — nothing an *edit* changes. So the table
+/// is maintained per changed doc via [`reconcile_doc`](Self::reconcile_doc) /
+/// [`remove_doc`](Self::remove_doc) in **O(log N)**, instead of an O(N²) full
+/// [`build`](Self::build) on every mutation. `build` is retained as the
+/// authoritative full recompute (load/adopt) and is now itself O(N log N)
+/// because it is just a sequence of `reconcile_doc` calls.
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct AliasTable {
     /// DocId string -> alias (`ENG-142` or `ENG-142b`).
     by_doc: HashMap<String, String>,
@@ -38,53 +48,162 @@ pub struct AliasTable {
     by_alias: HashMap<String, DocId>,
     /// DocId string -> shortest-unique canonical handle (`iss_3f9ab2c`).
     canonical: HashMap<String, String>,
+    /// All known DocIds, kept sorted so each doc's shortest-unique canonical
+    /// prefix is a function of its two lexicographic neighbours only:
+    /// `SUP(d) = max(lcp(d, pred), lcp(d, succ)) + 1`. This is what turns
+    /// canonical upkeep from the old O(N²) full scan into O(log N) per doc.
+    sorted: BTreeSet<DocId>,
+    /// `KEY-n` collision groups: `(projectId, seq) -> member docs`. Almost always
+    /// size 1; only an offline double-assign of the same seq makes it larger.
+    groups: HashMap<(String, u32), Vec<DocId>>,
+    /// doc -> the `(projectId, seq)` group it currently sits in, so a seq/project
+    /// change moves it between groups without a full rebuild.
+    doc_group: HashMap<String, (String, u32)>,
 }
 
 impl AliasTable {
-    /// Build the alias table from the current catalog state. Deterministic:
-    /// within one project+seq collision group, docs are ordered by DocId and the
-    /// first keeps the bare `KEY-n`, the rest get suffix `b`, `c`, … (S§5.4).
+    /// Full rebuild from the current catalog — the authoritative recompute used
+    /// on load/adopt. Order-independent and O(N log N): a `reconcile_doc` per
+    /// doc yields exactly the same table as any incremental sequence (each doc's
+    /// canonical prefix depends only on its final neighbours, and each insert
+    /// re-fixes the neighbours it touches — see the module invariant).
     pub fn build(catalog: &CatalogDoc) -> Self {
         let mut table = AliasTable::default();
-        // project id -> key
-        let key_of: HashMap<String, String> = catalog
-            .projects_list()
-            .into_iter()
-            .map(|p| (p.id.as_str().to_string(), p.key))
-            .collect();
-        // group rows by (projectId, seq)
-        let mut groups: HashMap<(String, u32), Vec<DocId>> = HashMap::new();
-        for row in catalog.all_rows() {
-            if let Some(seq) = row.seq {
-                groups
-                    .entry((row.project_id.as_str().to_string(), seq))
-                    .or_default()
-                    .push(row.doc_id);
-            }
+        for id in catalog.doc_ids() {
+            table.reconcile_doc(catalog, &id);
         }
-        for ((proj, seq), mut docs) in groups {
-            let Some(key) = key_of.get(&proj) else {
-                continue;
-            };
-            docs.sort();
-            for (i, doc) in docs.into_iter().enumerate() {
-                let alias = if i == 0 {
-                    format!("{key}-{seq}")
-                } else {
-                    format!("{key}-{seq}{}", suffix(i))
-                };
-                table
-                    .by_doc
-                    .insert(doc.as_str().to_string(), alias.to_ascii_lowercase());
-                table
-                    .by_alias
-                    .insert(alias.to_ascii_lowercase(), doc.clone());
-                // store the display form (original case) on by_doc value
-                table.by_doc.insert(doc.as_str().to_string(), alias);
-            }
-        }
-        table.canonical = shortest_unique_canonicals(&catalog.doc_ids());
         table
+    }
+
+    /// Bring one doc's alias/canonical entries into agreement with the catalog —
+    /// the incremental primitive behind create and every sync-apply. Handles a
+    /// brand-new doc, a `seq` (re)assignment, and a project move; a no-op when
+    /// the doc is already consistent, so calling it across every catalog doc on
+    /// a sync round is O(N) total, not O(N²).
+    pub fn reconcile_doc(&mut self, catalog: &CatalogDoc, doc_id: &DocId) {
+        // --- canonical (shortest-unique `iss_` prefix) ---
+        // The DocId itself never changes, so an already-known doc needs no
+        // canonical work: any collision a *new* doc introduces is repaired when
+        // that new doc is inserted (it recomputes its neighbours).
+        if self.sorted.insert(doc_id.clone()) {
+            let pred = self.pred(doc_id);
+            let succ = self.succ(doc_id);
+            self.recompute_canonical(doc_id);
+            if let Some(p) = pred {
+                self.recompute_canonical(&p);
+            }
+            if let Some(s) = succ {
+                self.recompute_canonical(&s);
+            }
+        }
+
+        // --- KEY-n alias group membership ---
+        let want = catalog
+            .row(doc_id)
+            .and_then(|r| r.seq.map(|s| (r.project_id.as_str().to_string(), s)));
+        let have = self.doc_group.get(doc_id.as_str()).cloned();
+        if want == have {
+            return;
+        }
+        if let Some(old) = have {
+            self.detach_from_group(doc_id, &old);
+            if let Some(key) = project_key(catalog, &old.0) {
+                self.reassign_group(&old, &key);
+            }
+        }
+        if let Some(new) = want {
+            if let Some(key) = project_key(catalog, &new.0) {
+                self.groups.entry(new.clone()).or_default().push(doc_id.clone());
+                self.doc_group.insert(doc_id.as_str().to_string(), new.clone());
+                self.reassign_group(&new, &key);
+            }
+        }
+    }
+
+    /// Drop a doc entirely (canonical + KEY-n). Not used by delete — which
+    /// tombstones and deliberately keeps the alias resolvable — but the symmetric
+    /// primitive for a genuine removal; the freed neighbours may shorten.
+    pub fn remove_doc(&mut self, catalog: &CatalogDoc, doc_id: &DocId) {
+        if self.sorted.remove(doc_id) {
+            self.canonical.remove(doc_id.as_str());
+            let pred = self.pred(doc_id);
+            let succ = self.succ(doc_id);
+            if let Some(p) = pred {
+                self.recompute_canonical(&p);
+            }
+            if let Some(s) = succ {
+                self.recompute_canonical(&s);
+            }
+        }
+        if let Some(gk) = self.doc_group.remove(doc_id.as_str()) {
+            self.detach_from_group(doc_id, &gk);
+            if let Some(key) = project_key(catalog, &gk.0) {
+                self.reassign_group(&gk, &key);
+            }
+        }
+    }
+
+    /// Greatest DocId strictly less than `doc` (its left sorted neighbour).
+    fn pred(&self, doc: &DocId) -> Option<DocId> {
+        self.sorted.range(..doc.clone()).next_back().cloned()
+    }
+    /// Least DocId strictly greater than `doc` (its right sorted neighbour).
+    fn succ(&self, doc: &DocId) -> Option<DocId> {
+        self.sorted
+            .range((Excluded(doc.clone()), Unbounded))
+            .next()
+            .cloned()
+    }
+
+    /// Recompute one doc's canonical handle from its two sorted neighbours:
+    /// the shortest prefix (≥ [`CANONICAL_MIN`]) not shared with either.
+    fn recompute_canonical(&mut self, doc: &DocId) {
+        let ulid = doc.ulid();
+        let lp = self.pred(doc).map(|p| lcp_len(ulid, p.ulid())).unwrap_or(0);
+        let ls = self.succ(doc).map(|s| lcp_len(ulid, s.ulid())).unwrap_or(0);
+        let k = (lp.max(ls) + 1).clamp(CANONICAL_MIN, ulid.len());
+        self.canonical.insert(
+            doc.as_str().to_string(),
+            format!("{}{}", DocId::PREFIX, &ulid[..k]),
+        );
+    }
+
+    /// Remove a doc from its group's member list and drop its alias entries
+    /// (leaving the group's remaining members to be reassigned by the caller).
+    fn detach_from_group(&mut self, doc_id: &DocId, gk: &(String, u32)) {
+        if let Some(v) = self.groups.get_mut(gk) {
+            v.retain(|d| d.as_str() != doc_id.as_str());
+            if v.is_empty() {
+                self.groups.remove(gk);
+            }
+        }
+        self.doc_group.remove(doc_id.as_str());
+        if let Some(a) = self.by_doc.remove(doc_id.as_str()) {
+            self.by_alias.remove(&a.to_ascii_lowercase());
+        }
+    }
+
+    /// Rewrite every alias in a `(project, seq)` group: sorted-first keeps the
+    /// bare `KEY-n`, the rest get deterministic suffixes `b`, `c`, … (S§5.4).
+    fn reassign_group(&mut self, gk: &(String, u32), key: &str) {
+        let seq = gk.1;
+        let mut docs = self.groups.get(gk).cloned().unwrap_or_default();
+        docs.sort();
+        // clear the group's current alias entries before rewriting.
+        for d in &docs {
+            if let Some(a) = self.by_doc.remove(d.as_str()) {
+                self.by_alias.remove(&a.to_ascii_lowercase());
+            }
+        }
+        for (i, d) in docs.iter().enumerate() {
+            let alias = if i == 0 {
+                format!("{key}-{seq}")
+            } else {
+                format!("{key}-{seq}{}", suffix(i))
+            };
+            self.by_alias.insert(alias.to_ascii_lowercase(), d.clone());
+            self.by_doc.insert(d.as_str().to_string(), alias);
+        }
     }
 
     /// The display alias for a doc, if it has one.
@@ -107,29 +226,17 @@ impl AliasTable {
     }
 }
 
-/// Git-style shortest-unique prefixes: for each doc, the smallest prefix
-/// (≥ [`CANONICAL_MIN`] ULID chars) that no other doc shares. Because ULIDs lead
-/// with a timestamp, same-millisecond docs extend into their random tail.
-fn shortest_unique_canonicals(ids: &[DocId]) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    for id in ids {
-        let ulid = id.ulid();
-        let max = ulid.len();
-        let mut k = CANONICAL_MIN.min(max);
-        while k < max {
-            let prefix = &ulid[..k];
-            let collisions = ids.iter().filter(|o| o.ulid().starts_with(prefix)).count();
-            if collisions <= 1 {
-                break;
-            }
-            k += 1;
-        }
-        out.insert(
-            id.as_str().to_string(),
-            format!("{}{}", DocId::PREFIX, &ulid[..k]),
-        );
-    }
-    out
+/// Length of the common prefix of two (ASCII, equal-alphabet) ULID strings —
+/// the metric behind a doc's shortest-unique canonical prefix.
+fn lcp_len(a: &str, b: &str) -> usize {
+    a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
+}
+
+/// The display key of a project id string, if the project exists.
+fn project_key(catalog: &CatalogDoc, project_id: &str) -> Option<String> {
+    ProjectId::parse(project_id)
+        .and_then(|p| catalog.project(&p))
+        .map(|p| p.key)
 }
 
 /// `1 -> "b", 2 -> "c", …, 25 -> "z", 26 -> "aa"` (collision suffix, S§5.4).
@@ -441,6 +548,100 @@ mod tests {
             resolve_ref(&c, &aliases, "ENG-5b"),
             RefResolution::One(second.clone())
         );
+    }
+
+    /// Every canonical handle must uniquely identify its doc: no *other* doc's
+    /// ULID may start with it. This is the invariant the old O(N²) scan gave and
+    /// the incremental neighbour recompute must preserve.
+    fn assert_canonicals_unique(t: &AliasTable, c: &CatalogDoc) {
+        let ids = c.doc_ids();
+        for d in &ids {
+            let handle = t.canonical_for(d);
+            let prefix = handle.strip_prefix(DocId::PREFIX).unwrap();
+            let hits = ids.iter().filter(|o| o.ulid().starts_with(prefix)).count();
+            assert_eq!(hits, 1, "canonical {handle} for {d} is not unique ({hits} hits)");
+            assert!(prefix.len() >= CANONICAL_MIN, "canonical shorter than min: {handle}");
+        }
+    }
+
+    #[test]
+    fn incremental_reconcile_matches_full_build_any_order() {
+        let (c, p, ws) = setup();
+        let q = ProjectId::mint(&SystemUlidSource);
+        c.add_project(&q, "Design", "DSN", "pink").unwrap();
+        c.doc().commit();
+        let mut ids = Vec::new();
+        for t in ["a", "b", "cc", "d", "e", "f"] {
+            ids.push(add_issue(&c, &ws, &p, t, true));
+        }
+        for t in ["g", "h", "i"] {
+            ids.push(add_issue(&c, &ws, &q, t, true));
+        }
+
+        // Reconcile in REVERSE doc order — must still equal the full build.
+        let mut inc = AliasTable::default();
+        let mut rev = c.doc_ids();
+        rev.reverse();
+        for id in &rev {
+            inc.reconcile_doc(&c, id);
+        }
+        let full = AliasTable::build(&c);
+        assert_eq!(inc, full, "incremental (reverse order) must equal full build");
+        assert_canonicals_unique(&inc, &c);
+        // and aliases resolve
+        for id in &ids {
+            let a = inc.alias_for(id).unwrap();
+            assert_eq!(inc.resolve_alias(&a), Some(id.clone()));
+        }
+    }
+
+    #[test]
+    fn reconcile_absorbs_a_seq_collision() {
+        // Two docs get distinct seqs, then an offline double-assign collides them.
+        let (c, p, ws) = setup();
+        let a = add_issue(&c, &ws, &p, "a", true); // ENG-1
+        let b = add_issue(&c, &ws, &p, "b", true); // ENG-2
+        let mut t = AliasTable::build(&c);
+        assert_eq!(t.alias_for(&a).as_deref(), Some("ENG-1"));
+        assert_eq!(t.alias_for(&b).as_deref(), Some("ENG-2"));
+
+        // Collide b onto seq 1, then reconcile just b.
+        c.set_seq(&b, 1).unwrap();
+        c.doc().commit();
+        t.reconcile_doc(&c, &b);
+
+        // Sorted-first of {a,b} at (ENG,1) keeps the bare alias; the other +suffix.
+        let (first, second) = if a < b { (&a, &b) } else { (&b, &a) };
+        assert_eq!(t.alias_for(first).as_deref(), Some("ENG-1"));
+        assert_eq!(t.alias_for(second).as_deref(), Some("ENG-1b"));
+        // and it matches a fresh full build after the change.
+        assert_eq!(t, AliasTable::build(&c));
+    }
+
+    #[test]
+    fn remove_doc_drops_entries_and_frees_neighbours() {
+        let (c, p, ws) = setup();
+        let ids: Vec<DocId> = ["a", "b", "cc", "d"]
+            .iter()
+            .map(|t| add_issue(&c, &ws, &p, t, true))
+            .collect();
+        let mut t = AliasTable::build(&c);
+        let victim = &ids[1];
+        assert!(t.alias_for(victim).is_some());
+        t.remove_doc(&c, victim);
+        // its alias no longer resolves and it has no canonical entry.
+        assert_eq!(t.resolve_alias("ENG-2"), None);
+        // remaining docs still have unique canonicals.
+        // (build a catalog view of the survivors by filtering the assertion set)
+        for d in ids.iter().filter(|d| *d != victim) {
+            let handle = t.canonical_for(d);
+            let prefix = handle.strip_prefix(DocId::PREFIX).unwrap();
+            let hits = ids
+                .iter()
+                .filter(|o| *o != victim && o.ulid().starts_with(prefix))
+                .count();
+            assert_eq!(hits, 1, "survivor canonical {handle} not unique");
+        }
     }
 
     #[test]

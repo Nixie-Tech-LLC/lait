@@ -22,6 +22,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{anyhow, Context, Result};
 use loro::LoroDoc;
@@ -43,6 +44,14 @@ pub struct Genesis {
 pub struct Store {
     repo: PathBuf,
     git: bool,
+    /// Durable-store mutations recorded since the last git commit. The git
+    /// snapshot is **deferred** off the mutation hot path (see [`Store::commit`]
+    /// vs [`Store::mark_dirty`]/[`Store::checkpoint`]): a `git add -A` is a
+    /// subprocess whose cost grows with the tree, so committing per edit is a
+    /// per-keystroke tax at thousands of docs. Durability does **not** depend on
+    /// it — every `.loro` write is fsync'd in [`write_atomic`] — so coalescing
+    /// commits only coarsens git history, never risks data.
+    pending: AtomicU64,
 }
 
 impl Store {
@@ -60,7 +69,11 @@ impl Store {
             let _ = run_git(&repo, &["config", "user.email", "lait@localhost"]);
             let _ = run_git(&repo, &["config", "user.name", "lait"]);
         }
-        Ok(Self { repo, git })
+        Ok(Self {
+            repo,
+            git,
+            pending: AtomicU64::new(0),
+        })
     }
 
     pub fn repo_path(&self) -> &Path {
@@ -182,9 +195,40 @@ impl Store {
         Ok(())
     }
 
-    /// Commit the current store state as a durability point (best-effort). A
-    /// no-op when git is unavailable or there is nothing to commit.
+    /// Record that the durable store changed but **defer** the git snapshot to
+    /// the next [`checkpoint`](Self::checkpoint). The mutation hot path calls
+    /// this instead of [`commit`](Self::commit) so no `git add -A` subprocess
+    /// runs per edit. Durability is unaffected — the `.loro` bytes are already
+    /// fsync'd by the time this is called.
+    pub fn mark_dirty(&self) {
+        self.pending.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Coalesce every mutation marked since the last commit into a **single**
+    /// git commit (best-effort, for inspectability/history). A no-op when
+    /// nothing is pending or git is unavailable. Returns whether it committed.
+    /// The daemon calls this on a slow periodic tick; tests/harness call it
+    /// explicitly. Safe at any time — it never touches durability.
+    pub fn checkpoint(&self) -> bool {
+        let n = self.pending.swap(0, Ordering::Relaxed);
+        if n == 0 {
+            return false;
+        }
+        let plural = if n == 1 { "" } else { "s" };
+        self.git_commit(&format!("lait: checkpoint ({n} change{plural})"))
+    }
+
+    /// Commit immediately under a descriptive `message` — for one-time
+    /// structural events (init/adopt/membership), not the per-edit path. Also
+    /// flushes any pending mutation batch into this same commit.
     pub fn commit(&self, message: &str) -> bool {
+        self.pending.store(0, Ordering::Relaxed);
+        self.git_commit(message)
+    }
+
+    /// The actual `git add -A && git commit` (best-effort). A no-op returning
+    /// `false` when git is unavailable or there is nothing to commit.
+    fn git_commit(&self, message: &str) -> bool {
         if !self.git {
             return false;
         }
