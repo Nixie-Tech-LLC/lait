@@ -1021,7 +1021,9 @@ impl Node {
         let resolve = |who: &str| -> std::result::Result<String, Response> {
             match resolve_user_dir(who, &me, &dir) {
                 UserResolution::One(u) => Ok(u.as_str().to_string()),
-                UserResolution::Zero => Err(Response::not_found(format!("no user matches '{who}'"))),
+                UserResolution::Zero => {
+                    Err(Response::not_found(format!("no user matches '{who}'")))
+                }
                 UserResolution::Many(c) => Err(Response::Candidates {
                     candidates: user_candidates(&c),
                 }),
@@ -1186,7 +1188,9 @@ impl Node {
                         };
                         Ok(Response::Ok { message: Some(msg) })
                     }
-                    UserResolution::Zero => Ok(Response::not_found(format!("no user matches '{who}'"))),
+                    UserResolution::Zero => {
+                        Ok(Response::not_found(format!("no user matches '{who}'")))
+                    }
                     UserResolution::Many(c) => Ok(Response::Candidates {
                         candidates: user_candidates(&c),
                     }),

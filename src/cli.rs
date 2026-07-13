@@ -113,7 +113,10 @@ pub fn emit_text(text: &str, out: Out) {
         let resp = Response::Text {
             text: text.to_string(),
         };
-        println!("{}", serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()));
+        println!(
+            "{}",
+            serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into())
+        );
     } else {
         println!("{text}");
     }
@@ -126,7 +129,10 @@ pub fn emit_ok(message: &str, out: Out) {
         let resp = Response::Ok {
             message: Some(message.to_string()),
         };
-        println!("{}", serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()));
+        println!(
+            "{}",
+            serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into())
+        );
     } else {
         println!("{message}");
     }
@@ -341,7 +347,10 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
             }
             0
         }
-        Response::Error { message, error_kind } => {
+        Response::Error {
+            message,
+            error_kind,
+        } => {
             eprintln!("error: {message}");
             exit_code_for_kind(*error_kind)
         }
@@ -810,7 +819,10 @@ mod tests {
             serde_json::from_str(r#"{"kind":"error","message":"boom"}"#).unwrap();
         assert!(matches!(
             legacy,
-            Response::Error { error_kind: ErrorKind::Error, .. }
+            Response::Error {
+                error_kind: ErrorKind::Error,
+                ..
+            }
         ));
     }
 

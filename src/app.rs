@@ -80,11 +80,13 @@ pub enum Command {
     },
     /// Render a project's board (workflow columns × ordered rows).
     Board { project: String },
-    /// Show a full issue — lazily loads the issue doc.
-    Show { reff: String },
-    /// Patch an issue's LWW fields (one commit = one activity row).
+    /// Show a full issue — lazily loads the issue doc. The ref is optional: on a
+    /// branch like `eng-142-fix`, `lait show` infers `ENG-142`.
+    Show { reff: Option<String> },
+    /// Patch an issue's LWW fields (one commit = one activity row). The ref is
+    /// optional — inferred from the git branch (e.g. `eng-142-…` → `ENG-142`).
     Edit {
-        reff: String,
+        reff: Option<String>,
         #[arg(long)]
         title: Option<String>,
         #[arg(long)]
@@ -92,9 +94,10 @@ pub enum Command {
         #[arg(long)]
         priority: Option<String>,
     },
-    /// Set project (truth) and/or board position (order).
+    /// Set project (truth) and/or board position (order). The ref is optional —
+    /// inferred from the git branch when omitted.
     Move {
-        reff: String,
+        reff: Option<String>,
         #[arg(short = 'p', long)]
         project: Option<String>,
         #[arg(long)]
@@ -122,10 +125,12 @@ pub enum Command {
     },
     /// Append a comment (immutable body). No BODY → read stdin.
     Comment { reff: String, body: Option<String> },
-    /// Delete (tombstone) an issue.
-    Delete { reff: String },
-    /// The issue's derived activity/time-travel feed.
-    History { reff: String },
+    /// Delete (tombstone) an issue. The ref is optional — inferred from the git
+    /// branch when omitted.
+    Delete { reff: Option<String> },
+    /// The issue's derived activity/time-travel feed. The ref is optional —
+    /// inferred from the git branch when omitted.
+    History { reff: Option<String> },
     /// Manage the project registry.
     Projects {
         #[command(subcommand)]
@@ -409,6 +414,69 @@ async fn run_update() -> Result<()> {
     Ok(())
 }
 
+/// Pull the first `KEY-n` token (letters `-` digits) out of a string and
+/// normalize the key to uppercase: `eng-142-fix-login` → `ENG-142`,
+/// `feature/ENG-7` → `ENG-7`. Returns `None` if there's no such token. No regex
+/// dependency — a small forward scan.
+fn parse_key_n(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_alphabetic() {
+            let start = i;
+            while i < b.len() && b[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            if i < b.len() && b[i] == b'-' {
+                let mut j = i + 1;
+                while j < b.len() && b[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j > i + 1 {
+                    return Some(format!(
+                        "{}-{}",
+                        s[start..i].to_ascii_uppercase(),
+                        &s[i + 1..j]
+                    ));
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Infer an issue ref from the current git branch (VCS-native ergonomics, à la
+/// linear-cli): a branch like `eng-142-fix-login` resolves to `ENG-142`, so
+/// `lait show` / `edit` / `history` are argument-free while you work the branch.
+/// `None` if not in a git repo, detached HEAD, or the branch carries no `KEY-n`.
+fn infer_ref_from_git_branch() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_key_n(String::from_utf8_lossy(&out.stdout).trim())
+}
+
+/// Resolve an optional issue-ref argument: the explicit value if given, else the
+/// ref inferred from the git branch (with a clear error when neither is available).
+fn resolve_reff_arg(reff: Option<String>) -> Result<String> {
+    match reff {
+        Some(r) => Ok(r),
+        None => infer_ref_from_git_branch().ok_or_else(|| {
+            anyhow!(
+                "no issue given, and none could be inferred from the current git branch \
+                 (name it like `eng-142-short-desc`). Pass a ref explicitly, e.g. `lait show ENG-142`."
+            )
+        }),
+    }
+}
+
 pub async fn run() -> Result<()> {
     // `try_parse` (not `parse`) so a usage/parse error exits `1` — the documented
     // code (UI.md §2.3) — instead of clap's default `2`, which collides with
@@ -579,13 +647,17 @@ pub async fn run() -> Result<()> {
         Command::Board { project } => {
             crate::cli::run(&home, Request::Board { project }, out).await?
         }
-        Command::Show { reff } => crate::cli::run(&home, Request::IssueView { reff }, out).await?,
+        Command::Show { reff } => {
+            let reff = resolve_reff_arg(reff)?;
+            crate::cli::run(&home, Request::IssueView { reff }, out).await?
+        }
         Command::Edit {
             reff,
             title,
             status,
             priority,
         } => {
+            let reff = resolve_reff_arg(reff)?;
             crate::cli::run(
                 &home,
                 Request::IssueEdit {
@@ -606,6 +678,7 @@ pub async fn run() -> Result<()> {
             before,
             after,
         } => {
+            let reff = resolve_reff_arg(reff)?;
             let pos = if top {
                 Some(BoardPos::Top)
             } else if bottom {
@@ -656,9 +729,13 @@ pub async fn run() -> Result<()> {
             crate::cli::run(&home, Request::Comment { reff, body }, out).await?
         }
         Command::Delete { reff } => {
+            let reff = resolve_reff_arg(reff)?;
             crate::cli::run(&home, Request::IssueDelete { reff }, out).await?
         }
-        Command::History { reff } => crate::cli::run(&home, Request::History { reff }, out).await?,
+        Command::History { reff } => {
+            let reff = resolve_reff_arg(reff)?;
+            crate::cli::run(&home, Request::History { reff }, out).await?
+        }
         Command::Projects { cmd } => match cmd {
             Some(ProjectsCmd::New { name, key }) => {
                 crate::cli::run(&home, Request::ProjectNew { name, key }, out).await?
@@ -775,4 +852,23 @@ pub async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_key_n;
+
+    #[test]
+    fn key_n_inference_from_branch_names() {
+        // Common branch shapes → KEY-n (key upper-cased).
+        assert_eq!(parse_key_n("eng-142-fix-login").as_deref(), Some("ENG-142"));
+        assert_eq!(parse_key_n("ENG-7").as_deref(), Some("ENG-7"));
+        assert_eq!(parse_key_n("feature/eng-142-x").as_deref(), Some("ENG-142"));
+        assert_eq!(parse_key_n("bob/PROJ-3-thing").as_deref(), Some("PROJ-3"));
+        // No KEY-n present → nothing inferred (fall back to explicit ref).
+        assert_eq!(parse_key_n("main"), None);
+        assert_eq!(parse_key_n("142-eng"), None);
+        assert_eq!(parse_key_n("release/v0.4.5"), None);
+        assert_eq!(parse_key_n("feat/onboarding-dx-bridge"), None);
+    }
 }

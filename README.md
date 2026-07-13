@@ -187,7 +187,15 @@ lait watch --exec 'curl -s -X POST "$WEBHOOK" -d "$LAIT_EVENT_NICK joined"'
 
 ## CLI reference
 
-Issue verbs (act on one issue by `<ref>` — a short `iss_` handle or a `KEY-n` alias):
+Issue verbs (act on one issue by `<ref>` — a short `iss_` handle or a `KEY-n` alias).
+On a git branch named `eng-142-fix-login`, the ref is **optional** for `show` / `edit`
+/ `move` / `history` / `delete` — lait infers `ENG-142` from the branch:
+
+```bash
+git switch -c eng-142-fix-login
+lait show            # → ENG-142, no ref needed
+lait edit --status in_progress
+```
 
 | Command | Description |
 |---|---|
