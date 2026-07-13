@@ -193,15 +193,13 @@ fn approve_join_request_key_first_and_seed_list_is_structured() {
     };
 
     // WS2: A sees B in `members requests`, carrying B's key AND nick.
-    let claimed_nick = poll_until(Duration::from_secs(30), || match req(
-        &a.home,
-        Request::MemberRequests,
-    ) {
-        Response::JoinRequests { requests } => requests
-            .into_iter()
-            .find(|r| r.key == b_id)
-            .map(|r| r.nick),
-        _ => None,
+    let claimed_nick = poll_until(Duration::from_secs(30), || {
+        match req(&a.home, Request::MemberRequests) {
+            Response::JoinRequests { requests } => {
+                requests.into_iter().find(|r| r.key == b_id).map(|r| r.nick)
+            }
+            _ => None,
+        }
     });
     assert_eq!(
         claimed_nick.as_deref(),
@@ -318,16 +316,15 @@ fn self_asserted_nick_never_resolves_only_admin_chosen_alias_does() {
     };
 
     // Wait until A sees the pending request carrying the claimed nick "bob".
-    let saw = poll_until(Duration::from_secs(30), || match req(
-        &a.home,
-        Request::MemberRequests,
-    ) {
-        Response::JoinRequests { requests }
-            if requests.iter().any(|r| r.key == b_id && r.nick == "bob") =>
-        {
-            Some(())
+    let saw = poll_until(Duration::from_secs(30), || {
+        match req(&a.home, Request::MemberRequests) {
+            Response::JoinRequests { requests }
+                if requests.iter().any(|r| r.key == b_id && r.nick == "bob") =>
+            {
+                Some(())
+            }
+            _ => None,
         }
-        _ => None,
     });
     assert!(saw.is_some(), "A never saw B's claimed-nick join request");
 

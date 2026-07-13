@@ -231,10 +231,11 @@ fn two_nodes_converge_over_iroh() {
     // actually connected to A (a real sync opportunity) — a positive proxy that's
     // both faster and more rigorous than a fixed pause — plus a small settling
     // margin for the pull to complete, then confirm B still sees only ciphertext.
-    let connected = poll_until(Duration::from_secs(30), || match req(&b.home, Request::Status)
-    {
-        Response::Status(s) if s.online_peers >= 1 => Some(()),
-        _ => None,
+    let connected = poll_until(Duration::from_secs(30), || {
+        match req(&b.home, Request::Status) {
+            Response::Status(s) if s.online_peers >= 1 => Some(()),
+            _ => None,
+        }
     });
     assert!(
         connected.is_some(),

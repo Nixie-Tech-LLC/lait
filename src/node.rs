@@ -1163,9 +1163,7 @@ impl Node {
                         };
                         Ok(Response::Ok { message: Some(msg) })
                     }
-                    UserResolution::Zero => {
-                        Ok(Response::err(format!("no user matches '{who}'")))
-                    }
+                    UserResolution::Zero => Ok(Response::err(format!("no user matches '{who}'"))),
                     UserResolution::Many(c) => Ok(Response::Candidates {
                         candidates: user_candidates(&c),
                     }),
