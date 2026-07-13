@@ -167,9 +167,35 @@ Scripts capture the resolved handle from `--json`:
 id=$(lait new "fix login" -p ENG --json | jq -r .reff)
 ```
 
+`lait watch` follows the presence/join event stream and can run a hook per event
+(`--exec CMD`) or raise a desktop notification (`--notify`). The hook runs in the
+platform shell (`sh -c` on Unix, `cmd /C` on Windows) with the event as JSON on
+stdin **and** in the environment:
+
+```bash
+# ping a webhook whenever someone asks to join
+lait watch --exec 'curl -s -X POST "$WEBHOOK" -d "$LAIT_EVENT_NICK joined"'
+```
+
+| Env var | Value |
+|---|---|
+| `LAIT_EVENT_KIND` | `join` · `presence` · `system` |
+| `LAIT_EVENT_NICK` | the peer's display name |
+| `LAIT_EVENT_ID` | the peer's endpoint id |
+| `LAIT_EVENT_TEXT` | human message |
+| `LAIT_EVENT_SEQ` · `LAIT_EVENT_TS` | session sequence · unix ts |
+
 ## CLI reference
 
-Issue verbs (act on one issue by `<ref>` — a short `iss_` handle or a `KEY-n` alias):
+Issue verbs (act on one issue by `<ref>` — a short `iss_` handle or a `KEY-n` alias).
+On a git branch named `eng-142-fix-login`, the ref is **optional** for `show` / `edit`
+/ `move` / `history` / `delete` — lait infers `ENG-142` from the branch:
+
+```bash
+git switch -c eng-142-fix-login
+lait show            # → ENG-142, no ref needed
+lait edit --status in_progress
+```
 
 | Command | Description |
 |---|---|
@@ -191,12 +217,13 @@ Registries + node:
 |---|---|
 | `projects [new <name> --key KEY \| ls]` | Manage the project registry |
 | `labels [new <name> --color C \| ls]` | Manage the label registry |
-| `members [add <userref> [--admin] \| remove <userref> \| rotate-key \| ls]` | Manage E2EE membership (signed ACL); add seals the key, remove rotates it |
+| `members [add \| remove \| requests \| approve \| name \| rotate-key \| ls]` | Manage E2EE membership (signed ACL); `add` seals the key, `remove` rotates it, `approve` admits a pending joiner, `name` sets a local label for a key |
 | `activity [--since N]` | Workspace-wide recent transitions |
 | `tui` | Launch the full-screen board |
 | `status` · `id` · `stop` | Node/workspace status · endpoint id · stop daemon |
-| `invite` · `join` · `connect` · `who` · `wait` · `watch` | P2P transport (P1 surface) |
-| `agents` / `resume <name>` | Manage per-session identities |
+| `invite` · `join` · `members requests` · `members approve` | Invite a teammate; they `join`; you approve their pending request |
+| `who` · `wait` · `watch` | Peers online · block for one event · follow the event stream |
+| `profiles` / `resume <name>` | List profiles / switch to a named profile (each a separate identity + store) |
 
 Global flags: `--home DIR`, `--json`, `--no-color`. Exit codes: `0` ok · `1`
 usage/error · `2` ref not found / ambiguous · `3` daemon unreachable.
@@ -239,18 +266,24 @@ parity test keeps the agent and human surfaces in lock-step.
 ## Multi-node & end-to-end encryption
 
 ```bash
-# host — create work, then share a ticket (carries the workspace + genesis)
-lait invite                        # → a base32 ticket; send it to a peer
+# host — share an invite link (carries the workspace + genesis)
+lait invite                        # → an invite link (+ a scannable QR); send it over
 
-# peer — join from the ticket (adopts the workspace, backfills over sync)
-lait connect <TICKET> --nick bob
-lait id                            # → bob's key; send it to the host
+# teammate — join from the link. This sends a *join request*: you are NOT on the
+# board yet — it stays encrypted until an admin approves you.
+lait join <INVITE> --nick bob
+lait status                        # you: pending   ← waiting to be approved
 
-# host — admit bob (seals him the workspace key); now bob can decrypt + edit
-lait members add <BOB_KEY>
-lait members                       # admin you · member bob
+# host — see who's waiting, confirm the short key out-of-band, then approve by
+# key/prefix (the nick is an unverified claim; `--as` is a local name you assign)
+lait members requests              # bob  (claims "bob")   <key-prefix>
+lait members approve <key-prefix> --as bob
+
+# teammate — you're in; the board decrypts and syncs automatically
+lait status                        # you: member
+
 # later: revoke — rotates the key so bob can't read new content (lazy revocation)
-lait members remove <BOB_KEY>
+lait members remove bob
 ```
 
 Workspace data is E2EE: issues sync as ciphertext, and a node that isn't in the

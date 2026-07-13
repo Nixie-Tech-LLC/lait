@@ -182,7 +182,7 @@ impl App {
                 self.board = Some(*b);
                 self.clamp_selection();
             }
-            Response::Error { message } => self.status = message,
+            Response::Error { message, .. } => self.status = message,
             _ => {}
         }
         Ok(())
@@ -203,7 +203,7 @@ impl App {
                     self.row_idx = self.list.len().saturating_sub(1);
                 }
             }
-            Response::Error { message } => self.status = message,
+            Response::Error { message, .. } => self.status = message,
             _ => {}
         }
         Ok(())
@@ -501,7 +501,7 @@ async fn submit_modal(app: &mut App, modal: Modal) -> Result<()> {
         },
     };
     match app.req(req).await? {
-        Response::Error { message } => {
+        Response::Error { message, .. } => {
             // validate-then-commit: on error nothing changed — roll back overlay.
             if let Some(row) = app.focused_row() {
                 app.overlay.clear_doc(row.doc_id.as_str());
@@ -600,7 +600,7 @@ async fn status_move(app: &mut App, dir: i32) -> Result<()> {
             priority: None,
         })
         .await?;
-    if let Response::Error { message } = resp {
+    if let Response::Error { message, .. } = resp {
         app.overlay.clear_doc(row.doc_id.as_str());
         app.status = message;
     }

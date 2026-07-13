@@ -388,7 +388,7 @@ impl Tracker {
     fn resolve_issue(&self, reff: &str) -> std::result::Result<DocId, Response> {
         match index::resolve_ref(&self.catalog, &self.aliases, reff) {
             RefResolution::One(id) => Ok(id),
-            RefResolution::Zero => Err(Response::err(format!("no issue matches '{reff}'"))),
+            RefResolution::Zero => Err(Response::not_found(format!("no issue matches '{reff}'"))),
             RefResolution::Many(cands) => Err(Response::Candidates { candidates: cands }),
         }
     }
@@ -429,7 +429,12 @@ impl Tracker {
         let project = match project {
             Some(p) => match self.resolve_project(&p) {
                 Some(pr) => pr,
-                None => return Ok((Response::err(format!("no project matches '{p}'")), None)),
+                None => {
+                    return Ok((
+                        Response::not_found(format!("no project matches '{p}'")),
+                        None,
+                    ))
+                }
             },
             None => match self.default_project() {
                 Ok(pr) => pr,
@@ -448,14 +453,14 @@ impl Tracker {
         for a in &assignees {
             match index::resolve_user(a, &self.me) {
                 Some(u) => assignee_ids.push(u),
-                None => return Ok((Response::err(format!("no user matches '{a}'")), None)),
+                None => return Ok((Response::not_found(format!("no user matches '{a}'")), None)),
             }
         }
         let mut label_ids = Vec::new();
         for l in &labels {
             match self.resolve_label(l) {
                 Some(id) => label_ids.push(id),
-                None => return Ok((Response::err(format!("no label matches '{l}'")), None)),
+                None => return Ok((Response::not_found(format!("no label matches '{l}'")), None)),
             }
         }
 
@@ -601,7 +606,12 @@ impl Tracker {
         let new_project = match &project {
             Some(p) => match self.resolve_project(p) {
                 Some(pr) => Some(pr),
-                None => return Ok((Response::err(format!("no project matches '{p}'")), None)),
+                None => {
+                    return Ok((
+                        Response::not_found(format!("no project matches '{p}'")),
+                        None,
+                    ))
+                }
             },
             None => None,
         };
@@ -692,7 +702,7 @@ impl Tracker {
         for w in &who {
             match index::resolve_user(w, &self.me) {
                 Some(u) => users.push(u),
-                None => return Ok((Response::err(format!("no user matches '{w}'")), None)),
+                None => return Ok((Response::not_found(format!("no user matches '{w}'")), None)),
             }
         }
         let project_id = {
@@ -738,14 +748,14 @@ impl Tracker {
         for l in &add {
             match self.resolve_label(l) {
                 Some(id) => add_ids.push(id),
-                None => return Ok((Response::err(format!("no label matches '{l}'")), None)),
+                None => return Ok((Response::not_found(format!("no label matches '{l}'")), None)),
             }
         }
         let mut remove_ids = Vec::new();
         for l in &remove {
             match self.resolve_label(l) {
                 Some(id) => remove_ids.push(id),
-                None => return Ok((Response::err(format!("no label matches '{l}'")), None)),
+                None => return Ok((Response::not_found(format!("no label matches '{l}'")), None)),
             }
         }
         let project_id = {
@@ -950,14 +960,14 @@ impl Tracker {
         let project_filter = match &project {
             Some(p) => match self.resolve_project(p) {
                 Some(pr) => Some(pr.id),
-                None => return Ok(Response::err(format!("no project matches '{p}'"))),
+                None => return Ok(Response::not_found(format!("no project matches '{p}'"))),
             },
             None => None,
         };
         let label_filter = match &filter.label {
             Some(l) => match self.resolve_label(l) {
                 Some(id) => Some(id),
-                None => return Ok(Response::err(format!("no label matches '{l}'"))),
+                None => return Ok(Response::not_found(format!("no label matches '{l}'"))),
             },
             None => None,
         };
@@ -1003,7 +1013,9 @@ impl Tracker {
     /// Done column via the append rule ordered by wall-clock desc (S§5.7).
     fn board(&self, project: String) -> Result<Response> {
         let Some(project_dto) = self.resolve_project(&project) else {
-            return Ok(Response::err(format!("no project matches '{project}'")));
+            return Ok(Response::not_found(format!(
+                "no project matches '{project}'"
+            )));
         };
         let pid = &project_dto.id;
         let rows_by_doc: HashMap<String, RowMeta> = self
@@ -1426,14 +1438,20 @@ impl Tracker {
 
     fn member_add_cmd(&mut self, who: String, admin: bool) -> (Response, Option<DirtySet>) {
         let Some(user) = index::resolve_user(&who, &self.me) else {
-            return (Response::err(format!("no user matches '{who}'")), None);
+            return (
+                Response::not_found(format!("no user matches '{who}'")),
+                None,
+            );
         };
         let role = if admin { Role::Admin } else { Role::Member };
         self.member_add(&user, role)
     }
     fn member_remove_cmd(&mut self, who: String) -> (Response, Option<DirtySet>) {
         let Some(user) = index::resolve_user(&who, &self.me) else {
-            return (Response::err(format!("no user matches '{who}'")), None);
+            return (
+                Response::not_found(format!("no user matches '{who}'")),
+                None,
+            );
         };
         self.member_remove(&user)
     }

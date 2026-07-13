@@ -10,7 +10,7 @@ use std::{io::Write, path::Path, process::Stdio, time::Duration};
 use anyhow::{anyhow, Context, Result};
 
 use crate::{
-    control::{request, Event, EventKind, Request, Response},
+    control::{request, ErrorKind, Event, EventKind, Request, Response},
     dto::{BoardView, IssueView, Priority, Row},
     proto::RoomTicket,
 };
@@ -28,6 +28,28 @@ impl Default for Out {
             json: false,
             color: true,
         }
+    }
+}
+
+/// Minimal ANSI styling. Every helper is gated on `Out.color`, which already
+/// folds in `--no-color`, `$NO_COLOR`, `--json`, and TTY detection (computed once
+/// in `app::run`), so a renderer just passes `out.color` and never re-checks.
+mod ansi {
+    pub const RESET: &str = "\x1b[0m";
+    pub const DIM: &str = "\x1b[2m";
+    pub const BOLD: &str = "\x1b[1m";
+    pub const RED: &str = "\x1b[31m";
+    pub const GREEN: &str = "\x1b[32m";
+    pub const YELLOW: &str = "\x1b[33m";
+    pub const CYAN: &str = "\x1b[36m";
+}
+
+/// Wrap `s` in an ANSI code when `on`, else return it unstyled.
+fn paint(on: bool, code: &str, s: &str) -> String {
+    if on {
+        format!("{code}{s}{}", ansi::RESET)
+    } else {
+        s.to_string()
     }
 }
 
@@ -82,13 +104,47 @@ pub async fn run(home: &Path, req: Request, out: Out) -> Result<()> {
     }
 }
 
+/// Emit a bare text value honouring the `--json` contract (UI.md §2.3): the
+/// `Response::Text` DTO under `--json`, else the raw string. For client-side
+/// commands (`id`, `invite`) that don't round-trip a daemon `Response` but must
+/// still emit a parseable DTO under `--json` instead of leaking plain text.
+pub fn emit_text(text: &str, out: Out) {
+    if out.json {
+        let resp = Response::Text {
+            text: text.to_string(),
+        };
+        println!(
+            "{}",
+            serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into())
+        );
+    } else {
+        println!("{text}");
+    }
+}
+
+/// Emit an acknowledgement honouring `--json`: the `Response::Ok` DTO under
+/// `--json`, else the human message (`init`, `install-mcp`, `resume`).
+pub fn emit_ok(message: &str, out: Out) {
+    if out.json {
+        let resp = Response::Ok {
+            message: Some(message.to_string()),
+        };
+        println!(
+            "{}",
+            serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into())
+        );
+    } else {
+        println!("{message}");
+    }
+}
+
 /// Print a response; return the process exit code it implies.
 pub fn print_response(resp: &Response, out: Out) -> i32 {
     if out.json {
         let json = serde_json::to_string(resp).unwrap_or_else(|_| "{}".into());
         println!("{json}");
         return match resp {
-            Response::Error { message } => exit_code_for_error(message),
+            Response::Error { error_kind, .. } => exit_code_for_kind(*error_kind),
             Response::Candidates { .. } => 2,
             _ => 0,
         };
@@ -220,10 +276,46 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
             println!("id:        {}", s.id);
             println!("nick:      {}", s.nick);
             println!("workspace: {}", s.workspace.as_deref().unwrap_or("(none)"));
+            if !s.membership.is_empty() {
+                let code = if s.membership == "pending" {
+                    ansi::YELLOW
+                } else {
+                    ansi::GREEN
+                };
+                println!("you:       {}", paint(out.color, code, &s.membership));
+            }
             println!("room:      {}", s.room);
             println!("issues:    {}", s.issues);
             println!("projects:  {}", s.projects);
             println!("online:    {} peer(s)", s.online_peers);
+            // Directional nudges so neither side of a join stalls silently.
+            if s.membership == "pending" {
+                println!();
+                println!(
+                    "{}",
+                    paint(
+                        out.color,
+                        ansi::CYAN,
+                        "⌛ you've requested to join — waiting for an admin to approve you."
+                    )
+                );
+                println!("   the board stays encrypted until then; it syncs automatically once you're in.");
+            } else if s.pending_requests > 0 {
+                let n = s.pending_requests;
+                let plural = if n == 1 { "" } else { "s" };
+                println!();
+                println!(
+                    "{}",
+                    paint(
+                        out.color,
+                        ansi::YELLOW,
+                        &format!(
+                            "⚠ {n} pending join request{plural} — someone is waiting to be let in."
+                        )
+                    )
+                );
+                println!("   review: `lait members requests`   approve: `lait members approve <id> --as <name>`");
+            }
             0
         }
         Response::Text { text } => {
@@ -246,40 +338,46 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
             }
             peers.sort_by_key(|p| (!p.online, p.nick.clone()));
             for p in peers {
-                let dot = match p.state.as_str() {
-                    "online" => "\u{25CF}",
-                    "away" => "\u{25D0}",
-                    _ => "\u{25CB}",
+                let (glyph, code) = match p.state.as_str() {
+                    "online" => ("\u{25CF}", ansi::GREEN),
+                    "away" => ("\u{25D0}", ansi::YELLOW),
+                    _ => ("\u{25CB}", ansi::DIM),
                 };
-                println!("{dot} {}  ({})", p.nick, p.id);
+                println!("{} {}  ({})", paint(out.color, code, glyph), p.nick, p.id);
             }
             0
         }
-        Response::Error { message } => {
+        Response::Error {
+            message,
+            error_kind,
+        } => {
             eprintln!("error: {message}");
-            exit_code_for_error(message)
+            exit_code_for_kind(*error_kind)
         }
     }
 }
 
-fn exit_code_for_error(message: &str) -> i32 {
-    let resolution_error = message.contains("no issue matches")
-        || message.contains("no project matches")
-        || message.contains("no user matches")
-        || message.contains("no label matches")
-        || message.contains("more than one project");
-    if resolution_error {
-        2
-    } else {
-        1
+/// Exit code from the typed error kind (UI.md §2.3), not from the message text.
+fn exit_code_for_kind(kind: ErrorKind) -> i32 {
+    match kind {
+        ErrorKind::NotFound => 2,
+        ErrorKind::Error => 1,
     }
 }
 
-fn prio_badge(p: Priority) -> String {
-    format!("·{}·", p.badge())
+fn prio_badge(p: Priority, color: bool) -> String {
+    let badge = format!("·{}·", p.badge());
+    let code = match p {
+        Priority::Urgent => ansi::RED,
+        Priority::High => ansi::YELLOW,
+        Priority::Medium => ansi::CYAN,
+        Priority::Low => ansi::DIM,
+        Priority::None => ansi::DIM,
+    };
+    paint(color, code, &badge)
 }
 
-fn print_rows(rows: &[Row], _out: Out) {
+fn print_rows(rows: &[Row], out: Out) {
     if rows.is_empty() {
         println!("(no issues)");
         return;
@@ -291,11 +389,15 @@ fn print_rows(rows: &[Row], _out: Out) {
         } else {
             format!("  {}", r.assignee_summary)
         };
-        let dim = if r.provisional { " (provisional)" } else { "" };
+        let dim = if r.provisional {
+            paint(out.color, ansi::DIM, " (provisional)")
+        } else {
+            String::new()
+        };
         println!(
-            "{:<10} {} {:<12} {}{}{}",
-            alias,
-            prio_badge(r.priority),
+            "{} {} {:<12} {}{}{}",
+            paint(out.color, ansi::BOLD, &format!("{alias:<10}")),
+            prio_badge(r.priority, out.color),
             r.status,
             r.title,
             asg,
@@ -304,10 +406,15 @@ fn print_rows(rows: &[Row], _out: Out) {
     }
 }
 
-fn print_board(b: &BoardView, _out: Out) {
-    println!("{} · {}", b.project.key, b.project.name);
+fn print_board(b: &BoardView, out: Out) {
+    println!(
+        "{} · {}",
+        paint(out.color, ansi::BOLD, &b.project.key),
+        b.project.name
+    );
     for col in &b.columns {
-        println!("\n┌ {} ({}) ", col.state.name, col.rows.len());
+        let header = format!("┌ {} ({}) ", col.state.name, col.rows.len());
+        println!("\n{}", paint(out.color, ansi::CYAN, &header));
         for r in &col.rows {
             let alias = r.key_alias.as_deref().unwrap_or(&r.reff);
             let asg = if r.assignee_summary.is_empty() {
@@ -318,7 +425,7 @@ fn print_board(b: &BoardView, _out: Out) {
             println!(
                 "│ {:<10} {} {}{}",
                 alias,
-                prio_badge(r.priority),
+                prio_badge(r.priority, out.color),
                 r.title,
                 asg
             );
@@ -326,10 +433,14 @@ fn print_board(b: &BoardView, _out: Out) {
     }
 }
 
-fn print_issue(v: &IssueView, _out: Out) {
+fn print_issue(v: &IssueView, out: Out) {
     let alias = v.key_alias.as_deref().unwrap_or(&v.reff);
-    println!("{}  {}", alias, v.title);
-    println!("{}", "─".repeat(60));
+    println!(
+        "{}  {}",
+        paint(out.color, ansi::BOLD, alias),
+        paint(out.color, ansi::BOLD, &v.title)
+    );
+    println!("{}", paint(out.color, ansi::DIM, &"─".repeat(60)));
     println!("id:       {}", v.reff);
     println!("project:  {}", v.project_key.as_deref().unwrap_or("?"));
     println!("status:   {}", v.status);
@@ -368,20 +479,24 @@ pub async fn run_invite(home: &Path, email: Option<String>, out: Out) -> Result<
             return Ok(());
         }
     };
+    // Under --json, emit the ticket as the versioned DTO and stop — no bare
+    // lines, no QR/clipboard/mail chrome (the link is derivable from the ticket).
+    if out.json {
+        emit_text(&token, out);
+        return Ok(());
+    }
     let link = token
         .parse::<RoomTicket>()
         .map(|t| t.link())
         .unwrap_or_else(|_| format!("lait://join/{token}"));
     println!("{token}");
     println!("{link}");
-    if !out.json {
-        match render_qr(&link) {
-            Ok(q) => println!("\n{q}"),
-            Err(e) => eprintln!("(qr unavailable: {e:#})"),
-        }
+    match render_qr(&link) {
+        Ok(q) => println!("\n{q}"),
+        Err(e) => eprintln!("(qr unavailable: {e:#})"),
     }
     if copy_to_clipboard(&token) && !out.json {
-        println!("(copied to clipboard — paste into `lait connect`)");
+        println!("(copied to clipboard — your teammate runs `lait join <link>`)");
     }
     if let Some(addr) = email {
         match open_mail_invite(&addr, &link) {
@@ -454,9 +569,10 @@ fn open_mail_invite(addr: &str, link: &str) -> Result<()> {
          https://github.com/Nixie-Tech-LLC/lait/releases/latest/download/lait-installer.sh | sh\n   \
          Windows:      powershell -c \"irm \
          https://github.com/Nixie-Tech-LLC/lait/releases/latest/download/lait-installer.ps1 | iex\"\n\n\
-         2. Join the workspace\n   lait connect {link}\n\n\
-         That announces a join request; I'll approve you and your device gets the \
-         workspace key automatically. lait is local-first and end-to-end encrypted.\n"
+         2. Join the workspace\n   lait join {link}\n\n\
+         That sends a join request; I approve you and your device gets the \
+         workspace key automatically (run `lait status` to see when you're in). \
+         lait is local-first and end-to-end encrypted.\n"
     );
     let mailto = format!(
         "mailto:{}?subject={}&body={}",
@@ -531,11 +647,28 @@ fn print_event(e: &Event) {
     }
 }
 
+/// Build the per-OS shell invocation for a `watch --exec` hook. `sh -c` doesn't
+/// exist on stock Windows, so a hook there silently failed to start; use the
+/// native `cmd /C` instead (mirrors how `copy_to_clipboard`/`open_url` split).
+fn hook_command(cmd: &str) -> std::process::Command {
+    #[cfg(windows)]
+    {
+        let mut c = std::process::Command::new("cmd");
+        c.arg("/C").arg(cmd);
+        c
+    }
+    #[cfg(not(windows))]
+    {
+        let mut c = std::process::Command::new("sh");
+        c.arg("-c").arg(cmd);
+        c
+    }
+}
+
 fn run_hook(cmd: &str, e: &Event) {
     let json = serde_json::to_string(e).unwrap_or_default();
-    let child = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
+    let mut command = hook_command(cmd);
+    let child = command
         .env("LAIT_EVENT_SEQ", e.seq.to_string())
         .env("LAIT_EVENT_KIND", kind_str(&e.kind))
         .env("LAIT_EVENT_NICK", &e.nick)
@@ -557,15 +690,45 @@ fn run_hook(cmd: &str, e: &Event) {
     }
 }
 
+/// Wrap `s` as a single-quoted PowerShell string literal (doubling embedded
+/// quotes) so an event nick/text can't break out of the notify command.
+#[cfg(target_os = "windows")]
+fn ps_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
 fn desktop_notify(e: &Event) {
     let title = format!("lait: {}", e.nick);
-    if cfg!(target_os = "macos") {
+    #[cfg(target_os = "macos")]
+    {
         let script = format!("display notification {:?} with title {:?}", e.text, title);
         let _ = std::process::Command::new("osascript")
             .arg("-e")
             .arg(script)
             .spawn();
-    } else {
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // Best-effort tray balloon via PowerShell NotifyIcon — no external module
+        // (BurntToast etc.) required, works on stock Windows 10/11.
+        let script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; \
+             $n = New-Object System.Windows.Forms.NotifyIcon; \
+             $n.Icon = [System.Drawing.SystemIcons]::Information; \
+             $n.Visible = $true; \
+             $n.ShowBalloonTip(5000, {}, {}, 'Info'); \
+             Start-Sleep -Milliseconds 6000; $n.Dispose()",
+            ps_single_quote(&title),
+            ps_single_quote(&e.text),
+        );
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
         let _ = std::process::Command::new("notify-send")
             .arg(&title)
             .arg(&e.text)
@@ -620,5 +783,54 @@ pub async fn watch(
             }
             cursor = last.max(cursor);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dto::Priority;
+
+    #[test]
+    fn paint_is_gated_on_color() {
+        // Color off → the string passes through untouched (pipes/`--no-color`/
+        // `$NO_COLOR`/non-tty stay clean); color on → wrapped in the code + reset.
+        assert_eq!(paint(false, ansi::RED, "hi"), "hi");
+        let on = paint(true, ansi::RED, "hi");
+        assert!(on.starts_with(ansi::RED) && on.ends_with(ansi::RESET) && on.contains("hi"));
+    }
+
+    #[test]
+    fn exit_code_is_derived_from_typed_kind_not_prose() {
+        // A resolution miss → exit 2, regardless of the (rewordable) message.
+        assert_eq!(exit_code_for_kind(ErrorKind::NotFound), 2);
+        assert_eq!(exit_code_for_kind(ErrorKind::Error), 1);
+        // The constructors carry the kind, and it survives a DTO round-trip so a
+        // --json consumer / MCP agent sees the same classification.
+        let nf = Response::not_found("no issue matches 'ENG-9x'");
+        let json = serde_json::to_string(&nf).unwrap();
+        assert!(json.contains("\"error_kind\":\"not_found\""));
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::Error { error_kind, .. } => assert_eq!(error_kind, ErrorKind::NotFound),
+            other => panic!("round-trip changed variant: {other:?}"),
+        }
+        // A legacy error object with no error_kind field defaults to Error (exit 1).
+        let legacy: Response =
+            serde_json::from_str(r#"{"kind":"error","message":"boom"}"#).unwrap();
+        assert!(matches!(
+            legacy,
+            Response::Error {
+                error_kind: ErrorKind::Error,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn prio_badge_colorless_is_plain() {
+        assert_eq!(prio_badge(Priority::Urgent, false), "·U·");
+        // Colored urgent badge carries an ANSI escape but the same visible text.
+        let c = prio_badge(Priority::Urgent, true);
+        assert!(c.contains("·U·") && c.contains('\u{1b}'));
     }
 }

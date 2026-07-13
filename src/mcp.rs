@@ -291,7 +291,7 @@ impl LaitMcp {
     async fn run(&self, req: Request) -> Result<CallToolResult, McpError> {
         match client(&self.home, req).await {
             Ok(resp) => {
-                if let Response::Error { message } = &resp {
+                if let Response::Error { message, .. } = &resp {
                     return Err(McpError::internal_error(message.clone(), None));
                 }
                 let json = serde_json::to_string(&resp)

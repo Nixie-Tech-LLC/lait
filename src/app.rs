@@ -80,11 +80,13 @@ pub enum Command {
     },
     /// Render a project's board (workflow columns × ordered rows).
     Board { project: String },
-    /// Show a full issue — lazily loads the issue doc.
-    Show { reff: String },
-    /// Patch an issue's LWW fields (one commit = one activity row).
+    /// Show a full issue — lazily loads the issue doc. The ref is optional: on a
+    /// branch like `eng-142-fix`, `lait show` infers `ENG-142`.
+    Show { reff: Option<String> },
+    /// Patch an issue's LWW fields (one commit = one activity row). The ref is
+    /// optional — inferred from the git branch (e.g. `eng-142-…` → `ENG-142`).
     Edit {
-        reff: String,
+        reff: Option<String>,
         #[arg(long)]
         title: Option<String>,
         #[arg(long)]
@@ -92,9 +94,10 @@ pub enum Command {
         #[arg(long)]
         priority: Option<String>,
     },
-    /// Set project (truth) and/or board position (order).
+    /// Set project (truth) and/or board position (order). The ref is optional —
+    /// inferred from the git branch when omitted.
     Move {
-        reff: String,
+        reff: Option<String>,
         #[arg(short = 'p', long)]
         project: Option<String>,
         #[arg(long)]
@@ -122,10 +125,12 @@ pub enum Command {
     },
     /// Append a comment (immutable body). No BODY → read stdin.
     Comment { reff: String, body: Option<String> },
-    /// Delete (tombstone) an issue.
-    Delete { reff: String },
-    /// The issue's derived activity/time-travel feed.
-    History { reff: String },
+    /// Delete (tombstone) an issue. The ref is optional — inferred from the git
+    /// branch when omitted.
+    Delete { reff: Option<String> },
+    /// The issue's derived activity/time-travel feed. The ref is optional —
+    /// inferred from the git branch when omitted.
+    History { reff: Option<String> },
     /// Manage the project registry.
     Projects {
         #[command(subcommand)]
@@ -183,22 +188,26 @@ pub enum Command {
         #[arg(long)]
         email: Option<String>,
     },
-    /// Join a workspace from a ticket and announce a join request.
-    Join { ticket: String },
-    /// Manage pinned always-on **seed** peers — the P2P "remote". A seed is a
-    /// sticky bootstrap + backfill anchor your node always dials, so you converge
-    /// even when no laptop peer is online. It is not a trust authority (genesis/
-    /// ACL still gate every op, A§10). Set one up with `daemon --seed` on the box.
-    #[command(visible_alias = "remote")]
-    Seed {
-        #[command(subcommand)]
-        cmd: SeedCmd,
-    },
-    /// One-step onboarding: connect to a workspace from a ticket.
-    Connect {
+    /// Join a workspace from an invite link. Sends a join request; a workspace
+    /// admin approves you, then your board decrypts and syncs automatically.
+    /// Check progress any time with `lait status`. (Alias: `connect`.)
+    #[command(alias = "connect")]
+    Join {
+        /// The invite link / ticket from `lait invite`.
         ticket: String,
+        /// Set your display name as you join — what the admin sees on your
+        /// pending request (a self-asserted claim; they approve you by key).
         #[arg(long)]
         nick: Option<String>,
+    },
+    /// Manage pinned **remotes** — always-on peers your node always dials for
+    /// bootstrap + backfill, so you converge even when no laptop peer is online.
+    /// A remote is not a trust authority (genesis/ACL still gate every op, A§10);
+    /// stand one up with `daemon --seed` on an always-on box. (Alias: `seed`.)
+    #[command(alias = "seed")]
+    Remote {
+        #[command(subcommand)]
+        cmd: SeedCmd,
     },
     /// Print presence/system events (optionally only after --since).
     Log {
@@ -225,9 +234,11 @@ pub enum Command {
     },
     /// List peers and their online status.
     Who,
-    /// List your identities (each agent/session is its own private identity).
-    Agents,
-    /// Resume (or create) a named identity for this session.
+    /// List your profiles — each is a separate private identity with its own key
+    /// and store (e.g. one per agent/session). (Alias: `agents`.)
+    #[command(alias = "agents")]
+    Profiles,
+    /// Switch to (or create) a named profile for this session.
     Resume { name: String },
     /// Update lait in place from the latest GitHub release (native self-update).
     Update,
@@ -265,18 +276,18 @@ pub enum LabelsCmd {
 
 #[derive(Subcommand, Debug)]
 pub enum SeedCmd {
-    /// Pin a seed and adopt its workspace. Accepts a room ticket (from
-    /// `lait invite` on the seed — adopts + backfills) or a bare endpoint id
+    /// Pin a remote and adopt its workspace. Accepts an invite link (from
+    /// `lait invite` on the remote — adopts + backfills) or a bare endpoint id
     /// (pin only, for a workspace you already share).
     Add {
-        /// A room ticket or an endpoint id.
+        /// An invite link or an endpoint id.
         target: String,
     },
-    /// List pinned seeds and whether each is currently reachable.
+    /// List pinned remotes and whether each is currently reachable.
     Ls,
-    /// Unpin a seed by endpoint id (or id-prefix) or nick.
+    /// Unpin a remote by endpoint id (or id-prefix) or name.
     Rm {
-        /// Endpoint id (or prefix) or nick to unpin.
+        /// Endpoint id (or prefix) or name to unpin.
         who: String,
     },
 }
@@ -285,39 +296,41 @@ pub enum SeedCmd {
 pub enum MembersCmd {
     /// Add a member (admin-only). Seals the workspace key to them.
     Add {
-        /// A user ref: @me, a local alias you've set, a key id-prefix, or a full
-        /// 64-hex key. (A self-asserted wire nick is NOT accepted — name people
-        /// yourself with `--as` / `members alias`.)
+        /// A user ref: @me, a local name you've set, a key id-prefix, or a full
+        /// 64-hex key. (A self-asserted wire name is NOT accepted — name people
+        /// yourself with `--as` / `members name`.)
         who: String,
         #[arg(long)]
         admin: bool,
-        /// Attach a local petname to this key as you add them (never synced).
+        /// Attach a local name to this key as you add them (never synced).
         #[arg(long = "as", value_name = "NAME")]
         as_name: Option<String>,
     },
     /// Remove a member (admin-only) and rotate the workspace key.
     Remove {
-        /// A user ref: @me, a local alias, a key id-prefix, or a full 64-hex key.
+        /// A user ref: @me, a local name, a key id-prefix, or a full 64-hex key.
         who: String,
     },
-    /// List pending join requests (people who ran `connect`/`join`, not yet added).
+    /// List pending join requests (people who ran `join`, not yet added).
     Requests,
     /// Approve a pending join request **by id-prefix / key** (admin-only). The
-    /// joiner's advertised nick is shown only as an unverified hint — confirm the
+    /// joiner's advertised name is shown only as an unverified hint — confirm the
     /// short key out-of-band, then approve it and name them with `--as`.
     Approve {
         /// A pending requester: a key id-prefix or a full 64-hex key.
         who: String,
-        /// Attach a local petname to this key as you approve them (never synced).
+        /// Attach a local name to this key as you approve them (never synced).
         #[arg(long = "as", value_name = "NAME")]
         as_name: Option<String>,
     },
-    /// Set (or clear, with an empty name) a local petname for a member/key. Local
-    /// to this device, never broadcast, never part of the signed ACL.
-    Alias {
-        /// A user ref: a key id-prefix, a full key, or an existing alias.
+    /// Set (or clear, with an empty name) a local **name** for a member/key —
+    /// your private label, never broadcast, never part of the signed ACL.
+    /// (Alias: `alias`.)
+    #[command(alias = "alias")]
+    Name {
+        /// A user ref: a key id-prefix, a full key, or an existing name.
         who: String,
-        /// The petname to assign (omit or pass "" to clear).
+        /// The name to assign (omit or pass "" to clear).
         #[arg(default_value = "")]
         name: String,
     },
@@ -408,14 +421,99 @@ async fn run_update() -> Result<()> {
     Ok(())
 }
 
+/// Pull the first `KEY-n` token (letters `-` digits) out of a string and
+/// normalize the key to uppercase: `eng-142-fix-login` → `ENG-142`,
+/// `feature/ENG-7` → `ENG-7`. Returns `None` if there's no such token. No regex
+/// dependency — a small forward scan.
+fn parse_key_n(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_alphabetic() {
+            let start = i;
+            while i < b.len() && b[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            if i < b.len() && b[i] == b'-' {
+                let mut j = i + 1;
+                while j < b.len() && b[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j > i + 1 {
+                    return Some(format!(
+                        "{}-{}",
+                        s[start..i].to_ascii_uppercase(),
+                        &s[i + 1..j]
+                    ));
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Infer an issue ref from the current git branch (VCS-native ergonomics, à la
+/// linear-cli): a branch like `eng-142-fix-login` resolves to `ENG-142`, so
+/// `lait show` / `edit` / `history` are argument-free while you work the branch.
+/// `None` if not in a git repo, detached HEAD, or the branch carries no `KEY-n`.
+fn infer_ref_from_git_branch() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_key_n(String::from_utf8_lossy(&out.stdout).trim())
+}
+
+/// Resolve an optional issue-ref argument: the explicit value if given, else the
+/// ref inferred from the git branch (with a clear error when neither is available).
+fn resolve_reff_arg(reff: Option<String>) -> Result<String> {
+    match reff {
+        Some(r) => Ok(r),
+        None => infer_ref_from_git_branch().ok_or_else(|| {
+            anyhow!(
+                "no issue given, and none could be inferred from the current git branch \
+                 (name it like `eng-142-short-desc`). Pass a ref explicitly, e.g. `lait show ENG-142`."
+            )
+        }),
+    }
+}
+
 pub async fn run() -> Result<()> {
-    let args = Cli::parse();
+    // `try_parse` (not `parse`) so a usage/parse error exits `1` — the documented
+    // code (UI.md §2.3) — instead of clap's default `2`, which collides with
+    // `2 = ref not found / ambiguous`. `--help`/`--version` still exit `0`.
+    let args = match Cli::try_parse() {
+        Ok(a) => a,
+        Err(e) => {
+            e.print().ok();
+            let code = match e.kind() {
+                clap::error::ErrorKind::DisplayHelp
+                | clap::error::ErrorKind::DisplayVersion
+                | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => 0,
+                _ => 1,
+            };
+            std::process::exit(code);
+        }
+    };
     if !is_service_command(&args.command) {
         reset_sigpipe();
     }
+    // Effective color, computed once: honour --no-color, the $NO_COLOR
+    // convention, --json (machine output is never styled), and whether stdout is
+    // an interactive terminal (so `lait ls | cat` / redirects stay clean).
+    use std::io::IsTerminal;
     let out = Out {
         json: args.json,
-        color: !args.no_color,
+        color: !args.no_color
+            && !args.json
+            && std::env::var_os("NO_COLOR").is_none()
+            && std::io::stdout().is_terminal(),
     };
 
     // Stateless commands that need neither an identity nor a workspace store:
@@ -436,9 +534,15 @@ pub async fn run() -> Result<()> {
 
     // Registry-level commands that operate across identities.
     match &args.command {
-        Command::Agents => {
+        Command::Profiles => {
             let names = config::list_identities()?;
-            if names.is_empty() {
+            if out.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({ "identities": names }))
+                        .unwrap_or_else(|_| "{}".into())
+                );
+            } else if names.is_empty() {
                 println!("no identities yet — one is created on first use");
             } else {
                 for n in names {
@@ -454,7 +558,11 @@ pub async fn run() -> Result<()> {
             // global identity + repo-discovered store (DUR-5).
             std::env::set_var("LAIT_HOME", &home);
             load_or_create_identity(&home)?;
-            println!("resumed identity '{name}'");
+            // Under --json only the Status DTO (below) is emitted — no human line
+            // leaking ahead of it.
+            if !out.json {
+                println!("resumed identity '{name}'");
+            }
             return crate::cli::run(&home, Request::Status, out).await;
         }
         _ => {}
@@ -481,11 +589,23 @@ pub async fn run() -> Result<()> {
                 profile.room = r;
             }
             profile.save(&home)?;
-            println!("initialized.");
-            println!("id:   {}", key.public());
-            println!("nick: {}", profile.nick);
-            println!("room: {}", profile.room);
-            println!("home: {}", home.display());
+            if out.json {
+                crate::cli::emit_ok(
+                    &format!(
+                        "initialized id={} nick={} room={}",
+                        key.public(),
+                        profile.nick,
+                        profile.room
+                    ),
+                    out,
+                );
+            } else {
+                println!("initialized.");
+                println!("id:   {}", key.public());
+                println!("nick: {}", profile.nick);
+                println!("room: {}", profile.room);
+                println!("home: {}", home.display());
+            }
         }
         Command::New {
             title,
@@ -534,13 +654,17 @@ pub async fn run() -> Result<()> {
         Command::Board { project } => {
             crate::cli::run(&home, Request::Board { project }, out).await?
         }
-        Command::Show { reff } => crate::cli::run(&home, Request::IssueView { reff }, out).await?,
+        Command::Show { reff } => {
+            let reff = resolve_reff_arg(reff)?;
+            crate::cli::run(&home, Request::IssueView { reff }, out).await?
+        }
         Command::Edit {
             reff,
             title,
             status,
             priority,
         } => {
+            let reff = resolve_reff_arg(reff)?;
             crate::cli::run(
                 &home,
                 Request::IssueEdit {
@@ -561,6 +685,7 @@ pub async fn run() -> Result<()> {
             before,
             after,
         } => {
+            let reff = resolve_reff_arg(reff)?;
             let pos = if top {
                 Some(BoardPos::Top)
             } else if bottom {
@@ -611,9 +736,13 @@ pub async fn run() -> Result<()> {
             crate::cli::run(&home, Request::Comment { reff, body }, out).await?
         }
         Command::Delete { reff } => {
+            let reff = resolve_reff_arg(reff)?;
             crate::cli::run(&home, Request::IssueDelete { reff }, out).await?
         }
-        Command::History { reff } => crate::cli::run(&home, Request::History { reff }, out).await?,
+        Command::History { reff } => {
+            let reff = resolve_reff_arg(reff)?;
+            crate::cli::run(&home, Request::History { reff }, out).await?
+        }
         Command::Projects { cmd } => match cmd {
             Some(ProjectsCmd::New { name, key }) => {
                 crate::cli::run(&home, Request::ProjectNew { name, key }, out).await?
@@ -652,7 +781,7 @@ pub async fn run() -> Result<()> {
             Some(MembersCmd::Approve { who, as_name }) => {
                 crate::cli::run(&home, Request::MemberApprove { who, as_name }, out).await?
             }
-            Some(MembersCmd::Alias { who, name }) => {
+            Some(MembersCmd::Name { who, name }) => {
                 crate::cli::run(&home, Request::MemberAlias { who, name }, out).await?
             }
             Some(MembersCmd::RotateKey) => crate::cli::run(&home, Request::KeyRotate, out).await?,
@@ -664,7 +793,7 @@ pub async fn run() -> Result<()> {
         Command::Tui => crate::tui::run(&home).await?,
         Command::Id => {
             let key = load_or_create_identity(&config::identity_dir()?)?;
-            println!("{}", key.public());
+            crate::cli::emit_text(&key.public().to_string(), out);
         }
         Command::Daemon { seed } => {
             tracing_subscriber::fmt()
@@ -689,22 +818,25 @@ pub async fn run() -> Result<()> {
         }
         Command::Status => crate::cli::run(&home, Request::Status, out).await?,
         Command::Invite { email } => crate::cli::run_invite(&home, email, out).await?,
-        Command::Join { ticket } => crate::cli::run(&home, Request::Join { ticket }, out).await?,
-        Command::Seed { cmd } => match cmd {
+        Command::Join { ticket, nick } => {
+            // Set the display name before the daemon is auto-spawned (below, via
+            // ensure_daemon) so a cold joiner announces the right name on its
+            // join request. It stays a self-asserted claim — the admin approves
+            // by key, never by this nick (UI.md §8).
+            if let Some(n) = nick {
+                let mut profile = Profile::load(&home)?;
+                profile.nick = n;
+                profile.save(&home)?;
+            }
+            crate::cli::run(&home, Request::Join { ticket }, out).await?
+        }
+        Command::Remote { cmd } => match cmd {
             SeedCmd::Add { target } => {
                 crate::cli::run(&home, Request::SeedAdd { arg: target }, out).await?
             }
             SeedCmd::Ls => crate::cli::run(&home, Request::SeedList, out).await?,
             SeedCmd::Rm { who } => crate::cli::run(&home, Request::SeedRemove { who }, out).await?,
         },
-        Command::Connect { ticket, nick } => {
-            if let Some(n) = nick {
-                let mut profile = Profile::load(&home)?;
-                profile.nick = n;
-                profile.save(&home)?;
-            }
-            crate::cli::run(&home, Request::Connect { ticket }, out).await?
-        }
         Command::Log { since } => crate::cli::run(&home, Request::Log { since }, out).await?,
         Command::Wait { since, timeout_ms } => {
             crate::cli::run(&home, Request::Wait { since, timeout_ms }, out).await?
@@ -716,7 +848,7 @@ pub async fn run() -> Result<()> {
             timeout_ms,
         } => crate::cli::watch(&home, since, exec, notify, timeout_ms).await?,
         Command::Who => crate::cli::run(&home, Request::Who, out).await?,
-        Command::Agents
+        Command::Profiles
         | Command::Resume { .. }
         | Command::Update
         | Command::Completions { .. }
@@ -727,4 +859,23 @@ pub async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_key_n;
+
+    #[test]
+    fn key_n_inference_from_branch_names() {
+        // Common branch shapes → KEY-n (key upper-cased).
+        assert_eq!(parse_key_n("eng-142-fix-login").as_deref(), Some("ENG-142"));
+        assert_eq!(parse_key_n("ENG-7").as_deref(), Some("ENG-7"));
+        assert_eq!(parse_key_n("feature/eng-142-x").as_deref(), Some("ENG-142"));
+        assert_eq!(parse_key_n("bob/PROJ-3-thing").as_deref(), Some("PROJ-3"));
+        // No KEY-n present → nothing inferred (fall back to explicit ref).
+        assert_eq!(parse_key_n("main"), None);
+        assert_eq!(parse_key_n("142-eng"), None);
+        assert_eq!(parse_key_n("release/v0.4.5"), None);
+        assert_eq!(parse_key_n("feat/onboarding-dx-bridge"), None);
+    }
 }

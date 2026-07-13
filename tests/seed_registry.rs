@@ -118,9 +118,7 @@ fn spawn(home: &Path, seed: bool) -> Proc {
 
 fn req(home: &Path, r: Request) -> Response {
     rt().block_on(async { request(home, &r).await })
-        .unwrap_or_else(|e| Response::Error {
-            message: format!("{e:#}"),
-        })
+        .unwrap_or_else(|e| Response::err(format!("{e:#}")))
 }
 
 fn id_of(home: &Path) -> String {

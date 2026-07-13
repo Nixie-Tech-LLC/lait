@@ -103,9 +103,7 @@ fn poll_until<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> Opt
 
 fn req(home: &Path, r: Request) -> Response {
     rt().block_on(async { request(home, &r).await })
-        .unwrap_or_else(|e| Response::Error {
-            message: format!("{e:#}"),
-        })
+        .unwrap_or_else(|e| Response::err(format!("{e:#}")))
 }
 
 fn list_titles(home: &Path) -> Vec<String> {
@@ -192,6 +190,16 @@ fn approve_join_request_key_first_and_seed_list_is_structured() {
         other => panic!("B: id returned {other:?}"),
     };
 
+    // Anchor DX: B's own `status` tells the honest truth — it has only *requested*
+    // to join and isn't a member yet, so it reads `pending` (not "you're live").
+    match req(&b.home, Request::Status) {
+        Response::Status(s) => assert_eq!(
+            s.membership, "pending",
+            "a joiner that hasn't been approved must read as `pending` in status"
+        ),
+        other => panic!("B: status returned {other:?}"),
+    }
+
     // WS2: A sees B in `members requests`, carrying B's key AND nick.
     let claimed_nick = poll_until(Duration::from_secs(30), || {
         match req(&a.home, Request::MemberRequests) {
@@ -206,6 +214,20 @@ fn approve_join_request_key_first_and_seed_list_is_structured() {
         Some("bob"),
         "A never saw B's join request carrying the announced nick"
     );
+
+    // Anchor DX: A's `status` now nudges the host that someone is waiting — the
+    // signal that unblocks onboarding (a host otherwise has no reason to run
+    // `members approve`, and the joiner stalls in ciphertext forever).
+    match req(&a.home, Request::Status) {
+        Response::Status(s) => {
+            assert_eq!(s.membership, "admin", "the founder must read as `admin`");
+            assert!(
+                s.pending_requests >= 1,
+                "the host's status must surface the pending join request as a nudge"
+            );
+        }
+        other => panic!("A: status returned {other:?}"),
+    }
 
     // Security: the joiner's self-asserted nick is NOT a valid approval ref — an
     // unauthenticated name must never select who gets sealed the workspace key.
@@ -243,6 +265,19 @@ fn approve_join_request_key_first_and_seed_list_is_structured() {
     assert!(
         poll_title(&b.home, "shared from A", Duration::from_secs(30)),
         "B did not converge after approval (membership never sealed?)"
+    );
+
+    // Anchor DX: once approved + synced, B's `status` flips `pending` → `member`,
+    // so the joiner can finally see they're on the board.
+    let became_member = poll_until(Duration::from_secs(10), || {
+        match req(&b.home, Request::Status) {
+            Response::Status(s) if s.membership == "member" => Some(()),
+            _ => None,
+        }
+    });
+    assert!(
+        became_member.is_some(),
+        "after approval B's status should read `member`, not `pending`"
     );
 
     // The local petname is now attached to B's authenticated key and surfaces in

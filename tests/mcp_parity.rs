@@ -120,9 +120,7 @@ fn response_dtos_round_trip() {
             }],
             last: 1,
         },
-        Response::Error {
-            message: "no issue matches 'ENG-9x'".into(),
-        },
+        Response::not_found("no issue matches 'ENG-9x'"),
     ];
 
     for resp in samples {
