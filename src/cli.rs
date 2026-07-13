@@ -470,8 +470,23 @@ fn print_issue(v: &IssueView, out: Out) {
 /// best-effort clipboard, and the optional `--email <addr>` (open the OS mail
 /// client with a prefilled invite). The QR always renders in human output; it is
 /// suppressed only under `--json` so scripts get clean, parseable output.
-pub async fn run_invite(home: &Path, email: Option<String>, out: Out) -> Result<()> {
-    let resp = client(home, Request::Invite).await?;
+pub async fn run_invite(
+    home: &Path,
+    email: Option<String>,
+    require_approval: bool,
+    reusable: bool,
+    ttl_hours: Option<u64>,
+    out: Out,
+) -> Result<()> {
+    let resp = client(
+        home,
+        Request::Invite {
+            require_approval,
+            reusable,
+            ttl_hours,
+        },
+    )
+    .await?;
     let token = match resp {
         Response::Text { text } => text.trim().to_string(),
         other => {
@@ -495,9 +510,19 @@ pub async fn run_invite(home: &Path, email: Option<String>, out: Out) -> Result<
         Ok(q) => println!("\n{q}"),
         Err(e) => eprintln!("(qr unavailable: {e:#})"),
     }
-    if copy_to_clipboard(&token) && !out.json {
-        println!("(copied to clipboard — your teammate runs `lait join <link>`)");
+    if copy_to_clipboard(&token) {
+        println!("(copied to clipboard)");
     }
+    // Tell the host what this ticket actually does, so the mental model matches
+    // the flow (Pattern A: default tickets self-approve).
+    let hint = if require_approval {
+        "your teammate runs `lait join <link>`, then you `lait members approve` them"
+    } else if reusable {
+        "anyone who runs `lait join <link>` is admitted automatically until it expires"
+    } else {
+        "your teammate runs `lait join <link>` and is admitted automatically — no approve step"
+    };
+    println!("→ {hint}");
     if let Some(addr) = email {
         match open_mail_invite(&addr, &link) {
             Ok(()) => {
@@ -570,9 +595,9 @@ fn open_mail_invite(addr: &str, link: &str) -> Result<()> {
          Windows:      powershell -c \"irm \
          https://github.com/Nixie-Tech-LLC/lait/releases/latest/download/lait-installer.ps1 | iex\"\n\n\
          2. Join the workspace\n   lait join {link}\n\n\
-         That sends a join request; I approve you and your device gets the \
-         workspace key automatically (run `lait status` to see when you're in). \
-         lait is local-first and end-to-end encrypted.\n"
+         The link carries a one-time pass, so that admits you automatically and \
+         your device gets the workspace key (run `lait status` to see when you're \
+         in). lait is local-first and end-to-end encrypted.\n"
     );
     let mailto = format!(
         "mailto:{}?subject={}&body={}",

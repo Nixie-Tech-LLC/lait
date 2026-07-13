@@ -27,6 +27,84 @@ pub fn topic_for_room(room: &str) -> TopicId {
     TopicId::from_bytes(*hash.as_bytes())
 }
 
+/// Length of an invite nonce — a random single-use id (128 bits).
+const INVITE_NONCE_LEN: usize = 16;
+
+/// A capability that **pre-authorizes** admission to a workspace (Pattern A). An
+/// admin signs it into a [`SignedInvite`]; whoever redeems it on `join` is sealed
+/// the workspace key automatically — collapsing the classic
+/// request→`members approve` round-trip into a single `join`.
+///
+/// It is a **bearer** token: authority rides the channel the invite travels over,
+/// bounded by an expiry and (by default) a single use. A workspace that wants a
+/// human in the loop mints a grant-less ticket instead (`invite --require-approval`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InviteGrant {
+    /// The workspace this grant admits into (binds the capability to one room).
+    pub workspace: String,
+    /// A random id so a single-use grant is spent exactly once.
+    pub nonce: [u8; INVITE_NONCE_LEN],
+    /// Unix seconds after which the grant is void.
+    pub expires_at: u64,
+    /// One redemption (`true`) vs. valid-until-expiry for a whole team (`false`).
+    pub single_use: bool,
+}
+
+impl InviteGrant {
+    /// Mint a fresh grant for `workspace`, valid for `ttl_secs` from `now`.
+    pub fn mint(workspace: String, now: u64, ttl_secs: u64, single_use: bool) -> Self {
+        let mut nonce = [0u8; INVITE_NONCE_LEN];
+        getrandom::fill(&mut nonce).expect("getrandom");
+        Self {
+            workspace,
+            nonce,
+            expires_at: now.saturating_add(ttl_secs),
+            single_use,
+        }
+    }
+
+    /// Whether the grant is past its expiry at `now` (unix seconds).
+    pub fn is_expired(&self, now: u64) -> bool {
+        now >= self.expires_at
+    }
+}
+
+/// An [`InviteGrant`] signed by its issuer (an admin), so a redeemer can prove the
+/// workspace's authority pre-authorized them. Verification here is signature-only;
+/// the *authority* (issuer ∈ current admins), *freshness* (not expired), and
+/// *single-use* checks are enforced by the redeeming node against live state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedInvite {
+    issuer: PublicKey,
+    grant: Bytes,
+    signature: SignatureBytes,
+}
+
+impl SignedInvite {
+    /// Sign `grant` with the issuer's secret key.
+    pub fn sign(secret_key: &SecretKey, grant: &InviteGrant) -> Result<Self> {
+        let data: Bytes = postcard::to_stdvec(grant)
+            .context("encode invite grant")?
+            .into();
+        let signature = secret_key.sign(&data);
+        Ok(Self {
+            issuer: secret_key.public(),
+            grant: data,
+            signature: ByteArray::new(signature.to_bytes()),
+        })
+    }
+
+    /// Verify the issuer signature and decode the grant.
+    pub fn verify(&self) -> Result<(PublicKey, InviteGrant)> {
+        self.issuer
+            .verify(&self.grant, &iroh::Signature::from_bytes(&self.signature))
+            .map_err(|e| anyhow::anyhow!("invalid invite signature: {e}"))?;
+        let grant: InviteGrant =
+            postcard::from_bytes(&self.grant).context("decode invite grant")?;
+        Ok((self.issuer, grant))
+    }
+}
+
 /// The application-level payload carried inside a signed gossip message. Scoped
 /// to announce + presence; the tracker's data sync rides its own per-doc streams
 /// (see `docs/ARCHITECTURE.md` §8), not this gossip payload.
@@ -34,8 +112,14 @@ pub fn topic_for_room(room: &str) -> TopicId {
 pub enum Payload {
     /// Announce/refresh our nickname.
     Hello { nick: String },
-    /// A request to be added to the room (surfaces for members to see).
-    JoinRequest { nick: String },
+    /// A request to be added to the room (surfaces for members to see). Carries
+    /// an optional pre-authorization capability (Pattern A): when present and
+    /// valid, an admin receiver auto-seals the workspace key with no manual step.
+    JoinRequest {
+        nick: String,
+        #[serde(default)]
+        invite: Option<SignedInvite>,
+    },
     /// Periodic liveness heartbeat for presence tracking. `state` carries the
     /// three-state input-driven presence (online/away, UI.md §4.5); a missing
     /// value from an older peer defaults to online.
@@ -122,6 +206,12 @@ pub struct RoomTicket {
     /// ticket: it adopts the id, then backfills the catalog + docs over sync.
     #[serde(default)]
     pub workspace: String,
+    /// An optional pre-authorization capability (Pattern A). Present ⇒ a joiner is
+    /// auto-admitted on `join` (the seal happens without a manual `members
+    /// approve`). Absent ⇒ the classic request→approve flow. The joiner echoes it
+    /// in its signed `JoinRequest`.
+    #[serde(default)]
+    pub invite: Option<SignedInvite>,
 }
 
 impl RoomTicket {
@@ -180,6 +270,7 @@ mod tests {
             host: host_key(),
             host_nick: "alice".into(),
             workspace: "ws_00000000000000000000000000".into(),
+            invite: None,
         }
     }
 
@@ -219,5 +310,38 @@ mod tests {
         let mangled = format!("  {}\n   {}  ", &s[..s.len() / 2], &s[s.len() / 2..]);
         let back: RoomTicket = mangled.parse().unwrap();
         assert_eq!(back.host, host_key());
+    }
+
+    #[test]
+    fn signed_invite_roundtrips_and_detects_tampering() {
+        let sk = SecretKey::from_bytes(&[9u8; 32]);
+        let grant = InviteGrant::mint("ws_1".into(), 1_000, 3_600, true);
+        let signed = SignedInvite::sign(&sk, &grant).unwrap();
+        let (issuer, back) = signed.verify().expect("valid signature verifies");
+        assert_eq!(issuer, sk.public());
+        assert_eq!(back, grant);
+        assert!(!back.is_expired(4_599) && back.is_expired(4_600));
+        // Flip a byte of the signed grant ⇒ verification must fail.
+        let mut tampered = signed;
+        let mut bytes = tampered.grant.to_vec();
+        bytes[0] ^= 0xff;
+        tampered.grant = bytes.into();
+        assert!(tampered.verify().is_err(), "tampered grant must not verify");
+    }
+
+    #[test]
+    fn ticket_carries_an_invite_through_base32() {
+        let sk = SecretKey::from_bytes(&[3u8; 32]);
+        let grant = InviteGrant::mint("ws_00000000000000000000000000".into(), 0, 604_800, true);
+        let mut t = sample();
+        t.invite = Some(SignedInvite::sign(&sk, &grant).unwrap());
+        let back: RoomTicket = t.to_string().parse().unwrap();
+        let (issuer, g) = back
+            .invite
+            .expect("invite survives roundtrip")
+            .verify()
+            .unwrap();
+        assert_eq!(issuer, sk.public());
+        assert_eq!(g, grant);
     }
 }

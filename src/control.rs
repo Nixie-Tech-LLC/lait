@@ -192,7 +192,21 @@ pub enum Request {
     // ---- transport / presence (kept from the skeleton; the P1 surface) ----
     Status,
     Id,
-    Invite,
+    /// Mint an invite ticket. By default it carries a signed, single-use
+    /// pre-authorization (Pattern A) so the joiner is auto-admitted on `join`.
+    Invite {
+        /// Mint a grant-less ticket: the joiner lands as a pending request that a
+        /// human admin must `members approve` (the classic flow).
+        #[serde(default)]
+        require_approval: bool,
+        /// Let the grant admit a whole team (valid until expiry) instead of one
+        /// person (single-use).
+        #[serde(default)]
+        reusable: bool,
+        /// Lifetime in hours before the grant expires (default 168 = 7 days).
+        #[serde(default)]
+        ttl_hours: Option<u64>,
+    },
     Join {
         ticket: String,
     },

@@ -174,7 +174,14 @@ fn approve_join_request_key_first_and_seed_list_is_structured() {
     ));
 
     // B connects — announcing a join request carrying nick "bob".
-    let ticket = match req(&a.home, Request::Invite) {
+    let ticket = match req(
+        &a.home,
+        Request::Invite {
+            require_approval: true,
+            reusable: false,
+            ttl_hours: None,
+        },
+    ) {
         Response::Text { text } => text.trim().to_string(),
         other => panic!("A: invite returned {other:?}"),
     };
@@ -334,7 +341,14 @@ fn self_asserted_nick_never_resolves_only_admin_chosen_alias_does() {
         ),
         Response::Ref { .. }
     ));
-    let ticket = match req(&a.home, Request::Invite) {
+    let ticket = match req(
+        &a.home,
+        Request::Invite {
+            require_approval: true,
+            reusable: false,
+            ttl_hours: None,
+        },
+    ) {
         Response::Text { text } => text.trim().to_string(),
         other => panic!("A: invite returned {other:?}"),
     };

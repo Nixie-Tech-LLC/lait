@@ -181,16 +181,31 @@ pub enum Command {
     /// Show node and workspace status.
     Status,
     /// Print a base32 ticket (+ a scannable QR of the invite link) others use to
-    /// join your workspace.
+    /// join your workspace. By default the ticket carries a signed, single-use
+    /// pass so your teammate is admitted automatically on `join` — no separate
+    /// approve step.
     Invite {
         /// Open your mail client with a prefilled invite to this address (uses the
         /// OS default mailto handler; lait sends nothing itself).
         #[arg(long)]
         email: Option<String>,
+        /// Mint a pass-less ticket: the joiner lands as a pending request you must
+        /// `members approve` by key — the classic, human-in-the-loop flow. Mutually
+        /// exclusive with the pass-tuning flags below (there is no pass to tune).
+        #[arg(long, conflicts_with_all = ["reusable", "ttl_hours"])]
+        require_approval: bool,
+        /// Let one ticket admit your whole team (valid until it expires) instead of
+        /// a single person.
+        #[arg(long)]
+        reusable: bool,
+        /// Hours until the pass expires (default 168 = 7 days). Must be ≥ 1.
+        #[arg(long, value_name = "HOURS", value_parser = clap::value_parser!(u64).range(1..))]
+        ttl_hours: Option<u64>,
     },
-    /// Join a workspace from an invite link. Sends a join request; a workspace
-    /// admin approves you, then your board decrypts and syncs automatically.
-    /// Check progress any time with `lait status`. (Alias: `connect`.)
+    /// Join a workspace from an invite link. A default link admits you
+    /// automatically; a `--require-approval` link instead sends a request an admin
+    /// must approve. Either way your board decrypts and syncs once you're in —
+    /// check progress with `lait status`. (Alias: `connect`.)
     #[command(alias = "connect")]
     Join {
         /// The invite link / ticket from `lait invite`.
@@ -817,7 +832,14 @@ pub async fn run() -> Result<()> {
             println!("{out}");
         }
         Command::Status => crate::cli::run(&home, Request::Status, out).await?,
-        Command::Invite { email } => crate::cli::run_invite(&home, email, out).await?,
+        Command::Invite {
+            email,
+            require_approval,
+            reusable,
+            ttl_hours,
+        } => {
+            crate::cli::run_invite(&home, email, require_approval, reusable, ttl_hours, out).await?
+        }
         Command::Join { ticket, nick } => {
             // Set the display name before the daemon is auto-spawned (below, via
             // ensure_daemon) so a cold joiner announces the right name on its

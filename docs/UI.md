@@ -470,8 +470,13 @@ grammar**. Where each lands:
   requests` lists announced joiners (authenticated key + an *unverified* nick claim) and
   `members approve <prefix|key> [--as <name>]` signs the `AddMember` op — resolving
   **key-first**, never by the self-asserted nick (an unauthenticated name must not select
-  who is sealed the workspace key). Friendly names are **local aliases** (petnames): a key
-  is the identity, and `<userref>` (§3.1) resolves an alias/prefix against your own alias
+  who is sealed the workspace key). By **default** this manual step is collapsed: an
+  `invite` ticket carries a signed, single-use **pass** (S§6.1) and the joiner is
+  auto-admitted on `join` — the admin node still signs the same `AddMember` op and seals
+  key-side, so E2EE is unchanged; the pass only removes the keystroke. `invite
+  --require-approval` mints a pass-less ticket for the human-in-the-loop flow above;
+  `--reusable`/`--ttl-hours` tune a pass. Friendly names are **local aliases** (petnames): a
+  key is the identity, and `<userref>` (§3.1) resolves an alias/prefix against your own alias
   store — never a wire nick.
 - **P4 — MCP parity & polish.** The MCP tool set (A§12) is generated from / checked against
   the **same `Response` DTOs** the CLI `--json` emits (S§7.3), so agent and human surfaces

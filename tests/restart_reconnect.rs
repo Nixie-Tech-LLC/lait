@@ -201,7 +201,14 @@ fn restarted_daemon_rejoins_from_persisted_peers() {
     );
 
     // B connects via A's ticket, and A grants B membership so B can decrypt.
-    let ticket = match req(&a_home, Request::Invite) {
+    let ticket = match req(
+        &a_home,
+        Request::Invite {
+            require_approval: true,
+            reusable: false,
+            ttl_hours: None,
+        },
+    ) {
         Response::Text { text } => text.trim().to_string(),
         other => panic!("A: invite returned {other:?}"),
     };

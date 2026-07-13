@@ -221,7 +221,7 @@ Registries + node:
 | `activity [--since N]` | Workspace-wide recent transitions |
 | `tui` | Launch the full-screen board |
 | `status` · `id` · `stop` | Node/workspace status · endpoint id · stop daemon |
-| `invite` · `join` · `members requests` · `members approve` | Invite a teammate; they `join`; you approve their pending request |
+| `invite [--require-approval] [--reusable] [--ttl-hours N]` · `join` | Invite a teammate; the default pass admits them on `join` (add `--require-approval` for the gated `members requests`/`members approve` flow) |
 | `who` · `wait` · `watch` | Peers online · block for one event · follow the event stream |
 | `profiles` / `resume <name>` | List profiles / switch to a named profile (each a separate identity + store) |
 
@@ -265,31 +265,45 @@ parity test keeps the agent and human surfaces in lock-step.
 
 ## Multi-node & end-to-end encryption
 
+The default invite carries a **signed, single-use pass**, so a teammate is on the
+board after a single `join` — no separate approval round-trip:
+
 ```bash
-# host — share an invite link (carries the workspace + genesis)
-lait invite                        # → an invite link (+ a scannable QR); send it over
+# host — mint an invite link (carries the workspace, genesis, and a single-use pass)
+lait invite                        # → a link (+ a scannable QR); send it over
 
-# teammate — join from the link. This sends a *join request*: you are NOT on the
-# board yet — it stays encrypted until an admin approves you.
+# teammate — join from the link; the pass admits you automatically
 lait join <INVITE> --nick bob
-lait status                        # you: pending   ← waiting to be approved
-
-# host — see who's waiting, confirm the short key out-of-band, then approve by
-# key/prefix (the nick is an unverified claim; `--as` is a local name you assign)
-lait members requests              # bob  (claims "bob")   <key-prefix>
-lait members approve <key-prefix> --as bob
-
-# teammate — you're in; the board decrypts and syncs automatically
-lait status                        # you: member
+lait status                        # you: member   ← board decrypts and syncs
 
 # later: revoke — rotates the key so bob can't read new content (lazy revocation)
 lait members remove bob
 ```
 
+The pass is a **bearer** capability: authority rides the channel you send the link
+over, bounded by expiry (`--ttl-hours`, default 7 days) and one use. Tune it, or
+keep a human in the loop:
+
+```bash
+lait invite --reusable --ttl-hours 24   # one link admits the whole team for a day
+lait invite --require-approval          # pass-less link — the classic gated flow:
+
+# teammate — join lands as a *request*; you stay encrypted until an admin approves
+lait join <INVITE> --nick bob
+lait status                             # you: pending   ← waiting to be approved
+
+# host — see who's waiting, confirm the short key out-of-band, then approve by
+# key/prefix (the nick is an unverified claim; `--as` is a local name you assign)
+lait members requests                   # bob  (claims "bob")   <key-prefix>
+lait members approve <key-prefix> --as bob
+```
+
 Workspace data is E2EE: issues sync as ciphertext, and a node that isn't in the
-signed ACL (or has been removed) sees only ciphertext. Changes propagate live P2P
-over iroh with no central server; any always-on node advertised in a ticket acts
-as a portable seed that backfills cold clients.
+signed ACL (or has been removed) sees only ciphertext. Auto-approval never weakens
+this — the seal still happens key-side on an admin node holding the workspace key;
+the pass only removes the manual keystroke. Changes propagate live P2P over iroh
+with no central server; any always-on node advertised in a ticket acts as a
+portable seed that backfills cold clients.
 
 ## Running several nodes on one machine
 

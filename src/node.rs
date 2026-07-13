@@ -57,7 +57,7 @@ use crate::{
     ids::{SystemUlidSource, UserId},
     index::{resolve_user_dir, KnownUser, UserResolution},
     presence::PeerState,
-    proto::{topic_for_room, Payload, RoomTicket, SignedMessage},
+    proto::{topic_for_room, InviteGrant, Payload, RoomTicket, SignedInvite, SignedMessage},
     store::Store,
     tracker::{DirtySet, Tracker},
 };
@@ -612,7 +612,7 @@ impl Node {
                 self.touch(from, Some(nick));
                 self.mark_offline(from, true);
             }
-            Payload::JoinRequest { nick } => {
+            Payload::JoinRequest { nick, invite } => {
                 let display = self.touch(from, Some(nick.clone()));
                 self.shared.events.lock().unwrap().push(
                     EventKind::Join,
@@ -620,6 +620,13 @@ impl Node {
                     display.clone(),
                     format!("{display} joined the room"),
                 );
+                // Pattern A: if the joiner presented a valid pre-authorization and
+                // we're an admin who can seal, admit them now — no manual approve.
+                // On any failure we simply leave the request pending (the event
+                // above already surfaces it to `members requests`).
+                if let Some(invite) = invite {
+                    self.clone().try_auto_approve(from, invite);
+                }
                 // a joiner wants our state — and may have state we lack; pull.
                 self.clone().trigger_pull(from);
             }
@@ -760,6 +767,9 @@ impl Node {
         self.join_topic(ticket.topic(), vec![ticket.host]).await?;
         self.broadcast(Payload::JoinRequest {
             nick: self.shared.nick.clone(),
+            // Echo the ticket's pre-authorization (if any) so an admin receiver can
+            // auto-seal us the key without a manual approve (Pattern A).
+            invite: ticket.invite.clone(),
         })
         .await
         .ok();
@@ -781,6 +791,15 @@ impl Node {
         let already_member = self.tracker.lock().unwrap().is_member(&self.my_userid());
         if already_member {
             "joined \u{2014} you're on the board and syncing.".to_string()
+        } else if ticket.invite.is_some() {
+            // Pattern A: the ticket carried a pre-authorization, so admission is
+            // automatic once an admin node processes the request (typically ~a
+            // couple seconds). Tell the truth without implying a manual step.
+            format!(
+                "joining {host}'s workspace with an invite pass \u{2014} you should be admitted \
+                 automatically in a moment, then your board decrypts and syncs.\n\
+                 run `lait status` to confirm you're in."
+            )
         } else {
             format!(
                 "join request sent to {host}.\n\
@@ -925,6 +944,44 @@ impl Node {
     /// Our own key as a [`UserId`] (the endpoint id is the ed25519 key, S§2).
     fn my_userid(&self) -> UserId {
         UserId::from_key_string(self.shared.my_id.to_string())
+    }
+
+    /// Pattern A: try to auto-admit `joiner` against a presented invite. Verifies
+    /// the issuer signature, the workspace binding, and expiry here (transport
+    /// concerns), then hands the state-dependent checks + sealing to the tracker's
+    /// `redeem_invite`. Best-effort: any failure is a silent fallback to the
+    /// classic pending-request flow, so a bad/expired/foreign invite never blocks
+    /// a manual approve. On success we ring the doorbell and re-announce so the
+    /// freshly-sealed joiner pulls and decrypts.
+    fn try_auto_approve(self: Arc<Self>, joiner_id: EndpointId, invite: SignedInvite) {
+        let (issuer_pk, grant) = match invite.verify() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let now = now_secs();
+        if grant.is_expired(now) {
+            return;
+        }
+        let joiner = UserId::from_key_string(joiner_id.to_string());
+        let issuer = UserId::from_key_string(issuer_pk.to_string());
+        let (changed, dirty) = {
+            let mut t = self.tracker.lock().unwrap();
+            // Bind the grant to *our* workspace before doing anything.
+            if grant.workspace != t.workspace_str() {
+                return;
+            }
+            let (_resp, dirty) = t.redeem_invite(&issuer, &joiner, &grant.nonce, grant.single_use);
+            (dirty.is_some(), dirty)
+        };
+        if let Some(dirty) = dirty {
+            self.ring_doorbell(dirty);
+        }
+        if changed {
+            let me = self.clone();
+            tokio::spawn(async move {
+                me.broadcast_announce().await.ok();
+            });
+        }
     }
 
     /// Assemble the user-ref resolution directory (UI.md §3.1). Keys are gathered
@@ -1292,12 +1349,30 @@ impl Node {
             Request::Id => Ok(Response::Text {
                 text: self.shared.my_id.to_string(),
             }),
-            Request::Invite => {
+            Request::Invite {
+                require_approval,
+                reusable,
+                ttl_hours,
+            } => {
+                let workspace = self.tracker.lock().unwrap().workspace_str();
+                // Default: embed a signed, single-use pre-authorization so the
+                // joiner is auto-admitted (Pattern A). `--require-approval` mints a
+                // grant-less ticket that falls back to the manual approve flow.
+                let invite = if require_approval {
+                    None
+                } else {
+                    const DEFAULT_TTL_HOURS: u64 = 24 * 7;
+                    let ttl_secs = ttl_hours.unwrap_or(DEFAULT_TTL_HOURS).saturating_mul(3600);
+                    let grant =
+                        InviteGrant::mint(workspace.clone(), now_secs(), ttl_secs, !reusable);
+                    SignedInvite::sign(&self.secret_key, &grant).ok()
+                };
                 let ticket = RoomTicket {
                     room: self.shared.room.clone(),
                     host: self.shared.my_id,
                     host_nick: self.shared.nick.clone(),
-                    workspace: self.tracker.lock().unwrap().workspace_str(),
+                    workspace,
+                    invite,
                 };
                 Ok(Response::Text {
                     text: ticket.to_string(),

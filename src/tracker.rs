@@ -1384,6 +1384,91 @@ impl Tracker {
         )
     }
 
+    /// **Pattern A auto-approval.** Admit a joiner who presented a valid,
+    /// admin-signed invite grant, sealing them the key exactly like [`member_add`]
+    /// but with no human `approve` step. The transport layer has already verified
+    /// the issuer signature, workspace binding, and expiry; here we enforce the
+    /// remaining, state-dependent checks: the issuer must be a *current* admin, we
+    /// must be an admin able to seal, and a single-use nonce must be unspent. The
+    /// nonce is burned inside the same commit as the AddMember op (atomic — no
+    /// window where a member is added but the invite stays live). Idempotent: a
+    /// re-presented grant or an already-member joiner is a harmless no-op.
+    ///
+    /// [`member_add`]: Self::member_add
+    pub fn redeem_invite(
+        &mut self,
+        issuer: &UserId,
+        joiner: &UserId,
+        nonce: &[u8; 16],
+        single_use: bool,
+    ) -> (Response, Option<DirtySet>) {
+        let acl = self.acl_state();
+        // Authority: only a grant signed by a current admin admits anyone.
+        if !acl.is_admin(issuer) {
+            return (
+                Response::err("invite issuer is not a workspace admin"),
+                None,
+            );
+        }
+        // We can only seal the key if we ourselves are an admin holding it; if not,
+        // stay silent and let the request sit for a human admin (graceful fallback).
+        if !acl.is_admin(&self.me) {
+            return (Response::err("this node is not an admin"), None);
+        }
+        // Single-use replay guard.
+        if single_use && self.membership.is_redeemed(nonce) {
+            return (Response::err("invite already redeemed"), None);
+        }
+        // Idempotent: already a member ⇒ nothing to seal, no ACL churn. (A repeat
+        // of an *already-spent* single-use nonce was rejected by the guard above.)
+        if acl.is_member(joiner) {
+            return (
+                Response::Ok {
+                    message: Some(format!("{} is already a member", joiner.short())),
+                },
+                None,
+            );
+        }
+        let op = acl::sign_op(
+            &self.seed,
+            &AclOp::AddMember {
+                key: joiner.clone(),
+                role: Role::Member,
+            },
+            self.membership.heads(),
+            &self.workspace_id,
+        );
+        let nonce = *nonce;
+        if let Err(e) = self.member_apply(op, |t| {
+            let epochs: Vec<(u32, WorkspaceKey)> =
+                t.keyring.iter().map(|(e, k)| (*e, *k)).collect();
+            for (epoch, key) in epochs {
+                if let Some(sealed) = crypto::seal_to(joiner, &key) {
+                    t.membership.put_sealed(epoch, joiner, &sealed)?;
+                }
+            }
+            if single_use {
+                t.membership.mark_redeemed(&nonce, joiner)?;
+            }
+            Ok(())
+        }) {
+            return (Response::err(format!("{e:#}")), None);
+        }
+        self.push_activity(
+            None,
+            &joiner.short(),
+            "member_added",
+            vec![],
+            &joiner.short(),
+        );
+        (
+            Response::Ok {
+                message: Some(format!("auto-approved {} via invite", joiner.short())),
+            },
+            Some(DirtySet::catalog(CatalogScope::Acl)),
+        )
+    }
+
     /// Remove a member (signed RemoveMember op) and **rotate the workspace key**
     /// (lazy revocation, A§3 non-goal 2): a new epoch sealed only to the remaining
     /// members, so the removed member cannot read *future* content. Admin-only.
@@ -2116,6 +2201,84 @@ mod tests {
         assert!(
             !titles(&mut b.tracker).iter().any(|t| t == "post-removal"),
             "lazy revocation: removed member can't read post-removal content"
+        );
+    }
+
+    #[test]
+    fn redeem_invite_seals_joiner_and_burns_single_use_nonce() {
+        let mut a = new_node(); // founder + admin (me())
+        with_project(&mut a.tracker);
+        new_issue(&mut a.tracker, "gated issue");
+        let joiner = user_from_seed([8u8; 32]);
+        let nonce = [1u8; 16];
+
+        let (resp, dirty) = a.tracker.redeem_invite(&me(), &joiner, &nonce, true);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        assert!(
+            dirty.is_some(),
+            "a successful admit dirties the catalog/ACL"
+        );
+        assert!(a.tracker.is_member(&joiner), "joiner is now a member");
+        assert!(
+            a.tracker.membership.is_redeemed(&nonce),
+            "single-use nonce is burned in the same commit"
+        );
+
+        // Replay: the same nonce must not seat a second, different joiner.
+        let other = user_from_seed([9u8; 32]);
+        let (resp2, dirty2) = a.tracker.redeem_invite(&me(), &other, &nonce, true);
+        assert!(
+            matches!(resp2, Response::Error { .. }),
+            "spent nonce is rejected: {resp2:?}"
+        );
+        assert!(dirty2.is_none(), "a rejected replay changes nothing");
+        assert!(!a.tracker.is_member(&other), "replay seats no one");
+    }
+
+    #[test]
+    fn redeem_invite_rejects_a_non_admin_issuer() {
+        let mut a = new_node(); // only me() is an admin
+        let issuer = user_from_seed([5u8; 32]); // never added to the ACL
+        let joiner = user_from_seed([8u8; 32]);
+
+        let (resp, dirty) = a.tracker.redeem_invite(&issuer, &joiner, &[2u8; 16], true);
+        assert!(
+            matches!(resp, Response::Error { .. }),
+            "a pass signed by a non-admin is not honored: {resp:?}"
+        );
+        assert!(dirty.is_none());
+        assert!(
+            !a.tracker.is_member(&joiner),
+            "no membership granted on a bad issuer"
+        );
+    }
+
+    #[test]
+    fn redeem_invite_is_idempotent_for_an_existing_member() {
+        let mut a = new_node();
+        let joiner = user_from_seed([8u8; 32]);
+        let (_r, _d) = a.tracker.member_add(&joiner, Role::Member);
+        assert!(a.tracker.is_member(&joiner));
+
+        let (resp, dirty) = a.tracker.redeem_invite(&me(), &joiner, &[3u8; 16], true);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        assert!(dirty.is_none(), "already a member ⇒ no ACL churn");
+    }
+
+    #[test]
+    fn redeem_invite_reusable_pass_admits_many_without_burning() {
+        let mut a = new_node();
+        let nonce = [4u8; 16];
+        let j1 = user_from_seed([8u8; 32]);
+        let j2 = user_from_seed([9u8; 32]);
+
+        let (r1, _) = a.tracker.redeem_invite(&me(), &j1, &nonce, false);
+        let (r2, _) = a.tracker.redeem_invite(&me(), &j2, &nonce, false);
+        assert!(matches!(r1, Response::Ok { .. }) && matches!(r2, Response::Ok { .. }));
+        assert!(a.tracker.is_member(&j1) && a.tracker.is_member(&j2));
+        assert!(
+            !a.tracker.membership.is_redeemed(&nonce),
+            "a reusable pass is never burned"
         );
     }
 

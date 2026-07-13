@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased — one-step invites (auto-approval)
+
+- **A default invite admits the joiner automatically — no `members approve`.**
+  `lait invite` now embeds a **signed, single-use pass** in the ticket (Pattern A):
+  the joiner runs `lait join <link>` once and transitions `pending → member` on
+  its own, the board decrypting as the workspace key is sealed to it. This
+  collapses the old two-humans round-trip (`invite → join → members requests →
+  members approve`) into `invite → join`. The seal still happens key-side on an
+  admin node that holds the workspace key, so **E2EE is unchanged**: a
+  non-member/removed node still sees only ciphertext.
+- **The pass is a bearer capability, bounded and revocable-by-design.** Authority
+  rides the channel the link travels over, capped by an expiry (`--ttl-hours`,
+  default 168 = 7 days) and, by default, a single redemption. A synced,
+  admin-signed replay guard (a nonce recorded in the membership doc) burns a
+  single-use pass atomically with the member add, so it can't seat a second
+  joiner. A pass signed by a non-admin, expired, foreign-workspace, or
+  already-spent is silently ignored — the join falls back to a pending request a
+  human can still `members approve`.
+- **Opt back into the gated flow, or widen the pass.** `lait invite
+  --require-approval` mints a pass-less ticket (the classic `members
+  requests`/`members approve` flow, preserved unchanged); `--reusable` admits a
+  whole team until expiry instead of one person. `invite` output and the post-join
+  `status` message now state which mode is in effect.
+- Wire note: `RoomTicket` and the gossip `JoinRequest` gained an optional invite
+  field — a coordinated format bump (nodes should run the same version).
+
 ## v0.4.6 — self-updater fix
 
 - **`lait update` now extracts the binary from cargo-dist archives.** The native

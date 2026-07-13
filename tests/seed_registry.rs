@@ -202,7 +202,14 @@ fn seed_pin_adopts_then_survives_restart() {
     // B pins the seed from its ticket — this should adopt the workspace AND
     // backfill, so B converges to the pre-existing issue with no other peer and
     // no prior peers.json.
-    let ticket = match req(&seed_home, Request::Invite) {
+    let ticket = match req(
+        &seed_home,
+        Request::Invite {
+            require_approval: true,
+            reusable: false,
+            ttl_hours: None,
+        },
+    ) {
         Response::Text { text } => text.trim().to_string(),
         other => panic!("seed: invite returned {other:?}"),
     };

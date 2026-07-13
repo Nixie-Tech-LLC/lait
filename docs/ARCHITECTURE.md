@@ -316,6 +316,13 @@ holds the workspace key.** Built last, adapting a proven design:
 - **Keys:** one workspace symmetric key, distributed to members; rotated on removal (lazy
   revocation). Key agreement via an adopted design (Keyhive/BeeKEM, or simpler
   distribution) — chosen at this phase.
+- **Invite pre-authorization (Pattern A):** an admin-signed, expiring, single-use **pass**
+  (a bearer capability) rides in the invite ticket; an admin receiver honors it by signing
+  the normal `AddMember` op automatically, so a teammate is admitted on a single `join` with
+  no manual approve. This changes only the *trigger* for the seal, never who can seal — the
+  key is still sealed key-side by an admin, so a non-member/removed node still sees only
+  ciphertext. A synced, single-use nonce guard prevents replay. `--require-approval` keeps a
+  human in the loop. Shape in [S§6.1](SCHEMA.md).
 - **Blind relay:** the ciphertext-chunk sedimentree envelope of [§10](#10-seed-node--compaction-p2)
   is what lets the seed reconcile without decrypting.
 - **Two-protocol split:** sync the signed ACL graph → authenticate + derive the key → sync

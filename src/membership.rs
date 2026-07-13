@@ -20,6 +20,7 @@ const K_WORKSPACE: &str = "workspaceId";
 const K_EPOCH: &str = "currentEpoch";
 const C_ACL: &str = "acl";
 const C_KEYS: &str = "keys"; // epoch(str) -> Map<UserId, sealed bytes>
+const C_REDEEMED: &str = "redeemed"; // invite nonce(hex) -> redeemer UserId
 
 /// A wrapper around the workspace's membership `LoroDoc`.
 pub struct MembershipDoc {
@@ -34,6 +35,7 @@ impl MembershipDoc {
         root.insert(K_EPOCH, 0i64)?;
         root.insert_container(C_ACL, LoroList::new())?;
         root.insert_container(C_KEYS, LoroMap::new())?;
+        root.insert_container(C_REDEEMED, LoroMap::new())?;
         doc.commit();
         Ok(Self { doc })
     }
@@ -176,6 +178,41 @@ impl MembershipDoc {
         lx::get_bytes(&m, member.as_str())
     }
 
+    // ---- single-use invite replay guard (Pattern A) ----
+
+    /// The redeemed-nonce map, created on demand so a workspace founded before
+    /// invites existed still records redemptions (the container syncs like the
+    /// rest of the membership doc, giving multi-admin replay safety).
+    fn redeemed_map(&self, create: bool) -> Option<LoroMap> {
+        match self.root().get(C_REDEEMED) {
+            Some(ValueOrContainer::Container(Container::Map(m))) => Some(m),
+            _ if create => self
+                .root()
+                .insert_container(C_REDEEMED, LoroMap::new())
+                .ok(),
+            _ => None,
+        }
+    }
+
+    /// Whether a single-use invite `nonce` has already been spent.
+    pub fn is_redeemed(&self, nonce: &[u8]) -> bool {
+        let key = data_encoding::HEXLOWER.encode(nonce);
+        self.redeemed_map(false)
+            .map(|m| m.get(&key).is_some())
+            .unwrap_or(false)
+    }
+
+    /// Burn a single-use invite `nonce`, recording who redeemed it. The caller is
+    /// responsible for committing/persisting the doc (e.g. via `member_apply`).
+    pub fn mark_redeemed(&self, nonce: &[u8], redeemer: &UserId) -> Result<()> {
+        let key = data_encoding::HEXLOWER.encode(nonce);
+        let m = self
+            .redeemed_map(true)
+            .ok_or_else(|| anyhow!("redeemed container missing"))?;
+        m.insert(&key, redeemer.as_str())?;
+        Ok(())
+    }
+
     /// Members with a sealed envelope for an epoch (for re-sealing on rotation).
     pub fn sealed_members(&self, epoch: u32) -> Vec<UserId> {
         match self.epoch_map(epoch, false) {
@@ -252,6 +289,29 @@ mod tests {
         let mut expect = vec![user(1), user(2)];
         expect.sort();
         assert_eq!(members, expect);
+    }
+
+    #[test]
+    fn redeemed_nonces_record_and_survive_a_snapshot() {
+        let m = MembershipDoc::create(&ws()).unwrap();
+        let nonce = [7u8; 16];
+        assert!(!m.is_redeemed(&nonce), "unseen nonce is not redeemed");
+        m.mark_redeemed(&nonce, &user(3)).unwrap();
+        m.doc().commit();
+        assert!(m.is_redeemed(&nonce), "burned nonce reads back as redeemed");
+        assert!(
+            !m.is_redeemed(&[8u8; 16]),
+            "a different nonce is still fresh"
+        );
+        // The guard is synced state, so it must survive a snapshot round-trip
+        // (this is what gives a second admin the same replay protection).
+        let snap = m.snapshot().unwrap();
+        let loaded = MembershipDoc::from_doc({
+            let d = LoroDoc::new();
+            d.import(&snap).unwrap();
+            d
+        });
+        assert!(loaded.is_redeemed(&nonce), "redemption survives snapshot");
     }
 
     #[test]

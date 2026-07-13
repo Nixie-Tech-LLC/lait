@@ -211,7 +211,14 @@ fn two_nodes_converge_over_iroh() {
     );
 
     // A mints a ticket (carrying its workspace id) and B connects.
-    let ticket = match req(&a.home, Request::Invite) {
+    let ticket = match req(
+        &a.home,
+        Request::Invite {
+            require_approval: true,
+            reusable: false,
+            ttl_hours: None,
+        },
+    ) {
         Response::Text { text } => text.trim().to_string(),
         other => panic!("A: invite returned {other:?}"),
     };

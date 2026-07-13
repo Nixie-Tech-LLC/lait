@@ -555,10 +555,15 @@ impl LaitMcp {
     }
 
     #[tool(
-        description = "Produce a base32 workspace ticket to share so a coworker can join/connect."
+        description = "Produce a base32 workspace ticket to share so a coworker can join. The ticket carries a signed, single-use pass so they are auto-admitted on join (no separate approve step)."
     )]
     async fn invite_ticket(&self) -> Result<CallToolResult, McpError> {
-        self.run(Request::Invite).await
+        self.run(Request::Invite {
+            require_approval: false,
+            reusable: false,
+            ttl_hours: None,
+        })
+        .await
     }
 
     #[tool(description = "Join a workspace from a ticket and broadcast a request to be added.")]

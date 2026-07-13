@@ -277,6 +277,44 @@ which is precisely why in-issue attribution stays advisory (A§ non-goal 6) whil
 itself is not forgeable. E2EE, key distribution, and the ciphertext envelope are deferred
 to P2/P3 (A§10–§11); only the shapes above exist at P0/P1.
 
+### 6.1 Invite pre-authorization (Pattern A) — a signed pass that auto-seals
+
+Admission normally needs two admin actions around the joiner's `join` (issue the ticket,
+then `members approve`). A **pass** collapses that to one: an admin signs a bearer
+capability that any node can carry, and an admin receiver honors it by signing the same
+`AddMember` op automatically — **no new trust primitive, no weakening of E2EE** (the seal
+still happens key-side on an admin holding the workspace key).
+
+```
+InviteGrant {
+  workspace  : WorkspaceId,   // binds the pass to one room
+  nonce      : bytes[16],     // random id; a single-use pass is spent exactly once
+  expires_at : u64,           // unix seconds; the redeemer checks freshness
+  single_use : bool,          // one redemption vs. valid-until-expiry (a team link)
+}
+SignedInvite { issuer: PublicKey, grant: bytes(InviteGrant), sig }   // rides in the RoomTicket
+                                                                     // + the gossip JoinRequest
+```
+
+A redeeming node enforces, against **live** state, in this order: the issuer signature
+(transport), `workspace` match + not `expires_at` (transport), the issuer ∈ current admins
+and *we* are an admin able to seal (tracker), and — for `single_use` — the nonce is unspent.
+Any failure is a **silent fallback** to the pending-request flow (§6), so a bad/expired/
+foreign/spent pass never blocks a manual `members approve`.
+
+The single-use guard is synced membership state — a new container alongside the ACL log:
+
+```
+membership doc (LoroDoc, synced unencrypted like the rest of §6):
+  acl       : LoroList<SignedOp>            // the signed op-graph above
+  keys      : Map<epoch, Map<UserId, sealed>>   // §11 key envelopes
+  redeemed  : Map<nonce(hex), UserId>       // burned single-use passes (redeemer recorded)
+```
+
+The nonce is burned in the **same commit** as its `AddMember` op (atomic — no window where
+a member is added but the pass stays live), and because it syncs, a second admin inherits the
+same replay protection.
+
 ## 7. Layer B — control protocol (`Request` / `Response` / `IssueEvent`)
 
 Newline-delimited JSON over the Unix socket, same transport as today. This is an
