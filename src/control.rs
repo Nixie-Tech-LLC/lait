@@ -273,7 +273,10 @@ pub enum Response {
     },
 
     // ---- transport / presence ----
-    Status(StatusInfo),
+    // Boxed like `Issue`/`Board`: `StatusInfo` is the largest variant, and keeping
+    // it inline makes `Response` (used as the `Err` type of the resolve helpers)
+    // trip clippy's `result_large_err`.
+    Status(Box<StatusInfo>),
     Text {
         text: String,
     },

@@ -1277,7 +1277,7 @@ impl Node {
                     )
                 };
                 let pending_requests = self.pending_join_requests().len();
-                Ok(Response::Status(StatusInfo {
+                Ok(Response::Status(Box::new(StatusInfo {
                     id: self.shared.my_id.to_string(),
                     nick: self.shared.nick.clone(),
                     room: self.shared.room.clone(),
@@ -1287,7 +1287,7 @@ impl Node {
                     projects,
                     membership,
                     pending_requests,
-                }))
+                })))
             }
             Request::Id => Ok(Response::Text {
                 text: self.shared.my_id.to_string(),
