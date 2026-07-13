@@ -379,6 +379,13 @@ async fn run_update() -> Result<()> {
             .repo_owner("Nixie-Tech-LLC")
             .repo_name("lait")
             .bin_name("lait")
+            // cargo-dist nests the binary inside a `lait-<target-triple>/`
+            // directory in the release archive (e.g. `lait-aarch64-apple-darwin/lait`).
+            // Without this, `self_update` looks for a bare `lait` at the archive
+            // root and fails with "Could not find the required path in the archive".
+            // `{{ target }}` expands to the build target triple (matching the dir
+            // name) and `{{ bin }}` to the bin name (with `.exe` on Windows).
+            .bin_path_in_archive("lait-{{ target }}/{{ bin }}")
             .current_version(env!("CARGO_PKG_VERSION"))
             .show_download_progress(true)
             .no_confirm(true)

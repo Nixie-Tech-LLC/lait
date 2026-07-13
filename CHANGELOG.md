@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.4.6 — self-updater fix
+
+- **`lait update` now extracts the binary from cargo-dist archives.** The native
+  in-place updater looked for a bare `lait` at the archive root, but release
+  tarballs nest the binary under a `lait-<target-triple>/` directory, so every
+  update failed with `Could not find the required path in the archive: "lait"`.
+  The updater now points at `lait-{{ target }}/{{ bin }}`, matching the layout
+  produced by cargo-dist on every platform. **Note:** binaries built before this
+  fix (≤ v0.4.5) can't self-heal — upgrade once via your installer (`brew upgrade
+  lait`, `install.sh`, etc.); subsequent `lait update` calls then work.
+
 ## v0.4.5 — invite & remote ergonomics
 
 - **User-refs resolve by local alias and id-prefix.** `<userref>` now accepts a
