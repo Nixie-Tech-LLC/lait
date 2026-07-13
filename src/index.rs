@@ -113,8 +113,12 @@ impl AliasTable {
         }
         if let Some(new) = want {
             if let Some(key) = project_key(catalog, &new.0) {
-                self.groups.entry(new.clone()).or_default().push(doc_id.clone());
-                self.doc_group.insert(doc_id.as_str().to_string(), new.clone());
+                self.groups
+                    .entry(new.clone())
+                    .or_default()
+                    .push(doc_id.clone());
+                self.doc_group
+                    .insert(doc_id.as_str().to_string(), new.clone());
                 self.reassign_group(&new, &key);
             }
         }
@@ -559,8 +563,14 @@ mod tests {
             let handle = t.canonical_for(d);
             let prefix = handle.strip_prefix(DocId::PREFIX).unwrap();
             let hits = ids.iter().filter(|o| o.ulid().starts_with(prefix)).count();
-            assert_eq!(hits, 1, "canonical {handle} for {d} is not unique ({hits} hits)");
-            assert!(prefix.len() >= CANONICAL_MIN, "canonical shorter than min: {handle}");
+            assert_eq!(
+                hits, 1,
+                "canonical {handle} for {d} is not unique ({hits} hits)"
+            );
+            assert!(
+                prefix.len() >= CANONICAL_MIN,
+                "canonical shorter than min: {handle}"
+            );
         }
     }
 
@@ -586,7 +596,10 @@ mod tests {
             inc.reconcile_doc(&c, id);
         }
         let full = AliasTable::build(&c);
-        assert_eq!(inc, full, "incremental (reverse order) must equal full build");
+        assert_eq!(
+            inc, full,
+            "incremental (reverse order) must equal full build"
+        );
         assert_canonicals_unique(&inc, &c);
         // and aliases resolve
         for id in &ids {
