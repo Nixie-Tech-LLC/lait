@@ -1,0 +1,118 @@
+# CD: stamp the Scoop manifest with a released version + SHA256 and push it to the
+# org Scoop bucket (github.com/Nixie-Tech-LLC/scoop-bucket), so `scoop install lait`
+# picks up the new version.
+#
+# Triggered on the **Release** workflow completing (`workflow_run`) — which fires
+# even though cargo-dist creates the release with the default GITHUB_TOKEN (a
+# `release:` trigger would be suppressed). By completion the release + assets
+# already exist. `workflow_dispatch` is kept for manual re-runs.
+#
+# Auth is a short-lived token minted from the org GitHub App (integration-runners)
+# scoped to just scoop-bucket — no long-lived PAT. App creds live in the repo
+# secrets RUNNERS_APP_ID / RUNNERS_APP_PRIVATE_KEY; without them the job soft-skips.
+name: Publish Scoop manifest
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.4.3)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  scoop:
+    name: update scoop-bucket
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    env:
+      APP_ID: ${{ secrets.RUNNERS_APP_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag + gate on app credentials
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISPATCH_TAG: ${{ github.event.inputs.tag }}
+          RUN_TAG: ${{ github.event.workflow_run.head_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${DISPATCH_TAG:-${RUN_TAG:-}}"
+          if [ -z "$tag" ] || [ "${tag#v}" = "$tag" ]; then
+            tag="$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')"
+          fi
+          [ -n "$tag" ] || { echo "::error::could not resolve a release tag"; exit 1; }
+          echo "tag=$tag"         >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          if [ -n "${APP_ID:-}" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"
+          else echo "::notice::RUNNERS_APP_ID not set — skipping Scoop publish."; echo "ok=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Fetch the Windows zip SHA256 from the release
+        id: hash
+        if: steps.gate.outputs.ok == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.gate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          asset="lait-x86_64-pc-windows-msvc.zip.sha256"
+          gh release download "$TAG" --repo "${{ github.repository }}" --pattern "$asset" --output sha.txt
+          hash=$(awk 'NR==1{print $1}' sha.txt)
+          [ -n "$hash" ] || { echo "::error::empty SHA256 for $asset"; exit 1; }
+          echo "sha256=$hash" >> "$GITHUB_OUTPUT"
+
+      - name: Stamp packaging/scoop/lait.json
+        if: steps.gate.outputs.ok == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=packaging/scoop/lait.json
+          v="${{ steps.gate.outputs.version }}"; h="${{ steps.hash.outputs.sha256 }}"
+          tmp=$(mktemp)
+          jq --arg v "$v" --arg h "$h" '
+            .version = $v
+            | .architecture."64bit".url = "https://github.com/Nixie-Tech-LLC/lait/releases/download/v\($v)/lait-x86_64-pc-windows-msvc.zip"
+            | .architecture."64bit".hash = $h
+          ' "$f" > "$tmp" && mv "$tmp" "$f"
+          jq empty "$f" && cat "$f"
+
+      - name: Mint a bucket-scoped token
+        id: token
+        if: steps.gate.outputs.ok == 'true'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RUNNERS_APP_ID }}
+          private-key: ${{ secrets.RUNNERS_APP_PRIVATE_KEY }}
+          owner: Nixie-Tech-LLC
+          repositories: scoop-bucket
+
+      - name: Push to scoop-bucket
+        if: steps.gate.outputs.ok == 'true'
+        env:
+          BUCKET_TOKEN: ${{ steps.token.outputs.token }}
+          VERSION: ${{ steps.gate.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 \
+            "https://x-access-token:${BUCKET_TOKEN}@github.com/Nixie-Tech-LLC/scoop-bucket" bucket
+          mkdir -p bucket/bucket
+          cp packaging/scoop/lait.json bucket/bucket/lait.json
+          cd bucket
+          git config user.name  "integration-runners[bot]"
+          git config user.email "integration-runners[bot]@users.noreply.github.com"
+          git add bucket/lait.json
+          if git diff --cached --quiet; then echo "manifest already up to date"; exit 0; fi
+          git commit -m "lait $VERSION"
+          git push

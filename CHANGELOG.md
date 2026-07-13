@@ -31,6 +31,38 @@
   <addr>` opens your OS mail client with a prefilled invite (mailto — no SMTP, no
   credentials).
 
+## v0.4.4 — crates.io + winget publishing
+
+- **All channels live.** Adds automated **crates.io** publishing
+  (`publish-crates.yml`, same `workflow_run` trigger — `cargo install lait` +
+  docs.rs) and enables **winget** submission. With Homebrew, Scoop, `cargo
+  binstall`, and the GitHub Release, a single version tag now publishes to every
+  supported channel automatically.
+
+## v0.4.3 — fully automatic release publishing
+
+- **One release run publishes everywhere.** The Homebrew, Scoop, and winget
+  publishers are now cargo-dist **custom publish jobs** (`publish-jobs` →
+  reusable `workflow_call` workflows), invoked by the release run itself after it
+  hosts the release. No more manual `workflow_dispatch` after each tag — pushing a
+  version tag builds, releases, and pushes to the tap + bucket end to end. Each job
+  still mints its own short-lived token from the org GitHub App and soft-skips if
+  its credentials are absent.
+
+## v0.4.2 — distribution: one command on every platform
+
+- **GitHub is the canonical home.** Removed the GitLab CI + `homepage` split-brain
+  (Cargo.toml + the Claude plugin now point at `github.com/Nixie-Tech-LLC/lait`);
+  local node state (`.lait/`, `.groupchat/`) is gitignored.
+- **Every install path works.** `cargo install`, `cargo binstall` (prebuilt, no
+  compile), Homebrew (`brew install nixie-tech-llc/tap/lait`), Scoop, winget, a
+  Docker image for an always-on **seed node**, and `lait completions <shell>` /
+  `lait man` generated from the CLI itself. New `docs/INSTALL.md` covers the matrix.
+- **Distribution CD.** On each release, the Homebrew formula and Scoop manifest are
+  published automatically using a short-lived token minted from the org GitHub App
+  (no long-lived PAT); a CI job structurally validates the Scoop + winget manifests.
+- Hardened tests for the new stateless CLI surfaces (`tests/cli_surfaces.rs`).
+
 ## v0.4.1 — native in-place updater
 
 - **Native in-place updater.** `lait update` now self-updates in-process from the

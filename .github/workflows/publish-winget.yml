@@ -1,0 +1,66 @@
+# CD: submit lait to the winget community repo (microsoft/winget-pkgs) on each
+# release. Uses winget-releaser, which builds the manifest from the release's
+# Windows zip and opens the PR.
+#
+# Triggered on the **Release** workflow completing (`workflow_run`) — which fires
+# even though cargo-dist creates the release with the default GITHUB_TOKEN.
+# `workflow_dispatch` is kept for manual re-runs.
+#
+# Needs a `WINGET_TOKEN` secret: a classic PAT with `public_repo`, from an account
+# that has forked microsoft/winget-pkgs (the org GitHub App can't provide a
+# user-namespace fork). Without it the job soft-skips, so it never blocks a release.
+name: Publish to winget
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.4.3)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  winget:
+    name: submit to winget-pkgs
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    env:
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    steps:
+      - name: Resolve tag + gate on token
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISPATCH_TAG: ${{ github.event.inputs.tag }}
+          RUN_TAG: ${{ github.event.workflow_run.head_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${DISPATCH_TAG:-${RUN_TAG:-}}"
+          if [ -z "$tag" ] || [ "${tag#v}" = "$tag" ]; then
+            tag="$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')"
+          fi
+          [ -n "$tag" ] || { echo "::error::could not resolve a release tag"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ -n "${WINGET_TOKEN:-}" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"
+          else echo "::notice::WINGET_TOKEN not set — skipping winget submission."; echo "ok=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Submit manifest
+        if: steps.gate.outputs.ok == 'true'
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: NixieTechLLC.Lait
+          release-tag: ${{ steps.gate.outputs.tag }}
+          installers-regex: 'x86_64-pc-windows-msvc\.zip$'
+          # The fork + WINGET_TOKEN live under omarbinyounes, not the repo org, so
+          # override the default fork-user (which is the repository owner).
+          fork-user: omarbinyounes
+          token: ${{ secrets.WINGET_TOKEN }}

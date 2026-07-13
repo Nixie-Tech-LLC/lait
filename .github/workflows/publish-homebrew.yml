@@ -1,0 +1,98 @@
+# CD: push the cargo-dist-generated Homebrew formula (lait.rb, a release asset) to
+# the org tap so `brew install nixie-tech-llc/tap/lait` picks up the release.
+#
+# Triggered on the **Release** workflow completing (`workflow_run`) — which fires
+# even though cargo-dist creates the release with the default GITHUB_TOKEN (a
+# `release:` trigger would be suppressed). By completion the release + assets
+# already exist (created in the Release `host` job). `workflow_dispatch` is kept
+# for manual re-runs.
+#
+# Auth is a short-lived token minted from the org GitHub App (integration-runners)
+# scoped to just homebrew-tap — no long-lived PAT. App creds live in the repo
+# secrets RUNNERS_APP_ID / RUNNERS_APP_PRIVATE_KEY; without them the job soft-skips.
+name: Publish Homebrew formula
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.4.3)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  homebrew:
+    name: push formula to tap
+    runs-on: ubuntu-latest
+    # Only a manual dispatch, or a successful Release run for a version tag.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    env:
+      APP_ID: ${{ secrets.RUNNERS_APP_ID }}
+    steps:
+      - name: Resolve tag + gate on app credentials
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISPATCH_TAG: ${{ github.event.inputs.tag }}
+          RUN_TAG: ${{ github.event.workflow_run.head_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${DISPATCH_TAG:-${RUN_TAG:-}}"
+          # Fallback: the Release just created a GitHub release — use its tag.
+          if [ -z "$tag" ] || [ "${tag#v}" = "$tag" ]; then
+            tag="$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')"
+          fi
+          [ -n "$tag" ] || { echo "::error::could not resolve a release tag"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ -n "${APP_ID:-}" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"
+          else echo "::notice::RUNNERS_APP_ID not set — skipping Homebrew publish."; echo "ok=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Mint a tap-scoped token
+        id: token
+        if: steps.gate.outputs.ok == 'true'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RUNNERS_APP_ID }}
+          private-key: ${{ secrets.RUNNERS_APP_PRIVATE_KEY }}
+          owner: Nixie-Tech-LLC
+          repositories: homebrew-tap
+
+      - name: Download the generated formula from the release
+        if: steps.gate.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.gate.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --repo "${{ github.repository }}" --pattern 'lait.rb' --output lait.rb --clobber
+          test -s lait.rb
+
+      - name: Push to homebrew-tap
+        if: steps.gate.outputs.ok == 'true'
+        env:
+          TAP_TOKEN: ${{ steps.token.outputs.token }}
+          TAG: ${{ steps.gate.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 \
+            "https://x-access-token:${TAP_TOKEN}@github.com/Nixie-Tech-LLC/homebrew-tap" tap
+          mkdir -p tap/Formula
+          cp lait.rb tap/Formula/lait.rb
+          cd tap
+          git config user.name  "integration-runners[bot]"
+          git config user.email "integration-runners[bot]@users.noreply.github.com"
+          git add Formula/lait.rb
+          if git diff --cached --quiet; then echo "formula already current"; exit 0; fi
+          git commit -m "lait $TAG"
+          git push

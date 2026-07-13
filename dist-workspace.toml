@@ -9,8 +9,19 @@ cargo-dist-version = "0.32.0"
 ci = "github"
 # The installers to generate for each app. `shell` for unix, `powershell` for
 # Windows (now that the control channel is a portable named pipe, not a Unix
-# socket). install.sh / install.ps1 + the self-updater cover upgrades.
-installers = ["shell", "powershell"]
+# socket), and `homebrew` — which generates `lait.rb` as a release artifact. We
+# deliberately do NOT set `publish-jobs = ["homebrew"]`: the formula is pushed to
+# the tap by our own `publish-homebrew.yml`, which mints a short-lived token from
+# the org GitHub App (durable, no static PAT) rather than a stored secret.
+# install.sh / install.ps1 + the self-updater cover upgrades.
+installers = ["shell", "powershell", "homebrew"]
+# Homebrew tap the formula targets: `brew install nixie-tech-llc/tap/lait`
+# (github.com/Nixie-Tech-LLC/homebrew-tap). cargo-dist only *generates* lait.rb as
+# a release asset — the push to the tap (and the Scoop/winget publishes) is done by
+# our own `publish-*.yml` workflows, triggered on the Release workflow completing
+# (`workflow_run`), which fires even though cargo-dist creates the release with the
+# default GITHUB_TOKEN (a `release:` trigger would not).
+tap = "Nixie-Tech-LLC/homebrew-tap"
 # Target platforms to build apps for (Rust target-triple syntax). Windows is
 # now included: the daemon's control channel is a cross-platform local IPC
 # channel (named pipe on Windows via `interprocess`), and the single-instance

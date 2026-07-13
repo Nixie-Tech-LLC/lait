@@ -1,0 +1,13 @@
+PackageIdentifier: NixieTechLLC.Lait
+PackageVersion: 0.4.1
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: lait.exe
+    PortableCommandAlias: lait
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/Nixie-Tech-LLC/lait/releases/download/v0.4.1/lait-x86_64-pc-windows-msvc.zip
+    InstallerSha256: 54A8037FF72EF575D3FA09A76F1C0865DA66B9B4457A1E50A5EB9024525BDE3D
+ManifestType: installer
+ManifestVersion: 1.6.0
