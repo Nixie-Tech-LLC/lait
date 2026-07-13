@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.4.8 — Windows self-update fix
+
+- **`lait update` works on Windows again.** cargo-dist ships the binary **flat**
+  at the root of the Windows `.zip` (`lait.exe`) but **nested** under a
+  `lait-<target-triple>/` directory in the unix `.tar.gz` archives; the updater
+  assumed the nested layout everywhere, so every Windows self-update failed at
+  extraction with `specified file not found in archive`. The in-archive path is
+  now chosen per-OS (with a unit test pinning the contract). **Note:** the broken
+  updater is baked into the running binary, so a Windows node on ≤ v0.4.7 must
+  reinstall once via its installer (`scoop update lait`, `winget upgrade lait`,
+  or the `install.ps1` one-liner) to land a fixed binary; `lait update` then
+  works in place from v0.4.8 on.
+
 ## v0.4.7 — guided-join onboarding & instant-at-scale edits
 
 - **Guided-join onboarding that names the one thing that's wrong.** A first
