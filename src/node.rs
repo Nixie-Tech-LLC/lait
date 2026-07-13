@@ -768,6 +768,29 @@ impl Node {
         Ok(())
     }
 
+    /// The honest post-`join` message. A join only *requests* access: until an
+    /// admin approves us we hold ciphertext and aren't on the board (UI.md §8).
+    /// So we tell the joiner the truth and point at the one next step, instead of
+    /// implying success. If we resolved to an already-member (a re-join), say so.
+    fn join_message(&self, ticket: &RoomTicket) -> String {
+        let host = if ticket.host_nick.is_empty() {
+            "the workspace admin".to_string()
+        } else {
+            ticket.host_nick.clone()
+        };
+        let already_member = self.tracker.lock().unwrap().is_member(&self.my_userid());
+        if already_member {
+            "joined \u{2014} you're on the board and syncing.".to_string()
+        } else {
+            format!(
+                "join request sent to {host}.\n\
+                 you're not on the board yet \u{2014} {host} still has to approve you, then \
+                 your board decrypts and syncs automatically.\n\
+                 run `lait status` any time to check whether you've been approved."
+            )
+        }
+    }
+
     /// Pin a seed (A§10). Accepts two forms: a full `RoomTicket` (adopt the
     /// workspace, join, and backfill — the primary path), or a bare endpoint id
     /// (pin only, for a peer we already share a workspace with). Either way the
@@ -1231,14 +1254,25 @@ impl Node {
                     .values()
                     .filter(|p| p.presence.is_online())
                     .count();
-                let (workspace, issues, projects) = {
+                let me = self.my_userid();
+                let (workspace, issues, projects, membership) = {
                     let t = self.tracker.lock().unwrap();
+                    let acl = t.acl_state();
+                    let membership = if acl.is_admin(&me) {
+                        "admin"
+                    } else if acl.is_member(&me) {
+                        "member"
+                    } else {
+                        "pending"
+                    };
                     (
                         Some(t.workspace_id().to_string()),
                         t.issue_count(),
                         t.project_count(),
+                        membership.to_string(),
                     )
                 };
+                let pending_requests = self.pending_join_requests().len();
                 Ok(Response::Status(StatusInfo {
                     id: self.shared.my_id.to_string(),
                     nick: self.shared.nick.clone(),
@@ -1247,6 +1281,8 @@ impl Node {
                     workspace,
                     issues,
                     projects,
+                    membership,
+                    pending_requests,
                 }))
             }
             Request::Id => Ok(Response::Text {
@@ -1263,18 +1299,11 @@ impl Node {
                     text: ticket.to_string(),
                 })
             }
-            Request::Join { ticket } => {
+            Request::Join { ticket } | Request::Connect { ticket } => {
                 let ticket: RoomTicket = ticket.parse().context("parse room ticket")?;
                 self.adopt_and_join(&ticket).await?;
                 Ok(Response::Ok {
-                    message: Some("joined room and sent join request".to_string()),
-                })
-            }
-            Request::Connect { ticket } => {
-                let ticket: RoomTicket = ticket.parse().context("parse room ticket")?;
-                self.adopt_and_join(&ticket).await?;
-                Ok(Response::Ok {
-                    message: Some("connected to room \u{2014} you're live".to_string()),
+                    message: Some(self.join_message(&ticket)),
                 })
             }
             Request::SeedAdd { arg } => self.seed_add(arg.trim()).await,

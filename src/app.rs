@@ -183,8 +183,18 @@ pub enum Command {
         #[arg(long)]
         email: Option<String>,
     },
-    /// Join a workspace from a ticket and announce a join request.
-    Join { ticket: String },
+    /// Join a workspace from an invite link. Sends a join request; a workspace
+    /// admin approves you, then your board decrypts and syncs automatically.
+    /// Check progress any time with `lait status`. (Alias: `connect`.)
+    #[command(alias = "connect")]
+    Join {
+        /// The invite link / ticket from `lait invite`.
+        ticket: String,
+        /// Set your display name as you join — what the admin sees on your
+        /// pending request (a self-asserted claim; they approve you by key).
+        #[arg(long)]
+        nick: Option<String>,
+    },
     /// Manage pinned always-on **seed** peers — the P2P "remote". A seed is a
     /// sticky bootstrap + backfill anchor your node always dials, so you converge
     /// even when no laptop peer is online. It is not a trust authority (genesis/
@@ -193,12 +203,6 @@ pub enum Command {
     Seed {
         #[command(subcommand)]
         cmd: SeedCmd,
-    },
-    /// One-step onboarding: connect to a workspace from a ticket.
-    Connect {
-        ticket: String,
-        #[arg(long)]
-        nick: Option<String>,
     },
     /// Print presence/system events (optionally only after --since).
     Log {
@@ -406,9 +410,16 @@ pub async fn run() -> Result<()> {
     if !is_service_command(&args.command) {
         reset_sigpipe();
     }
+    // Effective color, computed once: honour --no-color, the $NO_COLOR
+    // convention, --json (machine output is never styled), and whether stdout is
+    // an interactive terminal (so `lait ls | cat` / redirects stay clean).
+    use std::io::IsTerminal;
     let out = Out {
         json: args.json,
-        color: !args.no_color,
+        color: !args.no_color
+            && !args.json
+            && std::env::var_os("NO_COLOR").is_none()
+            && std::io::stdout().is_terminal(),
     };
 
     // Stateless commands that need neither an identity nor a workspace store:
@@ -431,7 +442,13 @@ pub async fn run() -> Result<()> {
     match &args.command {
         Command::Agents => {
             let names = config::list_identities()?;
-            if names.is_empty() {
+            if out.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({ "identities": names }))
+                        .unwrap_or_else(|_| "{}".into())
+                );
+            } else if names.is_empty() {
                 println!("no identities yet — one is created on first use");
             } else {
                 for n in names {
@@ -447,7 +464,11 @@ pub async fn run() -> Result<()> {
             // global identity + repo-discovered store (DUR-5).
             std::env::set_var("LAIT_HOME", &home);
             load_or_create_identity(&home)?;
-            println!("resumed identity '{name}'");
+            // Under --json only the Status DTO (below) is emitted — no human line
+            // leaking ahead of it.
+            if !out.json {
+                println!("resumed identity '{name}'");
+            }
             return crate::cli::run(&home, Request::Status, out).await;
         }
         _ => {}
@@ -474,11 +495,23 @@ pub async fn run() -> Result<()> {
                 profile.room = r;
             }
             profile.save(&home)?;
-            println!("initialized.");
-            println!("id:   {}", key.public());
-            println!("nick: {}", profile.nick);
-            println!("room: {}", profile.room);
-            println!("home: {}", home.display());
+            if out.json {
+                crate::cli::emit_ok(
+                    &format!(
+                        "initialized id={} nick={} room={}",
+                        key.public(),
+                        profile.nick,
+                        profile.room
+                    ),
+                    out,
+                );
+            } else {
+                println!("initialized.");
+                println!("id:   {}", key.public());
+                println!("nick: {}", profile.nick);
+                println!("room: {}", profile.room);
+                println!("home: {}", home.display());
+            }
         }
         Command::New {
             title,
@@ -657,7 +690,7 @@ pub async fn run() -> Result<()> {
         Command::Tui => crate::tui::run(&home).await?,
         Command::Id => {
             let key = load_or_create_identity(&config::identity_dir()?)?;
-            println!("{}", key.public());
+            crate::cli::emit_text(&key.public().to_string(), out);
         }
         Command::Daemon { seed } => {
             tracing_subscriber::fmt()
@@ -682,7 +715,18 @@ pub async fn run() -> Result<()> {
         }
         Command::Status => crate::cli::run(&home, Request::Status, out).await?,
         Command::Invite { email } => crate::cli::run_invite(&home, email, out).await?,
-        Command::Join { ticket } => crate::cli::run(&home, Request::Join { ticket }, out).await?,
+        Command::Join { ticket, nick } => {
+            // Set the display name before the daemon is auto-spawned (below, via
+            // ensure_daemon) so a cold joiner announces the right name on its
+            // join request. It stays a self-asserted claim — the admin approves
+            // by key, never by this nick (UI.md §8).
+            if let Some(n) = nick {
+                let mut profile = Profile::load(&home)?;
+                profile.nick = n;
+                profile.save(&home)?;
+            }
+            crate::cli::run(&home, Request::Join { ticket }, out).await?
+        }
         Command::Seed { cmd } => match cmd {
             SeedCmd::Add { target } => {
                 crate::cli::run(&home, Request::SeedAdd { arg: target }, out).await?
@@ -690,14 +734,6 @@ pub async fn run() -> Result<()> {
             SeedCmd::Ls => crate::cli::run(&home, Request::SeedList, out).await?,
             SeedCmd::Rm { who } => crate::cli::run(&home, Request::SeedRemove { who }, out).await?,
         },
-        Command::Connect { ticket, nick } => {
-            if let Some(n) = nick {
-                let mut profile = Profile::load(&home)?;
-                profile.nick = n;
-                profile.save(&home)?;
-            }
-            crate::cli::run(&home, Request::Connect { ticket }, out).await?
-        }
         Command::Log { since } => crate::cli::run(&home, Request::Log { since }, out).await?,
         Command::Wait { since, timeout_ms } => {
             crate::cli::run(&home, Request::Wait { since, timeout_ms }, out).await?

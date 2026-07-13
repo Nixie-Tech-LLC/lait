@@ -366,6 +366,16 @@ pub struct StatusInfo {
     pub workspace: Option<String>,
     pub issues: usize,
     pub projects: usize,
+    /// This node's standing in the workspace ACL: `admin` | `member` | `pending`.
+    /// `pending` means we joined from an invite but an admin hasn't approved us
+    /// yet — we can't decrypt the board (UI.md §8). Lets `status` tell a joiner
+    /// the truth instead of implying the join already succeeded.
+    #[serde(default)]
+    pub membership: String,
+    /// Joiners who have announced a join request but aren't members yet — the
+    /// host-side nudge to run `members approve`. Only meaningful for an admin.
+    #[serde(default)]
+    pub pending_requests: usize,
 }
 
 /// Send one request to the daemon and read one response (one-shot path).

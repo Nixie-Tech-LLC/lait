@@ -167,6 +167,24 @@ Scripts capture the resolved handle from `--json`:
 id=$(lait new "fix login" -p ENG --json | jq -r .reff)
 ```
 
+`lait watch` follows the presence/join event stream and can run a hook per event
+(`--exec CMD`) or raise a desktop notification (`--notify`). The hook runs in the
+platform shell (`sh -c` on Unix, `cmd /C` on Windows) with the event as JSON on
+stdin **and** in the environment:
+
+```bash
+# ping a webhook whenever someone asks to join
+lait watch --exec 'curl -s -X POST "$WEBHOOK" -d "$LAIT_EVENT_NICK joined"'
+```
+
+| Env var | Value |
+|---|---|
+| `LAIT_EVENT_KIND` | `join` · `presence` · `system` |
+| `LAIT_EVENT_NICK` | the peer's display name |
+| `LAIT_EVENT_ID` | the peer's endpoint id |
+| `LAIT_EVENT_TEXT` | human message |
+| `LAIT_EVENT_SEQ` · `LAIT_EVENT_TS` | session sequence · unix ts |
+
 ## CLI reference
 
 Issue verbs (act on one issue by `<ref>` — a short `iss_` handle or a `KEY-n` alias):
@@ -195,7 +213,8 @@ Registries + node:
 | `activity [--since N]` | Workspace-wide recent transitions |
 | `tui` | Launch the full-screen board |
 | `status` · `id` · `stop` | Node/workspace status · endpoint id · stop daemon |
-| `invite` · `join` · `connect` · `who` · `wait` · `watch` | P2P transport (P1 surface) |
+| `invite` · `join` · `members requests` · `members approve` | Invite a teammate; they `join`; you approve their pending request |
+| `who` · `wait` · `watch` | Peers online · block for one event · follow the event stream |
 | `agents` / `resume <name>` | Manage per-session identities |
 
 Global flags: `--home DIR`, `--json`, `--no-color`. Exit codes: `0` ok · `1`
@@ -239,18 +258,24 @@ parity test keeps the agent and human surfaces in lock-step.
 ## Multi-node & end-to-end encryption
 
 ```bash
-# host — create work, then share a ticket (carries the workspace + genesis)
-lait invite                        # → a base32 ticket; send it to a peer
+# host — share an invite link (carries the workspace + genesis)
+lait invite                        # → an invite link (+ a scannable QR); send it over
 
-# peer — join from the ticket (adopts the workspace, backfills over sync)
-lait connect <TICKET> --nick bob
-lait id                            # → bob's key; send it to the host
+# teammate — join from the link. This sends a *join request*: you are NOT on the
+# board yet — it stays encrypted until an admin approves you.
+lait join <INVITE> --nick bob
+lait status                        # you: pending   ← waiting to be approved
 
-# host — admit bob (seals him the workspace key); now bob can decrypt + edit
-lait members add <BOB_KEY>
-lait members                       # admin you · member bob
+# host — see who's waiting, confirm the short key out-of-band, then approve by
+# key/prefix (the nick is an unverified claim; `--as` is a local name you assign)
+lait members requests              # bob  (claims "bob")   <key-prefix>
+lait members approve <key-prefix> --as bob
+
+# teammate — you're in; the board decrypts and syncs automatically
+lait status                        # you: member
+
 # later: revoke — rotates the key so bob can't read new content (lazy revocation)
-lait members remove <BOB_KEY>
+lait members remove bob
 ```
 
 Workspace data is E2EE: issues sync as ciphertext, and a node that isn't in the
