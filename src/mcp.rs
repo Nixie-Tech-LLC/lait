@@ -80,6 +80,7 @@ pub const MCP_TOOL_NAMES: &[&str] = &[
     "member_alias",
     // transport / presence
     "status",
+    "doctor",
     "my_id",
     "invite_ticket",
     "join_room",
@@ -547,6 +548,19 @@ impl LaitMcp {
     )]
     async fn status(&self) -> Result<CallToolResult, McpError> {
         self.run(Request::Status).await
+    }
+
+    #[tool(
+        description = "Guided-join verifier: an ordered readout of the onboarding gates \
+                       (workspace, daemon, membership, peer, sync) with the one blocker \
+                       named in `blocked_on`. Use it to explain why the board is empty or \
+                       a join hasn't completed."
+    )]
+    async fn doctor(&self) -> Result<CallToolResult, McpError> {
+        self.run(Request::Diagnose {
+            expected_workspace: None,
+        })
+        .await
     }
 
     #[tool(description = "Get this node's endpoint id — the handle a coworker uses to reach us.")]

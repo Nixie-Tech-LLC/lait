@@ -19,6 +19,7 @@ use interprocess::local_socket::{
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+use crate::diagnose::DiagnosisView;
 use crate::dto::{
     ActivityEvent, BoardView, Candidate, IssueView, JoinRequestDto, LabelDto, MemberDto,
     ProjectDto, Row, SeedDto,
@@ -191,6 +192,15 @@ pub enum Request {
 
     // ---- transport / presence (kept from the skeleton; the P1 surface) ----
     Status,
+    /// Guided-join verifier (UI onboarding, `docs/GUIDED-JOIN.md`): project live
+    /// node state into an ordered list of onboarding gates so a stalled joiner
+    /// gets one legible blocker instead of a blank board. `expected_workspace`
+    /// (supplied by the `join` tail from the invite ticket) lets it catch a
+    /// directory/store mismatch; `None` for a standalone `doctor`.
+    Diagnose {
+        #[serde(default)]
+        expected_workspace: Option<String>,
+    },
     Id,
     /// Mint an invite ticket. By default it carries a signed, single-use
     /// pre-authorization (Pattern A) so the joiner is auto-admitted on `join`.
@@ -291,6 +301,8 @@ pub enum Response {
     // it inline makes `Response` (used as the `Err` type of the resolve helpers)
     // trip clippy's `result_large_err`.
     Status(Box<StatusInfo>),
+    /// The guided-join verifier's ordered gate list (reply to [`Request::Diagnose`]).
+    Diagnosis(Box<DiagnosisView>),
     Text {
         text: String,
     },

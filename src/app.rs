@@ -153,6 +153,15 @@ pub enum Command {
     },
     /// Launch the full-screen TUI board.
     Tui,
+    /// Guided-join verifier: diagnose why you can't "get to work" yet — an ordered
+    /// readout of the onboarding gates (workspace, daemon, membership, peer, sync)
+    /// naming the one thing that's blocking you. Runs automatically as the tail of
+    /// `join`. (Alias: `verify`.)
+    #[command(alias = "verify")]
+    Doctor,
+    /// List the workspaces you've joined and where each one lives on this machine
+    /// — the breadcrumb for "which directory holds the board I joined?".
+    Workspaces,
     /// Print our endpoint id (the handle others use to reach us).
     Id,
     /// Run the node daemon in the foreground.
@@ -384,6 +393,32 @@ fn is_service_command(cmd: &Command) -> bool {
     matches!(cmd, Command::Daemon { .. } | Command::Mcp)
 }
 
+/// Read-only commands that only *view* a workspace and so must never silently
+/// create a decoy store when run in a directory with none (the directory trap,
+/// docs/GUIDED-JOIN.md §B). Writes (`new`/`edit`/…), `init`, and `join`
+/// legitimately create and are deliberately excluded. `tui` is included: opening
+/// the board in a stray directory is exactly the original-bug symptom (an empty
+/// decoy board), and the guard only fires when you already have joined workspaces
+/// — so a genuine first-time founder (empty registry) is unaffected, while the
+/// store-free `lait workspaces` selector remains reachable from anywhere.
+fn is_read_only(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Ls { .. }
+            | Command::Board { .. }
+            | Command::Show { .. }
+            | Command::History { .. }
+            | Command::Activity { .. }
+            | Command::Who
+            | Command::Status
+            | Command::Doctor
+            | Command::Tui
+            | Command::Projects { cmd: None }
+            | Command::Labels { cmd: None }
+            | Command::Members { cmd: None }
+    )
+}
+
 /// `lait update`: update the installed binary in place from the latest GitHub
 /// release — natively, in-process, with no external updater binary. Best-effort
 /// stops a running daemon first, so it isn't left on stale code and — on Windows —
@@ -580,6 +615,11 @@ pub async fn run() -> Result<()> {
             }
             return crate::cli::run(&home, Request::Status, out).await;
         }
+        // The joined-workspace registry: pure navigation state, no store/daemon.
+        Command::Workspaces => {
+            crate::cli::print_workspaces(out);
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -590,6 +630,19 @@ pub async fn run() -> Result<()> {
     // `update` swaps the binary; it must not resolve/create a workspace store.
     if matches!(args.command, Command::Update) {
         return run_update().await;
+    }
+    // Directory-trap guard (docs/GUIDED-JOIN.md §B): a *read-only* command run in a
+    // directory with no discoverable `.lait/` must NOT silently create a decoy
+    // store — that's exactly how a joiner ends up staring at an empty board in the
+    // wrong place. When we know of workspaces they've joined, point them there and
+    // exit instead of manufacturing an empty one. `init`/`join` (and writes) still
+    // create; an explicit `--home`/`$LAIT_HOME` opts out (existing_home resolves it).
+    if is_read_only(&args.command) && config::existing_home().is_none() {
+        let known = crate::workspaces::list();
+        if !known.is_empty() {
+            crate::cli::warn_no_workspace_here(&known, out);
+            std::process::exit(2);
+        }
     }
     let home = config::resolve_home(None)?;
 
@@ -832,6 +885,16 @@ pub async fn run() -> Result<()> {
             println!("{out}");
         }
         Command::Status => crate::cli::run(&home, Request::Status, out).await?,
+        Command::Doctor => {
+            crate::cli::run(
+                &home,
+                Request::Diagnose {
+                    expected_workspace: None,
+                },
+                out,
+            )
+            .await?
+        }
         Command::Invite {
             email,
             require_approval,
@@ -850,7 +913,11 @@ pub async fn run() -> Result<()> {
                 profile.nick = n;
                 profile.save(&home)?;
             }
-            crate::cli::run(&home, Request::Join { ticket }, out).await?
+            // `join` runs the guided-join verifier as its tail (passing the ticket's
+            // workspace as `expected_workspace`) so the joiner immediately sees the
+            // gate readout — including a directory/store mismatch — instead of a
+            // bare "ok" that leaves them guessing.
+            crate::cli::run_join(&home, ticket, out).await?
         }
         Command::Remote { cmd } => match cmd {
             SeedCmd::Add { target } => {
@@ -871,6 +938,7 @@ pub async fn run() -> Result<()> {
         } => crate::cli::watch(&home, since, exec, notify, timeout_ms).await?,
         Command::Who => crate::cli::run(&home, Request::Who, out).await?,
         Command::Profiles
+        | Command::Workspaces
         | Command::Resume { .. }
         | Command::Update
         | Command::Completions { .. }

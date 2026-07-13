@@ -28,6 +28,20 @@ fn every_tracker_command_has_an_mcp_tool() {
     }
 }
 
+/// Onboarding/transport tools an agent needs but that live outside the tracker
+/// CRUD set (and so aren't covered by `REQUIRED_TRACKER_COMMANDS`). Pinned here so
+/// removing, say, the `doctor` tool — the guided-join verifier's agent surface —
+/// fails the build instead of silently dropping a channel.
+#[test]
+fn onboarding_and_transport_tools_stay_wired() {
+    for tool in ["status", "doctor", "who", "my_id", "join_room"] {
+        assert!(
+            MCP_TOOL_NAMES.contains(&tool),
+            "MCP tool `{tool}` is missing — an agent-facing channel regressed"
+        );
+    }
+}
+
 /// The MCP tool-name list has no duplicates (a copy-paste guard).
 #[test]
 fn mcp_tool_names_are_unique() {

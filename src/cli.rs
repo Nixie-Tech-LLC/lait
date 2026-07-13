@@ -11,8 +11,10 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::{
     control::{request, ErrorKind, Event, EventKind, Request, Response},
+    diagnose::{DiagnosisView, GateState},
     dto::{BoardView, IssueView, Priority, Row},
     proto::RoomTicket,
+    workspaces::{self, WorkspaceEntry},
 };
 
 /// Output mode threaded from the global `--json` / `--no-color` flags.
@@ -138,6 +140,139 @@ pub fn emit_ok(message: &str, out: Out) {
     }
 }
 
+/// Render the guided-join verifier's gate list (human output). Each gate is a
+/// coloured glyph + label + detail, followed by the one-line summary keyed off the
+/// blocking gate. Under `--json` the caller emits the DTO instead (handled in
+/// `print_response`), so this is the human path only.
+fn print_diagnosis(v: &DiagnosisView, out: Out) {
+    for g in &v.gates {
+        let code = match g.state {
+            GateState::Pass => ansi::GREEN,
+            GateState::Wait => ansi::YELLOW,
+            GateState::Fail => ansi::RED,
+            GateState::Skip => ansi::DIM,
+        };
+        let glyph = paint(out.color, code, g.state.glyph());
+        println!("{} {:<11} {}", glyph, g.label, g.detail);
+    }
+    println!();
+    let code = if v.blocked_on.is_some() {
+        ansi::YELLOW
+    } else {
+        ansi::GREEN
+    };
+    println!("{}", paint(out.color, code, &v.summary));
+}
+
+/// `join` display: send the join, echo the daemon's ack, then run the guided-join
+/// verifier as a tail — passing the ticket's workspace as `expected_workspace`, so
+/// a directory/store mismatch (the joiner ran `join` in the wrong folder) is caught
+/// and named immediately instead of surfacing later as a blank board. Under
+/// `--json` we emit only the join DTO (no verifier chrome), mirroring `run_invite`.
+pub async fn run_join(home: &Path, ticket: String, out: Out) -> Result<()> {
+    // Parse client-side to recover the intended workspace before the ticket is
+    // moved into the request. A malformed ticket simply yields no expectation; the
+    // daemon returns the real parse error.
+    let expected = ticket.parse::<RoomTicket>().ok().map(|t| t.workspace);
+    let resp = client(home, Request::Join { ticket }).await?;
+    match &resp {
+        Response::Ok { message } => {
+            if out.json {
+                emit_ok(message.as_deref().unwrap_or("ok"), out);
+                return Ok(());
+            }
+            println!("{}", message.as_deref().unwrap_or("ok"));
+        }
+        // A join error (bad ticket, unreachable host) is terminal — print and stop.
+        other => {
+            let code = print_response(other, out);
+            if code != 0 {
+                std::process::exit(code);
+            }
+            return Ok(());
+        }
+    }
+    // Human tail: the gate readout. Best-effort — a verifier hiccup must not make a
+    // successful join look failed, so we degrade to a hint rather than erroring.
+    match client(
+        home,
+        Request::Diagnose {
+            expected_workspace: expected,
+        },
+    )
+    .await
+    {
+        Ok(diag) => {
+            print_diagnosis_or(&diag, out);
+        }
+        Err(e) => eprintln!("(joined; run `lait doctor` for status — {e:#})"),
+    }
+    Ok(())
+}
+
+/// Render a `Diagnosis` response, or fall back gracefully if the daemon returned
+/// some other variant (e.g. an error) to the tail request.
+fn print_diagnosis_or(resp: &Response, out: Out) {
+    match resp {
+        Response::Diagnosis(v) => print_diagnosis(v, out),
+        other => {
+            print_response(other, out);
+        }
+    }
+}
+
+/// `lait workspaces`: list the joined-workspace registry (store-free navigation
+/// state). Honours `--json`.
+pub fn print_workspaces(out: Out) {
+    let entries = workspaces::list();
+    if out.json {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({ "workspaces": entries }))
+                .unwrap_or_else(|_| "{}".into())
+        );
+        return;
+    }
+    if entries.is_empty() {
+        println!("(no joined workspaces yet — run `lait join <link>`)");
+        return;
+    }
+    for e in &entries {
+        let nick = if e.host_nick.is_empty() {
+            String::new()
+        } else {
+            format!("  (from {})", e.host_nick)
+        };
+        println!("{}  room {:<12}{}", e.workspace, e.room, nick);
+        println!("  {}", paint(out.color, ansi::DIM, &e.path));
+    }
+}
+
+/// The directory-trap guard message: shown when a read-only command is run in a
+/// directory with no workspace but the registry knows of ones the user joined.
+/// Points them at the real locations instead of silently binding a decoy store.
+pub fn warn_no_workspace_here(known: &[WorkspaceEntry], out: Out) {
+    eprintln!("no lait workspace in this directory — refusing to create an empty one here.");
+    eprintln!();
+    eprintln!("you've joined {} workspace(s):", known.len());
+    for e in known {
+        let nick = if e.host_nick.is_empty() {
+            String::new()
+        } else {
+            format!(" (from {})", e.host_nick)
+        };
+        eprintln!(
+            "  {} {}{}  \u{2192}  {}",
+            paint(out.color, ansi::DIM, "\u{2022}"),
+            e.workspace,
+            nick,
+            e.path
+        );
+    }
+    eprintln!();
+    eprintln!("cd into one of those directories, or run `lait workspaces` to see them again.");
+}
+
 /// Print a response; return the process exit code it implies.
 pub fn print_response(resp: &Response, out: Out) -> i32 {
     if out.json {
@@ -200,6 +335,16 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
         Response::Projects { projects } => {
             if projects.is_empty() {
                 println!("(no projects — create one: `lait projects new <name> --key KEY`)");
+                // A just-joined peer sees this too, but should wait for sync, not
+                // create — point them at the verifier so an empty board is legible.
+                println!(
+                    "{}",
+                    paint(
+                        out.color,
+                        ansi::DIM,
+                        "  just joined? run `lait doctor` to check sync status"
+                    )
+                );
             }
             for p in projects {
                 println!("{:<6} {}  ({})", p.key, p.name, p.id);
@@ -316,6 +461,10 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
                 );
                 println!("   review: `lait members requests`   approve: `lait members approve <id> --as <name>`");
             }
+            0
+        }
+        Response::Diagnosis(v) => {
+            print_diagnosis(v, out);
             0
         }
         Response::Text { text } => {

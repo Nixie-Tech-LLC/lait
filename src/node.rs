@@ -1346,6 +1346,46 @@ impl Node {
                     pending_requests,
                 })))
             }
+            Request::Diagnose { expected_workspace } => {
+                // Gather the same live state `Status` does, then project it into
+                // the ordered onboarding gates (pure core, unit-tested separately).
+                let online_peers = self
+                    .shared
+                    .presence
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .filter(|p| p.presence.is_online())
+                    .count();
+                let me = self.my_userid();
+                let (workspace, issues, projects, membership) = {
+                    let t = self.tracker.lock().unwrap();
+                    let acl = t.acl_state();
+                    let membership = if acl.is_admin(&me) {
+                        "admin"
+                    } else if acl.is_member(&me) {
+                        "member"
+                    } else {
+                        "pending"
+                    };
+                    (
+                        t.workspace_id().to_string(),
+                        t.issue_count(),
+                        t.project_count(),
+                        membership.to_string(),
+                    )
+                };
+                let view = crate::diagnose::diagnose(crate::diagnose::DiagnoseInput {
+                    workspace: Some(workspace.as_str()),
+                    room: self.shared.room.as_str(),
+                    membership: membership.as_str(),
+                    online_peers,
+                    projects,
+                    issues,
+                    expected_workspace: expected_workspace.as_deref(),
+                });
+                Ok(Response::Diagnosis(Box::new(view)))
+            }
             Request::Id => Ok(Response::Text {
                 text: self.shared.my_id.to_string(),
             }),
@@ -1381,6 +1421,20 @@ impl Node {
             Request::Join { ticket } | Request::Connect { ticket } => {
                 let ticket: RoomTicket = ticket.parse().context("parse room ticket")?;
                 self.adopt_and_join(&ticket).await?;
+                // Record where this workspace now lives (store path → workspace) so
+                // a joiner who later runs commands from a different directory can be
+                // pointed back here instead of silently binding a decoy store — the
+                // directory trap (docs/GUIDED-JOIN.md §B). Best-effort: a registry
+                // write failure must never fail the join itself.
+                if let Err(e) = crate::workspaces::upsert(crate::workspaces::WorkspaceEntry {
+                    workspace: ticket.workspace.clone(),
+                    room: ticket.room.clone(),
+                    path: self.home.display().to_string(),
+                    host_nick: ticket.host_nick.clone(),
+                    last_seen: now_secs(),
+                }) {
+                    tracing::warn!("workspace registry upsert failed: {e:#}");
+                }
                 Ok(Response::Ok {
                     message: Some(self.join_message(&ticket)),
                 })
