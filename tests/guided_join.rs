@@ -1,0 +1,346 @@
+//! Guided-join verifier + directory-trap fix, end-to-end (see
+//! `docs/GUIDED-JOIN.md`). Two real nodes exercise the `Diagnose` control verb
+//! across the onboarding lifecycle, and a CLI-level test proves the read-command
+//! decoy-store guard. Drives daemons over the Layer-B control channel like
+//! `invite_ergonomics.rs`; the CLI guard test shells the binary because it is
+//! specifically about the pre-daemon store-resolution path.
+
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use lait::control::{request, Request, Response};
+use lait::diagnose::GateState;
+use lait::workspaces::WorkspaceEntry;
+
+fn bin() -> &'static str {
+    env!("CARGO_BIN_EXE_lait")
+}
+
+fn rt() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+fn unique(tag: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!(
+        "gc-gj-{}-{}-{}",
+        tag,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+struct Daemon {
+    child: Child,
+    home: PathBuf,
+    /// The isolated config root for this node (holds its workspaces.json).
+    config_root: PathBuf,
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.home);
+        let _ = std::fs::remove_dir_all(&self.config_root);
+    }
+}
+
+#[allow(clippy::zombie_processes)] // Daemon kills+waits on drop
+fn spawn_daemon(home: &Path, config_root: &Path) -> Daemon {
+    let mut child = Command::new(bin())
+        .arg("daemon")
+        .env("LAIT_HOME", home)
+        // Isolate the joined-workspace registry per node so one test's registry
+        // never bleeds into another's (it lives under config_root).
+        .env("LAIT_CONFIG_ROOT", config_root)
+        .env("LAIT_IDLE_SECS", "0")
+        .env("LAIT_HEARTBEAT_SECS", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn daemon");
+    let rt = rt();
+    let online = poll_until(Duration::from_secs(30), || {
+        rt.block_on(async { request(home, &Request::Status).await })
+            .ok()
+    });
+    if online.is_some() {
+        return Daemon {
+            child,
+            home: home.to_path_buf(),
+            config_root: config_root.to_path_buf(),
+        };
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!("daemon for {} never came online", home.display());
+}
+
+fn poll_until<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> Option<T> {
+    let start = Instant::now();
+    loop {
+        if let Some(v) = check() {
+            return Some(v);
+        }
+        if start.elapsed() >= timeout {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn req(home: &Path, r: Request) -> Response {
+    rt().block_on(async { request(home, &r).await })
+        .unwrap_or_else(|e| Response::err(format!("{e:#}")))
+}
+
+fn diagnose(home: &Path, expected_workspace: Option<String>) -> lait::diagnose::DiagnosisView {
+    match req(home, Request::Diagnose { expected_workspace }) {
+        Response::Diagnosis(v) => *v,
+        other => panic!("expected Diagnosis, got {other:?}"),
+    }
+}
+
+fn gate_state(v: &lait::diagnose::DiagnosisView, id: &str) -> GateState {
+    v.gates
+        .iter()
+        .find(|g| g.id == id)
+        .expect("gate present")
+        .state
+}
+
+fn ticket_for(home: &Path, require_approval: bool) -> String {
+    match req(
+        home,
+        Request::Invite {
+            require_approval,
+            reusable: false,
+            ttl_hours: None,
+        },
+    ) {
+        Response::Text { text } => text.trim().to_string(),
+        other => panic!("invite returned {other:?}"),
+    }
+}
+
+/// The full onboarding lifecycle through the verifier: a `require-approval` joiner
+/// is blocked on `membership` until an admin approves them, then every gate passes
+/// once the board converges. This is the "empty board → legible blocker → get to
+/// work" arc the whole change exists to make honest.
+#[test]
+fn diagnose_tracks_join_lifecycle_from_pending_to_all_pass() {
+    let a = spawn_daemon(&unique("life-a"), &unique("life-cfg-a"));
+    let b = spawn_daemon(&unique("life-b"), &unique("life-cfg-b"));
+
+    // A founds a workspace with a project (so the synced gate has something to
+    // converge once B is in).
+    assert!(matches!(
+        req(
+            &a.home,
+            Request::ProjectNew {
+                name: "Engineering".into(),
+                key: "ENG".into(),
+            }
+        ),
+        Response::Ref { .. }
+    ));
+
+    // B joins via a require-approval ticket → lands pending.
+    let ticket = ticket_for(&a.home, true);
+    assert!(matches!(
+        req(&b.home, Request::Connect { ticket }),
+        Response::Ok { .. }
+    ));
+
+    // B's diagnosis: the membership gate is the actionable blocker (not a blank
+    // board), and sync is Skip because the board is still encrypted.
+    let waited = poll_until(Duration::from_secs(30), || {
+        let v = diagnose(&b.home, None);
+        (v.blocked_on.as_deref() == Some("membership")).then_some(v)
+    });
+    let v = waited.expect("B should block on membership while pending");
+    assert_eq!(gate_state(&v, "membership"), GateState::Wait);
+    assert_eq!(
+        gate_state(&v, "synced"),
+        GateState::Skip,
+        "sync is not a second blocker while pending — the board is encrypted"
+    );
+
+    // A approves B by authenticated id.
+    let b_id = match req(&b.home, Request::Id) {
+        Response::Text { text } => text.trim().to_string(),
+        other => panic!("B id returned {other:?}"),
+    };
+    let approved = poll_until(Duration::from_secs(30), || {
+        // The pending request has to reach A before it can approve.
+        match req(&a.home, Request::MemberRequests) {
+            Response::JoinRequests { requests } if requests.iter().any(|r| r.key == b_id) => {
+                Some(())
+            }
+            _ => None,
+        }
+    });
+    assert!(approved.is_some(), "A never saw B's join request");
+    assert!(matches!(
+        req(
+            &a.home,
+            Request::MemberApprove {
+                who: b_id,
+                as_name: None,
+            }
+        ),
+        Response::Ok { .. }
+    ));
+
+    // After approval + convergence, B's diagnosis flips to all-pass: member,
+    // peer online, board synced. blocked_on clears.
+    let cleared = poll_until(Duration::from_secs(30), || {
+        let v = diagnose(&b.home, None);
+        v.blocked_on.is_none().then_some(v)
+    });
+    let v = cleared.expect("B should reach all-pass after approval + sync");
+    assert_eq!(gate_state(&v, "membership"), GateState::Pass);
+    assert_eq!(gate_state(&v, "peer"), GateState::Pass);
+    assert_eq!(gate_state(&v, "synced"), GateState::Pass);
+    assert!(v.summary.contains("get to work"));
+
+    drop(a);
+    drop(b);
+}
+
+/// The directory trap, made legible: `Diagnose { expected_workspace }` with a
+/// workspace that isn't the one this store is bound to fails the `workspace` gate,
+/// and that mismatch wins over every downstream gate — exactly the "you ran the
+/// command in the wrong folder" case the `join` tail catches.
+#[test]
+fn diagnose_flags_expected_workspace_mismatch() {
+    let a = spawn_daemon(&unique("mm-a"), &unique("mm-cfg-a"));
+
+    // A real workspace exists (A is admin), but we assert we expected a different
+    // one — as the join tail would if the cwd bound the wrong store.
+    let v = diagnose(&a.home, Some("ws_not_the_one_you_joined".into()));
+    assert_eq!(
+        gate_state(&v, "workspace"),
+        GateState::Fail,
+        "a wrong expected workspace must fail the workspace gate"
+    );
+    assert_eq!(
+        v.blocked_on.as_deref(),
+        Some("workspace"),
+        "the store mismatch must be the first/actionable blocker"
+    );
+    assert!(v.summary.contains("wrong directory"));
+
+    // Sanity: with the *correct* workspace the gate passes.
+    let ws = match req(&a.home, Request::Status) {
+        Response::Status(s) => s.workspace.expect("A has a workspace"),
+        other => panic!("status returned {other:?}"),
+    };
+    let ok = diagnose(&a.home, Some(ws));
+    assert_eq!(gate_state(&ok, "workspace"), GateState::Pass);
+
+    drop(a);
+}
+
+/// A successful join records the workspace in the registry (store path → workspace)
+/// so the CLI can later route a lost joiner back to the right directory.
+#[test]
+fn join_records_the_workspace_registry_entry() {
+    let a = spawn_daemon(&unique("reg-a"), &unique("reg-cfg-a"));
+    let b_home = unique("reg-b");
+    let b_cfg = unique("reg-cfg-b");
+    let b = spawn_daemon(&b_home, &b_cfg);
+
+    let ticket = ticket_for(&a.home, false); // default Pattern A (auto-approve)
+    assert!(matches!(
+        req(&b.home, Request::Connect { ticket }),
+        Response::Ok { .. }
+    ));
+
+    // The daemon writes workspaces.json under B's config root on join.
+    let reg_file = b_cfg.join("workspaces.json");
+    let found = poll_until(Duration::from_secs(10), || {
+        let txt = std::fs::read_to_string(&reg_file).ok()?;
+        let entries: Vec<WorkspaceEntry> = serde_json::from_str(&txt).ok()?;
+        entries
+            .into_iter()
+            .find(|e| e.path == b_home.display().to_string())
+    });
+    let entry = found.expect("join must record a registry entry pointing at B's store");
+    assert!(
+        entry.workspace.starts_with("ws_"),
+        "entry carries the workspace id"
+    );
+    assert!(!entry.room.is_empty(), "entry carries the room");
+
+    drop(a);
+    drop(b);
+}
+
+/// The decoy-store guard: a read-only command run in a directory with no `.lait/`,
+/// when the registry knows of joined workspaces, must refuse to create an empty
+/// store and instead point the user at the real one — exit non-zero, no `.lait/`
+/// left behind. This is the direct fix for "joined, but `lait projects` shows
+/// nothing" caused by running from the wrong folder.
+#[test]
+fn read_command_in_empty_dir_refuses_to_create_a_decoy_store() {
+    let cfg = unique("guard-cfg");
+    let cwd = unique("guard-cwd");
+
+    // Seed the registry with a workspace the user "joined" elsewhere.
+    let entry = WorkspaceEntry {
+        workspace: "ws_01JGUARDTESTWORKSPACEID".into(),
+        room: "lait".into(),
+        path: "/some/other/place/.lait".into(),
+        host_nick: "alice".into(),
+        last_seen: 42,
+    };
+    std::fs::write(
+        cfg.join("workspaces.json"),
+        serde_json::to_string(&vec![entry]).unwrap(),
+    )
+    .unwrap();
+
+    let out = Command::new(bin())
+        .arg("projects")
+        .current_dir(&cwd)
+        .env("LAIT_CONFIG_ROOT", &cfg)
+        // Deliberately NO LAIT_HOME: force the git-style discovery path where the
+        // decoy would otherwise be born.
+        .env_remove("LAIT_HOME")
+        .env_remove("LAIT_STORE")
+        .output()
+        .expect("spawn `lait projects`");
+
+    assert!(
+        !out.status.success(),
+        "a read command with no local workspace must exit non-zero, got {:?}",
+        out.status.code()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no lait workspace in this directory"),
+        "guard must explain why, got stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("ws_01JGUARDTESTWORKSPACEID"),
+        "guard must point at the registered workspace, got stderr: {stderr}"
+    );
+    assert!(
+        !cwd.join(".lait").exists(),
+        "the guard must NOT leave a decoy .lait/ behind"
+    );
+
+    let _ = std::fs::remove_dir_all(&cfg);
+    let _ = std::fs::remove_dir_all(&cwd);
+}

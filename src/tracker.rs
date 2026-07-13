@@ -492,8 +492,12 @@ impl Tracker {
         self.store.save_issue(&issue)?;
         self.store.save_catalog(&self.catalog)?;
         self.issues.insert(doc_id.clone(), issue);
-        self.rebuild_aliases();
-        self.store.commit(&format!("new issue {doc_id}"));
+        // Incremental alias upkeep (O(log N)): a fresh doc + its two sorted
+        // neighbours, not an O(N²) full rebuild.
+        self.aliases.reconcile_doc(&self.catalog, &doc_id);
+        // Durable already (fsync'd above); the git snapshot is coalesced by the
+        // daemon's periodic checkpoint — no `git add -A` on the create path.
+        self.store.mark_dirty();
 
         let reff = self.aliases.canonical_for(&doc_id);
         self.push_activity(Some(&doc_id), &reff, "created", vec![], &title);
@@ -822,7 +826,7 @@ impl Tracker {
         self.catalog.board_remove(&project_id, &doc_id)?;
         self.catalog.doc().commit();
         self.store.save_catalog(&self.catalog)?;
-        self.store.commit(&format!("delete {doc_id}"));
+        self.store.mark_dirty();
         let reff = self.aliases.canonical_for(&doc_id);
         self.push_activity(Some(&doc_id), &reff, "deleted", vec![], "");
         let dirty = DirtySet::issue(&project_id, &doc_id).with_scope(CatalogScope::Boards {
@@ -909,9 +913,24 @@ impl Tracker {
         self.catalog.upsert_row(issue)?;
         self.catalog.doc().commit();
         self.store.save_catalog(&self.catalog)?;
-        self.rebuild_aliases();
-        self.store.commit(&format!("edit {doc_id}"));
+        // Incremental alias upkeep. The table is a pure function of {DocId set,
+        // projectId, seq}: a plain field edit changes none of these, so this is a
+        // cheap O(1) no-op (one row read + a group-key compare). A *project move*
+        // (`issue_move`) does change projectId, and this is what re-groups its
+        // `KEY-n` alias (ENG-5 → DSN-5) — so keep it on the common tail rather
+        // than making each mutation remember whether it moved the issue.
+        self.aliases.reconcile_doc(&self.catalog, doc_id);
+        // Coalesced git snapshot (see `new_issue`): keep `git add -A` off the
+        // per-edit path; the daemon's checkpoint tick commits the batch.
+        self.store.mark_dirty();
         Ok(())
+    }
+
+    /// Coalesce all pending durable-store mutations into one git commit
+    /// (best-effort, inspectability only). Driven by the daemon's checkpoint
+    /// tick and by tests/harness; a no-op when nothing is pending.
+    pub fn checkpoint(&self) -> bool {
+        self.store.checkpoint()
     }
 
     // ---- projections (reads) ----
@@ -1668,7 +1687,13 @@ impl Tracker {
         if healed {
             self.catalog.doc().commit();
         }
-        self.rebuild_aliases();
+        // Incremental alias upkeep after a catalog reconcile: reconcile every doc
+        // the catalog now knows (O(1) per already-consistent doc, so O(N) total —
+        // no O(N²) rebuild on every sync round). New peer docs and any offline
+        // seq reconciliation are absorbed here.
+        for id in self.catalog.doc_ids() {
+            self.aliases.reconcile_doc(&self.catalog, &id);
+        }
         self.store.save_catalog(&self.catalog)?;
         Ok(needs)
     }
@@ -1704,7 +1729,8 @@ impl Tracker {
         self.catalog.doc().commit();
         let project_id = issue.project_id();
         self.store.save_catalog(&self.catalog)?;
-        self.rebuild_aliases();
+        // Incremental upkeep for the one fetched doc (new or updated), O(log N).
+        self.aliases.reconcile_doc(&self.catalog, &id);
         // a synced doc advances the activity feed (pulled, not streamed, S§7.5).
         let reff = self.aliases.canonical_for(&id);
         self.push_activity(Some(&id), &reff, "synced", vec![], "");
@@ -1858,7 +1884,11 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
 
         // --- seed N issues through the real Request path ---
+        // Git snapshotting is deferred off the mutation path (mark_dirty), so the
+        // seed measures the tracker/store cost WITHOUT a `git add -A` per create;
+        // the whole batch is committed by one explicit `checkpoint` afterwards.
         let t0 = Instant::now();
+        let checkpoint;
         {
             let store = Store::open(&home).unwrap();
             let clock = FakeClock::new(1_000_000);
@@ -1877,6 +1907,11 @@ mod tests {
                 assert!(matches!(resp, Response::Ref { .. }), "{resp:?}");
                 assert!(dirty.is_some());
             }
+            // One coalesced git commit for all N creates (the daemon does this on
+            // a periodic tick; here we drive it explicitly to measure it).
+            let c0 = Instant::now();
+            t.checkpoint();
+            checkpoint = c0.elapsed();
         }
         let seed = t0.elapsed();
         let store_bytes = fs_dir_size(&home);
@@ -1918,8 +1953,8 @@ mod tests {
         let catalog_export = tc.elapsed();
 
         println!(
-            "PERF n={n} seed={seed:?} store={store_kb}KB cold_load={cold_load:?} \
-             board_avg={board_avg:?} list_avg={list_avg:?} \
+            "PERF n={n} seed={seed:?} checkpoint={checkpoint:?} store={store_kb}KB \
+             cold_load={cold_load:?} board_avg={board_avg:?} list_avg={list_avg:?} \
              catalog_full_export={catalog_export:?} catalog_bytes={cat_bytes}",
             store_kb = store_bytes / 1024,
             cat_bytes = cat_diff.len(),
@@ -2109,6 +2144,32 @@ mod tests {
         let ops = board_reffs(&mut n.tracker, "OPS");
         assert!(!eng.contains(&reff), "old project board must drop it");
         assert!(ops.contains(&reff), "new project board must list it");
+
+        // Regression guard for the incremental alias upkeep: a project move
+        // changes projectId, so the `KEY-n` alias must re-group ENG-1 → OPS-1
+        // (with only incremental `reconcile_doc` on the edit tail, a stale table
+        // would keep showing ENG-1 on the OPS board row).
+        let ops_aliases = board_key_aliases(&mut n.tracker, "OPS");
+        assert!(
+            ops_aliases.contains(&"OPS-1".to_string()),
+            "moved issue's alias must re-group to the new project: {ops_aliases:?}"
+        );
+    }
+
+    fn board_key_aliases(t: &mut Tracker, project: &str) -> Vec<String> {
+        match t
+            .handle(Request::Board {
+                project: project.into(),
+            })
+            .0
+        {
+            Response::Board(b) => b
+                .columns
+                .iter()
+                .flat_map(|c| c.rows.iter().filter_map(|r| r.key_alias.clone()))
+                .collect(),
+            other => panic!("{other:?}"),
+        }
     }
 
     fn board_reffs(t: &mut Tracker, project: &str) -> Vec<String> {

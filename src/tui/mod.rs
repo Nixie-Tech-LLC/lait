@@ -30,7 +30,9 @@ use ratatui::{
 
 use crate::cli::ensure_daemon;
 use crate::control::{request, Doorbell, Filter, Request, Response, Subscription};
+use crate::diagnose::{DiagnosisView, GateState};
 use crate::dto::{BoardView, IssueView, MemberDto, ProjectDto, Row};
+use crate::workspaces::{self, WorkspaceEntry};
 
 /// Which view is on the navigation stack top (UI.md §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +42,10 @@ enum View {
     Activity,
     Detail,
     Members,
+    /// The guided-join verifier panel (the onboarding gate readout).
+    Doctor,
+    /// The joined-workspace selector (which directory holds which board).
+    Workspaces,
     Help,
 }
 
@@ -108,6 +114,11 @@ struct App {
     status: String,
     /// Sync indicator (UI.md §8): online peer count from the last status poll.
     peers_online: usize,
+    /// Last guided-join diagnosis (the `Doctor` panel), refreshed on entry + `r`.
+    diagnosis: Option<DiagnosisView>,
+    /// Joined-workspace registry rows for the selector, and the cursor into them.
+    workspaces: Vec<WorkspaceEntry>,
+    ws_idx: usize,
     quit: bool,
 }
 
@@ -130,8 +141,33 @@ impl App {
             modal: None,
             status: String::new(),
             peers_online: 0,
+            diagnosis: None,
+            workspaces: Vec::new(),
+            ws_idx: 0,
             quit: false,
         }
+    }
+
+    /// Refresh the guided-join diagnosis for the `Doctor` panel.
+    async fn reload_diagnosis(&mut self) -> Result<()> {
+        if let Response::Diagnosis(v) = self
+            .req(Request::Diagnose {
+                expected_workspace: None,
+            })
+            .await?
+        {
+            self.diagnosis = Some(*v);
+        }
+        Ok(())
+    }
+
+    /// Refresh the joined-workspace registry for the selector (store-free read).
+    async fn reload_workspaces(&mut self) -> Result<()> {
+        self.workspaces = workspaces::list();
+        if self.ws_idx >= self.workspaces.len() {
+            self.ws_idx = 0;
+        }
+        Ok(())
     }
 
     /// Refresh the ambient sync indicator (peers online) — polled on a timer so
@@ -258,6 +294,8 @@ impl App {
                     }
                 }
             }
+            View::Doctor => self.reload_diagnosis().await?,
+            View::Workspaces => self.reload_workspaces().await?,
             View::Help => {}
         }
         Ok(())
@@ -388,6 +426,17 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
         KeyCode::Char('4') => {
             app.view = View::Members;
             app.reload_members().await?;
+        }
+        // Onboarding: [d]octor = guided-join verifier; [w]orkspaces = selector.
+        KeyCode::Char('d') => {
+            app.prev_view = app.view;
+            app.view = View::Doctor;
+            app.reload_diagnosis().await?;
+        }
+        KeyCode::Char('w') => {
+            app.prev_view = app.view;
+            app.view = View::Workspaces;
+            app.reload_workspaces().await?;
         }
         KeyCode::Char('r') => app.refresh_current().await?,
         KeyCode::Char('p') if mods.contains(KeyModifiers::CONTROL) => {}
@@ -609,6 +658,16 @@ async fn status_move(app: &mut App, dir: i32) -> Result<()> {
 }
 
 fn move_row(app: &mut App, delta: i32) {
+    // The workspace selector has its own cursor into the registry rows.
+    if app.view == View::Workspaces {
+        let len = app.workspaces.len();
+        if len == 0 {
+            return;
+        }
+        let ni = (app.ws_idx as i32 + delta).clamp(0, len as i32 - 1);
+        app.ws_idx = ni as usize;
+        return;
+    }
     let len = match app.view {
         View::List => app.list.len(),
         _ => app
@@ -642,7 +701,7 @@ fn move_col(app: &mut App, delta: i32) {
 
 fn pop_view(app: &mut App) {
     match app.view {
-        View::Detail | View::Help => app.view = app.prev_view,
+        View::Detail | View::Help | View::Doctor | View::Workspaces => app.view = app.prev_view,
         View::List | View::Activity | View::Members => app.view = View::Board,
         View::Board => app.quit = true,
     }
@@ -668,6 +727,8 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         View::Activity => draw_activity(f, app, chunks[1]),
         View::Members => draw_members(f, app, chunks[1]),
         View::Detail => draw_detail(f, app, chunks[1]),
+        View::Doctor => draw_doctor(f, app, chunks[1]),
+        View::Workspaces => draw_workspaces(f, app, chunks[1]),
         View::Help => draw_help(f, chunks[1]),
     }
     draw_footer(f, app, chunks[2]);
@@ -688,6 +749,8 @@ fn draw_header(f: &mut ratatui::Frame, app: &App, area: Rect) {
         View::Activity => "activity",
         View::Members => "members",
         View::Detail => "detail",
+        View::Doctor => "doctor",
+        View::Workspaces => "workspaces",
         View::Help => "help",
     };
     // Sync indicator (UI.md §8): peers online / offline.
@@ -701,7 +764,7 @@ fn draw_header(f: &mut ratatui::Frame, app: &App, area: Rect) {
         Span::raw(format!("   [{view}]   ")),
         Span::styled(sync_txt, Style::default().fg(sync_color)),
         Span::styled(
-            "   [?] help  [1/2/3] views  [c] new  [q] quit",
+            "   [?] help  [1/2/3/4] views  [d]octor [w]orkspaces  [c] new  [q] quit",
             Style::default().fg(Color::DarkGray),
         ),
     ]);
@@ -920,10 +983,102 @@ fn draw_help(f: &mut ratatui::Frame, area: Rect) {
    Enter     open detail
    c         create issue     e  edit title
    a         assign           C  comment
+   d         doctor (guided-join verifier)
+   w         workspaces (which dir holds which board)
    r         reload (self-heal)
    ? / Esc   help / back      q  quit";
     let block = Block::default().borders(Borders::ALL).title(" Help ");
     f.render_widget(Paragraph::new(text).block(block), area);
+}
+
+/// The guided-join verifier panel: the ordered gate readout with a colour per
+/// state, then the one-line summary. Mirrors the CLI `doctor` output (same DTO).
+fn draw_doctor(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+    match &app.diagnosis {
+        None => lines.push(Line::from("(diagnosing… press r to refresh)")),
+        Some(v) => {
+            for g in &v.gates {
+                let color = match g.state {
+                    GateState::Pass => Color::Green,
+                    GateState::Wait => Color::Yellow,
+                    GateState::Fail => Color::Red,
+                    GateState::Skip => Color::DarkGray,
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(g.state.glyph(), Style::default().fg(color)),
+                    Span::raw(format!(" {:<11} ", g.label)),
+                    Span::raw(g.detail.clone()),
+                ]));
+            }
+            lines.push(Line::from(""));
+            let summary_color = if v.blocked_on.is_some() {
+                Color::Yellow
+            } else {
+                Color::Green
+            };
+            lines.push(Line::styled(
+                v.summary.clone(),
+                Style::default().fg(summary_color),
+            ));
+        }
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Doctor — guided-join verifier  [r] refresh  [Esc] back ");
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// The joined-workspace selector: which directory holds which board, current row
+/// highlighted. Selecting shows how to switch (cd there) — full live re-binding is
+/// out of scope for this panel, which is navigation, not a daemon re-home.
+fn draw_workspaces(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+    if app.workspaces.is_empty() {
+        lines.push(Line::from(
+            "(no joined workspaces yet — run `lait join <link>`)",
+        ));
+    }
+    for (i, e) in app.workspaces.iter().enumerate() {
+        let selected = i == app.ws_idx;
+        let marker = if selected { "> " } else { "  " };
+        let nick = if e.host_nick.is_empty() {
+            String::new()
+        } else {
+            format!("  (from {})", e.host_nick)
+        };
+        let style = if selected {
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Cyan)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::styled(
+            format!("{marker}{}  room {}{}", e.workspace, e.room, nick),
+            style,
+        ));
+        lines.push(Line::styled(
+            format!("    {}", e.path),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if let Some(sel) = app.workspaces.get(app.ws_idx) {
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            format!("→ to switch: cd {}  (then run `lait tui`)", sel.path),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Workspaces — joined boards  [j/k] move  [Esc] back ");
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_footer(f: &mut ratatui::Frame, app: &App, area: Rect) {

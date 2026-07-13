@@ -66,6 +66,12 @@ const PRESENCE_ALPN: &[u8] = b"lait/presence/0";
 const HEARTBEAT: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const REAP_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often the daemon coalesces pending durable-store mutations into a single
+/// git commit (A§6). git is inspectability, not durability (every write is
+/// fsync'd), so a slow cadence keeps `git add -A` off the edit hot path while
+/// still snapshotting history within a few seconds.
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 const PRUNE_WINDOW: Duration = Duration::from_secs(600);
 const IDLE_SHUTDOWN: Duration = Duration::from_secs(30 * 60);
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
@@ -921,6 +927,23 @@ impl Node {
         }
     }
 
+    /// Periodically coalesce pending durable-store mutations into a single git
+    /// commit, keeping `git add -A` (a subprocess whose cost grows with the
+    /// tree) off every edit's hot path (A§6). git is inspectability only —
+    /// durability is the per-write fsync — so a late or missed checkpoint never
+    /// risks data; at worst the working tree is briefly uncommitted and the next
+    /// tick tidies it.
+    async fn checkpoint_loop(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(CHECKPOINT_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if self.tracker.lock().unwrap().checkpoint() {
+                tracing::debug!("store checkpoint committed");
+            }
+        }
+    }
+
     /// Stamp a tracker [`DirtySet`] into a doorbell and wake every parked stream.
     fn ring_doorbell(&self, dirty: DirtySet) {
         let mut d = self.doorbell.lock().unwrap();
@@ -1346,6 +1369,46 @@ impl Node {
                     pending_requests,
                 })))
             }
+            Request::Diagnose { expected_workspace } => {
+                // Gather the same live state `Status` does, then project it into
+                // the ordered onboarding gates (pure core, unit-tested separately).
+                let online_peers = self
+                    .shared
+                    .presence
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .filter(|p| p.presence.is_online())
+                    .count();
+                let me = self.my_userid();
+                let (workspace, issues, projects, membership) = {
+                    let t = self.tracker.lock().unwrap();
+                    let acl = t.acl_state();
+                    let membership = if acl.is_admin(&me) {
+                        "admin"
+                    } else if acl.is_member(&me) {
+                        "member"
+                    } else {
+                        "pending"
+                    };
+                    (
+                        t.workspace_id().to_string(),
+                        t.issue_count(),
+                        t.project_count(),
+                        membership.to_string(),
+                    )
+                };
+                let view = crate::diagnose::diagnose(crate::diagnose::DiagnoseInput {
+                    workspace: Some(workspace.as_str()),
+                    room: self.shared.room.as_str(),
+                    membership: membership.as_str(),
+                    online_peers,
+                    projects,
+                    issues,
+                    expected_workspace: expected_workspace.as_deref(),
+                });
+                Ok(Response::Diagnosis(Box::new(view)))
+            }
             Request::Id => Ok(Response::Text {
                 text: self.shared.my_id.to_string(),
             }),
@@ -1381,6 +1444,20 @@ impl Node {
             Request::Join { ticket } | Request::Connect { ticket } => {
                 let ticket: RoomTicket = ticket.parse().context("parse room ticket")?;
                 self.adopt_and_join(&ticket).await?;
+                // Record where this workspace now lives (store path → workspace) so
+                // a joiner who later runs commands from a different directory can be
+                // pointed back here instead of silently binding a decoy store — the
+                // directory trap (docs/GUIDED-JOIN.md §B). Best-effort: a registry
+                // write failure must never fail the join itself.
+                if let Err(e) = crate::workspaces::upsert(crate::workspaces::WorkspaceEntry {
+                    workspace: ticket.workspace.clone(),
+                    room: ticket.room.clone(),
+                    path: self.home.display().to_string(),
+                    host_nick: ticket.host_nick.clone(),
+                    last_seen: now_secs(),
+                }) {
+                    tracing::warn!("workspace registry upsert failed: {e:#}");
+                }
                 Ok(Response::Ok {
                     message: Some(self.join_message(&ticket)),
                 })
@@ -1749,6 +1826,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     tokio::spawn(node.clone().recv_loop(receiver, 1));
     tokio::spawn(node.clone().heartbeat_loop());
     tokio::spawn(node.clone().reaper_loop());
+    tokio::spawn(node.clone().checkpoint_loop());
     tokio::spawn(node.clone().idle_shutdown_loop());
 
     node.broadcast(Payload::Hello {
@@ -1791,6 +1869,10 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     }
 
     node.persist_known_peers();
+    // Flush any mutations marked since the last checkpoint tick, so a clean
+    // shutdown (e.g. idle-out) leaves the git history current rather than a few
+    // seconds behind (the data itself is already fsync-durable regardless).
+    node.tracker.lock().unwrap().checkpoint();
     node.broadcast(Payload::Bye {
         nick: node.shared.nick.clone(),
     })
