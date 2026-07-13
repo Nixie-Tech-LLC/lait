@@ -9,11 +9,11 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-# All ignored advisories below are in the transitive tree of iroh 1.0.0-rc.1
-# (its network stack: netdev/netwatch/portmapper/plist, n0-error, etc.) — not in
-# code this project controls, and not fixable without an iroh release. Revisit
-# and prune this list when iroh moves past rc. New advisories NOT listed here
-# still fail the gate.
+# Everything ignored below is in the transitive tree of iroh 1.0.0-rc.1 (its
+# network stack: netdev/netwatch/portmapper/plist, n0-error, etc.) or loro — not
+# in code this project controls, and not fixable without an upstream release.
+# Revisit and prune this list when iroh moves past rc / loro updates. New
+# advisories NOT listed here still fail the gate.
 ignore = [
     "RUSTSEC-2023-0089", # atomic-polyfill: unmaintained (transitive via iroh)
     "RUSTSEC-2024-0436", # paste: unmaintained (transitive via iroh)
@@ -21,6 +21,10 @@ ignore = [
     "RUSTSEC-2026-0194", # transitive via iroh network stack
     "RUSTSEC-2026-0195", # transitive via iroh network stack
     "RUSTSEC-2026-0204", # quick-xml: alloc bound (transitive via iroh -> plist)
+    # spin: 0.9.8 AND 0.10.0 are yanked upstream, pinned transitively via
+    # heapless -> postcard -> iroh-gossip and via loro. No non-yanked version is
+    # reachable without bumping that chain; drop this when iroh-gossip/loro do.
+    { crate = "spin", reason = "all in-tree versions yanked upstream; transitive via iroh-gossip + loro" },
 ]
 
 [bans]
