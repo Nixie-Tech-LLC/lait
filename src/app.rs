@@ -867,7 +867,18 @@ pub async fn run() -> Result<()> {
                 crate::cli::run(&home, Request::MemberAlias { who, name }, out).await?
             }
             Some(MembersCmd::RotateKey) => crate::cli::run(&home, Request::KeyRotate, out).await?,
-            _ => crate::cli::run(&home, Request::Members, out).await?,
+            Some(MembersCmd::Ls) => crate::cli::run(&home, Request::Members, out).await?,
+            // Bare `lait members` in an interactive terminal opens the modal
+            // picker (browse/approve); `--json` and piped/redirected output keep
+            // the plain roster dump so scripts and agents are unaffected.
+            None => {
+                use std::io::IsTerminal;
+                if !out.json && std::io::stdout().is_terminal() {
+                    crate::members_ui::run(&home).await?
+                } else {
+                    crate::cli::run(&home, Request::Members, out).await?
+                }
+            }
         },
         Command::Activity { since } => {
             crate::cli::run(&home, Request::Activity { since }, out).await?
