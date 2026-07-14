@@ -195,7 +195,8 @@ impl App {
             who: key.to_string(),
             as_name,
         };
-        self.mutate(req, "approved — workspace key sealed to them").await;
+        self.mutate(req, "approved — workspace key sealed to them")
+            .await;
     }
 
     /// Set (or, with an empty `name`, clear) the local petname on `key`.
@@ -205,7 +206,11 @@ impl App {
             who: key.to_string(),
             name,
         };
-        let ok = if cleared { "local name cleared" } else { "renamed" };
+        let ok = if cleared {
+            "local name cleared"
+        } else {
+            "renamed"
+        };
         self.mutate(req, ok).await;
     }
 
