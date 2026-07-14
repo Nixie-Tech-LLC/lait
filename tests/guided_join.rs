@@ -344,3 +344,73 @@ fn read_command_in_empty_dir_refuses_to_create_a_decoy_store() {
     let _ = std::fs::remove_dir_all(&cfg);
     let _ = std::fs::remove_dir_all(&cwd);
 }
+
+/// Joining adopts the ticket's room — live (`status` reports it with no restart)
+/// and persisted (`profile.json`) — so a cold restart subscribes to the
+/// workspace's actual gossip topic instead of the seeded default. Without this,
+/// two cold daemons never rediscover each other and the joiner's `doctor` waits
+/// on a peer forever (the blind-reporter bug).
+#[test]
+fn join_adopts_the_tickets_room() {
+    let a_home = unique("room-a");
+    std::fs::write(
+        a_home.join("profile.json"),
+        r#"{"nick":"host","room":"adopted-room-e2e"}"#,
+    )
+    .unwrap();
+    let a = spawn_daemon(&a_home, &unique("room-cfg-a"));
+    let b_home = unique("room-b");
+    let b = spawn_daemon(&b_home, &unique("room-cfg-b"));
+
+    let ticket = ticket_for(&a.home, false);
+    assert!(matches!(
+        req(&b.home, Request::Connect { ticket }),
+        Response::Ok { .. }
+    ));
+
+    // Persisted: B's profile now carries the adopted room.
+    let adopted = poll_until(Duration::from_secs(10), || {
+        let txt = std::fs::read_to_string(b_home.join("profile.json")).ok()?;
+        let p: serde_json::Value = serde_json::from_str(&txt).ok()?;
+        (p["room"] == "adopted-room-e2e").then_some(())
+    });
+    assert!(
+        adopted.is_some(),
+        "join must persist the ticket's room into the joiner's profile"
+    );
+
+    // Live: B's status reports the adopted room without a daemon restart.
+    match req(&b.home, Request::Status) {
+        Response::Status(s) => assert_eq!(s.room, "adopted-room-e2e"),
+        other => panic!("expected Status, got {other:?}"),
+    }
+
+    drop(a);
+    drop(b);
+}
+
+/// `stop` must terminate the daemon even while a Subscribe stream is parked on
+/// the shutdown Notify. The zombie regression: `notify_one` could hand its
+/// single permit to the parked subscriber instead of the accept loop, leaving a
+/// daemon that answered "shutting down" running forever with a half-dead
+/// control channel that hangs every later client.
+#[test]
+fn stop_kills_the_daemon_even_with_a_live_subscriber() {
+    let mut d = spawn_daemon(&unique("stop-a"), &unique("stop-cfg-a"));
+
+    // Park a real subscriber server-side: read the first (Reset) frame so the
+    // daemon's stream task is provably inside its shutdown/doorbell select.
+    let rt = rt();
+    let _sub = rt.block_on(async {
+        let mut sub = lait::control::subscribe(&d.home, 0).await.expect("subscribe");
+        sub.next().await.expect("first frame").expect("reset frame");
+        sub
+    });
+
+    assert!(matches!(req(&d.home, Request::Stop), Response::Ok { .. }));
+    let exited = poll_until(Duration::from_secs(10), || d.child.try_wait().ok().flatten());
+    assert!(
+        exited.is_some(),
+        "daemon must exit after stop even with a live subscriber"
+    );
+}

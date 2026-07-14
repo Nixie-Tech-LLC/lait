@@ -239,11 +239,6 @@ pub enum Request {
     Log {
         since: u64,
     },
-    /// One-shot long-poll fallback to `Subscribe` (S§7.5).
-    Wait {
-        since: u64,
-        timeout_ms: u64,
-    },
     Who,
     Stop,
 }
@@ -372,6 +367,14 @@ pub struct Doorbell {
     pub dirty_catalog: Vec<CatalogScope>,
     /// New feed rows exist — pull via `Activity{since}` (S§7.5). Never streamed.
     pub activity_advanced: bool,
+    /// New presence/join rows exist — pull via `Log{since}` (S§7.5). Never
+    /// streamed: like every other plane this is a dirty *flag*, not the events.
+    /// The presence plane rings independently of the tracker dirty-set, so a
+    /// peer coming online wakes a subscriber even when no doc moved.
+    /// `default` so a frame from a pre-plane daemon (stale across `lait update`)
+    /// still decodes (S§9 rule 1: fields are add-only, absent ⇒ default).
+    #[serde(default)]
+    pub presence_advanced: bool,
 }
 
 /// A catalog-structure dirty scope (SCHEMA §7, UI.md §4.2).

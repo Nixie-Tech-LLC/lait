@@ -984,22 +984,6 @@ pub fn specs() -> Vec<Spec> {
                 })
             },
         ),
-        Spec::req(
-            "wait",
-            "Block until a new presence event arrives, then print it.",
-            vec![
-                A::val("since", "Wait for events after this seq.").default("0"),
-                A::val("timeout_ms", "Long-poll timeout in ms.")
-                    .long("timeout-ms")
-                    .default("30000"),
-            ],
-            |m| {
-                Ok(Request::Wait {
-                    since: u64_arg(m, "since")?,
-                    timeout_ms: u64_arg(m, "timeout_ms")?,
-                })
-            },
-        ),
         Spec::special(
             "watch",
             "Follow presence events like a notification stream.",
@@ -1007,9 +991,6 @@ pub fn specs() -> Vec<Spec> {
                 A::val("since", "Start after this seq."),
                 A::val("exec", "Run a hook command per event."),
                 A::flag("notify", "Emit a desktop notification per event."),
-                A::val("timeout_ms", "Reconnect long-poll timeout in ms.")
-                    .long("timeout-ms")
-                    .default("60000"),
             ],
             Special::Watch,
         ),

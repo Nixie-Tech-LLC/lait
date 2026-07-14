@@ -349,13 +349,9 @@ impl ProtocolHandler for SyncHandler {
 pub struct EventLog {
     seq: u64,
     events: VecDeque<LogEvent>,
-    notify: Arc<Notify>,
 }
 
 impl EventLog {
-    pub fn notify(&self) -> Arc<Notify> {
-        self.notify.clone()
-    }
     pub fn push(&mut self, kind: EventKind, id: String, nick: String, text: String) {
         self.seq += 1;
         self.events.push_back(LogEvent {
@@ -369,7 +365,6 @@ impl EventLog {
         while self.events.len() > 1000 {
             self.events.pop_front();
         }
-        self.notify.notify_waiters();
     }
     pub fn since(&self, since: u64) -> (Vec<LogEvent>, u64) {
         let out: Vec<LogEvent> = self
@@ -419,7 +414,11 @@ fn subscribe_should_reset(cursor: u64, oldest: u64) -> bool {
 #[derive(Debug, Clone)]
 pub struct Shared {
     pub nick: String,
-    pub room: String,
+    /// The gossip room we're in. Mutable because `Join` **adopts** the ticket's
+    /// room — live (the topic swap in `join_topic`) *and* here, so `status`,
+    /// `doctor`, and above all `invite` report/mint the room we actually joined,
+    /// not the one the profile was seeded with.
+    pub room: Arc<Mutex<String>>,
     pub my_id: EndpointId,
     pub presence: Arc<Mutex<HashMap<EndpointId, Peer>>>,
     pub events: Arc<Mutex<EventLog>>,
@@ -490,6 +489,7 @@ impl Node {
                 display.clone(),
                 format!("{display} is online"),
             );
+            self.ring_presence_doorbell();
         }
         display
     }
@@ -554,6 +554,7 @@ impl Node {
             display.clone(),
             format!("{display} is online"),
         );
+        self.ring_presence_doorbell();
     }
 
     fn announce_offline(&self, id: EndpointId, left: bool) {
@@ -568,6 +569,7 @@ impl Node {
             .lock()
             .unwrap()
             .push(EventKind::Presence, id.to_string(), display, text);
+        self.ring_presence_doorbell();
     }
 
     async fn reaper_loop(self: Arc<Self>) {
@@ -626,6 +628,7 @@ impl Node {
                     display.clone(),
                     format!("{display} joined the room"),
                 );
+                self.ring_presence_doorbell();
                 // Pattern A: if the joiner presented a valid pre-authorization and
                 // we're an admin who can seal, admit them now — no manual approve.
                 // On any failure we simply leave the request pending (the event
@@ -759,6 +762,35 @@ impl Node {
         Ok(())
     }
 
+    /// Adopt the ticket's room as ours — live and persisted. Joining a workspace
+    /// means living in its gossip room: without this the joiner's profile keeps
+    /// its seeded room ("default"/repo-dir), so the *next cold boot* subscribes
+    /// to the wrong topic — no peers, no presence, `doctor` waiting on a peer
+    /// forever — and any invite the joiner mints carries the wrong room onward.
+    /// Persistence is best-effort (the live topic swap already happened; a write
+    /// failure shouldn't fail the join), but it is warned, not swallowed.
+    fn adopt_room(&self, room: &str) {
+        if room.is_empty() {
+            return;
+        }
+        {
+            let mut cur = self.shared.room.lock().unwrap();
+            if *cur == room {
+                return;
+            }
+            room.clone_into(&mut cur);
+        }
+        match crate::config::Profile::load(&self.home) {
+            Ok(mut p) => {
+                p.room = room.to_string();
+                if let Err(e) = p.save(&self.home) {
+                    tracing::warn!("could not persist adopted room '{room}': {e:#}");
+                }
+            }
+            Err(e) => tracing::warn!("could not load profile to adopt room '{room}': {e:#}"),
+        }
+    }
+
     /// Adopt a ticket's workspace (if we're empty, A§6/A§10), join its gossip
     /// topic, announce, and eagerly pull from the host to backfill.
     async fn adopt_and_join(self: &Arc<Self>, ticket: &RoomTicket) -> Result<()> {
@@ -771,6 +803,7 @@ impl Node {
                 .adopt_workspace(&ticket.workspace, &founder);
         }
         self.join_topic(ticket.topic(), vec![ticket.host]).await?;
+        self.adopt_room(&ticket.room);
         self.broadcast(Payload::JoinRequest {
             nick: self.shared.nick.clone(),
             // Echo the ticket's pre-authorization (if any) so an admin receiver can
@@ -944,6 +977,40 @@ impl Node {
         }
     }
 
+    /// Signal shutdown to **every** waiter. The `shutdown` Notify has multiple
+    /// tasks parked on it (the main accept loop *and* each Subscribe stream), so
+    /// a bare `notify_one` could hand its single permit to a subscriber and leave
+    /// the accept loop running — a daemon that answered "shutting down" and then
+    /// didn't (the zombie: its pipe instance keeps accepting connects nobody
+    /// serves). `notify_waiters` wakes everyone currently parked; the follow-up
+    /// `notify_one` stores a permit for a waiter that hadn't re-parked yet.
+    fn signal_shutdown(&self) {
+        self.shutdown.notify_waiters();
+        self.shutdown.notify_one();
+    }
+
+    /// Ring the presence plane — a peer joined or changed presence. Carries no
+    /// tracker dirty-set: the `EventLog` moved, not a doc. Subscribers re-read
+    /// `Log{since}`. This is what lets a stream wake on presence at all; the
+    /// tracker `DirtySet` paths below never touch the `EventLog`.
+    fn ring_presence_doorbell(&self) {
+        let mut d = self.doorbell.lock().unwrap();
+        d.seq += 1;
+        let frame = Doorbell {
+            epoch: d.epoch,
+            seq: d.seq,
+            reset: false,
+            presence_advanced: true,
+            ..Default::default()
+        };
+        d.ring.push_back(frame);
+        while d.ring.len() > DOORBELL_RING {
+            d.ring.pop_front();
+        }
+        drop(d);
+        self.doorbell_notify.notify_waiters();
+    }
+
     /// Stamp a tracker [`DirtySet`] into a doorbell and wake every parked stream.
     fn ring_doorbell(&self, dirty: DirtySet) {
         let mut d = self.doorbell.lock().unwrap();
@@ -955,6 +1022,7 @@ impl Node {
             dirty_by_project: dirty.dirty_by_project,
             dirty_catalog: dirty.dirty_catalog,
             activity_advanced: dirty.activity_advanced,
+            presence_advanced: false,
         };
         d.ring.push_back(frame);
         while d.ring.len() > DOORBELL_RING {
@@ -1360,7 +1428,7 @@ impl Node {
                 Ok(Response::Status(Box::new(StatusInfo {
                     id: self.shared.my_id.to_string(),
                     nick: self.shared.nick.clone(),
-                    room: self.shared.room.clone(),
+                    room: self.shared.room.lock().unwrap().clone(),
                     online_peers,
                     workspace,
                     issues,
@@ -1398,9 +1466,10 @@ impl Node {
                         membership.to_string(),
                     )
                 };
+                let room = self.shared.room.lock().unwrap().clone();
                 let view = crate::diagnose::diagnose(crate::diagnose::DiagnoseInput {
                     workspace: Some(workspace.as_str()),
-                    room: self.shared.room.as_str(),
+                    room: room.as_str(),
                     membership: membership.as_str(),
                     online_peers,
                     projects,
@@ -1431,7 +1500,7 @@ impl Node {
                     SignedInvite::sign(&self.secret_key, &grant).ok()
                 };
                 let ticket = RoomTicket {
-                    room: self.shared.room.clone(),
+                    room: self.shared.room.lock().unwrap().clone(),
                     host: self.shared.my_id,
                     host_nick: self.shared.nick.clone(),
                     workspace,
@@ -1500,27 +1569,6 @@ impl Node {
                 let (events, last) = self.shared.events.lock().unwrap().since(since);
                 Ok(Response::Events { events, last })
             }
-            Request::Wait { since, timeout_ms } => {
-                let timeout_ms = timeout_ms.clamp(0, 300_000);
-                let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
-                let notify = self.shared.events.lock().unwrap().notify();
-                loop {
-                    let notified = notify.notified();
-                    tokio::pin!(notified);
-                    notified.as_mut().enable();
-                    let (events, last) = self.shared.events.lock().unwrap().since(since);
-                    if !events.is_empty() {
-                        return Ok(Response::Events { events, last });
-                    }
-                    tokio::select! {
-                        _ = &mut notified => continue,
-                        _ = tokio::time::sleep_until(deadline) => {
-                            let (events, last) = self.shared.events.lock().unwrap().since(since);
-                            return Ok(Response::Events { events, last });
-                        }
-                    }
-                }
-            }
             Request::Who => {
                 let peers = self
                     .shared
@@ -1551,10 +1599,10 @@ impl Node {
                 Ok(Response::Who { peers })
             }
             Request::Stop => {
-                let s = self.shutdown.clone();
+                let me = self.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(100)).await;
-                    s.notify_one();
+                    me.signal_shutdown();
                 });
                 Ok(Response::Ok {
                     message: Some("shutting down".to_string()),
@@ -1601,7 +1649,7 @@ impl Node {
             let idle_for = self.last_active.lock().unwrap().elapsed();
             if should_idle_shutdown(active, idle_for, self.idle_window, self.is_mesh_member()) {
                 tracing::info!("idle {idle_for:?} with no clients — shutting down");
-                self.shutdown.notify_one();
+                self.signal_shutdown();
                 break;
             }
         }
@@ -1720,6 +1768,17 @@ async fn write_line_half<T: serde::Serialize>(
     write_half.flush().await
 }
 
+/// Whether a registry `path` string names the same store as `home`, tolerant of
+/// slash direction and case differences (Windows) via canonicalization, falling
+/// back to a string compare when either side can't be canonicalized.
+fn same_store_path(registered: &str, home: &Path) -> bool {
+    let reg = Path::new(registered);
+    match (reg.canonicalize(), home.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => registered == home.display().to_string(),
+    }
+}
+
 /// Build and run the daemon until a Stop request arrives. When `seed` is set the
 /// node runs as an always-on seed and never idle-shuts-down (DUR-4).
 pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
@@ -1728,7 +1787,31 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     // Identity is global by default (DUR-5); store (profile/repo/lock/socket) is
     // this per-repo home. `$LAIT_HOME` collapses both back into `home`.
     let secret_key = load_or_create_identity(&crate::config::identity_dir()?)?;
-    let profile = Profile::load(&home)?;
+    let mut profile = Profile::load(&home)?;
+
+    // Self-heal a stale room. A store joined before rooms were adopted on `Join`
+    // kept its seeded room ("default"/repo-dir) while the workspace actually
+    // lives in the ticket's room — so every cold boot subscribed to the wrong
+    // gossip topic: no peers, no presence, a `doctor` stuck waiting on a peer.
+    // The workspace registry recorded the ticket's room at join time; if it has
+    // an entry for this exact store and the rooms disagree, the registry is the
+    // one that witnessed the join — adopt it.
+    if let Some(entry) = crate::workspaces::list()
+        .into_iter()
+        .find(|e| same_store_path(&e.path, &home))
+    {
+        if !entry.room.is_empty() && entry.room != profile.room {
+            tracing::info!(
+                "healing room '{}' -> '{}' (from the workspace registry)",
+                profile.room,
+                entry.room
+            );
+            profile.room = entry.room;
+            if let Err(e) = profile.save(&home) {
+                tracing::warn!("could not persist healed room: {e:#}");
+            }
+        }
+    }
 
     // Tracker core (P0): open the git-backed store and load/create the workspace.
     let store = Store::open(&home)?;
@@ -1755,7 +1838,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
 
     let shared = Shared {
         nick: profile.nick.clone(),
-        room: profile.room.clone(),
+        room: Arc::new(Mutex::new(profile.room.clone())),
         my_id,
         presence: Arc::new(Mutex::new(HashMap::new())),
         events: Arc::new(Mutex::new(EventLog::default())),
@@ -1868,22 +1951,37 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         }
     }
 
+    // Stop accepting control connections immediately: the pipe/socket server
+    // instance must go away with the loop, or a client that connects during
+    // teardown parks forever on a server that will never answer.
+    drop(listener);
+
     node.persist_known_peers();
     // Flush any mutations marked since the last checkpoint tick, so a clean
     // shutdown (e.g. idle-out) leaves the git history current rather than a few
     // seconds behind (the data itself is already fsync-durable regardless).
     node.tracker.lock().unwrap().checkpoint();
-    node.broadcast(Payload::Bye {
-        nick: node.shared.nick.clone(),
+
+    // The rest of the teardown is courtesy (Bye broadcast, router close) — it
+    // must never keep a "shutting down" daemon alive. A gossip/endpoint close
+    // that hangs past the deadline gets abandoned; state is already durable.
+    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+        node.broadcast(Payload::Bye {
+            nick: node.shared.nick.clone(),
+        })
+        .await
+        .ok();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        node.router.shutdown().await.ok();
     })
-    .await
-    .ok();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    .await;
 
     #[cfg(unix)]
     let _ = std::fs::remove_file(crate::config::socket_path(&home));
-    node.router.shutdown().await.ok();
-    Ok(())
+    // Hard guarantee: "stop" means the process exits. Anything still running
+    // (a wedged endpoint task, a non-tokio thread) would otherwise leave a
+    // zombie whose half-dead control channel hangs every later client.
+    std::process::exit(0);
 }
 
 #[cfg(test)]

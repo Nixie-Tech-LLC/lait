@@ -47,7 +47,7 @@ same refactor-freedom the contract buys the CLI and MCP.
 
 > `src/control.rs` now carries the **tracker** Layer B specified here (the S§7 enum):
 > the issue verbs, the membership/ACL verbs, `Subscribe`, and `Diagnose`. The chat-era
-> transport/presence verbs (`Status/Invite/Join/Connect/Log/Wait/Who/Stop`) survive
+> transport/presence verbs (`Status/Invite/Join/Connect/Log/Who/Stop`) survive
 > alongside as the P1 networking surface (§8).
 
 ## 2. CLI command surface
@@ -78,8 +78,7 @@ Verbs act on **issues**; plural nouns manage **registries**. Each maps to exactl
 | `labels [new <name> --color C \| ls]` | `LabelNew`/`LabelList` | Manage the label registry (`Catalog.labels`). |
 | `members [add\|remove\|requests\|approve\|name\|rotate-key\|ls]` | `MemberAdd`/`MemberRemove`/… | Manage E2EE membership (the signed ACL, S§6): `add` seals the key, `remove` rotates it, `approve` admits a pending joiner, `name` sets a local alias (§8, P3). |
 | `activity [--since N]` | `Activity` | Workspace-wide recent transitions (ex-`log`; ring-buffer `seq`). |
-| `wait [--since N] [--timeout-ms M]` | `Wait` | Block until the next event; prints it. The scripting primitive. |
-| `watch [--since N] [--exec CMD] [--notify]` | `Wait`-loop | Follow forever; run a hook / desktop-notify per event. |
+| `watch [--since N] [--exec CMD] [--notify]` | `Subscribe`-stream | Follow forever; run a hook / desktop-notify per event. The scripting primitive. |
 | `tui` | — | Launch the full-screen board (§4). |
 | `doctor` (alias `verify`) | `Diagnose` | Guided-join verifier: names the one onboarding gate that's blocking ([`GUIDED-JOIN.md`](./GUIDED-JOIN.md)). Auto-tails `join`. |
 | `workspaces` | — | List joined workspaces + their store paths (the directory-trap fix, [`GUIDED-JOIN.md`](./GUIDED-JOIN.md)). |
@@ -191,12 +190,12 @@ connections over the one socket:
 
   > **`Subscribe { since: u64 }`** — turns the one-shot handler into a **streaming
   > mode**: the daemon reads the request, then instead of returning after one response, parks
-  > on the `EventLog` `Notify` and writes newline-delimited **`Doorbell` frames** until the
-  > client hangs up or the daemon stops. Mechanically it is the existing `Wait` loop
-  > (`node.rs`) that never returns. **[DECISION] streaming Subscribe** over re-polling `Wait`:
-  > it pushes with no per-round request overhead and is a forward-compatible superset of
-  > `Wait`, which remains the documented fallback (and is exactly what CLI `watch` already
-  > does), so the daemon supports both.
+  > on the doorbell `Notify` and writes newline-delimited **`Doorbell` frames** until the
+  > client hangs up or the daemon stops. **[DECISION] streaming Subscribe is the one live
+  > channel**: it pushes with no per-round request overhead, and every plane rings it — the
+  > tracker dirty-set, `activity_advanced`, and `presence_advanced` (the presence/join plane
+  > CLI `watch` follows). The re-polling `Wait` verb it superseded is gone: it duplicated the
+  > wake path with a worse restart story (no epoch, so a stale cursor went silently deaf).
 
 **Reconnect, restart, and gaps all collapse to one path — `Reset`.** `seq` is per-daemon
 *session*, not durable (S§2): a daemon restart (crash, or the routine idle-shutdown) resets
@@ -496,8 +495,10 @@ touching the issue grammar. Where each attaches:
 ## 9. Decisions — settled (mirror of A§14 / S§10)
 
 - **§4 TUI substrate — ratatui** (default, agreed) vs any other Rust TUI lib. Settled.
-- **§4.1 live channel — streaming `Subscribe`** (default) vs re-polling `Wait`. Both
-  supported; Subscribe is the TUI path, Wait the scripting/`watch` path. Settled.
+- **§4.1 live channel — streaming `Subscribe`** (default) vs re-polling `Wait`. Originally
+  settled as "both supported" (Subscribe for the TUI, Wait for scripting/`watch`); **revised**
+  once the doorbell grew a presence plane — `watch` now rides `Subscribe` and `Wait` is
+  deleted. One wake path, one rebaseline story (`Reset`/`epoch`).
 - **§4.2 event shape — batched, project-keyed doorbells** (agreed) vs value-carrying deltas.
   Settled: doorbells carry a dirty-set, never state; the client re-reads.
 - **§4.3 reconciliation — correlation-free, accept the flicker** (agreed) vs op-id-correlated
@@ -530,8 +531,8 @@ touching the issue grammar. Where each attaches:
   CLI, palette, and MCP; ambiguity (short prefix / colliding `KEY-n`) is a first-class
   outcome with a candidate list, not a crash (§3). Canonical handle is always the short
   `DocId`; `KEY-n` is a friendly alias (S§5.4).
-- **`Subscribe` is the one new Layer-B verb the TUI needs** — a streaming superset of `Wait`,
-  forward-compatible, with `Wait`-loop as the documented fallback (§4.1). The rest of the TUI
+- **`Subscribe` is the one live Layer-B verb** — the single streaming wake path for the TUI
+  *and* CLI `watch`; the `Wait` long-poll it superseded is deleted (§4.1). The rest of the TUI
   is built from `Board`/`List`/`IssueView` + the doorbell stream over the S§7 surface — no new
   domain schema.
 - **The event stream is doorbells, not deltas** — a frame rings "these scopes are dirty," the
@@ -552,8 +553,9 @@ touching the issue grammar. Where each attaches:
 - **The cursor is ephemeral; `Reset` unifies every gap** — `seq` is per-daemon-session (S§2
   reworded), so first-connect, reconnect, restart, and ring-overrun all collapse to one "snapshot
   + rebaseline" path signalled by a `Reset` doorbell + a per-boot epoch nonce (§4.1). `seq`
-  never needs persisting. This also fixes a pre-existing `watch`/`wait`/`poll` deafness across
-  the routine idle-shutdown.
+  never needs persisting. This also fixes a pre-existing `watch` deafness across
+  the routine idle-shutdown (the old `Wait` poll loop held a stale cursor with no epoch to
+  void it).
 - **A `Subscribe`-pinned daemon is a feature; the only leak is false availability** — an open
   TUI keeps the node alive, densifying the mesh toward the seed role (A§10). Honesty is restored
   by input-driven three-state presence (`online`/`away`/`offline`), and `away` is precisely

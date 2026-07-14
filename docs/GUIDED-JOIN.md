@@ -40,7 +40,13 @@ The first non-passing gate is the actionable blocker, so a stalled joiner gets
 
 - **CLI:** `lait doctor`, and an automatic tail of `lait join` (the join passes
   the ticket's workspace as `expected_workspace`, so a directory/store mismatch
-  is caught the instant it happens).
+  is caught the instant it happens). The tail **polls** rather than snapshotting:
+  right after `join` returns, admission (Pattern A's auto-seal) and the gossip
+  handshake are still in flight, so a t=0 readout says "waiting on a peer"
+  moments before everything passes — the verifier itself becoming an unreliable
+  reporter. The tail re-diagnoses (500 ms, ≤15 s) until the gates settle: all
+  pass, a `workspace` Fail (time won't clear it), or — on a pass-less ticket —
+  a pending `membership` (a human has to act; don't stall the readout).
 - **MCP:** a `doctor` tool (enforced by the `tests/mcp_parity.rs` gate).
 - **TUI:** a keybound diagnosis panel.
 
@@ -66,6 +72,28 @@ The five daemon-side gates (ordered):
   `activity`, `members`) refuse to auto-create a `.lait/` when none is
   discoverable *and* the registry is non-empty — instead they point at the
   registered workspace(s) and exit non-zero. `init`/`join` still create.
+
+### C. The room trap (post-v0.4.8 hardening)
+
+Two more gates from the same silent-failure family, found by driving the flow:
+
+- **Join adopts the ticket's room.** A joiner's profile kept its *seeded* room
+  (`"default"`/repo-dir) while the workspace lives in the ticket's room. Warm,
+  everything worked (`join_topic` swaps the live topic); on the **next cold
+  boot** the daemon subscribed to the wrong gossip topic — no peers, no
+  presence, a `doctor` waiting on `peer` forever, and any invite the joiner
+  minted carried the wrong room onward. `Join` now adopts the ticket's room
+  live (`status`/`doctor`/`invite` all see it) **and** persists it to
+  `profile.json`; on boot the daemon self-heals a stale profile room from the
+  workspace registry (which witnessed the join). Pinned by
+  `tests/guided_join.rs::join_adopts_the_tickets_room`.
+- **`stop` means stopped.** The shutdown `Notify` has multiple waiters (the
+  accept loop *and* every Subscribe stream); `notify_one` could hand its single
+  permit to a subscriber, leaving a daemon that answered "shutting down" running
+  forever — its pipe instance accepting connects nobody serves, hanging every
+  later client. Shutdown now signals all waiters, bounds the courtesy teardown
+  (Bye, router close) with a deadline, and hard-exits. Pinned by
+  `tests/guided_join.rs::stop_kills_the_daemon_even_with_a_live_subscriber`.
 
 ## Completion criteria (local validation)
 

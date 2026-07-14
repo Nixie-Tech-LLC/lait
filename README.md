@@ -222,7 +222,7 @@ Registries + node:
 | `tui` | Launch the full-screen board |
 | `status` · `id` · `stop` | Node/workspace status · endpoint id · stop daemon |
 | `invite [--require-approval] [--reusable] [--ttl-hours N]` · `join` | Invite a teammate; the default pass admits them on `join` (add `--require-approval` for the gated `members requests`/`members approve` flow) |
-| `who` · `wait` · `watch` | Peers online · block for one event · follow the event stream |
+| `who` · `watch` | Peers online · follow the event stream |
 | `profiles` / `resume <name>` | List profiles / switch to a named profile (each a separate identity + store) |
 
 Global flags: `--home DIR`, `--json`, `--no-color`. Exit codes: `0` ok · `1`

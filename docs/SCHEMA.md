@@ -40,7 +40,7 @@ of thing with one stability guarantee.
 | `UserId` | ed25519 public key | forever | **a member *is* a key.** Same bytes as the iroh `EndpointId`. Key of `assignees`, signer of ACL ops. |
 | iroh `EndpointId` | ed25519 public key | per identity | the node's transport identity; equals its `UserId`. |
 | Loro `PeerId` | `u64` | **per session** | internal to Loro's op addressing `(peerId, counter)`. **Never surfaced** as a user- or app-level id. A node may present many peerIds over its life. |
-| log `seq` | `u64` | **per daemon session**, monotonic | ring-buffer cursor for `activity`/`wait`/`watch`/`subscribe` (B§7). **Display/notification ordering only.** **Not durable** — resets to 0 on daemon restart; clients rebaseline via a `Reset` doorbell (B§7.5), never persist it. |
+| log `seq` | `u64` | **per daemon session**, monotonic | ring-buffer cursor for `activity`/`watch`/`subscribe` (B§7). **Display/notification ordering only.** **Not durable** — resets to 0 on daemon restart; clients rebaseline via a `Reset` doorbell (B§7.5), never persist it. |
 | Lamport / `Frontiers` | Loro op ids | causal | authoritative *merge* ordering. Distinct from `seq`. |
 | `KEY-n` alias | e.g. `ENG-142` | advisory | human handle; Catalog-assigned, **may collide and disambiguate** (§5.4). |
 
@@ -337,8 +337,7 @@ enum Request {
   History   { reff: Ref },                           // derived from Loro op history
   ProjectNew{ name, key }, ProjectList, LabelNew{ name, color }, LabelList,
   Activity  { since: u64 },                          // ex-Log; the feed is PULLED, §7.5
-  Wait      { since: u64, timeout_ms: u64 },         // kept verbatim (one-shot long-poll)
-  Subscribe { since: u64 },                          // §7.5 — streaming doorbells for the TUI
+  Subscribe { since: u64 },                          // §7.5 — the one live channel (TUI + watch)
   Diagnose  { expected_workspace: Option<WorkspaceId> },   // guided-join verifier (GUIDED-JOIN.md)
   // transport (P1): Invite, Join, Connect, Who, SeedAdd/List/Remove
   // membership (P3): MemberAdd/Remove, KeyRotate, Members, MemberRequests/Approve/Alias
@@ -362,6 +361,7 @@ struct Doorbell {
   dirty_by_project: Map<ProjectId, Vec<DocId>>,   // issue-row plane — re-read these rows
   dirty_catalog:    Vec<CatalogScope>,     // structure plane: boards(proj)|projects|labels|workflow|acl
   activity_advanced: bool,                 // new feed rows exist — pull via Activity{since}
+  presence_advanced: bool,                 // new presence/join rows exist — pull via Log{since}
 }
 ```
 
@@ -395,8 +395,10 @@ struct Doorbell {
      — the row *is* the LWW winner. This is why reconciliation needs no correlation.
 
 5. **Streaming (`Subscribe`) and `Reset`.** `Subscribe{since}` turns the one-shot control
-   handler into a stream of `Doorbell` frames (above) until the client disconnects — the TUI's
-   live channel; `Wait` remains the one-shot long-poll fallback. Doorbells are **batched and
+   handler into a stream of `Doorbell` frames (above) until the client disconnects — the one
+   live channel (TUI and CLI `watch`; the `Wait` long-poll it superseded is deleted). The
+   `presence_advanced` plane rings on `EventLog` pushes (peer online/offline/join) independently
+   of the tracker dirty-set, so `watch` wakes even when no doc moved. Doorbells are **batched and
    project-keyed**: the daemon coalesces a whole sync-import transaction (+ a short local-edit
    debounce) into one frame carrying a *dirty set*, so the ring buffer holds ~1000 *batches*,
    not individual changes, and a client filters by visibility (re-reading only on-screen
@@ -405,7 +407,7 @@ struct Doorbell {
    daemon rings a **`Reset` doorbell** — as the first frame of every `Subscribe`, and whenever
    a client's `since` is stale or has fallen off the ring — meaning *rebaseline from a fresh
    `Board`/`List` snapshot*. A per-boot `epoch` lets a client detect a restart without a socket
-   drop. This is also the fix for the pre-existing `wait`/`watch` deafness across daemon
+   drop. This is also the fix for the pre-existing `watch` deafness across daemon
    restarts. The write path is **validate-then-commit**: a `Response::Error` is returned
    *before* any commit, so it guarantees nothing changed and no doorbell rang (there is no CAS,
    §7.2), which is what makes an optimistic client's rollback race-free.

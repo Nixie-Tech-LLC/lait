@@ -258,13 +258,7 @@ pub async fn run() -> Result<()> {
                 };
                 let exec = m.get_one::<String>("exec").cloned();
                 let notify = m.get_flag("notify");
-                let timeout_ms = m
-                    .get_one::<String>("timeout_ms")
-                    .map(|s| s.parse::<u64>())
-                    .transpose()
-                    .map_err(|_| anyhow!("--timeout-ms must be a non-negative integer"))?
-                    .unwrap_or(60_000);
-                crate::cli::watch(&home, since, exec, notify, timeout_ms).await?
+                crate::cli::watch(&home, since, exec, notify).await?
             }
             Special::Completions
             | Special::Man

@@ -10,7 +10,7 @@ use std::{io::Write, path::Path, process::Stdio, time::Duration};
 use anyhow::{anyhow, Context, Result};
 
 use crate::{
-    control::{request, ErrorKind, Event, EventKind, Request, Response},
+    control::{self, request, ErrorKind, Event, EventKind, Request, Response},
     diagnose::{DiagnosisView, GateState},
     dto::{BoardView, IssueView, Priority, Row},
     proto::RoomTicket,
@@ -173,7 +173,12 @@ pub async fn run_join(home: &Path, ticket: String, out: Out) -> Result<()> {
     // Parse client-side to recover the intended workspace before the ticket is
     // moved into the request. A malformed ticket simply yields no expectation; the
     // daemon returns the real parse error.
-    let expected = ticket.parse::<RoomTicket>().ok().map(|t| t.workspace);
+    let parsed = ticket.parse::<RoomTicket>().ok();
+    // A pass-carrying ticket (Pattern A) admits automatically within seconds, so
+    // a pending membership is worth polling out; a pass-less ticket waits on a
+    // human admin and would only stall the readout.
+    let has_pass = parsed.as_ref().is_some_and(|t| t.invite.is_some());
+    let expected = parsed.map(|t| t.workspace);
     let resp = client(home, Request::Join { ticket }).await?;
     match &resp {
         Response::Ok { message } => {
@@ -194,18 +199,57 @@ pub async fn run_join(home: &Path, ticket: String, out: Out) -> Result<()> {
     }
     // Human tail: the gate readout. Best-effort — a verifier hiccup must not make a
     // successful join look failed, so we degrade to a hint rather than erroring.
-    match client(
-        home,
-        Request::Diagnose {
-            expected_workspace: expected,
-        },
-    )
-    .await
-    {
-        Ok(diag) => {
-            print_diagnosis_or(&diag, out);
+    //
+    // Polled, not one-shot: right after `join` returns, admission (Pattern A's
+    // auto-seal) and the gossip handshake are still in flight, so a t=0 snapshot
+    // reads "waiting on a peer" moments before everything passes — the verifier
+    // itself becoming the unreliable reporter. We re-diagnose until the gates
+    // settle (all pass, or a Fail-state blocker that time won't clear) or a
+    // deadline, and report the settled truth.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut last: Option<Response> = None;
+    loop {
+        match client(
+            home,
+            Request::Diagnose {
+                expected_workspace: expected.clone(),
+            },
+        )
+        .await
+        {
+            Ok(diag) => {
+                let settled = match &diag {
+                    Response::Diagnosis(v) => match v.blocked_on.as_deref() {
+                        None => true,
+                        // `workspace` is the one Fail-state blocker (wrong
+                        // directory/store) — waiting can't clear it.
+                        Some("workspace") => true,
+                        // Pending membership clears itself only under a pass
+                        // (Pattern A auto-seal); pass-less waits on a human.
+                        Some("membership") => !has_pass,
+                        // peer / synced — convergence in flight; keep polling.
+                        Some(_) => false,
+                    },
+                    // Not a diagnosis (daemon error) — nothing to wait out.
+                    _ => true,
+                };
+                let expired = tokio::time::Instant::now() >= deadline;
+                if settled || expired {
+                    print_diagnosis_or(&diag, out);
+                    break;
+                }
+                last = Some(diag);
+            }
+            Err(e) => {
+                // Degrade to the freshest readout we have, or a hint.
+                match &last {
+                    Some(diag) => print_diagnosis_or(diag, out),
+                    None => eprintln!("(joined; run `lait doctor` for status — {e:#})"),
+                }
+                break;
+            }
         }
-        Err(e) => eprintln!("(joined; run `lait doctor` for status — {e:#})"),
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
     Ok(())
 }
@@ -911,14 +955,29 @@ fn desktop_notify(e: &Event) {
 }
 
 /// Foreground presence-notification runner (the `watch` command).
+///
+/// Parks on a streaming [`Request::Subscribe`] and treats the doorbell purely as
+/// a **wake signal**: a frame carries a dirty *flag*, never the events, so each
+/// `presence_advanced` ring is followed by a `Log{since}` re-read for the
+/// authoritative rows (UI.md §4.2).
+///
+/// Two cursors are in play and they are **not** interchangeable: `cursor` is an
+/// `EventLog` seq (what `Log{since}` filters on), while the doorbell carries its
+/// own per-session `seq`. We never compare them. The doorbell's `epoch` is the
+/// one field that matters here — a change means the daemon restarted, which
+/// resets the `EventLog` seq to 0 (S§2), voiding our cursor. Rebaselining to 0
+/// on an epoch change is what keeps `watch` from going deaf across a restart:
+/// the old `Wait` poll loop held its stale high-water and silently matched
+/// nothing forever (S§7.5).
 pub async fn watch(
     home: &Path,
     since: Option<u64>,
     exec: Option<String>,
     notify: bool,
-    timeout_ms: u64,
 ) -> Result<()> {
     ensure_daemon(home).await?;
+    // Default to the current high-water: `watch` follows from now, not from the
+    // start of the daemon's history.
     let mut cursor = match since {
         Some(n) => n,
         None => match request(home, &Request::Log { since: 0 }).await? {
@@ -927,17 +986,11 @@ pub async fn watch(
         },
     };
     eprintln!("watching from seq {cursor} (Ctrl-C to stop)\u{2026}");
+
+    let mut epoch: Option<u64> = None;
     loop {
-        let resp = match request(
-            home,
-            &Request::Wait {
-                since: cursor,
-                timeout_ms,
-            },
-        )
-        .await
-        {
-            Ok(r) => r,
+        let mut sub = match control::subscribe(home, 0).await {
+            Ok(s) => s,
             Err(e) => {
                 eprintln!("watch: {e}; reconnecting\u{2026}");
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -945,18 +998,49 @@ pub async fn watch(
                 continue;
             }
         };
-        if let Response::Events { events, last } = resp {
-            for e in &events {
-                print_event(e);
-                if let Some(cmd) = &exec {
-                    run_hook(cmd, e);
+        loop {
+            let frame = match sub.next().await {
+                Ok(Some(f)) => f,
+                // EOF or a broken stream: the daemon stopped or restarted. Drop
+                // to the outer loop, which respawns it and re-subscribes.
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("watch: {e}; reconnecting\u{2026}");
+                    break;
                 }
-                if notify {
-                    desktop_notify(e);
-                }
+            };
+            // A new epoch ⇒ a new daemon ⇒ the EventLog seq restarted at 0, so
+            // anything we remember is from a log that no longer exists.
+            if epoch.is_some_and(|prev| prev != frame.epoch) {
+                eprintln!("watch: daemon restarted; rebaselining\u{2026}");
+                cursor = 0;
             }
-            cursor = last.max(cursor);
+            epoch = Some(frame.epoch);
+            // `reset` covers first-frame + doorbell ring-overrun. Our EventLog
+            // cursor survives both (only an epoch change voids it), so a reset
+            // is just another reason to re-read.
+            if !(frame.presence_advanced || frame.reset) {
+                continue;
+            }
+            match request(home, &Request::Log { since: cursor }).await {
+                Ok(Response::Events { events, last }) => {
+                    for e in &events {
+                        print_event(e);
+                        if let Some(cmd) = &exec {
+                            run_hook(cmd, e);
+                        }
+                        if notify {
+                            desktop_notify(e);
+                        }
+                    }
+                    cursor = last.max(cursor);
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("watch: {e}"),
+            }
         }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = ensure_daemon(home).await;
     }
 }
 
