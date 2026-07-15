@@ -32,21 +32,29 @@ jobs:
     env:
       RUSTFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
+      # dtolnay/rust-toolchain@stable (branch head at time of pinning). The ref used
+      # to select the channel, so `toolchain` is now passed explicitly.
       - name: Install Rust (stable + rustfmt + clippy)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       # nextest runs test binaries in PARALLEL; `cargo test` runs them serially, so
       # the multi-node integration suite paid the sum of per-binary times. Prebuilt
       # binary install — no compile cost.
+      # taiki-e/install-action@nextest (the maintainer re-points this tag, so it is
+      # a moving target with no semver equivalent). The ref used to select the tool,
+      # so `tool` is now passed explicitly.
       - name: Install nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@e658debeddbabf20b2b866d9235eb08a2375b1ad
+        with:
+          tool: nextest
 
       - name: Format check
         run: cargo fmt --all --check
@@ -146,10 +154,15 @@ jobs:
     name: msrv (1.91)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      # dtolnay/rust-toolchain@1.91.0 (branch head at time of pinning) — the same
+      # commit publish-crates.yml pins for the MSRV floor. The ref used to select
+      # the toolchain, so it is now passed explicitly.
       - name: Install Rust 1.91
-        uses: dtolnay/rust-toolchain@1.91.0
-      - uses: Swatinem/rust-cache@v2
+        uses: dtolnay/rust-toolchain@ad7910d95e317a4b12a9a3dfad520f4b409b3ec0
+        with:
+          toolchain: "1.91.0"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # rust-toolchain.toml at the repo root pins `channel = "stable"`, and rustup
       # ranks that file ABOVE the default toolchain — so without this override the
       # job would silently `cargo check` on stable, not 1.91, and the MSRV floor
@@ -167,9 +180,9 @@ jobs:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: cargo-deny
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
 
@@ -181,7 +194,7 @@ jobs:
     name: release dry-run (dist plan)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: Install dist
         shell: bash
         run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh
@@ -206,7 +219,7 @@ jobs:
     name: packaging manifests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Validate Scoop manifest (JSON + required keys)
         shell: bash
