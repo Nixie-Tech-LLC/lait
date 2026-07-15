@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Group, Panel, Separator, useDefaultLayout, usePanelRef } from "react-resizable-panels";
-import { PanelLeft, Plus } from "lucide-react";
+import { Inbox as InboxIcon, LayoutGrid, List, PanelLeft, Plus } from "lucide-react";
 
 import { ConfirmRequired, LaitError, rpc, spaces as fetchSpaces } from "./api";
 import { useDoorbell } from "./doorbell";
@@ -8,6 +8,7 @@ import { contribute, registry, type AppApi, type Ctx, type View } from "./core/r
 import { useKeys } from "./core/useKeys";
 import { Activity } from "./ui/Activity";
 import { Board } from "./ui/Board";
+import { Inbox } from "./ui/Inbox";
 import { IssueDetail } from "./ui/IssueDetail";
 import { IssueList } from "./ui/IssueList";
 import { Palette } from "./ui/Palette";
@@ -37,6 +38,7 @@ export function App() {
   const [toast, setToast] = useState<string | null>(null);
   const [detail, setDetail] = useState(true);
   const [view, setView] = useState<View>("list");
+  const [unread, setUnread] = useState(0);
   // Bumped on every doorbell for this space: the detail pane re-reads off it.
   const [revision, setRevision] = useState(0);
   const sidebar = usePanelRef();
@@ -236,7 +238,32 @@ export function App() {
             <PanelLeft className="size-4" />
           </button>
           <h1 className="truncate font-semibold">{board?.project.name ?? "lait"}</h1>
-          <span className="text-mute capitalize">{view}</span>
+          <span className="text-mute sr-only capitalize">{view}</span>
+          <nav className="border-line ml-2 flex items-center gap-px rounded border p-px">
+            {(
+              [
+                ["list", List, "Issues", "g l"],
+                ["board", LayoutGrid, "Board", "g b"],
+                ["inbox", InboxIcon, "Inbox", "g i"],
+              ] as const
+            ).map(([v, Icon, label, chord]) => (
+              <button
+                key={v}
+                onClick={() => run(`go.${v}`)}
+                aria-pressed={view === v}
+                title={`${label} (${chord})`}
+                aria-label={label}
+                className={`relative grid size-6 place-items-center rounded-sm ${
+                  view === v ? "bg-active text-fg" : "text-mute hover:bg-hover hover:text-fg"
+                }`}
+              >
+                <Icon className="size-3.5" />
+                {v === "inbox" && unread > 0 && (
+                  <span className="bg-accent absolute -top-0.5 -right-0.5 size-1.5 rounded-full" />
+                )}
+              </button>
+            ))}
+          </nav>
           {readOnly && space?.identity.kind === "agent" && (
             <span
               className="border-line-strong text-dim rounded-sm border px-1.5 py-px text-2xs"
@@ -276,6 +303,17 @@ export function App() {
         <div className="group/list flex min-h-0 flex-1 flex-col">
           {!current ? (
             <p className="text-mute p-8 text-center">Pick a space.</p>
+          ) : view === "inbox" ? (
+            <Inbox
+              spaceId={current}
+              revision={revision}
+              onError={setError}
+              onCountChange={setUnread}
+              onOpen={(reff) => {
+                api.select(reff);
+                setView("list");
+              }}
+            />
           ) : view === "activity" ? (
             <Activity spaceId={current} revision={revision} onError={setError} onOpen={api.select} />
           ) : board && view === "board" ? (
