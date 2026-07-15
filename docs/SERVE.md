@@ -204,6 +204,54 @@ The cookie is also named per-port (`lait_token_<port>`), because **cookies ignor
 port**: a fixed name would have two concurrent `lait serve` runs clobbering each other's
 jar entry.
 
+## The client's seam
+
+The client has **one vocabulary** (`Command`) and **one door** (`contribute`). Keys, the
+palette, the shortcuts overlay, and buttons do not *do* anything — they resolve to a
+command id and run it. Every surface that lists commands is a **projection** of the
+registry, never a second list.
+
+What makes it real rather than decorative: **the core uses the same door.** Every
+built-in in `viewer/src/commands/` is registered through `contribute()`, exactly as a
+third party would. There is no privileged path, so anything the core can do an extension
+can do — and anything the core gets wrong, an extension can override. A test pins it.
+
+```js
+// Add a command. It appears in the palette, with its binding, in its group.
+lait.contribute({
+  commands: [{ id: "demo.greet", title: "Say hello", group: "Demo",
+               keys: ["g h"], run: () => alert("hi") }],
+});
+
+// Rebind a core command. `null` unbinds.
+lait.contribute({ keys: { "issue.create": "n" } });
+
+// Replace behaviour without touching the declaration.
+lait.contribute({ overrides: { "issue.delete": { run: myConfirmingDelete } } });
+```
+
+`window.lait` exposes it because the client ships as a compiled bundle inside a Rust
+binary: without a runtime handle, "extensible" would mean "fork `viewer/` and rebuild",
+which is a patch, not extensibility. Reaching it today means a userscript or the console
+— by design there is no remote script loading, since that is exactly what the `Origin`
+allowlist exists to prevent. A first-class extension host (user JS read from the config
+dir and served same-origin) would land on this same API.
+
+Two rules inherited from the TUI's `keymap.rs`, deliberately:
+
+- **An override replaces a command's key set; it does not add an alias.** Override a
+  command that ships `["mod+k", ":"]` and `:` stops working. Surprising, and still right:
+  the alternative is bindings you cannot remove.
+- **Warn, never gate.** An unknown id or unparseable chord warns (visible in the `?`
+  overlay) and is skipped. A typo in a config must never take the client down — you would
+  have no working client in which to fix it.
+
+Bindings follow Linear's grammar, because that is what users already have in their
+fingers: `mod+k` for the palette (`mod` = Cmd on macOS, Ctrl elsewhere), `g`-prefixed
+sequences for navigation with a 1s timeout, bare letters for actions, `?` for help. While
+typing, bare keys belong to the field; modified chords and `Escape` still get through,
+because a text box you cannot leave is worse than a shortcut that does not fire.
+
 ## Next
 
 - **Replace the shell with the React app**, embedded in the binary so `lait serve`
