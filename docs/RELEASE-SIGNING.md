@@ -203,14 +203,13 @@ signs the source, distributors build from it.
 Use a **master key kept offline** and a **signing subkey** in CI, so a leaked CI
 secret is revocable without losing the identity.
 
-The key's identity (UID) is a freeform brand string — we use **Nixie Software** —
-and is deliberately independent of the legal entity ("Nixie Solutions LLC") that
-the Apple/Azure code-signing certs require. A GPG UID vouches for source
-provenance, not a legal signer.
+The key's identity (UID) uses the legal entity **Nixie Solutions LLC**, matching
+the name the Apple/Azure code-signing certs will carry — one consistent signer
+across every channel.
 
 1. **Generate the key** (do this on a trusted machine, once):
    ```sh
-   gpg --quick-generate-key "Nixie Software (lait release signing) <releases@…>" ed25519 sign 2y
+   gpg --quick-generate-key "Nixie Solutions LLC (lait release signing) <omar@onnixi.com>" ed25519 sign 2y
    FPR=<the printed fingerprint>
    # a dedicated signing SUBKEY with its own 1-year expiry:
    gpg --quick-add-key "$FPR" ed25519 sign 1y
