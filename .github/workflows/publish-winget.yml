@@ -9,6 +9,13 @@
 # Needs a `WINGET_TOKEN` secret: a classic PAT with `public_repo`, from an account
 # that has forked microsoft/winget-pkgs (the org GitHub App can't provide a
 # user-namespace fork). Without it the job soft-skips, so it never blocks a release.
+#
+# winget-releaser is a third-party action and it necessarily receives that PAT — it
+# opens the winget-pkgs PR as the fork user, and there is no OIDC equivalent to trade
+# the secret away for (unlike the crates.io publisher). Two things bound the blast
+# radius instead: the action is pinned to a full commit SHA rather than the mutable
+# `v2` tag its maintainer re-points, and the token is step-scoped rather than living
+# in job-level `env` where every step would see it.
 name: Publish to winget
 
 on:
@@ -32,30 +39,34 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
        startsWith(github.event.workflow_run.head_branch, 'v'))
-    env:
-      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
     steps:
+      # WINGET_TOKEN is scoped to this step (to test presence) and to the submit step
+      # below (which actually needs it) — never to the job, where it would sit in the
+      # environment of every action that runs.
       - name: Resolve tag + gate on token
         id: gate
         env:
           GH_TOKEN: ${{ github.token }}
           DISPATCH_TAG: ${{ github.event.inputs.tag }}
           RUN_TAG: ${{ github.event.workflow_run.head_branch }}
+          REPO: ${{ github.repository }}
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
           tag="${DISPATCH_TAG:-${RUN_TAG:-}}"
           if [ -z "$tag" ] || [ "${tag#v}" = "$tag" ]; then
-            tag="$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')"
+            tag="$(gh release list --repo "$REPO" --limit 1 --json tagName --jq '.[0].tagName')"
           fi
           [ -n "$tag" ] || { echo "::error::could not resolve a release tag"; exit 1; }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           if [ -n "${WINGET_TOKEN:-}" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"
           else echo "::notice::WINGET_TOKEN not set — skipping winget submission."; echo "ok=false" >> "$GITHUB_OUTPUT"; fi
 
+      # vedantmgoyal9/winget-releaser@v2 (lightweight tag; the maintainer re-points it)
       - name: Submit manifest
         if: steps.gate.outputs.ok == 'true'
-        uses: vedantmgoyal9/winget-releaser@v2
+        uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e
         with:
           identifier: NixieTechLLC.Lait
           release-tag: ${{ steps.gate.outputs.tag }}
