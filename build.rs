@@ -19,13 +19,28 @@ fn main() {
     let sha = env::var("LAIT_BUILD_SHA").unwrap_or_default();
     let date = env::var("LAIT_BUILD_DATE").unwrap_or_default();
 
+    // Human-facing version for `lait --version`.
     let long = if sha.is_empty() {
-        base
+        base.clone()
     } else if date.is_empty() {
         format!("{base}-dev+{sha}")
     } else {
         format!("{base}-dev+{sha} ({date})")
     };
 
+    // A VALID-semver form for the self-updater's version comparison. A dev build
+    // uses a PRERELEASE identifier (`X.Y.Z-dev.<sha>`), which semver orders BELOW
+    // the stable `X.Y.Z` — so `lait update` on a dev node correctly sees the
+    // stable release as newer and heals onto it. LAIT_VERSION_LONG can't be used
+    // here: its ` (<date>)` suffix is not valid semver, and the bare
+    // CARGO_PKG_VERSION would make a dev node report itself as the stable version
+    // (so `lait update` saw "already up to date" and stranded it on the dev build).
+    let semver = if sha.is_empty() {
+        base
+    } else {
+        format!("{base}-dev.{sha}")
+    };
+
     println!("cargo:rustc-env=LAIT_VERSION_LONG={long}");
+    println!("cargo:rustc-env=LAIT_VERSION_SEMVER={semver}");
 }

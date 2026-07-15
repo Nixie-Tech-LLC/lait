@@ -62,6 +62,10 @@ use crate::{
     tracker::{DirtySet, Tracker},
 };
 
+// Presence-probe ALPN. Bumped to /1 in lockstep with the epoch-1 wire changes
+// (the workspace-identity rewrite + the sync `protocol_version` handshake) and
+// the gossip topic tag, so a version skew that partitions sync/gossip also
+// partitions the liveness probe rather than leaving cross-epoch peers half-visible.
 const PRESENCE_ALPN: &[u8] = b"lait/presence/1";
 const HEARTBEAT: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -902,9 +906,20 @@ impl Node {
             match receiver.try_next().await {
                 Ok(Some(event)) => match event {
                     Event::Received(msg) => {
-                        if let Ok((from, payload)) = SignedMessage::verify_and_decode(&msg.content)
-                        {
-                            self.handle_payload(from, payload).await;
+                        match SignedMessage::verify_and_decode(&msg.content) {
+                            Ok((from, payload)) => self.handle_payload(from, payload).await,
+                            // A decode failure here is almost always a version-skewed
+                            // peer: postcard is not self-describing, so a payload whose
+                            // shape changed across releases fails to deserialize (see
+                            // docs/HARDENING.md — "all nodes must upgrade together").
+                            // Swallowing it silently made mixed-version fleets
+                            // undiagnosable; log at debug with the error so the drop is
+                            // at least visible under `RUST_LOG=lait=debug`.
+                            Err(e) => tracing::debug!(
+                                error = %e,
+                                "dropped an undecodable gossip payload (likely a \
+                                 version-skewed or malformed peer)"
+                            ),
                         }
                     }
                     Event::NeighborUp(id) => {

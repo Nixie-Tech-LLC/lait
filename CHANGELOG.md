@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased — protocol version negotiation, schema gate & release hardening
+
+Composes with the workspace re-architecture break below — the same epoch-1 wire
+change (`lait/sync/1`, `lait/presence/1`, workspace-id gossip topic) — adding
+in-band version negotiation on top of it.
+
+- **In-band version negotiation.** The sync handshake now carries a
+  `protocol_version`; a peer outside the supported window
+  `[MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION]` is refused with a clear "upgrade
+  lait" diagnostic instead of a silent decode failure. Undecodable gossip
+  payloads (the other version-skew path) are logged at debug rather than dropped
+  silently. From here on this window absorbs backward-compatible changes without
+  another ALPN bump.
+- **On-disk schema gate.** Opening a workspace store written by a *newer* lait now
+  fails fast with an upgrade message rather than risking a lossy read
+  (`SCHEMA_VERSION` is finally enforced on load).
+- **`lait update` heals a dev-channel node.** A `dev` build now reports a
+  clean-semver `X.Y.Z-dev.<sha>` to the updater (which sorts below stable), so
+  `lait update` moves it onto the stable release instead of reporting "already up
+  to date" and stranding it.
+- **Distribution fixes.** `cargo binstall lait` now resolves the binary correctly
+  on Linux/macOS (the archive nests under `lait-<target>/`; only Windows is flat).
+  The MSRV CI gate actually tests 1.91 again (it was silently running on stable).
+  Releases now ship a build-provenance attestation and a CycloneDX SBOM, and the
+  build was migrated to a custom-artifacts architecture so binaries can be signed
+  in place (macOS notarization + Windows Azure signing land next). See
+  `docs/RELEASE-SIGNING.md`.
+
 ## Unreleased — the rich TUI (full CLI parity)
 
 `lait tui` grows from proof-of-concept to a full client. Board-centric with a

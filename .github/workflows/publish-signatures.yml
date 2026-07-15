@@ -1,0 +1,114 @@
+# CD: GPG-sign the release's source + checksums so downstream PROVIDERS (distro
+# packagers, Homebrew, Nix, …) can verify lait is authentically ours and build
+# their own binaries from source — independent of the Nixie-built, code-signed
+# artifacts. This is source provenance (GPG), separate from the OS code signing
+# in build-binaries.yml (Apple/Azure). See docs/RELEASE-SIGNING.md.
+#
+# Signs with a dedicated release SUBKEY (the master key stays offline). The
+# private subkey is stored base64-encoded in the GPG_SIGNING_KEY secret; the
+# public key is committed at docs/lait-release-key.asc for verifiers. Detached
+# `.asc` signatures over `sha256.sum` (which covers every release artifact) and
+# `source.tar.gz` are attached to the release.
+#
+# Triggered on the Release workflow completing (`workflow_run`) — by then the
+# assets exist. Soft-skips if GPG_SIGNING_KEY is unset, so releases keep shipping
+# (unsigned-source) until the key is provisioned.
+name: Publish signatures
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to sign (e.g. v0.4.9)"
+        required: true
+
+permissions:
+  # Upload the .asc signatures onto the existing GitHub Release.
+  contents: write
+
+jobs:
+  sign:
+    name: GPG-sign source + checksums
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    env:
+      GPG_SIGNING_KEY: ${{ secrets.GPG_SIGNING_KEY }}
+    steps:
+      - name: Resolve tag + gate on the signing key
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISPATCH_TAG: ${{ github.event.inputs.tag }}
+          RUN_TAG: ${{ github.event.workflow_run.head_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${DISPATCH_TAG:-${RUN_TAG:-}}"
+          if [ -z "$tag" ] || [ "${tag#v}" = "$tag" ]; then
+            tag="$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')"
+          fi
+          [ -n "$tag" ] || { echo "::error::could not resolve a release tag"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ -n "${GPG_SIGNING_KEY:-}" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"
+          else echo "::notice::GPG_SIGNING_KEY not set — skipping source signing."; echo "ok=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Import the release signing subkey
+        if: steps.gate.outputs.ok == 'true'
+        env:
+          GPG_SIGNING_KEY_ID: ${{ secrets.GPG_SIGNING_KEY_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Isolated ephemeral keyring for this run.
+          export GNUPGHOME="$(mktemp -d)"
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+          chmod 700 "$GNUPGHOME"
+          printf '%s' "$GPG_SIGNING_KEY" | base64 --decode | gpg --batch --import
+          # Fail loudly if the declared key id isn't actually present.
+          gpg --batch --list-secret-keys "$GPG_SIGNING_KEY_ID" >/dev/null
+
+      - name: Download source + checksums from the release
+        if: steps.gate.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.gate.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --repo "${{ github.repository }}" \
+            --pattern 'sha256.sum' --pattern 'source.tar.gz'
+          ls -l sha256.sum source.tar.gz
+
+      - name: Sign (detached, armored)
+        if: steps.gate.outputs.ok == 'true'
+        env:
+          GPG_SIGNING_KEY_ID: ${{ secrets.GPG_SIGNING_KEY_ID }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--batch --yes --pinentry-mode loopback --local-user "$GPG_SIGNING_KEY_ID"
+                --armor --detach-sign)
+          [ -n "${GPG_PASSPHRASE:-}" ] && args+=(--passphrase "$GPG_PASSPHRASE")
+          for f in sha256.sum source.tar.gz; do
+            gpg "${args[@]}" --output "$f.asc" "$f"
+            gpg --batch --verify "$f.asc" "$f"   # self-check before upload
+          done
+
+      - name: Attach signatures to the release
+        if: steps.gate.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.gate.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" --repo "${{ github.repository }}" --clobber \
+            sha256.sum.asc source.tar.gz.asc
+          echo "attached sha256.sum.asc + source.tar.gz.asc to $TAG"

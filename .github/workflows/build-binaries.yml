@@ -1,0 +1,175 @@
+# Per-target build for lait's release archives.
+#
+# Runs as cargo-dist's local-artifacts job (dist-workspace.toml:
+# `build-local-artifacts = false`, `local-artifacts-jobs = ["./build-binaries"]`).
+# We own the build so the binary can be SIGNED before it is archived — cargo-dist
+# builds + archives atomically with no hook in between, and its built-in signers
+# can't do macOS notarization or Azure. See docs/RELEASE-SIGNING.md.
+#
+# The contract with cargo-dist is by FILENAME + in-archive layout (its `host` job
+# collects everything matching `artifacts-*`):
+#   - unix:    lait-<target>.tar.gz  (+ .sha256), binary + misc nested under lait-<target>/
+#   - windows: lait-<target>.zip     (+ .sha256), flat: lait.exe + misc at the root
+#   - upload artifact name: artifacts-<target>
+# This is the same nested-unix / flat-windows split the self-updater and binstall
+# metadata encode — keep all three in lockstep.
+#
+# Step 1 (this file): reproduce today's UNSIGNED archives on the new architecture.
+# Signing (macOS notarize+staple, Windows Azure) is layered on next, secret-gated.
+name: Build binaries
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+  # Build every target (unsigned) on PRs that touch the build path itself, so the
+  # archive/contract logic is CI-tested without cutting a release. Deliberately
+  # NOT triggered on Cargo.toml/lock — routine dependency bumps are already
+  # covered by ci.yml, and this matrix (5 runners incl. 2× macOS) is expensive.
+  pull_request:
+    paths:
+      - .github/workflows/build-binaries.yml
+      - .github/scripts/archive-*.sh
+      - dist-workspace.toml
+
+concurrency:
+  group: build-binaries-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  RUSTUP_MAX_RETRIES: "10"
+
+jobs:
+  linux:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-latest }
+          # arm64 Linux builds natively on GitHub's hosted arm64 runner.
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rel-${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Archive (nested tar.gz + sha256)
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash .github/scripts/archive-unix.sh "$TARGET"
+      - name: Attest build provenance
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "lait-${{ matrix.target }}.tar.gz"
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-${{ matrix.target }}
+          path: |
+            lait-${{ matrix.target }}.tar.gz
+            lait-${{ matrix.target }}.tar.gz.sha256
+
+  macos:
+    name: build ${{ matrix.target }}
+    runs-on: macos-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rel-${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      # SIGNING SLOT (next increment): codesign --options runtime the binary here,
+      # then notarize + staple a .pkg, before the archive step. Secret-gated.
+      - name: Archive (nested tar.gz + sha256)
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash .github/scripts/archive-unix.sh "$TARGET"
+      - name: Attest build provenance
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "lait-${{ matrix.target }}.tar.gz"
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-${{ matrix.target }}
+          path: |
+            lait-${{ matrix.target }}.tar.gz
+            lait-${{ matrix.target }}.tar.gz.sha256
+
+  windows:
+    name: build x86_64-pc-windows-msvc
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rel-x86_64-pc-windows-msvc
+      - name: Build
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      # SIGNING SLOT (next increment): Azure-sign target\...\lait.exe here, before
+      # the zip step. Secret-gated.
+      - name: Archive (flat zip + sha256)
+        shell: bash
+        run: bash .github/scripts/archive-windows.sh "$TARGET"
+      - name: Attest build provenance
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "lait-x86_64-pc-windows-msvc.zip"
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-x86_64-pc-windows-msvc
+          path: |
+            lait-x86_64-pc-windows-msvc.zip
+            lait-x86_64-pc-windows-msvc.zip.sha256

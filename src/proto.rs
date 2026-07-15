@@ -23,8 +23,12 @@ type SignatureBytes = ByteArray<SIGNATURE_LENGTH>;
 /// Derive the gossip topic id from the workspace id. The topic is a pure
 /// function of the genesis identity — there is no user-settable network name,
 /// so it can never drift, be renamed apart, or collide across workspaces the
-/// way the old folder-seeded "room" string could. Domain-separated so the
-/// topic space is disjoint from any other blake3 use.
+/// way the old folder-seeded "room" string could. Domain-separated so the topic
+/// space is disjoint from any other blake3 use; the `lait/topic/v1` tag also
+/// serves as the gossip protocol **epoch** — bump it on any breaking change to
+/// [`Payload`] so old and new nodes partition onto different topics instead of
+/// silently failing to decode each other's frames (postcard is not
+/// self-describing; that drop is also logged in node.rs).
 pub fn topic_for_workspace(workspace: &str) -> TopicId {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"lait/topic/v1");
@@ -126,8 +130,14 @@ pub enum Payload {
         invite: Option<SignedInvite>,
     },
     /// Periodic liveness heartbeat for presence tracking. `state` carries the
-    /// three-state input-driven presence (online/away, UI.md §4.5); a missing
-    /// value from an older peer defaults to online.
+    /// three-state input-driven presence (online/away, UI.md §4.5).
+    ///
+    /// NOTE: postcard is not self-describing, so `#[serde(default)]` does NOT make
+    /// this field forward-compatible on the wire — a pre-`state` peer sends a
+    /// shorter frame and a newer peer fails to decode it with
+    /// `DeserializeUnexpectedEnd` (the drop is now logged in node.rs). Adding
+    /// `state` was a coordinated format bump; the `#[serde(default)]` only helps
+    /// the JSON/DTO paths, not the postcard wire. See docs/HARDENING.md.
     Presence {
         nick: String,
         #[serde(default)]

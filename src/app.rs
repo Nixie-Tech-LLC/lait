@@ -723,7 +723,10 @@ async fn run_update() -> Result<()> {
             .repo_name("lait")
             .bin_name("lait")
             .bin_path_in_archive(update_bin_path_in_archive())
-            .current_version(env!("CARGO_PKG_VERSION"))
+            // Clean-semver version (build.rs): a dev build reports `X.Y.Z-dev.<sha>`,
+            // which sorts below stable `X.Y.Z`, so `lait update` heals a dev node
+            // onto the stable release instead of seeing "already up to date".
+            .current_version(env!("LAIT_VERSION_SEMVER"))
             .show_download_progress(true)
             .no_confirm(true)
             .build()
@@ -736,7 +739,7 @@ async fn run_update() -> Result<()> {
     if status.updated() {
         println!(
             "updated {} -> v{}. run any lait command to start the daemon on the new version.",
-            env!("CARGO_PKG_VERSION"),
+            env!("LAIT_VERSION_LONG"),
             status.version()
         );
     } else {
@@ -792,6 +795,21 @@ fn reset_sigpipe() {}
 #[cfg(test)]
 mod tests {
     use super::update_bin_path_in_archive;
+
+    #[test]
+    fn updater_version_is_clean_semver() {
+        // The self-updater compares `current_version` as semver, so the string it
+        // gets (LAIT_VERSION_SEMVER) must be valid semver — never the ` (<date>)`
+        // form of LAIT_VERSION_LONG. In a non-dev build (no LAIT_BUILD_SHA, as in
+        // CI/test) it equals the crate version exactly; a dev build appends a
+        // `-dev.<sha>` prerelease that sorts below stable.
+        let v = env!("LAIT_VERSION_SEMVER");
+        assert!(
+            !v.contains(' ') && !v.contains('('),
+            "updater version must be valid semver, got {v:?}"
+        );
+        assert_eq!(v, env!("CARGO_PKG_VERSION"));
+    }
 
     #[test]
     fn update_bin_path_matches_cargo_dist_per_os_layout() {

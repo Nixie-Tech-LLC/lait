@@ -23,10 +23,43 @@ use serde::{Deserialize, Serialize};
 
 use crate::tracker::{DirtySet, Tracker};
 
-/// The ALPN for the pairwise Loro-sync protocol. Bumped to /1 with the
-/// workspace-identity rewrite (topic-from-workspace-id, WorkspaceTicket) so
-/// pre-rewrite nodes hard-partition instead of handshaking into confusion.
+/// The ALPN for the pairwise Loro-sync protocol. The trailing number is the
+/// protocol **epoch** — bump it for a change so breaking that peers of the old
+/// epoch must not even connect (QUIC's ALPN negotiation refuses them at the
+/// transport, before any frame is exchanged). Epoch 1 covers the
+/// workspace-identity rewrite (topic-from-workspace-id, WorkspaceTicket) AND the
+/// in-band `protocol_version` handshake below; epoch 0 had neither.
 pub const SYNC_ALPN: &[u8] = b"lait/sync/1";
+
+/// The sync protocol version this build **speaks**, exchanged in the `Pull`
+/// handshake. Within one ALPN epoch, bump this for a backward-compatible change
+/// and raise [`MIN_SUPPORTED_PROTOCOL`] only when dropping support for an old
+/// version. Peers outside `[MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION]` are
+/// refused with a clear diagnostic instead of failing to decode silently.
+pub const PROTOCOL_VERSION: u32 = 1;
+/// The oldest sync protocol version we still accept from a peer. Raising this is
+/// how a retired version is dropped — it defines the mixed-version support window.
+pub const MIN_SUPPORTED_PROTOCOL: u32 = 1;
+
+/// Whether we can sync with a peer advertising protocol version `peer`. Accepts
+/// peers inside the supported window; outside it, returns a human-facing reason
+/// (the peer is too old and must upgrade, or is newer and we must). Pure so the
+/// window policy is unit-testable without a live connection.
+fn check_sync_protocol(peer: u32) -> Result<()> {
+    if peer < MIN_SUPPORTED_PROTOCOL {
+        return Err(anyhow!(
+            "peer speaks sync protocol v{peer}, older than the minimum this build \
+             supports (v{MIN_SUPPORTED_PROTOCOL}); the peer must upgrade lait"
+        ));
+    }
+    if peer > PROTOCOL_VERSION {
+        return Err(anyhow!(
+            "peer speaks sync protocol v{peer}, newer than this build's \
+             v{PROTOCOL_VERSION}; upgrade lait to sync with it"
+        ));
+    }
+    Ok(())
+}
 
 /// A single sync frame. Postcard-encoded, length-prefixed on the stream.
 #[derive(Debug, Serialize, Deserialize)]
@@ -34,6 +67,10 @@ enum Msg {
     /// Dialer → accepter (first frame): "pull me up to date; here are my
     /// membership + catalog versions so you can send only what I lack."
     Pull {
+        /// The dialer's sync protocol version (see [`PROTOCOL_VERSION`]). First
+        /// field so the accepter can reject an out-of-window peer with a clear
+        /// error before touching the rest of the frame.
+        protocol_version: u32,
         workspace: String,
         membership_vv: Vec<u8>,
         catalog_vv: Vec<u8>,
@@ -102,6 +139,7 @@ pub async fn pull(conn: &Connection, tracker: &Mutex<Tracker>) -> Result<DirtySe
     write_msg(
         &mut send,
         &Msg::Pull {
+            protocol_version: PROTOCOL_VERSION,
             workspace,
             membership_vv,
             catalog_vv,
@@ -182,10 +220,14 @@ pub async fn serve(conn: Connection, tracker: &Mutex<Tracker>) -> Result<()> {
     // 1. read the Pull; guard the workspace.
     let (membership_vv, catalog_vv) = match read_msg(&mut recv).await? {
         Some(Msg::Pull {
+            protocol_version,
             workspace,
             membership_vv,
             catalog_vv,
         }) => {
+            // Version before workspace: an out-of-window peer gets a clear
+            // "upgrade" error rather than a confusing downstream failure.
+            check_sync_protocol(protocol_version)?;
             let mine = tracker.lock().unwrap().workspace_str();
             if workspace != mine {
                 return Err(anyhow!("workspace mismatch: {workspace} != {mine}"));
@@ -224,4 +266,23 @@ pub async fn serve(conn: Connection, tracker: &Mutex<Tracker>) -> Result<()> {
     write_msg(&mut send, &Msg::EndDocs).await?;
     send.finish().ok();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_window_accepts_supported_and_refuses_outside() {
+        // Everything in [MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION] is accepted.
+        assert!(check_sync_protocol(PROTOCOL_VERSION).is_ok());
+        assert!(check_sync_protocol(MIN_SUPPORTED_PROTOCOL).is_ok());
+
+        // A newer peer than we understand is refused (we must upgrade).
+        assert!(check_sync_protocol(PROTOCOL_VERSION + 1).is_err());
+
+        // A peer older than the support window is refused (it must upgrade).
+        // MIN is >= 1 today, so MIN - 1 is a real out-of-window value.
+        assert!(check_sync_protocol(MIN_SUPPORTED_PROTOCOL - 1).is_err());
+    }
 }

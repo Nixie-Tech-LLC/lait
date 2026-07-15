@@ -139,7 +139,10 @@ impl Store {
         let doc = LoroDoc::new();
         doc.import(&bytes)
             .map_err(|e| anyhow!("import catalog: {e}"))?;
-        Ok(Some(CatalogDoc::from_doc(doc)))
+        let catalog = CatalogDoc::from_doc(doc);
+        // Refuse a store written by a newer lait before handing it out (SCHEMA §9).
+        check_schema_version(catalog.schema_version())?;
+        Ok(Some(catalog))
     }
 
     pub fn save_catalog(&self, catalog: &CatalogDoc) -> Result<()> {
@@ -335,10 +338,35 @@ fn run_git(repo: &Path, args: &[&str]) -> Option<String> {
     }
 }
 
+/// Gate a loaded store's on-disk schema version against what this build supports
+/// (`dto::SCHEMA_VERSION`). Refuses a store written by a **newer** lait — opening
+/// it with an older binary risks dropping or misreading fields it doesn't know
+/// (SCHEMA §9). An older-or-equal store is accepted; migrations for older
+/// versions would run at the call site (none yet — only v1 exists). Pure, so the
+/// policy is unit-tested without touching the filesystem.
+fn check_schema_version(found: u32) -> Result<()> {
+    let supported = crate::dto::SCHEMA_VERSION;
+    if found > supported {
+        return Err(anyhow!(
+            "this workspace store was written by a newer lait (schema v{found}); \
+             this build supports up to schema v{supported} — upgrade lait to open it"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dto::Priority;
+    use crate::dto::{Priority, SCHEMA_VERSION};
+
+    #[test]
+    fn schema_gate_accepts_supported_and_refuses_newer() {
+        // Current and older schemas load; a newer store is refused (upgrade path).
+        assert!(check_schema_version(SCHEMA_VERSION).is_ok());
+        assert!(check_schema_version(0).is_ok());
+        assert!(check_schema_version(SCHEMA_VERSION + 1).is_err());
+    }
     use crate::ids::{ProjectId, SystemUlidSource};
     use crate::issue::NewIssue;
 

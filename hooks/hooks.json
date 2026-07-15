@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "command -v lait >/dev/null 2>&1 || echo 'lait plugin: the `lait` binary is not on your PATH, so its MCP server cannot start. Install it from the latest release (the lait-installer.sh asset at https://github.com/ItsOhmar/lait/releases/latest), then run: lait install-mcp --client claude'"
+            "command": "command -v lait >/dev/null 2>&1 || echo 'lait plugin: the `lait` binary is not on your PATH, so its MCP server cannot start. Install it from the latest release (the lait-installer.sh asset at https://github.com/Nixie-Tech-LLC/lait/releases/latest), then run: lait install-mcp --client claude'"
           }
         ]
       }
