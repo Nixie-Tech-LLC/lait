@@ -2,13 +2,21 @@
 # `cargo install lait` works.
 #
 # Triggered on the **Release** workflow completing (`workflow_run`), like the other
-# publishers, and checks out the exact commit that release built from. Soft-skips
-# if `CARGO_REGISTRY_TOKEN` is unset. `cargo publish` is idempotent-ish: it errors
-# if the version already exists, so re-running a published version is a no-op-ish
-# failure, not a double publish.
+# publishers, and checks out the exact commit that release built from. `cargo publish`
+# is idempotent-ish: it errors if the version already exists, so re-running a
+# published version is a no-op-ish failure, not a double publish.
 #
-# Note: the *first* publish claims the `lait` name and needs the token to carry the
-# `publish-new` scope (later versions only need `publish-update`).
+# Auth is crates.io **trusted publishing**: the job mints a short-lived token by
+# exchanging this workflow's OIDC identity (hence `id-token: write`), so there is no
+# long-lived `CARGO_REGISTRY_TOKEN` secret in the repo to leak or rotate. crates.io
+# must have the trusted publisher registered for this exact repo + workflow filename
+# (crates.io -> lait -> Settings -> Trusted Publishing); if it isn't registered, the
+# auth step fails closed and nothing publishes.
+#
+# Every third-party action is pinned to a full commit SHA, not a tag or branch. This
+# job briefly holds a crates.io publish token, so a mutable ref here would let an
+# upstream compromise publish as us. Note `dtolnay/rust-toolchain`'s version refs
+# (`stable`, `1.91.0`) are *branches*, not tags — pinning by name is not pinning.
 name: Publish to crates.io
 
 on:
@@ -28,14 +36,16 @@ jobs:
   crates:
     name: cargo publish
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Mint the OIDC token that crates.io trades for a short-lived publish token.
+      id-token: write
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
        startsWith(github.event.workflow_run.head_branch, 'v'))
-    env:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
-      - name: Gate on token + resolve ref
+      - name: Resolve ref
         id: gate
         env:
           DISPATCH_REF: ${{ github.event.inputs.ref }}
@@ -44,27 +54,56 @@ jobs:
         run: |
           set -euo pipefail
           echo "ref=${DISPATCH_REF:-$RUN_SHA}" >> "$GITHUB_OUTPUT"
-          if [ -n "${CARGO_REGISTRY_TOKEN:-}" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"
-          else echo "::notice::CARGO_REGISTRY_TOKEN not set — skipping crates.io publish."; echo "ok=false" >> "$GITHUB_OUTPUT"; fi
 
-      - uses: actions/checkout@v4
-        if: steps.gate.outputs.ok == 'true'
+      # actions/checkout@v4.3.1
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ steps.gate.outputs.ref }}
           persist-credentials: false
 
+      # Publishing on the MSRV floor verifies the crate still builds on its declared
+      # `rust-version`. rust-toolchain.toml (channel = "stable") would otherwise
+      # override the 1.91 toolchain installed here — rustup ranks that file above the
+      # default — so the publish step pins RUSTUP_TOOLCHAIN explicitly.
+      #
+      # dtolnay/rust-toolchain@1.91.0 (branch head at time of pinning)
       - name: Install Rust (publish on the MSRV floor, 1.91)
-        if: steps.gate.outputs.ok == 'true'
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@ad7910d95e317a4b12a9a3dfad520f4b409b3ec0
         with:
           toolchain: "1.91"
 
-      # Publishing on the MSRV floor verifies the crate still builds on its
-      # declared `rust-version`. rust-toolchain.toml (channel = "stable") would
-      # otherwise override the 1.91 toolchain installed above — rustup ranks that
-      # file above the default — so pin it explicitly for this step.
+      # rust-lang/crates-io-auth-action@v1.0.5
+      # Last step before publish, so the token's lifetime spans as few steps as
+      # possible and no third-party action runs while it's in scope.
+      #
+      # `continue-on-error` so a release still ships while the trusted publisher is
+      # being registered on crates.io: this step fails until it exists, and the
+      # publish below falls back to CARGO_REGISTRY_TOKEN. The fallback is loud, not
+      # silent — see the notice — so it can't quietly become the permanent path.
+      # Once a publish succeeds via OIDC, drop the fallback and delete the secret.
+      - name: Authenticate to crates.io (trusted publishing)
+        id: auth
+        continue-on-error: true
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
+
       - name: cargo publish
-        if: steps.gate.outputs.ok == 'true'
         env:
+          # Step-scoped, not job-scoped: only this step sees a credential, so no
+          # third-party action ever runs with one in its environment.
+          OIDC_TOKEN: ${{ steps.auth.outputs.token }}
+          FALLBACK_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           RUSTUP_TOOLCHAIN: "1.91"
-        run: cargo publish --locked
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${OIDC_TOKEN:-}" ]; then
+            echo "::notice::Publishing via crates.io trusted publishing (short-lived token)."
+            export CARGO_REGISTRY_TOKEN="$OIDC_TOKEN"
+          elif [ -n "${FALLBACK_TOKEN:-}" ]; then
+            echo "::warning::Trusted publishing unavailable — falling back to the long-lived CARGO_REGISTRY_TOKEN. Register the trusted publisher (crates.io -> lait -> Settings -> Trusted Publishing: Nixie-Tech-LLC/lait, workflow publish-crates.yml), then delete this secret."
+            export CARGO_REGISTRY_TOKEN="$FALLBACK_TOKEN"
+          else
+            echo "::error::No crates.io credential: trusted publishing is not registered and CARGO_REGISTRY_TOKEN is unset."
+            exit 1
+          fi
+          cargo publish --locked
