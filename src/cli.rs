@@ -337,11 +337,34 @@ fn mark_verified(home: &Path) {
 
 /// Ensure a daemon is running for this home dir, spawning one if needed.
 ///
-/// The three outcomes of [`control::probe`] are kept distinct on purpose. Only
-/// `Absent` may spawn: a daemon that is listening but unintelligible already
-/// holds this home's lock, so spawning a second one produces a child that dies
-/// instantly and a wait for a daemon that was never going to answer.
+/// Uses whatever identity this process would use — i.e. `$LAIT_HOME` if set,
+/// else the global `secret.key`. That is right for every caller that resolved
+/// its own store, which is every CLI invocation. A caller that supervises
+/// *several* homes at once cannot rely on its own env and must say which
+/// identity it means: see [`ensure_daemon_as`].
 pub async fn ensure_daemon(home: &Path) -> Result<()> {
+    ensure_daemon_as(home, None).await
+}
+
+/// Ensure a daemon is running for `home`, pinning the identity it runs as.
+///
+/// `identity: Some(dir)` spawns the daemon with `LAIT_HOME=dir`, which makes
+/// [`crate::config::identity_dir`] resolve there and the daemon sign with
+/// *that* home's `secret.key`.
+///
+/// This exists because identity does not follow the store. `identity_dir` reads
+/// `$LAIT_HOME` and nothing else — never `$LAIT_STORE` — so pointing a spawn at a
+/// self-contained home's store while `LAIT_HOME` is unset opens that store under
+/// the *global* key, silently ignoring the `secret.key` sitting inside it. For a
+/// named agent's home that is not a subtle mismatch: the workspace key is sealed
+/// to the agent's X25519 key, so the daemon cannot unwrap it, and it would
+/// announce the wrong identity as a peer in the agent's workspace.
+///
+/// One process resolving one store never notices, because its own env already
+/// says which identity it is. `lait serve` holds N homes across *two* identity
+/// kinds at once and cannot express that through a process-global env var, so
+/// the choice becomes an argument.
+pub async fn ensure_daemon_as(home: &Path, identity: Option<&Path>) -> Result<()> {
     if already_verified(home) {
         return Ok(());
     }
@@ -383,14 +406,18 @@ pub async fn ensure_daemon(home: &Path) -> Result<()> {
     // store regardless of its cwd (DUR-5). LAIT_HOME, when set (self-
     // contained / --home / resume), is inherited from our env and takes
     // precedence, so this is a no-op in that mode.
-    let mut child = std::process::Command::new(exe)
-        .arg("daemon")
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("daemon")
         .env("LAIT_STORE", home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(stderr)
-        .spawn()
-        .context("spawn daemon")?;
+        .stderr(stderr);
+    // An explicit identity overrides the inherited one — the supervisor case,
+    // where our own env cannot speak for the home we are starting.
+    if let Some(identity) = identity {
+        cmd.env("LAIT_HOME", identity);
+    }
+    let mut child = cmd.spawn().context("spawn daemon")?;
     for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(200)).await;
         if request(home, &Request::Status).await.is_ok() {

@@ -33,6 +33,8 @@ pub const HTML: &str = r##"<!doctype html>
   .space .meta { color:var(--mut); font-size:12px; display:flex; gap:6px; align-items:center; }
   .dot { width:6px; height:6px; border-radius:50%; display:inline-block; }
   .up{background:#22c55e} .idle{background:#a1a1aa} .missing{background:#ef4444}
+  .agent { font-size:11px; border:1px solid var(--line); border-radius:4px; padding:0 4px; color:var(--mut); }
+  .sect { font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--mut); margin:14px 0 6px; }
   .cols { display:flex; gap:12px; align-items:flex-start; overflow-x:auto; }
   .col { flex:0 0 260px; }
   .col h2 { font-size:12px; margin:0 0 8px; display:flex; gap:6px; align-items:center; }
@@ -77,17 +79,27 @@ async function loadSpaces() {
       $("spaces").innerHTML = '<div class="empty">No spaces yet.<br>`lait init` or `lait join`.</div>';
       return;
     }
-    $("spaces").innerHTML = spaces.map((s) => `
+    // Agents are listed for observability, but never silently mixed in with your
+    // own: their daemon runs on the agent's key, so the row says whose it is.
+    const row = (s) => `
       <div class="space" role="option" data-id="${esc(s.id)}" aria-selected="${s.id === current}">
         <div class="nm">${esc(s.name || s.workspace)}</div>
-        <div class="meta"><span class="dot ${esc(s.status)}"></span>${esc(s.status)} · ${esc(s.origin)}</div>
-      </div>`).join("");
+        <div class="meta"><span class="dot ${esc(s.status)}"></span>${esc(s.status)} · ${esc(s.origin)}
+          ${s.identity.kind === "agent" ? `<span class="agent">${esc(s.identity.name)}</span>` : ""}
+        </div>
+      </div>`;
+    const mine = spaces.filter((s) => s.identity.kind !== "agent");
+    const agents = spaces.filter((s) => s.identity.kind === "agent");
+    $("spaces").innerHTML =
+      mine.map(row).join("") +
+      (agents.length ? `<div class="sect">Agents</div>` + agents.map(row).join("") : "");
     for (const el of document.querySelectorAll(".space")) {
       el.onclick = () => select(el.dataset.id);
     }
-    // Selecting is what attaches a daemon, so never auto-select more than the
-    // single unambiguous case.
-    if (!current && spaces.length === 1) select(spaces[0].id);
+    // Selecting attaches a daemon, and attaching an agent brings that agent
+    // *online*. So auto-select only your own single unambiguous space — never an
+    // agent, which must be an explicit click.
+    if (!current && mine.length === 1) select(mine[0].id);
   } catch (e) {
     $("spaces").innerHTML = `<div class="err">${esc(e.message)}</div>`;
   }

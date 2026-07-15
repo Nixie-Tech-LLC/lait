@@ -103,18 +103,49 @@ homes mean separate `secret.key`s… one agent can't read another" — under a
 never-guess invariant, because a wrong auto-attach is a cross-identity leak.
 
 `workspaces.json` is a single global file that every daemon open upserts into, so it
-holds **both kinds**. A picker that rendered it verbatim would offer an agent's spaces
-beside your own, and one click would act as that agent. Hence `spaces::scope`:
+holds **both kinds**. `spaces::scope` decides who sees what, and the policy is
+deliberately **asymmetric**:
 
-- a **global** identity owns every registered store *except* self-contained homes
-  under `agents_base`;
-- a **self-contained** identity owns exactly its own home.
+- a **global** identity (you) sees its own stores **and every agent's**, each tagged
+  `SpaceIdentity::Agent { name }`. Agents are yours; watching them is a reason to have
+  a browser at all, and the registry it reads carries no secrets — it is navigation
+  state.
+- a **self-contained** identity sees exactly its own home. An agent must not enumerate
+  your spaces or its siblings. **Observability runs downward only.**
+
+The tag is load-bearing, not decorative. Seeing an agent's space is safe; *acting as*
+it is a different grant, and the tag is what lets the layers above tell those apart.
+
+### Identity does not follow the store
+
+The trap, and the reason `cli::ensure_daemon_as` exists: **`identity_dir` reads
+`$LAIT_HOME` and nothing else — never `$LAIT_STORE`.** So spawning a daemon at an
+agent's store while `LAIT_HOME` is unset opens that store under the *global* key,
+silently ignoring the `secret.key` sitting inside it. Verified: the same store yields
+identity `53a4…` via `--home` and `1363…` (the human's) via `LAIT_STORE` alone.
+
+That is not a cosmetic mismatch. The workspace key is sealed to the agent's X25519
+key, so such a daemon cannot unwrap it — and it would announce **your** identity as a
+peer in the agent's workspace.
+
+One process resolving one store never notices, because its own env already says which
+identity it is. `lait serve` holds N homes across *two* identity kinds and cannot
+express that through a process-global env var, so the choice becomes an argument:
+`Supervisor::attach` pins `LAIT_HOME` for `Agent` spaces and inherits for `Own`.
+
+### Listing is free; attaching is not
+
+`list` only probes, so enumerating agents has **no effect on anything**. Starting a
+daemon brings that identity *online* — it binds an endpoint and announces presence —
+so watching an idle agent is what makes it visible to its workspace. Usually what you
+want when you went looking for it, but it is a real consequence of a click, not a
+read. The shell therefore auto-selects only your own single space, never an agent.
 
 `scope` is the only place scoping is decided, and `Supervisor::resolve` routes through
-it — so a space belonging to another identity is indistinguishable from one that does
-not exist. **A future identity switcher changes only the caller**: it picks a different
+it — so a space this identity may not see is indistinguishable from one that does not
+exist. **An identity switcher changes only the caller**: it picks a different
 `(identity, self_contained)` pair. Nothing threads through the router, the supervisor,
-or the endpoints.
+or the endpoints — `--home` already exercises this today.
 
 ## Surface
 
@@ -123,7 +154,7 @@ or the endpoints.
 | Endpoint | Returns |
 |---|---|
 | `GET /` | the shell (and the one-time `?token=` → cookie handoff) |
-| `GET /api/spaces` | `{ spaces: [...] }`, scoped to this identity, probed, newest-first |
+| `GET /api/spaces` | `{ spaces: [...] }`, scoped to this identity, probed, newest-first. Each row carries `identity: {kind:"own"}` or `{kind:"agent",name}` |
 | `GET /api/spaces/{id}/board?project=` | `Response::Board` — attaches the space |
 | `GET /api/events` | SSE `doorbell` / `lagged`, multiplexed over attached spaces |
 
@@ -145,3 +176,9 @@ and CLI clients read one contract.
   reachable the same way, but writes should land with `confirm_destructive`'s intent
   preserved — the CLI gates `delete`/`members remove`/`key rotate` behind a prompt,
   and the browser needs an equivalent, not a bypass.
+- **Writes into an agent's space need a decision before they are possible.** Reads
+  through an agent's daemon are observability. A *write* through it would be signed by
+  the agent and land under the agent's name — the human operating a machine as one of
+  its agents. `SpaceIdentity::Agent` is the hook: the write path must either refuse it,
+  or make the attribution explicit and deliberate. It must not simply inherit the read
+  path's permissiveness.

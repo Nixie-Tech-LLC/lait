@@ -42,6 +42,22 @@ pub struct SpaceDoorbell {
     pub doorbell: Doorbell,
 }
 
+/// Whose key a space's daemon signs with.
+///
+/// Carried on every row because it is not cosmetic: it decides which
+/// `secret.key` [`Supervisor::attach`] must pin, and — once writes exist — whose
+/// name a mutation lands under. The browser shows both kinds side by side, so the
+/// distinction has to be in the data, not in a convention about paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SpaceIdentity {
+    /// The identity `lait serve` itself runs as.
+    Own,
+    /// A named agent's self-contained home: visible for observability, but its
+    /// daemon runs on the agent's key, not yours.
+    Agent { name: String },
+}
+
 /// One row of the spaces picker.
 #[derive(Debug, Clone, Serialize)]
 pub struct SpaceRow {
@@ -56,7 +72,15 @@ pub struct SpaceRow {
     pub last_opened: u64,
     /// `up` | `idle` | `missing`, exactly as `lait spaces` reports it.
     pub status: &'static str,
+    pub identity: SpaceIdentity,
     pub projects: Vec<workspaces::ProjectBrief>,
+}
+
+/// A registry entry, plus whose identity it runs under.
+#[derive(Debug, Clone)]
+pub struct Scoped<'a> {
+    pub entry: &'a WorkspaceEntry,
+    pub identity: SpaceIdentity,
 }
 
 /// A stable public id for a store path.
@@ -73,10 +97,10 @@ pub fn space_id(path: &str) -> String {
     hash.to_hex()[..16].to_string()
 }
 
-/// Which registered spaces belong to `identity`.
+/// Which registered spaces this identity may see, and whose key each runs on.
 ///
-/// **This function is the identity seam.** Getting it right depends on a fact
-/// that is easy to invert: in lait, identity is *global by default*.
+/// **This function is the identity seam.** It depends on a fact that is easy to
+/// invert: in lait, identity is *global by default*.
 /// [`crate::config::identity_dir`] puts `secret.key` under the config root and
 /// one key spans every repo-bound store — "like one `git` `user.email` across
 /// many repos" — so N ordinary spaces are N daemons signing with the *same*
@@ -85,42 +109,79 @@ pub fn space_id(path: &str) -> String {
 /// The exception is a **self-contained home**: `$LAIT_HOME` collapses identity
 /// and store into one directory, giving that home its own `secret.key`. Named
 /// agents are exactly that shape, living under [`crate::registry::agents_base`],
-/// and [`crate::registry`] isolates them deliberately — "separate homes mean
-/// separate `secret.key`s… one agent can't read another" — under a never-guess
-/// invariant, because a wrong auto-attach is a cross-identity leak.
+/// and [`crate::registry`] isolates them so one agent cannot read another.
 ///
 /// `workspaces.json` is a single global file that every daemon open upserts into
-/// (`node.rs`), so it holds *both* kinds. A picker that rendered it verbatim
-/// would silently offer an agent's spaces alongside your own, and acting in one
-/// would act as that agent. Hence:
+/// (`node.rs`), so it holds both kinds. The policy is deliberately **asymmetric**,
+/// and the asymmetry is the point:
 ///
-/// - a **global** identity owns every registered store *except* the self-contained
-///   homes under `agents_base`;
-/// - a **self-contained** identity owns exactly its own home and nothing else.
+/// - a **global** identity (you) sees its own stores **and every agent's**, each
+///   tagged [`SpaceIdentity::Agent`]. Agents are yours; watching them is the
+///   reason to have a browser at all, and the registry it reads carries no
+///   secrets — it is navigation state.
+/// - a **self-contained** identity sees exactly its own home. An agent must not
+///   enumerate your spaces or its siblings; that is what `registry`'s isolation
+///   is for, and observability runs downward only.
+///
+/// The tag is load-bearing rather than decorative. Seeing an agent's space is
+/// safe; *acting as* it is a different grant, and the tag is what lets the layers
+/// above tell those apart — [`Supervisor::attach`] uses it to pin the right
+/// `secret.key`, and a future write path must use it to refuse (or attribute)
+/// mutations that would land under an agent's name instead of yours.
 ///
 /// SEAM: an identity switcher changes only the caller — it picks a different
-/// `identity`/`self_contained` pair and calls this again. Scoping is decided
-/// here and nowhere else, so the switcher never has to be threaded through the
-/// router, the supervisor, or the endpoints.
+/// `(identity, self_contained)` pair and calls this again. Scoping is decided
+/// here and nowhere else, so the switcher never threads through the router, the
+/// supervisor, or the endpoints.
 pub fn scope<'a>(
     entries: &'a [WorkspaceEntry],
     identity: &Path,
     agents_base: &Path,
     self_contained: bool,
-) -> Vec<&'a WorkspaceEntry> {
+) -> Vec<Scoped<'a>> {
     entries
         .iter()
-        .filter(|e| {
-            let path = Path::new(&e.path);
+        .filter_map(|entry| {
+            let path = Path::new(&entry.path);
             if self_contained {
-                // $LAIT_HOME: this identity is its own store and owns only itself.
-                same_path(path, identity)
+                // $LAIT_HOME: this identity is its own store and sees only itself.
+                same_path(path, identity).then_some(Scoped {
+                    entry,
+                    identity: SpaceIdentity::Own,
+                })
+            } else if let Some(name) = agent_name(path, agents_base) {
+                Some(Scoped {
+                    entry,
+                    identity: SpaceIdentity::Agent { name },
+                })
             } else {
-                // The global identity: everything except somebody else's home.
-                !under(path, agents_base)
+                Some(Scoped {
+                    entry,
+                    identity: SpaceIdentity::Own,
+                })
             }
         })
         .collect()
+}
+
+/// The agent name for a home under `agents_base`, or `None` if it isn't one.
+///
+/// Agent homes are `agents_base/<name>` ([`crate::registry`]), so the name is the
+/// first component below the base. Anything deeper still belongs to *that* agent,
+/// so take the first component rather than the file name — a nested path must not
+/// be able to present itself as a different agent.
+///
+/// The name is read off the **original** path, not the normalized one: `normalize`
+/// lower-cases on Windows to make comparison case-insensitive, which is right for
+/// deciding *whether* a path is under the base and wrong for the name we then
+/// show a human.
+fn agent_name(path: &Path, agents_base: &Path) -> Option<String> {
+    if !under(path, agents_base) {
+        return None;
+    }
+    path.components()
+        .nth(agents_base.components().count())
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
 }
 
 /// Path equality that survives the shapes these strings actually arrive in.
@@ -230,8 +291,9 @@ impl Supervisor {
             self.self_contained,
         );
         let mut set = tokio::task::JoinSet::new();
-        for e in scoped {
-            let e = e.clone();
+        for s in scoped {
+            let e = s.entry.clone();
+            let identity = s.identity.clone();
             set.spawn(async move {
                 SpaceRow {
                     id: space_id(&e.path),
@@ -241,6 +303,7 @@ impl Supervisor {
                     origin: e.origin.to_string(),
                     last_opened: e.last_opened,
                     status: status(&e).await,
+                    identity,
                     projects: e.projects.clone(),
                 }
             });
@@ -252,13 +315,12 @@ impl Supervisor {
         rows
     }
 
-    /// Resolve a public space id to its home, scoped to this identity.
+    /// Resolve a public space id to its home and the identity it runs under.
     ///
-    /// Resolution goes through [`scope`], so an id belonging to another identity
-    /// is indistinguishable from one that does not exist — the browser cannot
-    /// address an agent's space by guessing, only by being given a different
-    /// identity to run under.
-    pub fn resolve(&self, id: &str) -> Result<PathBuf> {
+    /// Resolution goes through [`scope`], so a space this identity may not see is
+    /// indistinguishable from one that does not exist — an agent-scoped `serve`
+    /// cannot address your spaces by guessing an id.
+    pub fn resolve(&self, id: &str) -> Result<(PathBuf, SpaceIdentity)> {
         let entries = workspaces::list();
         let scoped = scope(
             &entries,
@@ -268,8 +330,8 @@ impl Supervisor {
         );
         scoped
             .into_iter()
-            .find(|e| space_id(&e.path) == id)
-            .map(|e| PathBuf::from(&e.path))
+            .find(|s| space_id(&s.entry.path) == id)
+            .map(|s| (PathBuf::from(&s.entry.path), s.identity))
             .ok_or_else(|| anyhow!("no such space"))
     }
 
@@ -277,13 +339,36 @@ impl Supervisor {
     ///
     /// Idempotent, and the *only* place a daemon is started: attaching is what
     /// selecting a space means. Returns the home so callers can round-trip it.
+    ///
+    /// Two things worth knowing before calling this on an agent's space.
+    ///
+    /// **The identity must be pinned, not inherited.** `identity_dir` reads
+    /// `$LAIT_HOME` and never `$LAIT_STORE`, so spawning a daemon at an agent's
+    /// store from a globally-scoped `serve` would open it under *your* key —
+    /// which cannot unwrap a workspace key sealed to the agent, and would put
+    /// your identity on the wire in the agent's workspace. Hence
+    /// [`crate::cli::ensure_daemon_as`] and the explicit home below.
+    ///
+    /// **Attaching is not free the way listing is.** [`list`](Self::list) only
+    /// probes, so enumerating agents has no effect on anything. Starting a
+    /// daemon brings that identity *online* — it binds an endpoint and announces
+    /// presence — so watching an idle agent is what makes it visible to its
+    /// workspace. That is usually what you want when you went looking for it, but
+    /// it is a real consequence of a click, not a read.
     pub async fn attach(&self, id: &str) -> Result<PathBuf> {
-        let home = self.resolve(id)?;
+        let (home, identity) = self.resolve(id)?;
         let mut attached = self.attached.lock().await;
         if let Some(a) = attached.get(id) {
             return Ok(a.home.clone());
         }
-        crate::cli::ensure_daemon(&home).await?;
+        // A self-contained home *is* its own identity dir, so pinning it to
+        // `home` is the whole fix. `Own` keeps inheriting our env, which is
+        // already correct for every store the global identity signs for.
+        let pin = match identity {
+            SpaceIdentity::Agent { .. } => Some(home.as_path()),
+            SpaceIdentity::Own => None,
+        };
+        crate::cli::ensure_daemon_as(&home, pin).await?;
 
         let tx = self.doorbells.clone();
         let space = id.to_string();
@@ -354,11 +439,16 @@ mod tests {
         }
     }
 
+    fn paths<'a>(scoped: &[Scoped<'a>]) -> Vec<&'a str> {
+        scoped.iter().map(|s| s.entry.path.as_str()).collect()
+    }
+
     #[test]
-    fn global_identity_sees_repo_stores_but_not_agent_homes() {
-        // The case that matters: workspaces.json is one global file holding both
-        // kinds, and an agent home carries its own secret.key. Offering it in the
-        // picker would let one click act as that agent.
+    fn global_identity_sees_its_own_stores_and_every_agent_tagged() {
+        // Observability runs downward: your agents are yours, and watching them is
+        // the reason to have a browser. But the tag has to survive the trip — it
+        // decides which secret.key `attach` pins, so an untagged agent row would
+        // open the agent's store under the human's key.
         let entries = vec![
             entry("/home/u/proj-a/.lait"),
             entry("/home/u/.config/lait/agents/scout"),
@@ -370,14 +460,29 @@ mod tests {
             Path::new("/home/u/.config/lait/agents"),
             false,
         );
-        let paths: Vec<&str> = scoped.iter().map(|e| e.path.as_str()).collect();
-        assert_eq!(paths, vec!["/home/u/proj-a/.lait", "/home/u/proj-b/.lait"]);
+        assert_eq!(
+            paths(&scoped),
+            vec![
+                "/home/u/proj-a/.lait",
+                "/home/u/.config/lait/agents/scout",
+                "/home/u/proj-b/.lait"
+            ]
+        );
+        assert_eq!(scoped[0].identity, SpaceIdentity::Own);
+        assert_eq!(
+            scoped[1].identity,
+            SpaceIdentity::Agent {
+                name: "scout".into()
+            }
+        );
+        assert_eq!(scoped[2].identity, SpaceIdentity::Own);
     }
 
     #[test]
-    fn self_contained_identity_sees_only_itself() {
-        // $LAIT_HOME (and every named agent) is its own identity: it must not be
-        // shown its siblings, and must not be shown the global identity's stores.
+    fn an_agent_sees_only_itself_never_the_human_or_a_sibling() {
+        // The asymmetry: the human sees agents, but an agent-scoped serve must not
+        // enumerate the human's spaces or another agent's — that is exactly what
+        // `registry`'s per-home isolation exists to protect.
         let entries = vec![
             entry("/home/u/proj-a/.lait"),
             entry("/home/u/.config/lait/agents/scout"),
@@ -389,8 +494,47 @@ mod tests {
             Path::new("/home/u/.config/lait/agents"),
             true,
         );
-        let paths: Vec<&str> = scoped.iter().map(|e| e.path.as_str()).collect();
-        assert_eq!(paths, vec!["/home/u/.config/lait/agents/scout"]);
+        assert_eq!(paths(&scoped), vec!["/home/u/.config/lait/agents/scout"]);
+        // From its own vantage point an agent is simply itself, not "an agent".
+        assert_eq!(scoped[0].identity, SpaceIdentity::Own);
+    }
+
+    #[test]
+    fn agent_name_is_the_component_below_the_base_not_the_leaf() {
+        // A nested path still belongs to the agent that owns the subtree; taking
+        // the file name would let `agents/scout/sub` present itself as "sub".
+        let entries = vec![entry("/home/u/.config/lait/agents/scout/nested/store")];
+        let scoped = scope(
+            &entries,
+            Path::new("/home/u/.config/lait"),
+            Path::new("/home/u/.config/lait/agents"),
+            false,
+        );
+        assert_eq!(
+            scoped[0].identity,
+            SpaceIdentity::Agent {
+                name: "scout".into()
+            }
+        );
+    }
+
+    #[test]
+    fn agent_name_keeps_its_case_even_where_paths_compare_case_insensitively() {
+        // `normalize` lower-cases on Windows so the *comparison* tolerates drift;
+        // the displayed name must not inherit that.
+        let entries = vec![entry("/home/u/.config/lait/agents/Scout")];
+        let scoped = scope(
+            &entries,
+            Path::new("/home/u/.config/lait"),
+            Path::new("/home/u/.config/lait/agents"),
+            false,
+        );
+        assert_eq!(
+            scoped[0].identity,
+            SpaceIdentity::Agent {
+                name: "Scout".into()
+            }
+        );
     }
 
     #[test]
@@ -408,8 +552,9 @@ mod tests {
         if cfg!(windows) {
             assert_eq!(scoped.len(), 1, "same dir, different spelling");
         }
-        // And a path that merely *starts with the same text* as agents_base is
-        // not under it.
+        // A path that merely *starts with the same text* as agents_base is not
+        // under it, and must not be mistaken for an agent — misclassifying it
+        // would pin `LAIT_HOME` at a store that has no `secret.key` of its own.
         let entries = vec![entry("/home/u/.config/lait/agents-notreally/x")];
         let scoped = scope(
             &entries,
@@ -417,7 +562,12 @@ mod tests {
             Path::new("/home/u/.config/lait/agents"),
             false,
         );
-        assert_eq!(scoped.len(), 1, "'agents-notreally' is not under 'agents'");
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(
+            scoped[0].identity,
+            SpaceIdentity::Own,
+            "'agents-notreally' is not under 'agents'"
+        );
     }
 
     #[test]
