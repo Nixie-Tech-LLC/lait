@@ -106,6 +106,44 @@
     @apply outline-accent rounded-sm outline-2 outline-offset-2;
   }
 
+  /*
+    Buttons get the hand.
+
+    Nothing gives them one: `<button>` inherits `cursor: auto`, which resolves to
+    the arrow, and Tailwind's preflight deliberately doesn't touch it (it follows
+    the UA default rather than overriding it). Every app adds this itself.
+
+    Here rather than in the Button variant, because the rule is about *anything
+    clickable*, not about one component: Radix renders triggers as bare `<button>`
+    elements, cmdk and the dropdowns render `[role]`-carrying divs, and none of
+    them route through our `cva`. A component-level `cursor-pointer` would be a
+    rule each new control has to remember — and the one that forgets is the one
+    that feels broken.
+
+    Scoped to enabled controls only. A disabled button offering a hand is the UI
+    promising something it won't do. (Our `Button` also sets
+    `disabled:pointer-events-none`, so the hand can't even be provoked.)
+
+    Two exceptions are deliberate, and both keep `cursor-default` on purpose —
+    they are not oversights to tidy up:
+
+    - **Issue rows and board cards.** Clicking one *selects*, it does not navigate.
+      Native lists don't offer a hand for selection, and a list that does reads as
+      a page of links rather than a set of records.
+    - **Menu and palette items.** Same reason, and native menus agree. These carry
+      `role="menuitem"`/`role="option"` rather than `role="button"`, so the rule
+      above doesn't reach them anyway — the explicit class states the intent.
+
+    The sidebar's space entries *do* get the hand: switching space is navigation,
+    not selection within a view.
+  */
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  label[for],
+  summary {
+    cursor: pointer;
+  }
+
   ::selection {
     @apply bg-accent/25;
   }
