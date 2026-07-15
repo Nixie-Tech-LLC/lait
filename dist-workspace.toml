@@ -44,3 +44,18 @@ install-updater = false
 # Use gzip (not xz) for unix archives so the native updater can extract release
 # assets with pure-Rust inflate (no liblzma/C dependency). Windows stays .zip.
 unix-archive = ".tar.gz"
+# SLSA build provenance: cargo-dist wires `actions/attest-build-provenance` into
+# the release, producing a cryptographic attestation that each artifact was built
+# by THIS repo's Release workflow (not a laptop). Free for public repos; verify
+# with `gh attestation verify <file> --repo Nixie-Tech-LLC/lait`. This is
+# provenance, not OS gatekeeping — it does not affect SmartScreen/Gatekeeper.
+github-attestations = true
+# Software Bill of Materials: we generate a CycloneDX SBOM per release, but NOT
+# via cargo-dist's built-in `cargo-cyclonedx = true`. That option is broken in
+# cargo-dist v0.32.0 (the latest): its generated release.yml references
+# `steps.cargo-cyclonedx.output.paths` (template line 458) — `output` should be
+# `outputs` — so the `.cdx.xml` renders to an empty path and never reaches the
+# uploaded bundle. The SBOM is instead produced and uploaded by our own
+# `.github/workflows/publish-sbom.yml`, decoupled on `workflow_run` like the
+# homebrew/scoop/winget publishers. Re-enable the built-in once upstream fixes
+# the typo.

@@ -53,12 +53,18 @@ jobs:
           ref: ${{ steps.gate.outputs.ref }}
           persist-credentials: false
 
-      - name: Install Rust (MSRV 1.91, matching rust-toolchain.toml)
+      - name: Install Rust (publish on the MSRV floor, 1.91)
         if: steps.gate.outputs.ok == 'true'
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.91"
 
+      # Publishing on the MSRV floor verifies the crate still builds on its
+      # declared `rust-version`. rust-toolchain.toml (channel = "stable") would
+      # otherwise override the 1.91 toolchain installed above — rustup ranks that
+      # file above the default — so pin it explicitly for this step.
       - name: cargo publish
         if: steps.gate.outputs.ok == 'true'
+        env:
+          RUSTUP_TOOLCHAIN: "1.91"
         run: cargo publish --locked

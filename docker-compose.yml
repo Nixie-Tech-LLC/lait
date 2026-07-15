@@ -16,6 +16,10 @@
 services:
   seed:
     build: .
+    # Built locally from ./Dockerfile (see `build:` above) and tagged with this
+    # name. No image is published to GHCR yet, so use `--build` on first bring-up
+    # (`docker compose up -d --build`); a bare `docker compose pull` won't find it
+    # until a container-publish channel is enabled.
     image: ghcr.io/nixie-tech-llc/lait:latest
     container_name: lait-seed
     restart: unless-stopped

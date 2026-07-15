@@ -3,9 +3,12 @@
 lait ships one self-contained binary. Prebuilt archives (macOS/Linux `.tar.gz`,
 Windows `.zip`) plus the shell/PowerShell installers and the Homebrew formula are
 produced for every tag by **cargo-dist** (`dist-workspace.toml` →
-`.github/workflows/release.yml`). Each archive is **flat** (the binary sits at the
-archive root) and ships with a `.sha256` sidecar; a unified `sha256.sum` is
-published alongside the release.
+`.github/workflows/release.yml`). Archive layout is per-OS: the unix `.tar.gz`
+archives nest the binary under a `lait-<target-triple>/` directory, while the
+Windows `.zip` is flat with `lait.exe` at the root (the self-updater and
+`cargo binstall` metadata both encode this shape). Each archive ships with a
+`.sha256` sidecar; a unified `sha256.sum`, a build-provenance attestation, and a
+CycloneDX SBOM are published alongside the release.
 
 This directory holds the packaging definitions cargo-dist does **not** generate.
 
@@ -131,6 +134,8 @@ bucket pushes (in addition to its runner permissions).
 ## Version bumps at a glance
 
 On a new release `vX.Y.Z`, cargo-dist handles the installers/archives/Homebrew,
-`cargo binstall` needs nothing, and the Scoop + winget CD jobs stamp and publish
-their manifests automatically. The only manual step is `cargo publish` if you're
-also releasing to crates.io.
+`cargo binstall` needs nothing, and the Scoop, winget, crates.io, and SBOM CD
+jobs publish automatically off the `Release` workflow completing (crates.io
+publishes when `CARGO_REGISTRY_TOKEN` is set). The only manual step is the
+release commit itself: bump `Cargo.toml` + `CHANGELOG.md` and push the `vX.Y.Z`
+tag.

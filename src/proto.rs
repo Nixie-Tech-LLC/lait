@@ -121,8 +121,14 @@ pub enum Payload {
         invite: Option<SignedInvite>,
     },
     /// Periodic liveness heartbeat for presence tracking. `state` carries the
-    /// three-state input-driven presence (online/away, UI.md §4.5); a missing
-    /// value from an older peer defaults to online.
+    /// three-state input-driven presence (online/away, UI.md §4.5).
+    ///
+    /// NOTE: postcard is not self-describing, so `#[serde(default)]` does NOT make
+    /// this field forward-compatible on the wire — a pre-`state` peer sends a
+    /// shorter frame and a newer peer fails to decode it with
+    /// `DeserializeUnexpectedEnd` (the drop is now logged in node.rs). Adding
+    /// `state` was a coordinated format bump; the `#[serde(default)]` only helps
+    /// the JSON/DTO paths, not the postcard wire. See docs/HARDENING.md.
     Presence {
         nick: String,
         #[serde(default)]

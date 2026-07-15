@@ -1,0 +1,97 @@
+# CD: generate a CycloneDX SBOM for the released version and attach it to the
+# GitHub Release as an asset (lait.cdx.xml + lait.cdx.json).
+#
+# Why a standalone workflow instead of cargo-dist's built-in `cargo-cyclonedx`?
+# That option is broken in cargo-dist v0.32.0 (the latest): its generated
+# release.yml references `steps.cargo-cyclonedx.output.paths` (should be
+# `outputs`), so the SBOM is generated and then dropped before upload. Rather
+# than hand-patch a generated file (which `dist plan` would then reject as
+# out-of-date), we produce the SBOM here — decoupled on `workflow_run` exactly
+# like publish-homebrew / publish-scoop / publish-winget. Drop this once upstream
+# fixes the template.
+#
+# Triggered on the **Release** workflow completing (`workflow_run`) — by then the
+# release + assets already exist. `workflow_dispatch` is kept for manual re-runs.
+# No external secret is needed: the SBOM is uploaded to this repo's own release
+# with the default GITHUB_TOKEN, so the job always runs (no soft-skip).
+name: Publish SBOM
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach the SBOM to (e.g. v0.4.9)"
+        required: true
+
+permissions:
+  # Needed to upload the SBOM asset onto the existing GitHub Release.
+  contents: write
+
+jobs:
+  sbom:
+    name: generate + attach CycloneDX SBOM
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    steps:
+      - name: Resolve tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISPATCH_TAG: ${{ github.event.inputs.tag }}
+          RUN_TAG: ${{ github.event.workflow_run.head_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${DISPATCH_TAG:-${RUN_TAG:-}}"
+          # workflow_run head_branch is the tag for a tag push; fall back to the
+          # newest release if it arrives as something else.
+          if [ -z "$tag" ] || [ "${tag#v}" = "$tag" ]; then
+            tag="$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')"
+          fi
+          [ -n "$tag" ] || { echo "::error::could not resolve a release tag"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      # Build the SBOM from the exact commit the release was cut from, so the
+      # dependency set matches what shipped.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          persist-credentials: false
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      # Pin cargo-cyclonedx to the same version cargo-dist would have used, via
+      # its prebuilt installer (no compile cost).
+      - name: Install cargo-cyclonedx
+        shell: bash
+        run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-0.5.5/cargo-cyclonedx-installer.sh | sh
+
+      # Emit both CycloneDX encodings. `--locked` reads the committed Cargo.lock so
+      # the SBOM reflects the exact pinned graph (no dependency resolution drift).
+      - name: Generate SBOM (CycloneDX xml + json)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo cyclonedx --locked --format xml
+          cargo cyclonedx --locked --format json
+          echo "generated:"; find . -name '*.cdx.*' -maxdepth 2 -print
+
+      - name: Attach SBOM to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t boms < <(find . -maxdepth 2 -name '*.cdx.xml' -o -name '*.cdx.json')
+          [ "${#boms[@]}" -gt 0 ] || { echo "::error::no SBOM files were produced"; exit 1; }
+          # --clobber so a manual re-run replaces the assets rather than failing.
+          gh release upload "$TAG" --repo "${{ github.repository }}" --clobber "${boms[@]}"
+          echo "attached ${#boms[@]} SBOM asset(s) to $TAG"

@@ -34,15 +34,20 @@ exclude = [
 
 # `cargo binstall lait` — fetch the prebuilt cargo-dist release archive from
 # GitHub instead of compiling. The URL/layout below matches what cargo-dist
-# publishes: `lait-<target>.tar.gz` (unix) / `.zip` (windows), a FLAT archive
-# with the binary at its root (verified against `dist build` output).
+# **actually** publishes (verified against the released v0.4.8 assets), which is
+# per-OS, NOT flat everywhere: the unix `.tar.gz` archives nest the binary under
+# a `lait-<target-triple>/` directory, while the Windows `.zip` is flat with
+# `lait.exe` at the archive root. `bin-dir` must reflect that per-OS shape — the
+# same layout the self-updater encodes in `update_bin_path_in_archive` (app.rs).
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.{ archive-format }"
 pkg-fmt = "tgz"
-bin-dir = "{ bin }{ binary-ext }"
+bin-dir = "{ name }-{ target }/{ bin }{ binary-ext }"
 
 [package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
 pkg-fmt = "zip"
+# Windows `.zip` is flat: `lait.exe` at the root, no nesting directory.
+bin-dir = "{ bin }{ binary-ext }"
 
 [lib]
 name = "lait"

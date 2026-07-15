@@ -1,8 +1,9 @@
 # Installing lait
 
-`lait` is a single self-contained binary that runs on **Linux, macOS, and
-Windows** (arm64 + x86_64). Pick whichever channel fits your platform — they all
-land the same `lait` executable. Upgrade any install in place with `lait update`
+`lait` is a single self-contained binary. Native builds ship for **Linux** and
+**macOS** (arm64 + x86_64) and **Windows** (x86_64 — arm64 Windows runs the
+x86_64 build under the OS's built-in emulation). Pick whichever channel fits your
+platform — they all land the same `lait` executable. Upgrade any install in place with `lait update`
 (a native self-updater), regardless of how you installed it.
 
 > **Heads-up on the crypto:** lait's end-to-end encryption is research-grade and

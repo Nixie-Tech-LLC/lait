@@ -147,7 +147,14 @@ jobs:
       - name: Install Rust 1.91
         uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
+      # rust-toolchain.toml at the repo root pins `channel = "stable"`, and rustup
+      # ranks that file ABOVE the default toolchain — so without this override the
+      # job would silently `cargo check` on stable, not 1.91, and the MSRV floor
+      # could drift upward undetected. RUSTUP_TOOLCHAIN outranks rust-toolchain.toml,
+      # forcing the 1.91.0 toolchain installed above.
       - name: Check on MSRV
+        env:
+          RUSTUP_TOOLCHAIN: "1.91.0"
         run: cargo check --locked --all-targets
 
   # Supply-chain gate: advisories + licenses + bans + sources (deny.toml). The
