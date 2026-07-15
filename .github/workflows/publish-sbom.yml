@@ -59,7 +59,7 @@ jobs:
 
       # Build the SBOM from the exact commit the release was cut from, so the
       # dependency set matches what shipped.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ steps.tag.outputs.tag }}
           persist-credentials: false
