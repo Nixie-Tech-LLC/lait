@@ -10,6 +10,7 @@ import { Activity } from "./ui/Activity";
 import { Board } from "./ui/Board";
 import { FilterBar } from "./ui/FilterBar";
 import { Inbox } from "./ui/Inbox";
+import { Members } from "./ui/Members";
 import { IssueDetail } from "./ui/IssueDetail";
 import { IssueList } from "./ui/IssueList";
 import { Palette } from "./ui/Palette";
@@ -378,6 +379,13 @@ export function App() {
                 api.select(reff);
                 setView("list");
               }}
+            />
+          ) : view === "members" ? (
+            <Members
+              spaceId={current}
+              revision={revision}
+              readOnly={readOnly}
+              onError={setError}
             />
           ) : view === "activity" ? (
             <Activity spaceId={current} revision={revision} onError={setError} onOpen={api.select} />
