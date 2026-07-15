@@ -221,18 +221,37 @@ fn a_dead_daemon_is_reported_dead_and_a_live_one_is_not() {
     );
     std::fs::remove_dir_all(&empty).ok();
 
-    // Live: a real store, so it stays up — and must not be declared dead.
+    // Live: a real store, so it comes up — and must not be declared dead.
+    //
+    // It reaps itself on a short idle window rather than being told to stop: a
+    // `shutdown` races the daemon's control-channel bind, and losing that race
+    // strands a live `lait.exe`. On Windows that is not a stray process but a
+    // broken build — the linker cannot replace a running binary, so the next
+    // `cargo run` fails with "Access is denied" in some later step that has
+    // nothing to do with this test. Self-reaping means no assertion below can
+    // leak one.
+    std::env::set_var("LAIT_IDLE_SECS", "2");
     let home = tmp_home("live");
     init(&home);
     let mut child = lait::daemon_spawn::spawn(&exe, &home, None).expect("spawn daemon");
     let alive = child.try_wait().expect("try_wait");
-    shutdown(&home);
-    std::fs::remove_dir_all(&home).ok();
     assert!(
         alive.is_none(),
-        "a daemon still starting up was reported as exited ({alive:?}) — the spawn \
-         wait would abandon a daemon that was coming up fine",
+        "a daemon that had just started was reported as exited ({alive:?}) — the \
+         spawn wait would abandon a daemon that was coming up fine",
     );
+
+    // ...and when that same daemon idles out, the sensor must notice: proof the
+    // `None` above was a live reading rather than a stuck one.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match child.try_wait().expect("try_wait") {
+            Some(_) => break,
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(200)),
+            None => panic!("a daemon that idled out was never reported as exited"),
+        }
+    }
+    std::fs::remove_dir_all(&home).ok();
 }
 
 /// A selector that matches nothing is a not-found, and must answer like one on
