@@ -134,13 +134,18 @@ tui-textarea = "0.7"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# windows-only: clear HANDLE_FLAG_INHERIT on our own stdio so a spawned daemon
-# can't inherit it and hold a captured parent's pipe open forever (the other
-# half of the same "fix the platform default at startup" pair as libc above —
-# see `disinherit_stdio` in app.rs). Already present transitively (iroh/tokio);
-# declared directly for that call.
+# windows-only: keep our handles ours. `CreateProcess` inherits all-or-nothing,
+# so the daemon we spawn would otherwise come up holding a captured caller's
+# stdout pipe and never let it see EOF. Needs `SetHandleInformation` (clear the
+# inherit flag on our own stdio — `disinherit_stdio` in app.rs) and
+# `CreateProcessW` + `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (inherit exactly the
+# three handles we name — `daemon_spawn`), which std only exposes as an unstable
+# feature. Already present transitively (iroh/tokio); declared directly for those.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 # property-based convergence testing (random op sequences across N peers).

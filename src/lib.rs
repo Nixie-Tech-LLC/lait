@@ -26,6 +26,7 @@ pub mod cmdspec;
 pub mod config;
 pub mod control;
 pub mod crypto;
+pub mod daemon_spawn;
 pub mod diagnose;
 pub mod dto;
 pub mod ids;

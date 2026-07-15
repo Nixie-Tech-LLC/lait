@@ -49,9 +49,15 @@ Additive within epoch 1 — no flag day. The new `hello` handshake and the
   command auto-spawns came up holding a write-end of that command's stdout — its own
   `Stdio::null()` notwithstanding. The command exited, the pipe never closed, and
   anything reading to EOF (`$(lait new …)`, a test harness, an MCP client) waited on an
-  EOF that could not arrive. lait now clears `HANDLE_FLAG_INHERIT` on its own stdio at
-  startup, which children given stdio explicitly still inherit (std duplicates the
-  handle for them). Unix was never affected — those fds are `CLOSE_ON_EXEC`.
+  EOF that could not arrive. The daemon is now spawned through `CreateProcessW` with a
+  `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` naming the only three handles it may inherit, so
+  it comes up holding what we handed it and nothing else — including nothing we
+  inherited from *our* parent and never knew we had. lait also clears
+  `HANDLE_FLAG_INHERIT` on its own stdio at startup, which bounds the same leak through
+  the children spawned without that ceremony (a `hook`, the notification balloon);
+  children given stdio explicitly still inherit it, as std duplicates the handle for
+  them. Unix was never affected — those fds are `CLOSE_ON_EXEC` — and Windows now
+  matches it exactly: nextest reports the suite leak-free on all three OSes.
 
 ## Unreleased — protocol version negotiation, schema gate & release hardening
 

@@ -862,19 +862,24 @@ fn reset_sigpipe() {}
 /// all-or-nothing: a child inherits *every* inheritable handle in this process,
 /// not just the three named in `STARTUPINFO`. When our stdout/stderr are pipes
 /// (any captured run — `Command::output()`, `$(lait ...)`, a test harness) those
-/// pipe handles are inheritable, so `ensure_daemon`'s spawn hands the daemon a
-/// write-end of *our* stdout even though its own stdio is `Stdio::null()`. The
-/// daemon outlives us, the write-end never closes, and our caller waits on an EOF
-/// that can never come — a captured `lait new` hangs forever. Unix is immune:
-/// those fds are `CLOSE_ON_EXEC`.
+/// pipe handles are inheritable, so a child that outlives us keeps our caller's
+/// stdout open and it never sees the EOF it is reading for. Unix is immune: those
+/// fds are `CLOSE_ON_EXEC`.
 ///
-/// Clearing `HANDLE_FLAG_INHERIT` on our end fixes it at the source. It does not
-/// break children we *do* want to inherit stdio: for `Stdio::inherit()` std
-/// duplicates the handle with `bInheritHandle=TRUE` into the child's
-/// `STARTUPINFO`, so their output still lands on our stdout.
+/// The daemon — the child that outlives us by design, and the one this actually
+/// bit — is handled precisely in [`crate::daemon_spawn`], which names the handles
+/// it may inherit. This is the blanket for everything else we spawn without that
+/// ceremony: the Windows notification balloon outlives the `watch` that raised it
+/// by ~6s, and a `hook` runs whatever the user wrote. Neither should be able to
+/// hold `lait watch | tee`'s pipe open.
+///
+/// Clearing `HANDLE_FLAG_INHERIT` on our end costs nothing we want: for
+/// `Stdio::inherit()` std duplicates the handle with `bInheritHandle=TRUE` into
+/// the child's `STARTUPINFO`, so a child we *do* hand stdio to still lands its
+/// output on ours.
 ///
 /// Unlike [`reset_sigpipe`], this runs for the services too — `lait mcp` speaks
-/// its protocol over stdio pipes and spawns a daemon, which is the same hang.
+/// its protocol over stdio pipes, and its client is reading for that same EOF.
 #[cfg(windows)]
 fn disinherit_stdio() {
     use std::os::windows::io::AsRawHandle;
