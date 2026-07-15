@@ -119,6 +119,12 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/spaces", get(list_spaces))
         .route("/api/spaces/{id}/rpc", post(rpc))
         .route("/api/events", get(events))
+        // Everything else is the client: a real asset, or the SPA entry so the
+        // app can resolve its own routes. Registered last so it can never shadow
+        // `/api`, and inside the gate like everything else — the bundle is not
+        // secret, but an unauthenticated page that immediately 401s on every
+        // fetch is a worse experience than an honest refusal.
+        .fallback(get(static_asset))
         .layer(axum::middleware::from_fn_with_state(app.clone(), gate))
         .with_state(app)
 }
@@ -217,7 +223,12 @@ async fn index(State(app): State<Arc<App>>, Query(q): Query<IndexQuery>) -> Resp
         let cookie = format!("{}={token}; Path=/; HttpOnly; SameSite=Strict", app.cookie);
         return ([(header::SET_COOKIE, cookie)], Redirect::to("/")).into_response();
     }
-    axum::response::Html(shell::HTML).into_response()
+    shell::index()
+}
+
+/// Any non-`/api` path: an embedded asset, or the SPA entry.
+async fn static_asset(uri: axum::http::Uri) -> Response {
+    shell::asset(uri.path())
 }
 
 async fn list_spaces(State(app): State<Arc<App>>) -> Response {

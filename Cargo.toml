@@ -127,6 +127,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # bridge the doorbell multiplex needs.
 axum = "0.8"
 tokio-stream = { version = "0.1", features = ["sync"] }
+# The web client, compiled into the binary. `include_dir` reads `src/serve/assets`
+# at compile time, which is why the built bundle is COMMITTED and lives under
+# `src/` rather than in the excluded `viewer/`: `cargo install lait` must not need
+# npm (same reproducibility bar `build.rs` holds by never shelling out to git),
+# and the published crate drops `viewer/` entirely. See docs/SERVE.md.
+include_dir = "0.7"
 
 # mcp server (stdio)
 rmcp = { version = "1.7", features = ["server", "macros", "transport-io"] }
