@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use super::super::app::{App, HitTarget};
+use super::super::app::{App, HitTarget, OverlayLayer};
 use super::super::keymap::FocusKind;
 
 /// A transient message with severity; expires after a few frames of ticks.
@@ -40,6 +40,17 @@ impl StatusLine {
 }
 
 pub fn draw(f: &mut Frame, app: &mut App, area: Rect, ctx: FocusKind) {
+    // Live `/` filter input takes over the bar while editing.
+    if matches!(app.stack.last(), Some(OverlayLayer::Filter { .. })) {
+        let line = Line::from(vec![
+            Span::styled(" / ", app.theme.accent_style()),
+            Span::raw(app.filter_text.clone()),
+            Span::styled("_", app.theme.accent_style()),
+            Span::styled("   enter keep · esc restore", app.theme.dim_style()),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
     // Status message takes priority over the legend while alive.
     if !app.status.text.is_empty() {
         let style = if app.status.is_error {

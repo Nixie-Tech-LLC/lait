@@ -1,6 +1,9 @@
-//! Shared components: the text editor (tui-textarea wrapper) and the status
-//! bar / legend. The scrolling list-picker joins in Stage 2 (lifted from
-//! members_ui).
+//! Shared components: the text editor (tui-textarea wrapper), the status bar /
+//! legend, the scrolling list machinery (shared with members_ui), the picker
+//! modal, and the confirm modal.
 
+pub mod confirm;
 pub mod editor;
+pub mod list_picker;
+pub mod picker;
 pub mod statusbar;

@@ -59,6 +59,8 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         let mut cards = Vec::new();
         for (ri, row) in rows.iter().enumerate() {
             let selected = is_focused && ri == app.row_idx;
+            let marked = app.selection.contains(&row.reff);
+            let mark = if marked { "▣ " } else { "" };
             let handle = row.key_alias.clone().unwrap_or_else(|| row.reff.clone());
             let optimistic = if app.overlay.has(row.doc_id.as_str()) {
                 " ▲"
@@ -96,7 +98,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
             let title = app.effective_title(row);
             cards.push(Card {
                 line1: Line::from(vec![Span::styled(
-                    format!("{handle}{pri_badge}{assigned}{optimistic}"),
+                    format!("{mark}{handle}{pri_badge}{assigned}{optimistic}"),
                     meta_style,
                 )]),
                 line2: Line::from(vec![Span::styled(format!("  {title}"), title_style)]),

@@ -47,6 +47,7 @@ use crate::cli::ensure_daemon;
 use crate::control::{request, Request, Response};
 use crate::dto::{JoinRequestDto, MemberDto};
 use crate::proto::WorkspaceTicket;
+use crate::tui::widgets::list_picker::{row_line, window, Cell};
 
 /// One selectable row: a pending request (approvable) or an existing member.
 #[derive(Clone)]
@@ -453,13 +454,6 @@ fn header(s: &str) -> Line<'static> {
     )
 }
 
-/// A visual row of the list: a section header, a spacer, or a selectable item.
-enum Cell {
-    Header(&'static str),
-    Blank,
-    Row { idx: usize, text: String },
-}
-
 fn list_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
     if app.items.is_empty() {
         return vec![Line::from("  (no members)")];
@@ -493,25 +487,17 @@ fn list_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
         .map(|c| match c {
             Cell::Header(h) => header(h),
             Cell::Blank => Line::from(""),
-            Cell::Row { idx, text } => row_line(*idx == app.sel, text, area.width as usize),
+            Cell::Row { idx, text } => row_line(
+                *idx == app.sel,
+                text,
+                area.width as usize,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
         })
         .collect()
-}
-
-/// Slice `cells` to at most `budget` entries, keeping the selected item visible.
-fn window(cells: &[Cell], sel: usize, budget: usize) -> Vec<&Cell> {
-    if budget == 0 || cells.len() <= budget {
-        return cells.iter().collect();
-    }
-    let sel_pos = cells
-        .iter()
-        .position(|c| matches!(c, Cell::Row { idx, .. } if *idx == sel))
-        .unwrap_or(0);
-    let mut start = sel_pos.saturating_sub(budget / 2);
-    if start + budget > cells.len() {
-        start = cells.len() - budget;
-    }
-    cells[start..start + budget].iter().collect()
 }
 
 /// The unstyled text for item `i` (a bullet marks a request; a role marks a
@@ -536,27 +522,6 @@ fn item_text(app: &App, i: usize) -> String {
             let you = if m.me { "   (you)" } else { "" };
             format!("{:<6} {}{}{}", m.role, m.key.short(), name, you)
         }
-    }
-}
-
-/// One item row: a full-width reverse-style bar when selected, else a plain
-/// indented line. Padding to `w` makes the highlight span the whole row.
-fn row_line(selected: bool, text: &str, w: usize) -> Line<'static> {
-    if selected {
-        let mut s = format!("> {text}");
-        let len = s.chars().count();
-        if len < w {
-            s.push_str(&" ".repeat(w - len));
-        }
-        Line::styled(
-            s,
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Line::from(format!("  {text}"))
     }
 }
 
@@ -860,21 +825,5 @@ mod tests {
         assert!(out.contains("REQUEST DETAIL"));
         assert!(out.contains("confirm this key out-of-band"));
         assert!(out.contains("Approve alice?"));
-    }
-
-    #[test]
-    fn window_keeps_selection_visible() {
-        let cells: Vec<Cell> = (0..20)
-            .map(|i| Cell::Row {
-                idx: i,
-                text: format!("row{i}"),
-            })
-            .collect();
-        let win = window(&cells, 18, 5);
-        assert_eq!(win.len(), 5);
-        assert!(
-            win.iter().any(|c| matches!(c, Cell::Row { idx: 18, .. })),
-            "selected row 18 must be in the window"
-        );
     }
 }

@@ -16,12 +16,38 @@ pub async fn dispatch_key(app: &mut App, ev: KeyEvent) -> Result<()> {
     if ev.kind != KeyEventKind::Press {
         return Ok(());
     }
-    // Editor layer consumes raw input.
-    if matches!(app.stack.last(), Some(OverlayLayer::Editor(_))) {
-        if let Some((intent, content)) = app.handle_editor_key(ev) {
-            app.submit_editor(intent, content).await?;
+    // Input layers consume raw keys before the keymap (top of stack owns
+    // input); each handler pops on submit and returns what to execute.
+    match app.stack.last() {
+        Some(OverlayLayer::Editor(_)) => {
+            if let Some((intent, content)) = app.handle_editor_key(ev) {
+                app.submit_editor(intent, content).await?;
+            }
+            return Ok(());
         }
-        return Ok(());
+        Some(OverlayLayer::Palette(_)) => {
+            if let Some(line) = app.handle_palette_key(ev) {
+                app.run_palette(line).await?;
+            }
+            return Ok(());
+        }
+        Some(OverlayLayer::Picker(_)) => {
+            if let Some(p) = app.handle_picker_key(ev) {
+                app.submit_picker(p).await?;
+            }
+            return Ok(());
+        }
+        Some(OverlayLayer::Confirm(_)) => {
+            if let Some(intent) = app.handle_confirm_key(ev) {
+                app.run_confirm(intent).await?;
+            }
+            return Ok(());
+        }
+        Some(OverlayLayer::Filter { .. }) => {
+            app.handle_filter_key(ev);
+            return Ok(());
+        }
+        Some(OverlayLayer::Help) | None => {}
     }
     let ctx = app.focus();
     let Some(action) = app.keymap.resolve(ctx, &ev) else {
@@ -61,6 +87,32 @@ pub async fn dispatch_mouse(app: &mut App, ev: MouseEvent) -> Result<()> {
                 .rev()
                 .find(|r| contains(r.rect, ev.column, ev.row))
                 .map(|r| r.target);
+            // Modal layers eat clicks: rows act, everything else is inert.
+            match app.stack.last_mut() {
+                Some(OverlayLayer::Palette(p)) => {
+                    if let Some(HitTarget::ListRow(i)) = target {
+                        p.sel = i;
+                        p.complete();
+                    }
+                    return Ok(());
+                }
+                Some(OverlayLayer::Picker(p)) => {
+                    if let Some(HitTarget::ListRow(i)) = target {
+                        p.sel = i;
+                        if p.multi {
+                            p.toggle_selected();
+                        } else if let Some(OverlayLayer::Picker(p)) = app.stack.pop() {
+                            // Single-select: a click IS the pick.
+                            Box::pin(app.submit_picker(*p)).await?;
+                        }
+                    }
+                    return Ok(());
+                }
+                Some(OverlayLayer::Editor(_)) | Some(OverlayLayer::Confirm(_)) => {
+                    return Ok(());
+                }
+                _ => {}
+            }
             match target {
                 Some(HitTarget::ProjectTab(i)) => {
                     if i != app.project_idx && i < app.projects.len() {
@@ -100,6 +152,18 @@ pub async fn dispatch_mouse(app: &mut App, ev: MouseEvent) -> Result<()> {
         }
         MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
             let down = ev.kind == MouseEventKind::ScrollDown;
+            // A picker on top: the wheel moves its selection.
+            if let Some(OverlayLayer::Picker(p)) = app.stack.last_mut() {
+                let n = p.filtered().len();
+                if down {
+                    if n > 0 && p.sel + 1 < n {
+                        p.sel += 1;
+                    }
+                } else {
+                    p.sel = p.sel.saturating_sub(1);
+                }
+                return Ok(());
+            }
             // Scroll the panel UNDER the cursor: peek if hit, else the board.
             let over_peek = app
                 .regions

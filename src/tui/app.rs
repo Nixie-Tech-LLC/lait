@@ -7,20 +7,24 @@
 //! peek-vs-board, then the active screen. `Esc` pops stack → closes peek →
 //! returns to Board → quits.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::Result;
 use ratatui::layout::Rect;
 
-use crate::control::{request, CatalogScope, Doorbell, Request, Response};
+use crate::cmdspec::Special;
+use crate::control::{request, BoardPos, CatalogScope, Doorbell, Request, Response};
 use crate::diagnose::DiagnosisView;
-use crate::dto::{ActivityEvent, BoardView, IssueView, ProjectDto, Row};
+use crate::dto::{ActivityEvent, BoardView, IssueView, Priority, ProjectDto, Row};
 
 use super::action::Action;
 use super::keymap::{FocusKind, Keymap};
+use super::palette::PaletteState;
 use super::theme::Theme;
+use super::widgets::confirm::{ConfirmIntent, ConfirmState};
 use super::widgets::editor::{EditorIntent, EditorOutcome, EditorState};
+use super::widgets::picker::{PickIntent, PickItem, PickerState};
 use super::widgets::statusbar::StatusLine;
 
 /// Full-body screens. Board is the root; the rest land across stages (an
@@ -42,6 +46,9 @@ pub enum Screen {
 /// stack — a picker can sit over peek over board and all three render).
 pub struct PeekState {
     pub view: IssueView,
+    /// The issue's derived activity timeline (`Request::History`), fetched
+    /// with the view.
+    pub history: Vec<ActivityEvent>,
     pub scroll: u16,
     pub expanded: bool,
     pub focused: bool,
@@ -50,6 +57,14 @@ pub struct PeekState {
 /// Modal layers; top of the stack owns input.
 pub enum OverlayLayer {
     Editor(Box<EditorState>),
+    Palette(Box<PaletteState>),
+    Picker(Box<PickerState>),
+    Confirm(ConfirmState),
+    /// Live `/` filter input: edits `App::filter_text` keystroke-by-keystroke;
+    /// Esc restores what it was on open.
+    Filter {
+        prev: String,
+    },
     Help,
 }
 
@@ -128,6 +143,9 @@ pub struct App {
     pub row_idx: usize,
     pub list_cursors: HashMap<Screen, ListCursor>,
     pub filter_text: String,
+    /// Multi-select (canonical reffs, board order of insertion). Non-empty
+    /// selection makes issue verbs bulk (one Request per reff, sequential).
+    pub selection: Vec<String>,
     /// Cursor into the actionable `?` help overlay.
     pub help_sel: usize,
     pub theme: Theme,
@@ -157,6 +175,7 @@ impl App {
             row_idx: 0,
             list_cursors: HashMap::new(),
             filter_text: String::new(),
+            selection: Vec::new(),
             help_sel: 0,
             theme,
             keymap,
@@ -318,12 +337,30 @@ impl App {
         let Some(reff) = self.peek.as_ref().map(|p| p.view.reff.clone()) else {
             return Ok(());
         };
-        if let Response::Issue(v) = self.req(Request::IssueView { reff }).await? {
+        if let Response::Issue(v) = self.req(Request::IssueView { reff: reff.clone() }).await? {
             if let Some(p) = &mut self.peek {
                 p.view = *v;
             }
         }
+        let history = self.fetch_history(&reff).await;
+        if let Some(p) = &mut self.peek {
+            p.history = history;
+        }
         Ok(())
+    }
+
+    /// The issue's derived timeline — best-effort (an empty history renders
+    /// as nothing, never an error).
+    async fn fetch_history(&self, reff: &str) -> Vec<ActivityEvent> {
+        match self
+            .req(Request::History {
+                reff: reff.to_string(),
+            })
+            .await
+        {
+            Ok(Response::Activity { events, .. }) => events,
+            _ => Vec::new(),
+        }
     }
 
     pub async fn refresh_inbox_count(&mut self) {
@@ -511,7 +548,18 @@ impl App {
                 }
             }
             StartIssue | DoneIssue | StopIssue => {
-                if let Some(reff) = self.target_reff() {
+                let targets = self.bulk_targets();
+                if targets.len() > 1 {
+                    let reqs: Vec<Request> = targets
+                        .into_iter()
+                        .map(|reff| match action {
+                            StartIssue => Request::IssueStart { reff },
+                            DoneIssue => Request::IssueDone { reff },
+                            _ => Request::IssueStop { reff },
+                        })
+                        .collect();
+                    self.run_bulk(reqs).await?;
+                } else if let Some(reff) = targets.into_iter().next() {
                     let req = match action {
                         StartIssue => Request::IssueStart { reff },
                         DoneIssue => Request::IssueDone { reff },
@@ -549,13 +597,41 @@ impl App {
                 // Help overlay's "run action" lands in mod.rs (needs the
                 // highlighted row); other Submits are handled by their layers.
             }
-            // Stage 2+ actions — visible in help, honest about arrival.
-            OpenPalette | OpenFilter | PickAssign | PickLabel | PickPriority | PickStatus
-            | PickMoveProject | ReorderUp | ReorderDown | Delete | ToggleSelect
-            | ClearSelection | InboxClear | SpaceSwitch | PinFilterAsTab | TabNext | TabPrev
-            | Cancel => {
+            OpenPalette => self
+                .stack
+                .push(OverlayLayer::Palette(Box::new(PaletteState::new()))),
+            OpenFilter => self.stack.push(OverlayLayer::Filter {
+                prev: self.filter_text.clone(),
+            }),
+            PickAssign => self.open_assign_picker().await?,
+            PickLabel => self.open_label_picker().await?,
+            PickPriority => self.open_priority_picker(),
+            PickStatus => self.open_status_picker(),
+            PickMoveProject => self.open_move_picker(),
+            ToggleSelect => self.toggle_select(),
+            ClearSelection => {
+                self.selection.clear();
+            }
+            ReorderUp | ReorderDown => self.reorder(action == ReorderDown).await?,
+            Delete => {
+                let targets = self.bulk_targets();
+                if !targets.is_empty() {
+                    let what = if targets.len() == 1 {
+                        targets[0].clone()
+                    } else {
+                        format!("{} issues", targets.len())
+                    };
+                    self.stack.push(OverlayLayer::Confirm(ConfirmState {
+                        title: "delete".into(),
+                        body: format!("Delete {what}? This tombstones — history survives."),
+                        intent: ConfirmIntent::DeleteIssues { targets },
+                    }));
+                }
+            }
+            // Stage 3/4 actions — visible in help, honest about arrival.
+            InboxClear | SpaceSwitch | PinFilterAsTab | TabNext | TabPrev | Cancel => {
                 self.status.info(format!(
-                    "'{}' lands later in this branch (stage 2+)",
+                    "'{}' lands later in this branch (stage 3+)",
                     action.id()
                 ));
             }
@@ -627,8 +703,10 @@ impl App {
             .await?
         {
             Response::Issue(v) => {
+                let history = self.fetch_history(&v.reff).await;
                 self.peek = Some(PeekState {
                     view: *v,
+                    history,
                     scroll: 0,
                     expanded: false,
                     focused: false,
@@ -702,6 +780,622 @@ impl App {
             self.status.error(message);
         }
         Ok(())
+    }
+
+    // ---- multi-select / bulk ----
+
+    /// The issues a verb applies to: the multi-select set when non-empty,
+    /// else the focused issue.
+    pub fn bulk_targets(&self) -> Vec<String> {
+        if !self.selection.is_empty() {
+            return self.selection.clone();
+        }
+        self.target_reff().into_iter().collect()
+    }
+
+    fn toggle_select(&mut self) {
+        let Some(row) = self.focused_row() else {
+            return;
+        };
+        if let Some(pos) = self.selection.iter().position(|r| *r == row.reff) {
+            self.selection.remove(pos);
+        } else {
+            self.selection.push(row.reff);
+        }
+        // Advance like a checkbox list.
+        self.motion(Action::Down);
+    }
+
+    /// Route N requests: a single one goes through [`Self::dispatch_request`]
+    /// (Candidates handling); a set runs sequentially with an ok/failed tally.
+    async fn run_requests(&mut self, reqs: Vec<Request>) -> Result<()> {
+        if reqs.len() == 1 && self.selection.is_empty() {
+            let req = reqs.into_iter().next().unwrap();
+            return self.dispatch_request(req).await;
+        }
+        self.run_bulk(reqs).await
+    }
+
+    /// One Request per issue, sequential (each is its own commit / activity
+    /// row, S§7.1); summary like `7 ok · 1 failed`. Full success clears the
+    /// selection; partial failure keeps it for a retry.
+    async fn run_bulk(&mut self, reqs: Vec<Request>) -> Result<()> {
+        let total = reqs.len();
+        let mut ok = 0usize;
+        let mut first_err: Option<String> = None;
+        for r in reqs {
+            match self.req(r).await {
+                Ok(Response::Error { message, .. }) => {
+                    if first_err.is_none() {
+                        first_err = Some(message);
+                    }
+                }
+                Ok(_) => ok += 1,
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(format!("{e:#}"));
+                    }
+                }
+            }
+        }
+        let failed = total - ok;
+        if failed == 0 {
+            self.status.info(format!("{ok} ok"));
+            self.selection.clear();
+        } else {
+            self.status.error(format!(
+                "{ok} ok · {failed} failed — {}",
+                first_err.unwrap_or_default()
+            ));
+        }
+        self.reload_board().await?;
+        self.refresh_peek().await?;
+        self.refresh_inbox_count().await;
+        Ok(())
+    }
+
+    // ---- the `:` palette (one grammar, two entry points — U tenet 4) ----
+
+    /// Dispatch a palette line through the CLI grammar. A parse error reopens
+    /// the palette with the line intact and the error inline.
+    pub async fn run_palette(&mut self, line: String) -> Result<()> {
+        let tokens = super::palette::tokenize(&line);
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        let mut argv = vec!["lait".to_string()];
+        argv.extend(tokens);
+        let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
+        match crate::cmdspec::parse_to_dispatch(&argv_ref) {
+            Ok(crate::cmdspec::ParsedCommand::Request(r)) => self.dispatch_request(r).await?,
+            Ok(crate::cmdspec::ParsedCommand::Special { which, name, .. }) => {
+                self.run_special(which, name, &argv_ref).await?;
+            }
+            Err(e) => {
+                let first = e
+                    .to_string()
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("parse error")
+                    .to_string();
+                self.stack
+                    .push(OverlayLayer::Palette(Box::new(PaletteState::with_content(
+                        &line,
+                        Some(first),
+                    ))));
+            }
+        }
+        Ok(())
+    }
+
+    /// The palette's `Special` table (see cmdspec): work verbs run natively
+    /// (no git-branch step in the TUI), screens that exist route, everything
+    /// process-level is honestly CLI-only.
+    async fn run_special(&mut self, which: Special, name: &str, argv: &[&str]) -> Result<()> {
+        match which {
+            Special::Start | Special::Done | Special::Stop => {
+                // The optional positional ref is the first non-flag token
+                // after the verb; flags like --no-branch are meaningless in
+                // the TUI (no git step) and ignored.
+                let reff = argv
+                    .iter()
+                    .skip(2)
+                    .find(|a| !a.starts_with('-'))
+                    .map(|s| s.to_string())
+                    .or_else(|| self.target_reff());
+                let Some(reff) = reff else {
+                    self.status.error("no issue focused (or pass a ref)");
+                    return Ok(());
+                };
+                let req = match which {
+                    Special::Start => Request::IssueStart { reff },
+                    Special::Done => Request::IssueDone { reff },
+                    _ => Request::IssueStop { reff },
+                };
+                self.dispatch_request(req).await?;
+            }
+            Special::Id => self.dispatch_request(Request::Id).await?,
+            Special::Tui => self.status.info("you're already here"),
+            Special::Invite => self
+                .status
+                .error("the invite panel lands in stage 4 — run `lait invite` in a shell"),
+            Special::Watch => self
+                .status
+                .error("the log screen lands in stage 4 — run `lait watch` in a shell"),
+            Special::Workspaces | Special::WorkspacesForget | Special::WorkspacesPrune => self
+                .status
+                .error("the spaces screen lands in stage 3 — run `lait spaces` in a shell"),
+            Special::ConfigGet
+            | Special::ConfigSet
+            | Special::ConfigUnset
+            | Special::ConfigList => self
+                .status
+                .error("the config panel lands in stage 4 — run `lait config` in a shell"),
+            _ => self
+                .status
+                .error(format!("`{name}` is CLI-only — run it in a shell")),
+        }
+        Ok(())
+    }
+
+    /// Send a request and route the outcome: `Candidates` opens a
+    /// disambiguation picker that retries with the chosen ref (UI.md §3.2);
+    /// success lands a one-line summary and refreshes.
+    pub async fn dispatch_request(&mut self, req: Request) -> Result<()> {
+        let resp = self.req(req.clone()).await?;
+        match resp {
+            Response::Candidates { candidates } => {
+                let items: Vec<PickItem> = candidates
+                    .iter()
+                    .map(|c| PickItem {
+                        label: format!(
+                            "{}  {}",
+                            c.key_alias.clone().unwrap_or_else(|| c.reff.clone()),
+                            c.title
+                        ),
+                        value: c.reff.clone(),
+                    })
+                    .collect();
+                self.stack
+                    .push(OverlayLayer::Picker(Box::new(PickerState::new(
+                        "which issue?",
+                        items,
+                        PickIntent::Disambiguate {
+                            retry: Box::new(req),
+                        },
+                        false,
+                        HashSet::new(),
+                    ))));
+            }
+            Response::Error { message, .. } => self.status.error(message),
+            other => {
+                self.status.info(summarize_response(&other));
+                self.reload_board().await?;
+                self.refresh_peek().await?;
+                self.refresh_inbox_count().await;
+            }
+        }
+        Ok(())
+    }
+
+    // ---- pickers ----
+
+    /// The full issue view for a target — the peek's copy when it matches,
+    /// else a fetch (pre-checks must reflect current truth, not a guess).
+    async fn target_issue_view(&self, reff: &str) -> Option<IssueView> {
+        if let Some(p) = &self.peek {
+            if p.view.reff == reff {
+                return Some(p.view.clone());
+            }
+        }
+        match self
+            .req(Request::IssueView {
+                reff: reff.to_string(),
+            })
+            .await
+        {
+            Ok(Response::Issue(v)) => Some(*v),
+            _ => None,
+        }
+    }
+
+    fn picker_title(&self, verb: &str, targets: &[String]) -> String {
+        if targets.len() == 1 {
+            format!("{verb} {}", targets[0])
+        } else {
+            format!("{verb} {} issues", targets.len())
+        }
+    }
+
+    async fn open_assign_picker(&mut self) -> Result<()> {
+        let targets = self.bulk_targets();
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let members = match self.req(Request::Members).await? {
+            Response::Members { members } => members,
+            Response::Error { message, .. } => {
+                self.status.error(message);
+                return Ok(());
+            }
+            _ => Vec::new(),
+        };
+        let items: Vec<PickItem> = members
+            .iter()
+            .map(|mb| {
+                let name = if mb.alias.is_empty() {
+                    mb.key.short()
+                } else {
+                    mb.alias.clone()
+                };
+                PickItem {
+                    label: format!("{name}{}", if mb.me { "  (you)" } else { "" }),
+                    value: mb.key.as_str().to_string(),
+                }
+            })
+            .collect();
+        let mut precheck = HashSet::new();
+        if targets.len() == 1 {
+            if let Some(v) = self.target_issue_view(&targets[0]).await {
+                precheck = v.assignees.iter().map(|u| u.as_str().to_string()).collect();
+            }
+        }
+        let title = self.picker_title("assign", &targets);
+        self.stack
+            .push(OverlayLayer::Picker(Box::new(PickerState::new(
+                title,
+                items,
+                PickIntent::Assign { targets },
+                true,
+                precheck,
+            ))));
+        Ok(())
+    }
+
+    async fn open_label_picker(&mut self) -> Result<()> {
+        let targets = self.bulk_targets();
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let labels = match self.req(Request::LabelList).await? {
+            Response::Labels { labels } => labels,
+            Response::Error { message, .. } => {
+                self.status.error(message);
+                return Ok(());
+            }
+            _ => Vec::new(),
+        };
+        if labels.is_empty() {
+            self.status
+                .info("no labels yet — create one via `:` (label REF +name)");
+            return Ok(());
+        }
+        let items: Vec<PickItem> = labels
+            .iter()
+            .map(|l| PickItem {
+                label: l.name.clone(),
+                value: l.name.clone(),
+            })
+            .collect();
+        let mut precheck = HashSet::new();
+        if targets.len() == 1 {
+            if let Some(v) = self.target_issue_view(&targets[0]).await {
+                precheck = v.label_names.iter().cloned().collect();
+            }
+        }
+        let title = self.picker_title("label", &targets);
+        self.stack
+            .push(OverlayLayer::Picker(Box::new(PickerState::new(
+                title,
+                items,
+                PickIntent::Label { targets },
+                true,
+                precheck,
+            ))));
+        Ok(())
+    }
+
+    fn open_status_picker(&mut self) {
+        let targets = self.bulk_targets();
+        let Some(b) = &self.board else {
+            return;
+        };
+        if targets.is_empty() {
+            return;
+        }
+        let items: Vec<PickItem> = b
+            .columns
+            .iter()
+            .map(|c| PickItem {
+                label: c.state.name.clone(),
+                value: c.state.id.clone(),
+            })
+            .collect();
+        let title = self.picker_title("status", &targets);
+        self.stack
+            .push(OverlayLayer::Picker(Box::new(PickerState::new(
+                title,
+                items,
+                PickIntent::Status { targets },
+                false,
+                HashSet::new(),
+            ))));
+    }
+
+    fn open_priority_picker(&mut self) {
+        let targets = self.bulk_targets();
+        if targets.is_empty() {
+            return;
+        }
+        let items: Vec<PickItem> = [
+            Priority::None,
+            Priority::Low,
+            Priority::Medium,
+            Priority::High,
+            Priority::Urgent,
+        ]
+        .iter()
+        .map(|p| PickItem {
+            label: p.as_str().to_string(),
+            value: p.as_str().to_string(),
+        })
+        .collect();
+        let title = self.picker_title("priority", &targets);
+        self.stack
+            .push(OverlayLayer::Picker(Box::new(PickerState::new(
+                title,
+                items,
+                PickIntent::Priority { targets },
+                false,
+                HashSet::new(),
+            ))));
+    }
+
+    fn open_move_picker(&mut self) {
+        let targets = self.bulk_targets();
+        if targets.is_empty() || self.projects.is_empty() {
+            return;
+        }
+        let items: Vec<PickItem> = self
+            .projects
+            .iter()
+            .map(|p| PickItem {
+                label: format!("{}  {}", p.key, p.name),
+                value: p.key.clone(),
+            })
+            .collect();
+        let title = self.picker_title("move", &targets);
+        self.stack
+            .push(OverlayLayer::Picker(Box::new(PickerState::new(
+                title,
+                items,
+                PickIntent::MoveProject { targets },
+                false,
+                HashSet::new(),
+            ))));
+    }
+
+    /// Execute a submitted picker (the layer is already popped).
+    pub async fn submit_picker(&mut self, p: PickerState) -> Result<()> {
+        match p.intent.clone() {
+            PickIntent::Disambiguate { retry } => {
+                if let Some(it) = p.selected() {
+                    let req = substitute_reff(*retry, &it.value);
+                    self.dispatch_request(req).await?;
+                }
+            }
+            PickIntent::Status { targets } => {
+                let Some(value) = p.selected().map(|i| i.value.clone()) else {
+                    return Ok(());
+                };
+                let mut reqs = Vec::new();
+                for reff in &targets {
+                    if let Some(doc) = self.doc_id_for_reff(reff) {
+                        self.overlay.set(&doc, "status", &value);
+                    }
+                    reqs.push(Request::IssueEdit {
+                        reff: reff.clone(),
+                        title: None,
+                        status: Some(value.clone()),
+                        priority: None,
+                        description: None,
+                    });
+                }
+                self.run_requests(reqs).await?;
+            }
+            PickIntent::Priority { targets } => {
+                let Some(value) = p.selected().map(|i| i.value.clone()) else {
+                    return Ok(());
+                };
+                let reqs = targets
+                    .iter()
+                    .map(|reff| Request::IssueEdit {
+                        reff: reff.clone(),
+                        title: None,
+                        status: None,
+                        priority: Some(value.clone()),
+                        description: None,
+                    })
+                    .collect();
+                self.run_requests(reqs).await?;
+            }
+            PickIntent::MoveProject { targets } => {
+                let Some(value) = p.selected().map(|i| i.value.clone()) else {
+                    return Ok(());
+                };
+                let reqs = targets
+                    .iter()
+                    .map(|reff| Request::IssueMove {
+                        reff: reff.clone(),
+                        project: Some(value.clone()),
+                        pos: None,
+                    })
+                    .collect();
+                self.run_requests(reqs).await?;
+            }
+            PickIntent::Assign { targets } => {
+                let added: Vec<String> = p.checked.difference(&p.precheck).cloned().collect();
+                let removed: Vec<String> = p.precheck.difference(&p.checked).cloned().collect();
+                let mut reqs = Vec::new();
+                if targets.len() == 1 {
+                    if !added.is_empty() {
+                        reqs.push(Request::Assign {
+                            reff: targets[0].clone(),
+                            who: added,
+                            add: true,
+                        });
+                    }
+                    if !removed.is_empty() {
+                        reqs.push(Request::Assign {
+                            reff: targets[0].clone(),
+                            who: removed,
+                            add: false,
+                        });
+                    }
+                } else {
+                    // Bulk assign is add-only: removing from N issues you
+                    // can't see the current assignees of would be a guess.
+                    let who: Vec<String> = p.checked.iter().cloned().collect();
+                    if !who.is_empty() {
+                        for reff in &targets {
+                            reqs.push(Request::Assign {
+                                reff: reff.clone(),
+                                who: who.clone(),
+                                add: true,
+                            });
+                        }
+                    }
+                }
+                if reqs.is_empty() {
+                    self.status.info("no changes");
+                    return Ok(());
+                }
+                self.run_requests(reqs).await?;
+            }
+            PickIntent::Label { targets } => {
+                let added: Vec<String> = p.checked.difference(&p.precheck).cloned().collect();
+                let removed: Vec<String> = p.precheck.difference(&p.checked).cloned().collect();
+                let mut reqs = Vec::new();
+                if targets.len() == 1 {
+                    if !added.is_empty() || !removed.is_empty() {
+                        reqs.push(Request::Label {
+                            reff: targets[0].clone(),
+                            add: added,
+                            remove: removed,
+                        });
+                    }
+                } else {
+                    let add: Vec<String> = p.checked.iter().cloned().collect();
+                    if !add.is_empty() {
+                        for reff in &targets {
+                            reqs.push(Request::Label {
+                                reff: reff.clone(),
+                                add: add.clone(),
+                                remove: Vec::new(),
+                            });
+                        }
+                    }
+                }
+                if reqs.is_empty() {
+                    self.status.info("no changes");
+                    return Ok(());
+                }
+                self.run_requests(reqs).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Execute a confirmed destructive action (the layer is already popped).
+    pub async fn run_confirm(&mut self, intent: ConfirmIntent) -> Result<()> {
+        match intent {
+            ConfirmIntent::DeleteIssues { targets } => {
+                if self
+                    .peek
+                    .as_ref()
+                    .is_some_and(|pk| targets.contains(&pk.view.reff))
+                {
+                    self.peek = None;
+                }
+                let reqs: Vec<Request> = targets
+                    .into_iter()
+                    .map(|reff| Request::IssueDelete { reff })
+                    .collect();
+                self.run_requests(reqs).await?;
+            }
+        }
+        Ok(())
+    }
+
+    // ---- reorder (J/K, UI.md §5.1) ----
+
+    /// Swap the focused card with its column neighbor: optimistic local swap,
+    /// then `IssueMove` anchored on the neighbor; an error reloads.
+    async fn reorder(&mut self, down: bool) -> Result<()> {
+        let (reff, anchor, my_doc, other_doc, other_idx) = {
+            let rows = self.column_rows(self.col_idx);
+            let n = rows.len();
+            if n < 2 {
+                return Ok(());
+            }
+            let cur = self.row_idx.min(n - 1);
+            if (down && cur + 1 >= n) || (!down && cur == 0) {
+                return Ok(());
+            }
+            let other = if down { cur + 1 } else { cur - 1 };
+            (
+                rows[cur].reff.clone(),
+                rows[other].reff.clone(),
+                rows[cur].doc_id.clone(),
+                rows[other].doc_id.clone(),
+                other,
+            )
+        };
+        if let Some(b) = &mut self.board {
+            if let Some(col) = b.columns.get_mut(self.col_idx) {
+                let i = col.rows.iter().position(|x| x.doc_id == my_doc);
+                let j = col.rows.iter().position(|x| x.doc_id == other_doc);
+                if let (Some(i), Some(j)) = (i, j) {
+                    col.rows.swap(i, j);
+                }
+            }
+        }
+        self.row_idx = other_idx;
+        let pos = if down {
+            BoardPos::After { reff: anchor }
+        } else {
+            BoardPos::Before { reff: anchor }
+        };
+        let resp = self
+            .req(Request::IssueMove {
+                reff,
+                project: None,
+                pos: Some(pos),
+            })
+            .await?;
+        if let Response::Error { message, .. } = resp {
+            self.status.error(message);
+            self.reload_board().await?;
+        }
+        Ok(())
+    }
+
+    fn doc_id_for_reff(&self, reff: &str) -> Option<String> {
+        if let Some(b) = &self.board {
+            for c in &b.columns {
+                for r in &c.rows {
+                    if r.reff == reff {
+                        return Some(r.doc_id.as_str().to_string());
+                    }
+                }
+            }
+        }
+        if let Some(p) = &self.peek {
+            if p.view.reff == reff {
+                return Some(p.view.doc_id.as_str().to_string());
+            }
+        }
+        None
     }
 
     /// Submit an editor layer's content (the intent→Request mapping carried
@@ -829,5 +1523,154 @@ impl App {
                 _ => None,
             },
         }
+    }
+
+    /// Feed a key to the top palette layer; `Some(line)` on submit (popped).
+    pub fn handle_palette_key(&mut self, ev: crossterm::event::KeyEvent) -> Option<String> {
+        use super::palette::PaletteOutcome;
+        let outcome = match self.stack.last_mut() {
+            Some(OverlayLayer::Palette(p)) => p.handle_key(ev),
+            _ => return None,
+        };
+        match outcome {
+            PaletteOutcome::Consumed => None,
+            PaletteOutcome::Cancel => {
+                self.stack.pop();
+                None
+            }
+            PaletteOutcome::Submit(line) => {
+                self.stack.pop();
+                Some(line)
+            }
+        }
+    }
+
+    /// Feed a key to the top picker layer; `Some(state)` on submit (popped).
+    pub fn handle_picker_key(&mut self, ev: crossterm::event::KeyEvent) -> Option<PickerState> {
+        use super::widgets::picker::PickerOutcome;
+        let outcome = match self.stack.last_mut() {
+            Some(OverlayLayer::Picker(p)) => p.handle_key(ev),
+            _ => return None,
+        };
+        match outcome {
+            PickerOutcome::Consumed => None,
+            PickerOutcome::Cancel => {
+                self.stack.pop();
+                None
+            }
+            PickerOutcome::Submit => match self.stack.pop() {
+                Some(OverlayLayer::Picker(p)) => Some(*p),
+                _ => None,
+            },
+        }
+    }
+
+    /// Feed a key to the top confirm layer; `Some(intent)` on yes (popped).
+    pub fn handle_confirm_key(&mut self, ev: crossterm::event::KeyEvent) -> Option<ConfirmIntent> {
+        use super::widgets::confirm::ConfirmOutcome;
+        let outcome = match self.stack.last_mut() {
+            Some(OverlayLayer::Confirm(c)) => c.handle_key(ev),
+            _ => return None,
+        };
+        match outcome {
+            ConfirmOutcome::Consumed => None,
+            ConfirmOutcome::No => {
+                self.stack.pop();
+                None
+            }
+            ConfirmOutcome::Yes => match self.stack.pop() {
+                Some(OverlayLayer::Confirm(c)) => Some(c.intent),
+                _ => None,
+            },
+        }
+    }
+
+    /// The `/` filter edits `filter_text` live; Enter keeps it, Esc restores.
+    pub fn handle_filter_key(&mut self, ev: crossterm::event::KeyEvent) {
+        use crossterm::event::KeyCode;
+        match ev.code {
+            KeyCode::Esc => {
+                if let Some(OverlayLayer::Filter { prev }) = self.stack.pop() {
+                    self.filter_text = prev;
+                }
+                self.clamp_selection();
+            }
+            KeyCode::Enter => {
+                self.stack.pop();
+            }
+            KeyCode::Backspace => {
+                self.filter_text.pop();
+                self.clamp_selection();
+            }
+            KeyCode::Char(c) => {
+                self.filter_text.push(c);
+                self.clamp_selection();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Rebuild a request with its ref swapped for the disambiguated canonical one
+/// (retry path of `Response::Candidates`). Requests without a ref pass through.
+pub fn substitute_reff(req: Request, new: &str) -> Request {
+    let reff = new.to_string();
+    match req {
+        Request::IssueEdit {
+            title,
+            status,
+            priority,
+            description,
+            ..
+        } => Request::IssueEdit {
+            reff,
+            title,
+            status,
+            priority,
+            description,
+        },
+        Request::IssueMove { project, pos, .. } => Request::IssueMove { reff, project, pos },
+        Request::Assign { who, add, .. } => Request::Assign { reff, who, add },
+        Request::Label { add, remove, .. } => Request::Label { reff, add, remove },
+        Request::Comment { body, .. } => Request::Comment { reff, body },
+        Request::IssueDelete { .. } => Request::IssueDelete { reff },
+        Request::IssueStart { .. } => Request::IssueStart { reff },
+        Request::IssueDone { .. } => Request::IssueDone { reff },
+        Request::IssueStop { .. } => Request::IssueStop { reff },
+        Request::IssueView { .. } => Request::IssueView { reff },
+        Request::History { .. } => Request::History { reff },
+        other => other,
+    }
+}
+
+/// One status-line summary per response shape (the palette's success line).
+pub fn summarize_response(resp: &Response) -> String {
+    match resp {
+        Response::Ok { message } => message.clone().unwrap_or_else(|| "ok".into()),
+        Response::Ref { reff } => format!("✓ {reff}"),
+        Response::Issue(v) => format!(
+            "{}  {}",
+            v.key_alias.as_deref().unwrap_or(&v.reff),
+            v.status
+        ),
+        Response::List { rows } => format!("{} issue(s)", rows.len()),
+        Response::Board(b) => format!(
+            "{}: {} issue(s)",
+            b.project.key,
+            b.columns.iter().map(|c| c.rows.len()).sum::<usize>()
+        ),
+        Response::Activity { events, .. } => format!("{} event(s)", events.len()),
+        Response::Inbox { unread, .. } => format!("{unread} unread"),
+        Response::Projects { projects } => format!("{} project(s)", projects.len()),
+        Response::Labels { labels } => format!("{} label(s)", labels.len()),
+        Response::Members { members } => format!("{} member(s)", members.len()),
+        Response::JoinRequests { requests } => format!("{} pending request(s)", requests.len()),
+        Response::Seeds { seeds } => format!("{} seed(s)", seeds.len()),
+        Response::Status(s) => format!("{} peer(s) online", s.online_peers),
+        Response::Diagnosis(d) => d.summary.clone(),
+        Response::Text { text } => text.lines().next().unwrap_or("").to_string(),
+        Response::Events { events, .. } => format!("{} event(s)", events.len()),
+        Response::Who { peers } => format!("{} peer(s)", peers.len()),
+        Response::Candidates { .. } | Response::Error { .. } => String::new(),
     }
 }

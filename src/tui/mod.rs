@@ -12,7 +12,8 @@ pub mod keymap;
 mod palette;
 mod panels;
 mod theme;
-mod widgets;
+mod util;
+pub(crate) mod widgets;
 
 use std::io::Stdout;
 use std::path::Path;
@@ -191,18 +192,28 @@ fn draw(f: &mut Frame, app: &mut App) {
     };
     widgets::statusbar::draw(f, app, chunks[2], ctx);
 
-    // Overlay stack renders last (regions pushed last = hit first).
+    // Overlay stack renders in order (later layers' regions are pushed last,
+    // so the backwards hit-scan gives them clicks first). The stack is taken
+    // out so layer draw fns can borrow `app` for theme + regions.
     let body = chunks[1];
-    if app.stack.iter().any(|l| matches!(l, OverlayLayer::Help)) {
-        let hctx = event::underlying_ctx(app);
-        panels::help::draw(f, app, body, hctx);
-    }
-    if matches!(app.stack.last(), Some(OverlayLayer::Editor(_))) {
-        let theme = app.theme;
-        if let Some(OverlayLayer::Editor(ed)) = app.stack.last_mut() {
-            ed.draw(f, body, &theme);
+    let mut stack = std::mem::take(&mut app.stack);
+    for layer in &mut stack {
+        match layer {
+            OverlayLayer::Help => {
+                let hctx = event::underlying_ctx(app);
+                panels::help::draw(f, app, body, hctx);
+            }
+            OverlayLayer::Editor(ed) => {
+                let theme = app.theme;
+                ed.draw(f, body, &theme);
+            }
+            OverlayLayer::Palette(p) => p.draw(f, app, body),
+            OverlayLayer::Picker(p) => p.draw(f, app, body),
+            OverlayLayer::Confirm(c) => c.draw(f, app, body),
+            OverlayLayer::Filter { .. } => {} // rendered by the status bar
         }
     }
+    app.stack = stack;
 }
 
 fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
@@ -269,6 +280,18 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
     if app.inbox_unread > 0 {
         spans.push(Span::styled(
             format!("  inbox {}", app.inbox_unread),
+            app.theme.accent_style(),
+        ));
+    }
+    if !app.selection.is_empty() {
+        spans.push(Span::styled(
+            format!("  ▣ {} selected", app.selection.len()),
+            app.theme.accent_style(),
+        ));
+    }
+    if !app.filter_text.is_empty() {
+        spans.push(Span::styled(
+            format!("  /{}", app.filter_text),
             app.theme.accent_style(),
         ));
     }
@@ -419,6 +442,7 @@ mod tests {
                 created_at: 0,
                 provisional: false,
             },
+            history: Vec::new(),
             scroll: 0,
             expanded: false,
             focused: false,
@@ -462,6 +486,154 @@ mod tests {
         let out = rendered(&mut app);
         assert!(out.contains("enter runs the highlighted action"));
         assert!(out.contains("start"), "work-state verbs discoverable");
+    }
+
+    #[test]
+    fn palette_overlay_renders_suggestions() {
+        let mut app = fixture();
+        app.stack.push(OverlayLayer::Palette(
+            Box::new(palette::PaletteState::new()),
+        ));
+        let out = rendered(&mut app);
+        assert!(out.contains(": command"), "palette title");
+        assert!(out.contains("tab complete"), "hint line");
+        assert!(out.contains("board"), "top-level verbs listed");
+    }
+
+    #[test]
+    fn picker_overlay_renders_marks_and_filter() {
+        use widgets::picker::{PickIntent, PickItem, PickerState};
+        let mut app = fixture();
+        let mut checked = std::collections::HashSet::new();
+        checked.insert("k1".to_string());
+        app.stack
+            .push(OverlayLayer::Picker(Box::new(PickerState::new(
+                "assign DEMO-1",
+                vec![
+                    PickItem {
+                        label: "alice".into(),
+                        value: "k1".into(),
+                    },
+                    PickItem {
+                        label: "bob".into(),
+                        value: "k2".into(),
+                    },
+                ],
+                PickIntent::Assign {
+                    targets: vec!["iss_DEMO-1".into()],
+                },
+                true,
+                checked,
+            ))));
+        let out = rendered(&mut app);
+        assert!(out.contains("assign DEMO-1"));
+        assert!(out.contains("▣ alice"), "pre-checked assignee");
+        assert!(out.contains("☐ bob"), "unchecked member");
+        assert!(out.contains("space toggle"));
+    }
+
+    #[test]
+    fn selection_marks_cards_and_header_badge() {
+        let mut app = fixture();
+        futures_lite_block_on(async {
+            app.apply(action::Action::ToggleSelect).await.unwrap();
+        });
+        assert_eq!(app.selection, vec!["iss_DEMO-1".to_string()]);
+        assert_eq!(app.bulk_targets(), vec!["iss_DEMO-1".to_string()]);
+        let out = rendered(&mut app);
+        assert!(out.contains("▣ DEMO-1"), "card carries the mark");
+        assert!(out.contains("1 selected"), "header badge");
+    }
+
+    #[test]
+    fn filter_layer_takes_over_the_statusbar() {
+        let mut app = fixture();
+        app.stack.push(OverlayLayer::Filter {
+            prev: String::new(),
+        });
+        app.filter_text = "rec".into();
+        let out = rendered(&mut app);
+        assert!(out.contains("enter keep"), "filter input hint");
+        assert!(!out.contains("[c] new"), "legend hidden while editing");
+    }
+
+    #[test]
+    fn delete_asks_for_confirmation() {
+        let mut app = fixture();
+        futures_lite_block_on(async {
+            app.apply(action::Action::Delete).await.unwrap();
+        });
+        let out = rendered(&mut app);
+        assert!(out.contains("Delete iss_DEMO-1?"), "{out}");
+        assert!(out.contains("y confirm"));
+    }
+
+    #[test]
+    fn substitute_reff_swaps_only_the_ref() {
+        use crate::control::Request;
+        let req = Request::Label {
+            reff: "amb".into(),
+            add: vec!["bug".into()],
+            remove: vec![],
+        };
+        match app::substitute_reff(req, "iss_9") {
+            Request::Label { reff, add, .. } => {
+                assert_eq!(reff, "iss_9");
+                assert_eq!(add, vec!["bug".to_string()]);
+            }
+            _ => panic!("variant preserved"),
+        }
+        match app::substitute_reff(Request::ProjectList, "iss_9") {
+            Request::ProjectList => {}
+            _ => panic!("ref-less requests pass through"),
+        }
+    }
+
+    #[test]
+    fn peek_history_section_renders() {
+        let mut app = fixture();
+        app.peek = Some(app::PeekState {
+            view: crate::dto::IssueView {
+                schema_version: SCHEMA_VERSION,
+                reff: "iss_DEMO-1".into(),
+                doc_id: DocId::mint(&SystemUlidSource),
+                workspace_id: crate::ids::WorkspaceId::mint(&SystemUlidSource),
+                project_id: app.projects[0].id.clone(),
+                project_key: Some("DEMO".into()),
+                key_alias: Some("DEMO-1".into()),
+                title: "fix login race".into(),
+                description: String::new(),
+                status: "backlog".into(),
+                priority: Priority::High,
+                assignees: vec![],
+                labels: vec![],
+                label_names: vec![],
+                comments: vec![],
+                created_by: crate::ids::UserId::from_key_string("a".repeat(64)),
+                created_at: 0,
+                provisional: false,
+            },
+            history: vec![crate::dto::ActivityEvent {
+                seq: 1,
+                doc_id: None,
+                reff: "iss_DEMO-1".into(),
+                kind: "edit".into(),
+                changes: vec![],
+                actor: None,
+                actor_nick: "mira".into(),
+                text: "status backlog → in_progress".into(),
+                ts: 0,
+                collision: true,
+            }],
+            scroll: 0,
+            expanded: false,
+            focused: false,
+        });
+        let out = rendered(&mut app);
+        assert!(out.contains("history"), "timeline section title");
+        assert!(out.contains("status backlog → in_progress"));
+        assert!(out.contains("mira"));
+        assert!(out.contains("⚠"), "collision marker");
     }
 
     #[test]

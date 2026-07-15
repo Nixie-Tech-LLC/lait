@@ -71,6 +71,32 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
             ]));
         }
     }
+    // The derived activity timeline (Request::History) — chronological, with
+    // the non-blocking LWW collision note surfaced as ⚠ (A§9).
+    if !peek.history.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::styled("history", theme.title()));
+        for e in &peek.history {
+            let mut spans = vec![Span::styled(
+                format!("{:<9} ", super::super::util::ago(e.ts)),
+                theme.dim_style(),
+            )];
+            if e.collision {
+                spans.push(Span::styled(
+                    "⚠ ",
+                    ratatui::style::Style::default().fg(theme.warn),
+                ));
+            }
+            if !e.actor_nick.is_empty() {
+                spans.push(Span::styled(
+                    format!("{} ", e.actor_nick),
+                    theme.accent_style(),
+                ));
+            }
+            spans.push(Span::raw(e.text.clone()));
+            lines.push(Line::from(spans));
+        }
+    }
 
     let focused = peek.focused;
     let scroll = peek.scroll;
