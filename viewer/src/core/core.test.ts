@@ -222,6 +222,47 @@ describe("the core has no privileged path", () => {
   });
 });
 
+describe("the palette's cmdk filter bridge", () => {
+  // `score` adapts our scorer to cmdk's contract, and the two disagree in a way
+  // that fails silently: ours returns null-for-no-match over an unbounded range,
+  // cmdk reads 0 as "hide". A legitimate match CAN score <= 0 (the length
+  // penalty), so without the shift a real hit vanishes from the palette.
+  it("never returns 0 for a real match, however long the title", () => {
+    const long = "Configure the extremely verbose thing with a very long name indeed";
+    expect(fuzzyScore("c", long)).toBeLessThanOrEqual(0); // the trap
+    expect(paletteScore(long, "c")).toBeGreaterThan(0); // the fix
+  });
+
+  it("returns 0 only for an actual non-match", () => {
+    expect(paletteScore("New issue", "zzz")).toBe(0);
+  });
+
+  it("shows everything for an empty query", () => {
+    expect(paletteScore("anything", "")).toBeGreaterThan(0);
+    expect(paletteScore("anything", "   ")).toBeGreaterThan(0);
+  });
+
+  it("ranks a better match higher, so cmdk sorts the way we do", () => {
+    expect(paletteScore("New issue", "ni")).toBeGreaterThan(paletteScore("Toggle sidebar", "ni"));
+  });
+
+  it("matches on the command id via keywords", () => {
+    expect(paletteScore("New issue", "issue.cr", ["issue.create"])).toBeGreaterThan(0);
+  });
+});
+
+/** Mirror of `ui/Palette.tsx`'s `score` — kept here so the contract is pinned
+ *  without dragging React into a unit test. */
+function paletteScore(value: string, search: string, keywords?: string[]): number {
+  if (!search.trim()) return 1;
+  let best: number | null = null;
+  for (const hay of [value, ...(keywords ?? [])]) {
+    const s = fuzzyScore(search, hay);
+    if (s !== null && (best === null || s > best)) best = s;
+  }
+  return best === null ? 0 : Math.max(best + 100, 1);
+}
+
 describe("fuzzy ranking", () => {
   it("prefers prefixes and word boundaries over scattered hits", () => {
     expect(fuzzyScore("sta", "start")!).toBeGreaterThan(fuzzyScore("sta", "instant")!);

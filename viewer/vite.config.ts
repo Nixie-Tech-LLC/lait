@@ -1,5 +1,6 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 
 /**
  * The client builds straight into `src/serve/assets`, which is **committed**.
@@ -16,7 +17,7 @@ import react from "@vitejs/plugin-react";
  * guarded by CI diffing a rebuild.
  */
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
   build: {
     outDir: "../src/serve/assets",
     emptyOutDir: true,

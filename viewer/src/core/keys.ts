@@ -163,14 +163,18 @@ export function formatBinding(binding: Binding, opts: { glyphs?: boolean } = {})
 }
 
 function formatChord(c: Chord, { glyphs = false }: { glyphs?: boolean }): string {
+  // Two audiences, two spellings. `glyphs` is for a human reading a key hint —
+  // macOS renders modifiers as symbols that need no separator (⌘K), everything
+  // else spells them out (Ctrl+K). Without `glyphs` this is the *notation*: the
+  // exact lowercase string `parseBinding` accepts, so the loop stays closed and
+  // what the `?` overlay documents is what an override can be written with.
   const mods: string[] = [];
-  if (c.ctrl) mods.push(glyphs && IS_MAC ? "⌃" : "ctrl");
-  if (c.alt) mods.push(glyphs && IS_MAC ? "⌥" : "alt");
+  if (c.ctrl) mods.push(glyphs ? (IS_MAC ? "⌃" : "Ctrl") : "ctrl");
+  if (c.alt) mods.push(glyphs ? (IS_MAC ? "⌥" : "Alt") : "alt");
   if (c.shift) mods.push(glyphs ? "⇧" : "shift");
   if (c.meta) mods.push(glyphs ? "⌘" : "cmd");
   const key = glyphs ? (GLYPH[c.key] ?? c.key.toUpperCase()) : (NAMED_INVERSE[c.key] ?? c.key);
-  // On mac the glyphs read as one token (⌘K); elsewhere they need separators.
-  const sep = glyphs && IS_MAC ? "" : glyphs ? "+" : "+";
+  const sep = glyphs && IS_MAC ? "" : "+";
   return [...mods, key].join(sep);
 }
 

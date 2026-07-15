@@ -1,129 +1,120 @@
+@import "tailwindcss";
+
 /**
- * Design tokens, then a thin base. Everything downstream reads these variables —
- * no component invents a colour or a spacing value.
+ * The design system — one file, and the only place a colour or a spacing value is
+ * decided.
  *
- * Dark-first with a light counterpart, both driven by `prefers-color-scheme` and
- * overridable by a `data-theme` attribute on :root (the TUI's `tui.theme` had the
- * same escape hatch; the browser's is the same idea with a different home).
+ * Tailwind v4's `@theme` *is* CSS custom properties: every token below emits a
+ * `--color-*` variable **and** generates the utility that reads it. So there is no
+ * second source of truth to keep in sync — `bg-raised` and `var(--color-raised)`
+ * are the same token, and a redesign is an edit to this block rather than a sweep
+ * through components.
+ *
+ * Light/dark is `light-dark()` rather than duplicated palettes. It reads from
+ * `color-scheme`, so the whole theme flips by setting one property — the media
+ * query handles the default and `[data-theme]` handles a manual override, both
+ * without restating a single colour.
  */
 
-:root {
-  /* Spacing: a 4px scale. Every gap/pad in the app is one of these. */
-  --s-1: 4px;
-  --s-2: 8px;
-  --s-3: 12px;
-  --s-4: 16px;
-  --s-5: 24px;
-  --s-6: 32px;
+@theme {
+  /* Semantic, not literal: components ask for `raised` or `line`, never a hex.
+     Renaming a shade must not mean touching a component. */
+  --color-bg: light-dark(#ffffff, #0b0b0d);
+  --color-raised: light-dark(#fafafa, #131316);
+  --color-hover: light-dark(#f2f2f4, #1a1a1f);
+  --color-active: light-dark(#e9e9ee, #202027);
+  --color-line: light-dark(#e6e6ea, #26262d);
+  --color-line-strong: light-dark(#d2d2d9, #34343d);
 
-  --radius: 6px;
+  --color-fg: light-dark(#17171a, #e9e9ec);
+  --color-dim: light-dark(#5c5c66, #a0a0aa);
+  --color-mute: light-dark(#8b8b95, #6e6e78);
+
+  --color-accent: light-dark(#2f6bff, #5b8cff);
+  --color-accent-fg: #ffffff;
+  --color-danger: light-dark(#d1242f, #f0616d);
+  --color-ok: light-dark(#1a7f37, #3fb950);
+  --color-warn: light-dark(#9a6700, #d29922);
+
+  /* Priority + status accents, so a glyph never hard-codes a colour. */
+  --color-urgent: light-dark(#d1242f, #f0616d);
+  --color-high: light-dark(#c2410c, #fb923c);
+  --color-medium: light-dark(#a16207, #facc15);
+  --color-low: light-dark(#64748b, #94a3b8);
+
+  /* A 4px rhythm. `p-2` is 8px, `gap-3` is 12px — the scale the tracker's density
+     depends on; rows are tight and the spacing has to be predictable. */
+  --spacing: 4px;
+
+  --radius-sm: 4px;
+  --radius-DEFAULT: 6px;
   --radius-lg: 10px;
 
-  --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
 
-  /* Type scale. */
-  --t-xs: 11px;
-  --t-sm: 12px;
-  --t-md: 13px;
-  --t-lg: 15px;
+  /* Dense-UI type scale: 13px is the body size a tracker actually reads at. */
+  --text-2xs: 10px;
+  --text-2xs--line-height: 14px;
+  --text-xs: 11px;
+  --text-xs--line-height: 16px;
+  --text-sm: 12px;
+  --text-sm--line-height: 16px;
+  --text-base: 13px;
+  --text-base--line-height: 20px;
+  --text-lg: 15px;
+  --text-lg--line-height: 22px;
 
-  --dur: 120ms;
-  --ease: cubic-bezier(0.2, 0, 0.2, 1);
-
-  color-scheme: dark light;
+  --ease-out: cubic-bezier(0.2, 0, 0.2, 1);
+  --shadow-overlay: light-dark(0 8px 30px rgb(0 0 0 / 0.12), 0 8px 30px rgb(0 0 0 / 0.5));
 }
 
-/* Dark (default). */
-:root,
-:root[data-theme="dark"] {
-  --bg: #0b0b0d;
-  --bg-raised: #131316;
-  --bg-hover: #1a1a1f;
-  --bg-active: #202027;
-  --line: #26262d;
-  --line-strong: #34343d;
-  --fg: #e9e9ec;
-  --fg-dim: #a0a0aa;
-  --fg-mute: #6e6e78;
-  --accent: #5b8cff;
-  --accent-fg: #ffffff;
-  --danger: #f0616d;
-  --ok: #3fb950;
-  --warn: #d29922;
-  --shadow: 0 8px 30px rgb(0 0 0 / 0.5);
+/* Dark by default; the OS decides unless the user overrode it. `color-scheme` is
+   the single switch every `light-dark()` above reads — and it also fixes native
+   scrollbars and form controls for free, which a class-based dark mode does not. */
+:root {
+  color-scheme: dark;
 }
-
 @media (prefers-color-scheme: light) {
-  :root:not([data-theme="dark"]) {
-    --bg: #ffffff;
-    --bg-raised: #fafafa;
-    --bg-hover: #f2f2f4;
-    --bg-active: #e9e9ee;
-    --line: #e6e6ea;
-    --line-strong: #d2d2d9;
-    --fg: #17171a;
-    --fg-dim: #5c5c66;
-    --fg-mute: #8b8b95;
-    --accent: #2f6bff;
-    --accent-fg: #ffffff;
-    --danger: #d1242f;
-    --ok: #1a7f37;
-    --warn: #9a6700;
-    --shadow: 0 8px 30px rgb(0 0 0 / 0.12);
+  :root {
+    color-scheme: light;
+  }
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-bg text-fg font-sans text-base antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* A keyboard-first app must never hide focus — but it should not paint rings on
+     mouse clicks either. `:focus-visible` is exactly that distinction, and it is
+     why no component sets `outline: none`. */
+  :focus-visible {
+    @apply outline-accent rounded-sm outline-2 outline-offset-2;
+  }
+
+  ::selection {
+    @apply bg-accent/25;
   }
 }
 
-:root[data-theme="light"] {
-  --bg: #ffffff;
-  --bg-raised: #fafafa;
-  --bg-hover: #f2f2f4;
-  --bg-active: #e9e9ee;
-  --line: #e6e6ea;
-  --line-strong: #d2d2d9;
-  --fg: #17171a;
-  --fg-dim: #5c5c66;
-  --fg-mute: #8b8b95;
-  --accent: #2f6bff;
-  --accent-fg: #ffffff;
-  --danger: #d1242f;
-  --ok: #1a7f37;
-  --warn: #9a6700;
-  --shadow: 0 8px 30px rgb(0 0 0 / 0.12);
-}
-
-* {
-  box-sizing: border-box;
-}
-
-html,
-body,
-#root {
-  height: 100%;
-}
-
-body {
-  margin: 0;
-  background: var(--bg);
-  color: var(--fg);
-  font: var(--t-md) / 1.5 var(--font);
-  -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
-}
-
-/* A keyboard-first app must never hide focus — but it also shouldn't paint rings
-   on mouse clicks. :focus-visible is exactly that distinction. */
-:focus {
-  outline: none;
-}
-:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-  border-radius: var(--radius);
-}
-
 @media (prefers-reduced-motion: reduce) {
-  * {
+  *,
+  *::before,
+  *::after {
     animation-duration: 0.01ms !important;
     transition-duration: 0.01ms !important;
   }
