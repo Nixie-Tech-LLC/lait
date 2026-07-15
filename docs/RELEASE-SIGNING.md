@@ -203,9 +203,14 @@ signs the source, distributors build from it.
 Use a **master key kept offline** and a **signing subkey** in CI, so a leaked CI
 secret is revocable without losing the identity.
 
+The key's identity (UID) is a freeform brand string — we use **Nixie Software** —
+and is deliberately independent of the legal entity ("Nixie Solutions LLC") that
+the Apple/Azure code-signing certs require. A GPG UID vouches for source
+provenance, not a legal signer.
+
 1. **Generate the key** (do this on a trusted machine, once):
    ```sh
-   gpg --quick-generate-key "lait release signing (Nixie Solutions LLC) <releases@…>" ed25519 sign 2y
+   gpg --quick-generate-key "Nixie Software (lait release signing) <releases@…>" ed25519 sign 2y
    FPR=<the printed fingerprint>
    # a dedicated signing SUBKEY with its own 1-year expiry:
    gpg --quick-add-key "$FPR" ed25519 sign 1y
@@ -303,19 +308,21 @@ binaries.
    confirm `dist plan` matches. Releases work, unsigned, on the new architecture.
 2. ✅ **Done** (`b3bc929`). Attestation runs inside the custom job (skipped on PR
    test-builds).
-3. ⏳ **Blocked on accounts.** Add macOS codesign + notarize + `.pkg`, secret-gated
-   (§ "What the CI will do"). Do the Apple account setup (§A) first.
-4. ⏳ **Blocked on accounts.** Add Windows Azure signing, secret-gated. Do the
-   Azure setup (§B) first.
-5. Flip the first signed `-rc` release; run the verification checklist above;
-   then a stable tag.
+3. ✅ **Done + wired.** GPG source signing (`publish-signatures.yml`), identity
+   **Nixie Software**. Soft-skips until `GPG_SIGNING_KEY` is provisioned (§C).
+4. ⏸️ **On hold (deferred by decision).** macOS codesign + notarize + `.pkg`.
+   The Apple account setup (§A) and the CI steps are documented but NOT being
+   wired yet. The `SIGNING SLOT` comment in `build-binaries.yml` marks where.
+5. ⏸️ **On hold (deferred by decision).** Windows Azure signing (§B). Same — the
+   marked slot is a comment only; nothing is half-wired.
+6. When resumed: flip the first signed `-rc` release, run the verification
+   checklist, then a stable tag.
 
 ### Who does what next
 
-- **You:** work through §A (Apple — start the D-U-N-S now), §B (Azure), and §C
-  (GPG — quick, fully local), then add the secrets and commit
-  `docs/lait-release-key.asc`. Start signing tags with `git tag -s`.
-- **Me:** the GPG source-signing workflow is already wired (it soft-skips until
-  `GPG_SIGNING_KEY` lands). Once the Apple/Azure secrets exist I'll wire the
-  binary-signing steps into `build-binaries.yml` at the marked `SIGNING SLOT`
-  comments, then we cut a `-rc` tag and verify everything before a stable release.
+- **You (now):** do §C (GPG — quick, fully local, no accounts): generate the
+  key, commit `docs/lait-release-key.asc`, add the `GPG_*` secrets, and start
+  signing tags with `git tag -s`. That fully activates source provenance.
+- **Deferred:** the Apple (§A) and Windows/Azure (§B) binary signing are on hold
+  by decision. When you want them, do the account setup and ping me to wire the
+  steps at the `SIGNING SLOT` markers, then verify on an `-rc` tag.
