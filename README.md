@@ -7,15 +7,16 @@ coding agents work the board like anyone else — no server, no signup, no
 browser tab. If `cd` gets you into the project, you're already in.
 
 ```console
-$ cd my-project && lait init
-founded space 'my-project' — project MP seeded
+$ cd my-project
+$ lait init                          # one-time: this repo now has its own tracker
 
-$ lait new "fix login race" -P high --start
+$ lait new "fix login race" --start  # file the issue, take it, branch it
 MP-1  fix login race  in_progress  · you
 switched to new branch 'mp-1-fix-login-race'
 
-# ...code, commit...
-$ lait done
+# ...write the fix, commit...
+
+$ lait done                          # the branch tells lait which issue
 MP-1  fix login race  done
 ```
 
@@ -107,8 +108,10 @@ Every transcript below is real output from the shipped binary.
 
 ### 1 · Solo: track a repo's work without leaving it
 
-No server, no signup, no browser tab. A space lives beside your code like `.git`
-does, and founding one seeds a project so the first command already works:
+Your tracker lives beside your code the way `.git` does — one per project
+directory, found by walking up from wherever you stand. `lait init` creates it
+and sets up a first **project** (the issue prefix, like `MP-1`, `MP-2`…) named
+after your directory, so there's nothing to configure before the first issue:
 
 ```console
 $ cd my-project
@@ -116,17 +119,14 @@ $ lait init
 founded space 'my-project' (ws_01JTHLH8QT…)
 project: my-project (MP) — `lait new "..."` files into it
 
-$ lait new "fix login race" -P high --start
-MP-1  fix login race  in_progress  · you
-switched to new branch 'mp-1-fix-login-race'
-
-# ...code, commit...
-$ lait done                     # the ref comes from the branch you're on
-MP-1  fix login race  done
+$ lait new "flaky websocket reconnect" -P high    # -P = priority
+MP-1
 ```
 
-Bare `lait` is your focus — unread inbox + what you're working on — and
-`lait board` / `lait tui` render the columns when you want the wall view.
+From there, three views: bare `lait` is your **focus** (unread inbox + what
+you're working on, in under 50 ms), `lait board` prints the columns, and
+`lait tui` is the full-screen live board. Nothing needs the network — it's
+your tracker; teammates come later (scenario 2) or never.
 
 ### 2 · Two of you: onboarding is one link
 
