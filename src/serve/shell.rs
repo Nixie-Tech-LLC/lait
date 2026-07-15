@@ -58,6 +58,7 @@ pub const HTML: &str = r##"<!doctype html>
 <script>
 const $ = (id) => document.getElementById(id);
 let current = null;
+let spacesCache = [];
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
@@ -72,9 +73,31 @@ async function api(path) {
   return body;
 }
 
+// The control plane, verbatim — the same `Request` the CLI sends. A 409 means a
+// destructive verb wants its question asked; the question is the CLI's own, so
+// the modal and the terminal say the same thing.
+async function rpc(space, request, confirmed) {
+  const r = await fetch(`/api/spaces/${space}/rpc${confirmed ? "?confirm=true" : ""}`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(request),
+  });
+  const body = await r.json().catch(() => null);
+  if (r.status === 409 && body && body.kind === "confirm_required") {
+    if (!confirm(body.question)) return null;
+    return rpc(space, request, true);
+  }
+  if (!r.ok || (body && body.kind === "error")) {
+    throw new Error((body && body.message) || `HTTP ${r.status}`);
+  }
+  return body;
+}
+
 async function loadSpaces() {
   try {
     const { spaces } = await api("/api/spaces");
+    spacesCache = spaces;
     if (!spaces.length) {
       $("spaces").innerHTML = '<div class="empty">No spaces yet.<br>`lait init` or `lait join`.</div>';
       return;
@@ -116,20 +139,60 @@ async function select(id) {
 async function loadBoard() {
   if (!current) return;
   try {
-    const b = await api(`/api/spaces/${current}/board`);
+    // `project: null` is legitimate — the daemon's choose-project chain resolves
+    // the view, so the picker needn't know a project to show a board.
+    const b = await rpc(current, { cmd: "board", project: null, project_hint: null });
     if (b.kind !== "board") throw new Error("unexpected reply");
+    const ro = readOnly();
     $("board").className = "";
-    $("board").innerHTML = `<h1>${esc(b.project.name)}</h1><div class="cols">` +
+    $("board").innerHTML =
+      `<h1>${esc(b.project.name)}${ro ? ` — read-only (${esc(ro)}'s space)` : ""}</h1>` +
+      (ro ? "" : `<button id="add">+ New issue</button> `) +
+      `<div class="cols">` +
       b.columns.map((c) => `
         <div class="col">
           <h2><span class="dot" style="background:${esc(c.state.color)}"></span>
               ${esc(c.state.name)} <span class="count">${c.rows.length}</span></h2>
           ${c.rows.filter((r) => !r.tombstone).map((r) => `
-            <div class="card">
+            <div class="card" data-reff="${esc(r.reff)}">
               <div>${esc(r.title)}</div>
-              <div class="reff">${esc(r.key_alias || r.reff)}</div>
+              <div class="reff">${esc(r.key_alias || r.reff)}
+                ${ro ? "" : `<a href="#" class="del" data-reff="${esc(r.reff)}">delete</a>`}</div>
             </div>`).join("") || '<div class="empty">—</div>'}
         </div>`).join("") + "</div>";
+    if (!ro) {
+      $("add").onclick = async () => {
+        const title = prompt("Issue title");
+        if (!title) return;
+        // Every other field is `serde(default)`; omitting `project` lets the
+        // daemon's choose-project chain decide, same as bare `lait new`.
+        await write({ cmd: "issue_new", title });
+      };
+      for (const el of document.querySelectorAll(".del")) {
+        el.onclick = async (ev) => {
+          ev.preventDefault();
+          await write({ cmd: "issue_delete", reff: el.dataset.reff });
+        };
+      }
+    }
+  } catch (e) {
+    $("board").className = "err";
+    $("board").textContent = e.message;
+  }
+}
+
+// Whose space this is, if it isn't ours — agent spaces are observable, not
+// operable, so the UI must not offer writes it knows will be refused.
+function readOnly() {
+  const s = spacesCache.find((x) => x.id === current);
+  return s && s.identity.kind === "agent" ? s.identity.name : null;
+}
+
+// Writes need no explicit refetch: the daemon rings, and the doorbell handler
+// reloads. Failure is the only thing worth reporting here.
+async function write(request) {
+  try {
+    await rpc(current, request);
   } catch (e) {
     $("board").className = "err";
     $("board").textContent = e.message;

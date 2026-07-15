@@ -215,7 +215,15 @@ fn paint(on: bool, code: &str, s: &str) -> String {
 /// Deliberately keyed on the `Request` rather than the command name: this is the
 /// single list of what lait asks before doing, so adding a destructive verb means
 /// adding it here, not remembering to prompt at a call site.
-fn destructive_question(req: &Request) -> Option<String> {
+/// The question a destructive verb must answer before it runs, or `None` if the
+/// verb destroys nothing.
+///
+/// Keyed on the `Request` so the list lives in exactly one place, whatever asks
+/// it. The CLI asks on a TTY (`confirm_destructive`); `lait serve` hands the same
+/// string to the browser to put in a modal. A second copy of this list, phrased
+/// slightly differently, is how two surfaces end up disagreeing about what is
+/// dangerous.
+pub(crate) fn destructive_question(req: &Request) -> Option<String> {
     match req {
         // The ref is inferred from the git branch when omitted, so this is the
         // one verb that can destroy something you never named.

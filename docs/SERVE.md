@@ -1,8 +1,8 @@
 # SERVE — the local HTTP surface (`lait serve`)
 
-Status: **vertical slice**. The two load-bearing parts (the loopback gate and the
-N-daemon supervisor) are implemented and tested; the client is a placeholder shell
-pending the React app. See [Next](#next).
+Status: **API complete, client pending**. The loopback gate, the N-daemon supervisor,
+and the full CRUD surface are implemented and tested end to end; the served client is a
+placeholder shell pending the React app. See [Next](#next).
 
 ## Why this exists
 
@@ -155,30 +155,70 @@ or the endpoints — `--home` already exercises this today.
 |---|---|
 | `GET /` | the shell (and the one-time `?token=` → cookie handoff) |
 | `GET /api/spaces` | `{ spaces: [...] }`, scoped to this identity, probed, newest-first. Each row carries `identity: {kind:"own"}` or `{kind:"agent",name}` |
-| `GET /api/spaces/{id}/board?project=` | `Response::Board` — attaches the space |
+| `POST /api/spaces/{id}/rpc[?confirm=true]` | the control plane, verbatim: body is a `Request`, reply is a `Response`. Attaches the space |
 | `GET /api/events` | SSE `doorbell` / `lagged`, multiplexed over attached spaces |
 
 Errors use the same `{"kind":"error","message":…}` envelope `--json` emits, so browser
 and CLI clients read one contract.
+
+### Why one RPC endpoint and not a REST surface
+
+A REST surface would be a second, hand-maintained projection of a façade that is
+*already* the stable, versioned, hand-maintained projection (S§7). Two of those drift —
+and the `feat/lait-viewer` branch is the proof: its REST router still calls
+`projects new --key`, a shape that stopped existing. The RPC endpoint cannot drift,
+because it carries the same enum the CLI, TUI, and MCP send. The browser is a Layer-B
+client; this is what that sentence means in practice.
+
+The surface is therefore **full CRUD** from day one: every verb the control plane
+exposes is reachable, because there is no per-verb handler to write.
+
+### The three gates
+
+1. **`Subscribe` is refused** (400). It is a stream, not a one-shot — `control::request`
+   writes and reads exactly one line, so a subscribe here would decode a `Doorbell` as a
+   `Response`. `GET /api/events` is the door.
+2. **An agent's space is observable, not operable** (403 on writes). Reads through an
+   agent's daemon are the observability it was scoped in for; a write would be signed by
+   the agent and land under its name. If you are a member of that workspace, write
+   through your own space and sign as yourself. `policy::is_read` is an allowlist with an
+   exhaustive match, so a verb added later fails to *compile* until classified rather
+   than defaulting to permitted — and `Inbox` proves why it can't be a per-variant list:
+   `clear: true` advances the read watermark, a write wearing a read's name.
+3. **Destructive verbs keep the CLI's question** (409 `confirm_required`).
+   `confirm_destructive` is a TTY affordance — it refuses under `--json` because a pipe
+   cannot be asked. A browser can: it has a modal. So rather than bypass the gate or
+   inherit the pipe's refusal, the question comes back and the UI asks it. The string is
+   `cli::destructive_question`'s own, so the two surfaces cannot disagree about what is
+   dangerous. This protects against an *accident*, not an attacker — anything that can
+   POST `delete` can POST `?confirm=true`, which is exactly the guarantee the CLI's
+   prompt gives.
+
+### Credential precedence
+
+`bearer` → **query** → cookie, and the middle one is load-bearing. The token is per-run;
+the cookie outlives the run that set it. Cookie-first would let a stale credential shadow
+the fresh token in a freshly-printed URL and 401 the user out of a link they legitimately
+clicked — permanently, since the page cannot clear an `HttpOnly` cookie it cannot read.
+The cookie is also named per-port (`lait_token_<port>`), because **cookies ignore the
+port**: a fixed name would have two concurrent `lait serve` runs clobbering each other's
+jar entry.
 
 ## Next
 
 - **Replace the shell with the React app**, embedded in the binary so `lait serve`
   stays one self-contained artifact and the SPA stays same-origin — which is what
   makes the `Origin` allowlist enforceable in the first place.
-- **The rest of the surface**: issues/inbox/members/invite over the endpoints that
-  already exist on the control plane.
 - **Notifications** belong to the *daemon*, not the tab. `http://localhost` is a
   secure context so the Notification API works, but a tab only fires while it is
   open; the always-on component is the daemon. The browser should badge; the daemon
   should raise the OS toast.
-- **`lait serve` currently reads.** Every mutating verb the control plane exposes is
-  reachable the same way, but writes should land with `confirm_destructive`'s intent
-  preserved — the CLI gates `delete`/`members remove`/`key rotate` behind a prompt,
-  and the browser needs an equivalent, not a bypass.
-- **Writes into an agent's space need a decision before they are possible.** Reads
-  through an agent's daemon are observability. A *write* through it would be signed by
-  the agent and land under the agent's name — the human operating a machine as one of
-  its agents. `SpaceIdentity::Agent` is the hook: the write path must either refuse it,
-  or make the attribution explicit and deliberate. It must not simply inherit the read
-  path's permissiveness.
+- **The confirm gate is client-enforced by design.** Worth re-reading before anyone
+  "hardens" it: a server-side `confirm` flag cannot distinguish a human clicking a modal
+  from a script setting the flag. It buys accident-resistance, which is all the CLI's
+  prompt buys either. Adding ceremony there would be theatre; the real boundaries are
+  the loopback bind, the token, and the `Host`/`Origin` allowlist.
+- **`lait config` and the spaces registry are not on the control plane** — they are
+  local state the CLI reads directly (`Special` commands, not `Request`s), so the RPC
+  endpoint cannot reach them. A browser settings surface needs supervisor-level
+  endpoints beside `/api/spaces`, not a new `Request` variant.

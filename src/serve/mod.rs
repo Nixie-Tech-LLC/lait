@@ -23,6 +23,7 @@
 //! the TUI was, and the device remains the only network identity.
 
 pub mod auth;
+pub mod policy;
 pub mod spaces;
 
 mod shell;
@@ -39,7 +40,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Redirect, Response,
     },
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -59,11 +60,21 @@ use spaces::Supervisor;
 pub const DEFAULT_PORT: u16 = 7717;
 
 /// The cookie the browser trades its one-time URL token for.
-const COOKIE: &str = "lait_token";
+///
+/// Named per-port, because **cookies ignore the port**: `127.0.0.1:7717` and
+/// `127.0.0.1:7801` are the same cookie origin, so a fixed name would have two
+/// concurrent `lait serve` runs silently clobbering each other's credential —
+/// whichever loaded last wins, and the other tab starts 401ing. The port is not a
+/// security boundary here (the token is); it is what keeps two runs from being the
+/// same jar entry.
+fn cookie_name(port: u16) -> String {
+    format!("lait_token_{port}")
+}
 
 struct App {
     guard: Guard,
     sup: Supervisor,
+    cookie: String,
 }
 
 /// Run the local server until interrupted.
@@ -88,6 +99,7 @@ pub async fn run(port: u16, open: bool) -> Result<()> {
     let app = Arc::new(App {
         guard: Guard::new(token.clone(), bound.port()),
         sup: Supervisor::new(identity, agents_base, self_contained),
+        cookie: cookie_name(bound.port()),
     });
 
     let url = format!("http://127.0.0.1:{}/?token={}", bound.port(), token);
@@ -105,7 +117,7 @@ fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/api/spaces", get(list_spaces))
-        .route("/api/spaces/{id}/board", get(board))
+        .route("/api/spaces/{id}/rpc", post(rpc))
         .route("/api/events", get(events))
         .layer(axum::middleware::from_fn_with_state(app.clone(), gate))
         .with_state(app)
@@ -135,6 +147,13 @@ async fn gate(State(app): State<Arc<App>>, req: axum::extract::Request, next: Ne
     // Three ways to present the token, one meaning. The query form exists only
     // for the opening navigation — `index` immediately trades it for the cookie
     // and redirects, so it never lingers in history or a Referer.
+    //
+    // Precedence is load-bearing: **query beats cookie**. The token is per-run,
+    // but the cookie outlives the run that set it, so after a restart the jar
+    // holds a stale credential. Consulting it first would shadow the fresh token
+    // the user was just handed and 401 them out of the link they legitimately
+    // clicked — with no way back, since nothing in the UI can clear a cookie it
+    // cannot read. An explicit token in the URL is a deliberate handoff and wins.
     let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -142,9 +161,9 @@ async fn gate(State(app): State<Arc<App>>, req: axum::extract::Request, next: Ne
     let cookie = headers
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
-        .and_then(|c| auth::cookie_value(c, COOKIE));
+        .and_then(|c| auth::cookie_value(c, &app.cookie));
     let query = req.uri().query().and_then(|q| query_param(q, "token"));
-    let presented = bearer.or(cookie).or(query.as_deref());
+    let presented = bearer.or(query.as_deref()).or(cookie);
 
     if let Err(r) = app.guard.check_token(presented) {
         return refuse(r);
@@ -191,9 +210,11 @@ struct IndexQuery {
 /// history, and out of any `Referer` the page might later emit. `HttpOnly` keeps
 /// it out of reach of script in our own page; `SameSite=Strict` keeps the browser
 /// from attaching it to anyone else's request.
-async fn index(State(_app): State<Arc<App>>, Query(q): Query<IndexQuery>) -> Response {
+async fn index(State(app): State<Arc<App>>, Query(q): Query<IndexQuery>) -> Response {
     if let Some(token) = q.token {
-        let cookie = format!("{COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict");
+        // Overwrites whatever this port's previous run left behind — the gate let
+        // us here on the query token, so this is the credential that is current.
+        let cookie = format!("{}={token}; Path=/; HttpOnly; SameSite=Strict", app.cookie);
         return ([(header::SET_COOKIE, cookie)], Redirect::to("/")).into_response();
     }
     axum::response::Html(shell::HTML).into_response()
@@ -204,24 +225,102 @@ async fn list_spaces(State(app): State<Arc<App>>) -> Response {
 }
 
 #[derive(Deserialize)]
-struct BoardQuery {
-    project: Option<String>,
+struct RpcQuery {
+    /// The client has already asked [`crate::cli::destructive_question`] and been
+    /// told yes. See [`rpc`].
+    #[serde(default)]
+    confirm: bool,
 }
 
-/// One space's board. Selecting a space is what attaches its daemon — this is
-/// the first point at which anything is started.
-async fn board(
+/// The control plane, verbatim: `POST /api/spaces/{id}/rpc` with a [`Request`],
+/// back a [`crate::control::Response`].
+///
+/// One endpoint rather than a REST surface, because the REST surface would be a
+/// second, hand-maintained projection of a façade that is *already* the stable,
+/// versioned, hand-maintained projection (S§7). Two of those drift; the viewer
+/// branch is the proof — it still calls `projects new --key`, a shape that stopped
+/// existing. This cannot drift: it is the same enum the CLI, TUI and MCP send.
+///
+/// Selecting a space is what attaches its daemon, so this is also the first point
+/// at which anything is started.
+///
+/// Three gates, in order:
+///
+/// 1. **`Subscribe` is refused.** It is a stream, not a one-shot: `control::request`
+///    writes and reads exactly one line, so a subscribe here would decode a
+///    `Doorbell` as a `Response` and fail confusingly. `GET /api/events` is the door.
+/// 2. **An agent's space is observable, not operable.** Writes are refused with the
+///    agent's name in the message. Reads through an agent's daemon are exactly the
+///    observability they were scoped in for; a *write* would be signed by the agent
+///    and land under its name. If you are a member of that workspace, write through
+///    your own space and sign as yourself — see [`spaces::scope`].
+/// 3. **Destructive verbs keep the CLI's question.** `confirm_destructive` is a TTY
+///    affordance: it refuses under `--json` because a pipe cannot be asked. A browser
+///    can — it has a modal — so rather than bypass the gate or inherit the pipe's
+///    refusal, the question comes back as a `409 confirm_required` and the UI asks
+///    it. The string is `cli::destructive_question`'s, not a paraphrase, so the two
+///    surfaces cannot disagree about what is dangerous.
+///
+/// Gate 3 protects against an *accident*, not an attacker: anything that can POST
+/// `delete` can also POST `?confirm=1`. That is the same guarantee the CLI's prompt
+/// gives, and it is worth being honest that it is the whole of it.
+async fn rpc(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
-    Query(q): Query<BoardQuery>,
+    Query(q): Query<RpcQuery>,
+    Json(req): Json<Request>,
 ) -> Response {
-    // `project: None` is legitimate: the daemon's choose-project chain resolves
-    // the view (sole project / `project.default` / branch hint), so the picker
-    // does not have to know a project before it can show a board.
-    let req = Request::Board {
-        project: q.project,
-        project_hint: None,
+    if matches!(req, Request::Subscribe { .. }) {
+        return (
+            StatusCode::BAD_REQUEST,
+            err_json(
+                "subscribe is a stream, not a request — use GET /api/events",
+                ErrorKind::Error,
+            ),
+        )
+            .into_response();
+    }
+
+    let identity = match app.sup.resolve(&id) {
+        Ok((_, identity)) => identity,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                err_json(&e.to_string(), ErrorKind::NotFound),
+            )
+                .into_response()
+        }
     };
+
+    if let spaces::SpaceIdentity::Agent { name } = &identity {
+        if !policy::is_read(&req) {
+            return (
+                StatusCode::FORBIDDEN,
+                err_json(
+                    &format!(
+                        "{name}'s space is read-only here — a write would be signed as {name}. \
+                         Open the same workspace from your own space to write as yourself."
+                    ),
+                    ErrorKind::Error,
+                ),
+            )
+                .into_response();
+        }
+    }
+
+    if !q.confirm {
+        if let Some(question) = crate::cli::destructive_question(&req) {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "kind": "confirm_required",
+                    "question": question,
+                })),
+            )
+                .into_response();
+        }
+    }
+
     match app.sup.request(&id, &req).await {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => (
@@ -290,6 +389,35 @@ mod tests {
         // A key that merely ends with ours must not match.
         assert_eq!(query_param("xtoken=abc", "token"), None);
         assert_eq!(query_param("", "token"), None);
+    }
+
+    /// The precedence bug this exists to prevent, reproduced at the unit level.
+    ///
+    /// Cookies ignore the port, so a previous `lait serve` run leaves a stale
+    /// `lait_token_*` in the jar for `127.0.0.1`. If the cookie were consulted
+    /// before the query, clicking a freshly-printed URL would 401 — and stay
+    /// 401ing, because the page cannot clear an HttpOnly cookie it cannot read.
+    /// Found by restarting the server and opening the new link.
+    #[test]
+    fn a_fresh_url_token_beats_a_stale_cookie() {
+        let guard = Guard::new("fresh".into(), 7717);
+        let stale = auth::cookie_value("lait_token_7717=stale", "lait_token_7717");
+        let query = query_param("token=fresh", "token");
+
+        // The resolution order `gate` uses.
+        let presented = None.or(query.as_deref()).or(stale);
+        assert_eq!(presented, Some("fresh"));
+        assert!(guard.check_token(presented).is_ok());
+
+        // Cookie-first would have picked the stale one and locked the user out.
+        let wrong = None.or(stale).or(query.as_deref());
+        assert_eq!(wrong, Some("stale"));
+        assert!(guard.check_token(wrong).is_err());
+    }
+
+    #[test]
+    fn cookie_name_is_per_port_so_two_runs_do_not_share_a_jar_entry() {
+        assert_ne!(cookie_name(7717), cookie_name(7801));
     }
 
     #[test]
