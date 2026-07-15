@@ -1028,11 +1028,27 @@ pub async fn run_invite(
         .unwrap_or_else(|_| format!("lait://join/{token}"));
     println!("{token}");
     println!("{link}");
-    match render_qr(&link) {
-        Ok(q) => println!("\n{q}"),
-        Err(e) => eprintln!("(qr unavailable: {e:#})"),
+    let copied = copy_to_clipboard(&token);
+    // The QR is a scan-on-your-phone convenience; an invite ticket is long, so the
+    // matrix can be taller/wider than the terminal. Render it only when it fits —
+    // otherwise it explodes the scrollback for no gain (the link is right above and
+    // on the clipboard). Suppress with $LAIT_NO_QR for a clean, QR-free invite.
+    if std::env::var_os("LAIT_NO_QR").is_none() {
+        match render_qr(&link) {
+            Ok(q) => {
+                let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                let qw = q.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+                let qh = q.lines().count();
+                if qw <= cols as usize && qh + 3 <= rows as usize {
+                    println!("\n{q}");
+                } else {
+                    println!("(QR omitted — too large for this terminal; use the link above)");
+                }
+            }
+            Err(e) => eprintln!("(qr unavailable: {e:#})"),
+        }
     }
-    if copy_to_clipboard(&token) {
+    if copied {
         println!("(copied to clipboard)");
     }
     // Tell the host what this ticket actually does, so the mental model matches
@@ -1060,7 +1076,8 @@ pub async fn run_invite(
 
 /// Copy `s` to the system clipboard, best-effort, using the platform's native
 /// tool: `clip` (Windows), `pbcopy` (macOS), or `wl-copy`/`xclip` (Linux).
-fn copy_to_clipboard(s: &str) -> bool {
+/// `pub(crate)` so the interactive members picker can copy a fresh invite link.
+pub(crate) fn copy_to_clipboard(s: &str) -> bool {
     #[cfg(target_os = "windows")]
     let candidates: &[(&str, &[&str])] = &[
         ("clip", &[]),
@@ -1093,10 +1110,14 @@ fn copy_to_clipboard(s: &str) -> bool {
     false
 }
 
-/// Render a scannable QR of the invite link as terminal half-block glyphs.
+/// Render a scannable QR of the invite link as terminal half-block glyphs. Uses
+/// the lowest error-correction level (`L`) so a long invite ticket yields the
+/// smallest module count — the QR still scans, but takes far fewer lines than the
+/// default level.
 fn render_qr(data: &str) -> Result<String> {
-    use qrcode::{render::unicode, QrCode};
-    let code = QrCode::new(data.as_bytes()).context("build QR code")?;
+    use qrcode::{render::unicode, EcLevel, QrCode};
+    let code = QrCode::with_error_correction_level(data.as_bytes(), EcLevel::L)
+        .context("build QR code")?;
     Ok(code
         .render::<unicode::Dense1x2>()
         .dark_color(unicode::Dense1x2::Light)

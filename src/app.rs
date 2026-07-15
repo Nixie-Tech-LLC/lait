@@ -317,10 +317,16 @@ pub async fn run() -> Result<()> {
         // The uniform path: build one Request and round-trip the daemon.
         Dispatch::Request(f) => {
             let req = f(m)?;
+            use std::io::IsTerminal;
             // `new --start` chains the create into the work loop: file it, then
             // claim it (two honest commits = two activity rows, S§7.1).
             if leaf.name == "new" && m.get_flag("start") {
                 crate::cli::run_new_start(&home, req, out).await?;
+            } else if leaf.name == "members" && !out.json && std::io::stdout().is_terminal() {
+                // Bare `lait members` in an interactive terminal opens the modal
+                // picker (browse/approve); `--json` and piped/redirected output
+                // keep the plain roster dump so scripts and agents are unaffected.
+                crate::members_ui::run(&home).await?
             } else {
                 crate::cli::run(&home, req, out).await?;
             }

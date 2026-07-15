@@ -1,0 +1,26 @@
+#!/bin/sh
+# Pre-commit guard: run the same formatting check CI enforces, so a `cargo fmt`
+# reflow never lands in a commit (and never blocks a merge after the fact). This
+# is the cheap, deterministic half of the CI gate; the full build/clippy/test
+# matrix still runs in CI. Enable once per clone with:
+#
+#     git config core.hooksPath .githooks
+#
+# Bypass a single commit (e.g. a docs-only change on a machine without cargo)
+# with:
+#
+#     git commit --no-verify
+
+# No Rust toolchain present (docs-only checkout, CI image, etc.) — don't block.
+if ! command -v cargo >/dev/null 2>&1; then
+    exit 0
+fi
+
+echo "pre-commit: cargo fmt --all --check"
+if ! cargo fmt --all --check; then
+    echo >&2
+    echo "pre-commit: formatting check FAILED." >&2
+    echo "pre-commit: run 'cargo fmt --all', stage the changes, and commit again." >&2
+    echo "pre-commit: (bypass with 'git commit --no-verify')" >&2
+    exit 1
+fi

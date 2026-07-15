@@ -35,6 +35,7 @@ pub mod install;
 pub mod issue;
 pub mod loro_ext;
 pub mod mcp;
+pub mod members_ui;
 pub mod membership;
 pub mod node;
 pub mod presence;
