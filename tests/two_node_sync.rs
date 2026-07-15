@@ -84,6 +84,9 @@ fn spawn_daemon(home: &Path) -> Daemon {
     let mut child = Command::new(bin())
         .arg("daemon")
         .env("LAIT_HOME", home)
+        // Isolate the workspace registry per node: the daemon-boot upsert must land
+        // in a scratch config root, never the developer's real workspaces.json.
+        .env("LAIT_CONFIG_ROOT", home.join("cfgroot"))
         .env("LAIT_IDLE_SECS", "0")
         // Run the protocol on a fast heartbeat so catch-up/absence windows are
         // seconds, not the 10s production default — the pipeline's biggest lever.
@@ -113,6 +116,28 @@ fn spawn_daemon(home: &Path) -> Daemon {
 fn req(home: &Path, r: Request) -> Response {
     rt().block_on(async { request(home, &r).await })
         .unwrap_or_else(|e| Response::err(format!("{e:#}")))
+}
+
+/// Found a workspace in `home` in-process, using the SAME identity the daemon
+/// will load (`<home>/secret.key`, since the daemon runs with `LAIT_HOME=home`).
+/// Workspaces are never minted lazily anymore — a daemon errors on an
+/// uninitialized store — so every founder home goes through this first.
+fn found_home(home: &Path) {
+    let key = lait::config::load_or_create_identity(home).expect("identity");
+    let me = lait::ids::UserId::from_key_string(key.public().to_string());
+    let store = lait::store::Store::open(home).expect("store");
+    lait::tracker::found_workspace(&store, &me, "test", &lait::ids::SystemUlidSource)
+        .expect("found workspace");
+}
+
+/// Bootstrap a joiner store from a ticket (the client half of `lait join`), so
+/// its daemon boots already bound to the host's workspace — the daemon-side
+/// Connect/Join no longer adopts a foreign workspace.
+fn join_home(home: &Path, ticket: &str) {
+    let t: lait::proto::WorkspaceTicket = ticket.parse().expect("parse ticket");
+    let store = lait::store::Store::open(home).expect("store");
+    lait::tracker::join_workspace_store(&store, &t.workspace, &t.host.to_string())
+        .expect("bootstrap joiner store");
 }
 
 fn list_titles(home: &Path) -> Vec<String> {
@@ -172,10 +197,10 @@ fn poll_body(home: &Path, reff: &str, needle: &str, timeout: Duration) -> bool {
 fn two_nodes_converge_over_iroh() {
     let a_home = tmp_home("a");
     let b_home = tmp_home("b");
+    found_home(&a_home);
     let a = spawn_daemon(&a_home);
-    let b = spawn_daemon(&b_home);
 
-    // Node A founds the workspace and files an issue.
+    // Node A (the founder) adds a project and files an issue.
     assert!(
         matches!(
             req(
@@ -196,6 +221,7 @@ fn two_nodes_converge_over_iroh() {
                 Request::IssueNew {
                     title: "shared from A".into(),
                     project: Some("ENG".into()),
+                    project_hint: None,
                     assignees: vec![],
                     priority: Some("high".into()),
                     labels: vec![],
@@ -210,7 +236,9 @@ fn two_nodes_converge_over_iroh() {
         "A: new"
     );
 
-    // A mints a ticket (carrying its workspace id) and B connects.
+    // A mints a ticket (carrying its workspace id); B bootstraps its store from
+    // it BEFORE its daemon first starts (the daemon-side Connect no longer
+    // adopts a foreign workspace), then connects.
     let ticket = match req(
         &a.home,
         Request::Invite {
@@ -223,6 +251,8 @@ fn two_nodes_converge_over_iroh() {
         other => panic!("A: invite returned {other:?}"),
     };
     assert!(!ticket.is_empty(), "ticket should be non-empty");
+    join_home(&b_home, &ticket);
+    let b = spawn_daemon(&b_home);
     assert!(
         matches!(
             req(&b.home, Request::Connect { ticket }),
@@ -297,6 +327,7 @@ fn two_nodes_converge_over_iroh() {
                 Request::IssueNew {
                     title: "reply from B".into(),
                     project: Some("ENG".into()),
+                    project_hint: None,
                     assignees: vec![],
                     priority: None,
                     labels: vec![],
@@ -333,6 +364,7 @@ fn two_nodes_converge_over_iroh() {
                 Request::IssueNew {
                     title: "post-removal secret".into(),
                     project: Some("ENG".into()),
+                    project_hint: None,
                     assignees: vec![],
                     priority: None,
                     labels: vec![],

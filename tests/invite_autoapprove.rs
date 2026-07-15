@@ -74,6 +74,9 @@ fn spawn_daemon(home: &Path) -> Daemon {
     let mut child = Command::new(bin())
         .arg("daemon")
         .env("LAIT_HOME", home)
+        // Isolate the workspace registry per node: the daemon-boot upsert must land
+        // in a scratch config root, never the developer's real workspaces.json.
+        .env("LAIT_CONFIG_ROOT", home.join("cfgroot"))
         .env("LAIT_IDLE_SECS", "0")
         .env("LAIT_HEARTBEAT_SECS", TEST_HEARTBEAT.as_secs().to_string())
         .stdin(Stdio::null())
@@ -109,14 +112,36 @@ fn membership(home: &Path) -> Option<String> {
     }
 }
 
+/// Found a workspace in `home` in-process, using the SAME identity the daemon
+/// will load (`<home>/secret.key`, since the daemon runs with `LAIT_HOME=home`).
+/// Workspaces are never minted lazily anymore — a daemon errors on an
+/// uninitialized store — so every founder home goes through this first.
+fn found_home(home: &Path) {
+    let key = lait::config::load_or_create_identity(home).expect("identity");
+    let me = lait::ids::UserId::from_key_string(key.public().to_string());
+    let store = lait::store::Store::open(home).expect("store");
+    lait::tracker::found_workspace(&store, &me, "test", &lait::ids::SystemUlidSource)
+        .expect("found workspace");
+}
+
+/// Bootstrap a joiner store from a ticket (the client half of `lait join`), so
+/// its daemon boots already bound to the host's workspace — the daemon-side
+/// Connect/Join no longer adopts a foreign workspace.
+fn join_home(home: &Path, ticket: &str) {
+    let t: lait::proto::WorkspaceTicket = ticket.parse().expect("parse ticket");
+    let store = lait::store::Store::open(home).expect("store");
+    lait::tracker::join_workspace_store(&store, &t.workspace, &t.host.to_string())
+        .expect("bootstrap joiner store");
+}
+
 #[test]
 fn default_invite_auto_admits_the_joiner() {
     let a_home = tmp_home("host");
     let b_home = tmp_home("joiner");
+    found_home(&a_home);
     let a = spawn_daemon(&a_home);
-    let b = spawn_daemon(&b_home);
 
-    // Host founds a workspace and files an issue with a body (body lives ONLY in
+    // Host (the founder) adds a project and files an issue with a body (body lives ONLY in
     // the issue doc, so reading it back on B proves the key was sealed + the
     // ciphertext decrypted — not just a catalog row synced).
     assert!(
@@ -139,6 +164,7 @@ fn default_invite_auto_admits_the_joiner() {
                 Request::IssueNew {
                     title: "secret work".into(),
                     project: Some("ENG".into()),
+                    project_hint: None,
                     assignees: vec![],
                     priority: Some("high".into()),
                     labels: vec![],
@@ -164,7 +190,10 @@ fn default_invite_auto_admits_the_joiner() {
     };
     assert!(!ticket.is_empty(), "ticket should be non-empty");
 
-    // Joiner joins ONCE. No `members approve` anywhere in this test.
+    // Joiner bootstraps its store from the ticket BEFORE its daemon first
+    // starts, then joins ONCE. No `members approve` anywhere in this test.
+    join_home(&b_home, &ticket);
+    let b = spawn_daemon(&b_home);
     assert!(
         matches!(req(&b.home, Request::Join { ticket }), Response::Ok { .. }),
         "joiner: join"

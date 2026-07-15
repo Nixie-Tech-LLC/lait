@@ -113,10 +113,13 @@ impl AliasTable {
         }
         if let Some(new) = want {
             if let Some(key) = project_key(catalog, &new.0) {
-                self.groups
-                    .entry(new.clone())
-                    .or_default()
-                    .push(doc_id.clone());
+                let members = self.groups.entry(new.clone()).or_default();
+                members.push(doc_id.clone());
+                // Keep the stored member list sorted so the table is truly
+                // order-independent (the module invariant `build()` relies on):
+                // any incremental sequence and a full rebuild — whose iteration
+                // order is a HashMap walk — must produce identical tables.
+                members.sort();
                 self.doc_group
                     .insert(doc_id.as_str().to_string(), new.clone());
                 self.reassign_group(&new, &key);
@@ -453,7 +456,7 @@ mod tests {
 
     fn setup() -> (CatalogDoc, ProjectId, WorkspaceId) {
         let ws = WorkspaceId::mint(&SystemUlidSource);
-        let c = CatalogDoc::create(&ws).unwrap();
+        let c = CatalogDoc::create(&ws, "test").unwrap();
         let p = ProjectId::mint(&SystemUlidSource);
         c.add_project(&p, "Engineering", "ENG", "blue").unwrap();
         c.doc().commit();

@@ -32,6 +32,10 @@ pub const REQUIRED_TRACKER_COMMANDS: &[&str] = &[
     "issue_new",
     "issue_edit",
     "issue_move",
+    "issue_start",
+    "issue_done",
+    "issue_stop",
+    "inbox",
     "assign",
     "label",
     "comment",
@@ -58,6 +62,10 @@ pub const MCP_TOOL_NAMES: &[&str] = &[
     "issue_new",
     "issue_edit",
     "issue_move",
+    "issue_start",
+    "issue_done",
+    "issue_stop",
+    "inbox",
     "assign",
     "label",
     "comment",
@@ -94,7 +102,8 @@ pub const MCP_TOOL_NAMES: &[&str] = &[
 pub struct IssueNewArgs {
     /// Issue title.
     pub title: String,
-    /// Project ref (key like `ENG` or a `prj_` id). Optional if there is one.
+    /// Project ref (key like `ENG` or a `prj_` id). Optional — falls back to
+    /// the store's configured `project.default`, then the sole project.
     #[serde(default)]
     pub project: Option<String>,
     /// Assignee refs (`@me`, or a 64-hex key).
@@ -112,6 +121,13 @@ pub struct IssueNewArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InboxArgs {
+    /// Mark everything read after listing.
+    #[serde(default)]
+    pub clear: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RefArg {
     /// An issue ref: short `iss_` handle, or a `KEY-n` alias like `ENG-142`.
     pub reff: String,
@@ -126,6 +142,9 @@ pub struct IssueEditArgs {
     pub status: Option<String>,
     #[serde(default)]
     pub priority: Option<String>,
+    /// Replace the whole description (full-buffer, S§5.1/U§5.3).
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -181,8 +200,10 @@ pub struct ListArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BoardArgs {
-    /// Project ref (key or `prj_` id).
-    pub project: String,
+    /// Project ref (key or `prj_` id). Optional — falls back to the store's
+    /// configured `project.default`, then the sole project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -313,12 +334,59 @@ impl LaitMcp {
         self.run(Request::IssueNew {
             title: a.title,
             project: a.project,
+            // Agents have no git branch context — the environment hint is a
+            // CLI-only input; MCP always sends none.
+            project_hint: None,
             assignees: a.assignees,
             priority: a.priority,
             labels: a.labels,
             body: a.body,
         })
         .await
+    }
+
+    #[tool(
+        description = "Start working an issue: assign yourself + move it to the first \
+                       active-category status, atomically. Returns the fresh issue snapshot."
+    )]
+    async fn issue_start(
+        &self,
+        Parameters(a): Parameters<RefArg>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::IssueStart { reff: a.reff }).await
+    }
+
+    #[tool(
+        description = "Finish an issue: move it to the first done-category status (assignee \
+                       kept). Returns the fresh issue snapshot."
+    )]
+    async fn issue_done(
+        &self,
+        Parameters(a): Parameters<RefArg>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::IssueDone { reff: a.reff }).await
+    }
+
+    #[tool(
+        description = "Put an issue down: back to the first backlog-category status, \
+                       unassign yourself. Returns the fresh issue snapshot."
+    )]
+    async fn issue_stop(
+        &self,
+        Parameters(a): Parameters<RefArg>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::IssueStop { reff: a.reff }).await
+    }
+
+    #[tool(
+        description = "The durable inbox: remote assignments/comments/status moves addressed \
+                       to this node, newest first with an unread count. clear=true marks all read."
+    )]
+    async fn inbox(
+        &self,
+        Parameters(a): Parameters<InboxArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::Inbox { clear: a.clear }).await
     }
 
     #[tool(description = "Edit an issue's title/status/priority (one commit = one activity row).")]
@@ -331,6 +399,7 @@ impl LaitMcp {
             title: a.title,
             status: a.status,
             priority: a.priority,
+            description: a.description,
         })
         .await
     }
@@ -423,7 +492,11 @@ impl LaitMcp {
         &self,
         Parameters(a): Parameters<BoardArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(Request::Board { project: a.project }).await
+        self.run(Request::Board {
+            project: a.project,
+            project_hint: None,
+        })
+        .await
     }
 
     #[tool(description = "An issue's derived activity/time-travel feed.")]
@@ -580,7 +653,11 @@ impl LaitMcp {
         .await
     }
 
-    #[tool(description = "Join a workspace from a ticket and broadcast a request to be added.")]
+    #[tool(
+        description = "Connect to the bound workspace via a ticket for it and broadcast a request \
+                       to be added. MCP runs against an already-bound store: a ticket for a \
+                       different workspace errors (join it with the CLI first)."
+    )]
     async fn join_room(
         &self,
         Parameters(a): Parameters<JoinArgs>,

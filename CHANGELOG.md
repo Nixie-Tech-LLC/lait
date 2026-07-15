@@ -1,19 +1,18 @@
 # Changelog
 
-## Unreleased — protocol versioning & release hardening
+## Unreleased — protocol version negotiation, schema gate & release hardening
 
-- **Protocol epoch bump (a coordinated break).** The sync ALPN (`lait/sync/0` →
-  `lait/sync/1`), the gossip topic derivation (now domain-separated by a
-  `GOSSIP_PROTOCOL` epoch), and the presence ALPN (`lait/presence/0` → `/1`) all
-  moved to epoch 1, which **introduces in-band version negotiation**. A node on
-  this version does **not** interoperate with a v0.4.8-or-earlier node — for this
-  one transition, upgrade every node in a workspace together. From here on, the
-  new windowed policy prevents flag-days.
-- **Mixed-version safety.** The sync handshake now carries a `protocol_version`;
-  a peer outside the supported window `[MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION]`
-  is refused with a clear "upgrade lait" diagnostic instead of a silent decode
-  failure. Undecodable gossip payloads (the other version-skew path) are now
-  logged at debug instead of dropped silently.
+Composes with the workspace re-architecture break below — the same epoch-1 wire
+change (`lait/sync/1`, `lait/presence/1`, workspace-id gossip topic) — adding
+in-band version negotiation on top of it.
+
+- **In-band version negotiation.** The sync handshake now carries a
+  `protocol_version`; a peer outside the supported window
+  `[MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION]` is refused with a clear "upgrade
+  lait" diagnostic instead of a silent decode failure. Undecodable gossip
+  payloads (the other version-skew path) are logged at debug rather than dropped
+  silently. From here on this window absorbs backward-compatible changes without
+  another ALPN bump.
 - **On-disk schema gate.** Opening a workspace store written by a *newer* lait now
   fails fast with an upgrade message rather than risking a lossy read
   (`SCHEMA_VERSION` is finally enforced on load).
@@ -28,6 +27,121 @@
   build was migrated to a custom-artifacts architecture so binaries can be signed
   in place (macOS notarization + Windows Azure signing land next). See
   `docs/RELEASE-SIGNING.md`.
+
+## Unreleased — the rich TUI (full CLI parity)
+
+`lait tui` grows from proof-of-concept to a full client. Board-centric with a
+co-visible right-side issue peek; every CLI verb is reachable inside it.
+
+- **Board + peek.** Workflow columns with two-line cards, colors from the
+  workflow/project/label registries, an optimistic overlay (`▲`), and a peek
+  panel with description, comments, and the derived history timeline (⚠ marks
+  LWW collisions). `S`/`D`/`O` run start/done/stop; `H`/`L` move status;
+  `J`/`K` reorder (`IssueMove`, optimistic).
+- **One grammar, two entry points.** The `:` palette parses through the same
+  clap tree as the shell, with fuzzy verb completion; `start`/`config`/
+  `spaces`/`invite`/`watch` map to native TUI surfaces, process-level commands
+  say "CLI-only" honestly. Ambiguous refs open a disambiguation picker that
+  retries with the chosen candidate.
+- **In-TUI editors** (tui-textarea): quick-create parses inline `-p/-a/-P/-l`
+  tokens with `new`'s grammar; multi-line description/comment (`Ctrl+S`
+  saves); a parse error reopens the editor with the line intact.
+- **Pickers + multi-select.** Assign/label pickers pre-check current state and
+  submit the diff; `x` marks issues and every verb goes bulk (one request per
+  issue, `7 ok · 1 failed` tally).
+- **Screens.** Inbox (unread watermark, `C` clears), Activity, Members (the
+  inline picker's domain: key-first approve, rename, remove, invite w/ QR
+  overlay), Spaces (live, commit-last space switch), Config (edit any key;
+  `tui.*` changes apply live), Remotes, Log.
+- **Filter + saved tabs.** `/` live filter; `P` pins it as a named tab
+  (store-layer `tui.tabs`), `[`/`]` cycle; daemon-side tab filters apply by
+  doc-id intersection with `List` — mine/label semantics stay server truth.
+- **Mouse, themes, rebinding.** Clickable tabs/rows/legend, double-click
+  peeks, wheel scrolls the panel under the cursor. `tui.theme = dark|light|
+  auto`; `tui.key.<action-id>` rebinds any action (bad overrides warn, never
+  gate). Panic-safe terminal restore (RAII + hook).
+
+## Unreleased — the daily-loop DX pass (spaces, start/done/stop, inbox)
+
+Shaped by a blind design exercise (Linear-style and Jira-style teams designing
+this CLI from the same capability spec): both independently reinvented our
+explicit-create + registry architecture, and exposed the gaps this pass closes.
+
+- **`spaces`.** The user-facing noun is now *space*: `lait spaces [ls|forget|prune]`
+  (`workspaces` kept as an alias), global `-w/--space` selector, all messages
+  reworded. Internal identifiers and architecture docs keep "workspace".
+- **Work-state verbs.** `lait start [ref]` = assign yourself + first
+  active-category status + create/checkout `key-n-slug` (one commit = one
+  activity row; `--no-branch` to skip; branch step silently skipped outside
+  git). `lait done` / `lait stop` close the loop — refs infer from the branch,
+  so the daily cycle is `lait` → `start` → work → `done` with no ref typed.
+  `new --start` files and claims in one line. The daemon off-switch is renamed
+  **`shutdown`** (`stop` the word belongs to the work loop).
+- **A durable inbox.** `lait inbox [--clear]`: remote assignments, comments on
+  your work, `@nick` mentions, and status moves on your issues — derived at
+  sync-import time (attribution-honest: comments carry their real author,
+  everything else renders actor-unknown rather than guessing), persisted to
+  `inbox.json` with a read watermark, so unread items survive daemon restarts.
+  Sits beside `activity` (the workspace firehose). TUI shows an unread badge.
+- **Bare `lait` is your focus** — unread inbox summary + your open issues —
+  instead of help.
+- **Fewer nouns.** Labels are created on first use (`-l perf` just works;
+  removals still error on unknown). Project creation is key-first:
+  `projects add OPS ["Operations"]` (name defaults to the key; `new` aliased).
+  Help is bucketed: the first screen leads with the daily loop; registries and
+  node plumbing sink to the bottom. Empty outputs always name the next command.
+- MCP gains `issue_start` / `issue_done` / `issue_stop` / `inbox` tools — an
+  agent works an issue exactly like a human (claim → comment → done).
+
+## Unreleased — workspace & project re-architecture (BREAKING)
+
+> **Clean break.** Stores, invite tickets, and the wire protocol all changed;
+> old and new nodes cannot see each other (new gossip topics + ALPN bumps
+> `lait/sync/1`, `lait/presence/1`). **Every node must re-init (founders) or
+> re-join from a fresh invite (everyone else).** Pre-rewrite `.lait/` stores and
+> tickets are not migrated.
+
+Five early decisions were removed at the root instead of guarded (see
+`ARCHITECTURE.md` §15 and `GUIDED-JOIN.md`):
+
+- **Workspaces are founded explicitly.** `lait init [--name]` is the founding
+  verb: it mints the genesis here, names the workspace (default: the directory),
+  and **seeds a first project** so `lait new` works on the very next command.
+  Nothing creates a store implicitly anymore — a command in a directory with no
+  workspace errors with guidance instead of silently minting a decoy store (the
+  old lazy mint created a genesis + sealed key as a side effect of `lait ls` in
+  the wrong folder).
+- **The gossip topic derives from the workspace id.** The chat-era "room" string
+  (folder-seeded, drift-prone, three self-heal layers) is gone; the display name
+  is a synced, cosmetic catalog field — renaming never re-topics and never
+  invalidates tickets. `profile.json` is retired. Tickets are now
+  `WorkspaceTicket { workspace, name, host, host_nick, invite }`; old tickets
+  fail to parse with an "ask for a fresh one" hint.
+- **`lait join` bootstraps the store client-side** (cwd or `--dir`) from the
+  ticket before the daemon ever runs, so a daemon only opens a store already
+  bound to the right workspace. Joining from a directory bound to a *different*
+  workspace is a hard exit-2 error — the old silent adopt-if-empty /
+  split-brain-if-not heuristic is deleted. `remote add` with a foreign-workspace
+  ticket now errors ("join it first").
+- **`lait workspaces` is complete and live.** The registry is written by
+  `init`, `join`, and every daemon open — founders finally register. Rows carry
+  name, origin (founded/joined), advisory project keys, and `ls` probes live
+  status (`up`/`idle`/`missing`); `forget` deregisters, `prune` drops missing
+  entries. A new global **`-w <name|ws_id|path>`** selector targets any
+  registered workspace from any directory.
+- **`lait config`** — git-style layered local settings: global + per-store
+  `config.json`, store wins. Keys: `user.nick` (set applies live to a running
+  daemon via a new `ConfigReload` request — never a silent wait-for-restart) and
+  `project.default`; the `workspace.*` namespace is reserved for future synced
+  settings. `lait init`'s old settings-editor role (and the `--room` footgun
+  that silently re-topiced a live workspace) is gone.
+- **Project defaulting that matches how you work.** `new`/`board` resolve their
+  project through a fixed chain: explicit `-p` → the git branch's project key
+  (`eng-142-fix` → `ENG`, used only if it resolves) → `project.default` →
+  the sole project → a teaching error. `board`'s positional is now optional;
+  `ls -p` stays a pure filter; `move -p` stays explicit-only. Project keys are
+  validated (1–8 ASCII letters) so `KEY-n` aliases and branch inference stay
+  parseable.
 
 ## v0.4.8 — Windows self-update fix
 

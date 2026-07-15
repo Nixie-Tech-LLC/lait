@@ -1,10 +1,12 @@
 # Architecture & Plan — lait: a P2P issue tracker
 
-> **Status:** design draft, pre-build. Native Rust. Loro CRDT, git-backed store,
-> iroh P2P propagation. Built **functionality-first** (see [§13](#13-phased-build-plan)).
-> Supersedes the current chat-oriented `lait` code; keeps the name + iroh
-> foundation. The sync/catalog/index design (§5–§10) is validated against Loro's real
-> API and Beelay's implementation (see [§15](#15-decision-log) for sources).
+> **Status:** implemented (v0.4.8) — P0–P3 done and verified multi-node, P4 shipping;
+> this is the design of record. Native Rust. Loro CRDT, git-backed store, iroh P2P
+> propagation. Built **functionality-first** (see [§13](#13-phased-build-plan)). This
+> superseded the earlier chat-oriented `groupchat` code — keeping the iroh foundation
+> and, since the v0.4.0 rename, the name `lait`. The sync/catalog/index design (§5–§10)
+> was validated against Loro's real API and Beelay's implementation (see
+> [§15](#15-decision-log) for sources).
 
 ## 1. What this is
 
@@ -24,7 +26,7 @@ Git is the **durable local store, never the sync transport.** This is *not* git-
 issues are Loro CRDT documents, propagated P2P over iroh; git holds each node's durable
 copy and its persisted view of the shared root of trust (the genesis keys, [§6](#6-git-backed-store--trust-root)).
 
-### Kept from today's lait
+### Kept from the chat-era foundation
 iroh endpoint + `EndpointId` (ed25519 identity) · iroh-gossip topic (→ per-workspace
 announce/presence) · direct QUIC streams on a custom ALPN (→ pairwise Loro sync) ·
 iroh-blobs (→ attachments/snapshots) · `SignedMessage` sign/verify primitive (→ signed
@@ -171,11 +173,28 @@ One **git repo per node**, with a precise and *only* role: **durable local persi
 **Where the root of trust actually lives (clarified from the earlier draft).** Git is *not*
 a shared "central truth" — every node has its own repo and git never transports between
 them. The real root of trust is the **genesis key set**, distributed with the workspace
-invite/ticket (the descendant of today's `RoomTicket`). The membership/ACL graph is
+invite/ticket (the `WorkspaceTicket`). The membership/ACL graph is
 **synced P2P over iroh** like any other data and merely *persisted* in each node's git; it
 is authenticated by chaining back to the genesis keys, not by living in a repo. So: git =
 local durability; genesis-in-the-ticket = trust anchor. A node works fully standalone on
 its git-backed store with no network.
+
+**Workspace creation is explicit (workspace re-architecture, §15).** A store — and the
+genesis it holds — is born in exactly two places: `lait init` **founds** (mints the
+genesis with this node as founding admin, creates the catalog with a display name, seals
+the epoch-0 key to itself, seeds a first project) and `lait join` **bootstraps** (writes
+the ticket's genesis plus *empty* catalog/membership docs client-side, before the daemon
+ever runs, so importing the founder's ops adopts identical container ids). The old model
+— any command lazily self-founding a workspace in whatever directory it ran, and `join`
+adopting over an "empty" store at runtime — minted cryptographic authority as a side
+effect and is the documented root of the directory/room traps (GUIDED-JOIN.md). A daemon
+now only ever *opens* an initialized store; opening anything else is an error.
+
+**Network identity = the workspace id.** The gossip topic is
+`topic_for_workspace(WorkspaceId)` (domain-separated blake3). The human display name is a
+synced, cosmetic LWW register in the Catalog (S§4.1); renaming never re-topics and never
+invalidates tickets. There is no per-node "room" setting — the chat-era room string,
+which doubled as the topic and could drift from the workspace, is retired.
 
 ## 7. Cataloging & discovery
 
@@ -290,9 +309,10 @@ product. On the always-on box: `lait daemon --seed` — the ordinary daemon with
 idle-shutdown disabled (DUR-4) so it stays reachable to serve sync/backfill with no local
 client attached. On a client: `lait seed add <ticket|endpoint-id>` — pins that peer into
 a **sticky `seeds.json` registry**, distinct from the opportunistic `peers.json` bootstrap
-cache (DUR-1). A ticket form also *adopts* the workspace and backfills (a fresh client
-establishes the whole workspace from the ticket alone); a bare id form pins a peer whose
-workspace you already share. Pins are **unioned into the gossip bootstrap set and eagerly
+cache (DUR-1). A ticket form must be for the workspace this store is bound to (connect +
+backfill); a ticket for a foreign workspace errors — `lait join` it first (which
+bootstraps a store from the ticket alone). A bare id form pins a peer whose workspace
+you already share. Pins are **unioned into the gossip bootstrap set and eagerly
 pulled on every daemon start**, so a client redials and reconverges through its seed even when
 no laptop peer is online. `seed ls` shows pins + reachability; `seed rm <id|nick>` unpins.
 Crucially a pin is **bootstrap + backfill, not trust**: the seed can neither read (P2+) nor
@@ -346,17 +366,18 @@ VMs double as durable seed peers.
 
 No P1 wire rework is needed at P2/P3: formats are forward-compatible from the start (§10).
 
-## 14. Open decisions
+## 14. Decisions & open questions
 
-- **Which security design** to adapt at P3 (Beelay-ported / Keyhive-BeeKEM / Loro %ELO) —
-  deferred; all research-grade.
-- **UI surface beyond TUI** (Tauri vs local-web) — decide before/at P4.
-- **Naming** — "lait" is kept (fits a rapid-feedback tool).
-- **Validate before building (from the substrate research):** (a) two peers that
-  `shallow_snapshot` at *different* frontiers must still merge — confirm and test; (b)
-  `find_id_spans_between` / catalog-diff cost at thousands of docs; (c) whether per-`(peerId)`
-  run chunking maps cleanly onto Loro's `updates_in_range` export for the §10 envelope, or
-  needs custom framing.
+- **Which security design** to adapt (Beelay-ported / Keyhive-BeeKEM / Loro %ELO) —
+  **resolved for P3:** the simpler X25519 **sealed-box** distribution is used; a CGKA
+  (BeeKEM) key-agreement upgrade remains deferred (all research-grade).
+- **UI surface beyond TUI** (Tauri vs local-web) — still open; decide at/after P4.
+- **Naming** — **resolved:** `lait` (the v0.4.0 rename from `groupchat`).
+- **Validated during P0/P1 (from the substrate research):** (a) two peers that
+  `shallow_snapshot` at *different* frontiers still merge — confirmed, with the divergent
+  double-trim boundary handled by seed backfill; (b) `find_id_spans_between` / catalog-diff
+  cost at thousands of docs — measured; (c) whether per-`(peerId)` run chunking maps onto
+  Loro's `updates_in_range` export for the §10 envelope stays open, deferred with P2.
 
 ## 15. Decision log
 
@@ -396,6 +417,23 @@ No P1 wire rework is needed at P2/P3: formats are forward-compatible from the st
   cross-platform advisory lock (`fs2`, not raw `flock(2)`), and TLS is the portable `ring`
   rustls backend (never `aws-lc-rs`). CI builds + tests on Linux, macOS, and Windows to keep
   it that way.
+- **Workspace re-architecture (post-v0.4.8)** — five early decisions were removed at the
+  root rather than kept behind guards: (1) **lazy workspace mint** (any command
+  self-founding a workspace, minting a genesis + sealed key as a side effect) → explicit
+  `lait init`/`lait join` only, `Tracker::open` errors on an uninitialized store; (2)
+  **room = folder name as network identity** → topic derives from the `WorkspaceId`
+  (`topic_for_workspace`), display name is a synced cosmetic register, `profile.json` and
+  its three heal layers deleted; (3) **silent store auto-create** → discovery never
+  creates, one universal guided error, the read-only decoy guard deleted; (4) **join
+  mutates the cwd store** (adopt-if-empty, silent split-brain if not) → client-side store
+  bootstrap from the ticket before the daemon spawns, mismatch = hard exit 2; (5)
+  **join-only registry** → `workspaces.json` upserted by init/join/every daemon open
+  (founders register), with origin + advisory name/project snapshots, powering
+  `lait workspaces` and the global `-w` selector. Clean break: tickets (`WorkspaceTicket`),
+  ALPNs (`lait/sync/1`, `lait/presence/1`), and store expectations all changed; pre-rewrite
+  stores re-init/re-join. Companion changes: founding seeds a first project (key derived
+  from the name), `Tracker::choose_project` defaulting chain (S§7.6), and git-style layered
+  `lait config` (S§8.1).
 - **Functionality-first sequencing** — prove the DX-critical core (data model + catalog +
   TUI + git-backed store) before networking, and networking before the hard, research-grade
   security layer.

@@ -1,5 +1,11 @@
 # Hardening: delivery, acknowledgment, and urgency tiers
 
+> **Status:** design proposal — **not yet built** (a deferred P4 hardening item, see
+> [`ROADMAP.md`](./ROADMAP.md)). This specifies the agent-messaging receipt/tier model;
+> the wire types and daemon plumbing below do not exist in the code yet. Companion to
+> [`ARCHITECTURE.md`](./ARCHITECTURE.md) (A§) and [`UI.md`](./UI.md) (U§8, where the TUI
+> surface is slotted).
+
 ## The problem
 
 N-way group chat works (it's a gossip topic — `send` reaches everyone). But when
@@ -24,7 +30,7 @@ cooperation.
 | Guarantee | Answers | Mechanism | Needs the agent? |
 |---|---|---|---|
 | **Delivered** | reached their daemon? | recipient daemon auto-emits `Receipt{Delivered}` | No — pure protocol |
-| **Seen** | the agent read it? | recipient emits `Receipt{Seen}` when a `wait`/`log` cursor passes it | No — the read cursor is the proxy |
+| **Seen** | the agent read it? | recipient emits `Receipt{Seen}` when a `log`/`watch` cursor passes it | No — the read cursor is the proxy |
 | **Acted** | the agent did/acked it? | explicit `ack <seq>` → `Receipt{Acked}` | **Yes — cannot be inferred** |
 
 The first two are airtight in the daemon. The third can't be inferred, so the
@@ -71,8 +77,8 @@ preempt = effective >= Interrupt
 
 ## Attention model: layered
 
-- **t0–t2 are cooperative.** Agents follow the room by looping on `wait` /
-  `chat_wait` (or `watch`). Tiers shape what happens at loop boundaries:
+- **t0–t2 are cooperative.** Agents follow the room via `watch` (or looping on
+  the proposed `chat_wait`). Tiers shape what happens at loop boundaries:
   `direct` prints a 🔔, `needs_ack` additionally obligates an `ack`.
 - **t3 is preemptive (opt-in).** `lait watch` gains a tier policy: a
   `--on-interrupt <cmd>` hook fires only for `interrupt`-tier (preempt) events,

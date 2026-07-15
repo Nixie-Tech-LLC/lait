@@ -40,6 +40,13 @@ pub struct Genesis {
     pub founding_admins: Vec<UserId>,
 }
 
+/// Whether `home` holds an initialized store — a pure probe (no dirs created,
+/// unlike `Store::open`), for the registry and the CLI pre-flight checks.
+pub fn initialized_at(home: &Path) -> bool {
+    let repo = home.join("repo");
+    repo.join("genesis.json").exists() && repo.join("catalog.loro").exists()
+}
+
 /// The git-backed store rooted at `<home>/repo`.
 pub struct Store {
     repo: PathBuf,
@@ -111,6 +118,14 @@ impl Store {
 
     pub fn is_initialized(&self) -> bool {
         self.genesis_path().exists() && self.catalog_path().exists()
+    }
+
+    /// The home directory this store lives in (the `.lait/` dir or `$LAIT_HOME`)
+    /// — where the store-layer `config.json` sits, beside `repo/`.
+    pub fn home_path(&self) -> &Path {
+        self.repo
+            .parent()
+            .expect("store repo has a parent home dir")
     }
 
     // ---- catalog ----
@@ -384,7 +399,7 @@ mod tests {
         let home = tmp_home();
         let store = Store::open(&home).unwrap();
         let ws = WorkspaceId::mint(&SystemUlidSource);
-        let cat = CatalogDoc::create(&ws).unwrap();
+        let cat = CatalogDoc::create(&ws, "test").unwrap();
         let p = ProjectId::mint(&SystemUlidSource);
         cat.add_project(&p, "Eng", "ENG", "blue").unwrap();
         let issue = IssueDoc::create(NewIssue {
@@ -419,7 +434,7 @@ mod tests {
         let home = tmp_home();
         let store = Store::open(&home).unwrap();
         let ws = WorkspaceId::mint(&SystemUlidSource);
-        let cat = CatalogDoc::create(&ws).unwrap();
+        let cat = CatalogDoc::create(&ws, "test").unwrap();
         store.save_catalog(&cat).unwrap();
         assert!(!store.repo.join("catalog.tmp").exists());
         assert!(store.repo.join("catalog.loro").exists());

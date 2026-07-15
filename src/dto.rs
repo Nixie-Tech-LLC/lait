@@ -267,6 +267,32 @@ pub struct Candidate {
     pub title: String,
 }
 
+/// One inbox item — a remote change **addressed to you**, derived at sync-import
+/// time and persisted locally (S§8.1 `inbox.json`). Attribution-honest:
+/// `actor_nick` is present only for comments (the one in-doc field that carries
+/// a real author); assignment/status changes render actor-unknown rather than
+/// guessing (S non-goal 6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxEntry {
+    /// Local receive time (unix secs) — the read-watermark axis (advisory, S§2).
+    pub ts: u64,
+    /// `assigned` | `comment` | `status`.
+    pub kind: String,
+    pub reff: String,
+    pub doc_id: String,
+    pub title: String,
+    /// One human line: the comment body, or the status transition.
+    pub detail: String,
+    /// The attributed author's key (comments only — the one in-doc field with a
+    /// real author; `None` = actor unknown). Durable truth in `inbox.json`.
+    #[serde(default)]
+    pub actor: Option<String>,
+    /// The author's display nick, resolved by the daemon at read time from its
+    /// live directory (presence nicks + local petnames). Never persisted.
+    #[serde(default)]
+    pub actor_nick: Option<String>,
+}
+
 /// A workspace member projection (P3 members view, UI.md §8). Roles come from the
 /// signed ACL graph — the only cryptographically-verified identity in the system.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

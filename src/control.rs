@@ -21,8 +21,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::diagnose::DiagnosisView;
 use crate::dto::{
-    ActivityEvent, BoardView, Candidate, IssueView, JoinRequestDto, LabelDto, MemberDto,
-    ProjectDto, Row, SeedDto,
+    ActivityEvent, BoardView, Candidate, InboxEntry, IssueView, JoinRequestDto, LabelDto,
+    MemberDto, ProjectDto, Row, SeedDto,
 };
 
 /// The OS name of the control channel for a home (unix socket / Windows named
@@ -77,6 +77,12 @@ pub enum Request {
         title: String,
         #[serde(default)]
         project: Option<String>,
+        /// Environment hint (the CLI's git-branch project key) — distinct from
+        /// `project` because "user said X" must error loudly on a miss while
+        /// "environment suggests X" must fall through silently (S: the
+        /// choose-project chain). MCP always sends `None`.
+        #[serde(default)]
+        project_hint: Option<String>,
         #[serde(default)]
         assignees: Vec<String>,
         #[serde(default)]
@@ -94,6 +100,10 @@ pub enum Request {
         status: Option<String>,
         #[serde(default)]
         priority: Option<String>,
+        /// Full-buffer description replace (P0, UI.md §5.3 — the client holds
+        /// no `LoroText` cursor; the daemon applies it as a text update).
+        #[serde(default)]
+        description: Option<String>,
     },
     IssueMove {
         reff: String,
@@ -122,6 +132,21 @@ pub enum Request {
     IssueDelete {
         reff: String,
     },
+    /// Work-state verbs (UI.md §2): each is ONE commit = one activity row,
+    /// bundling the fields a single human intent moves. Targets are picked by
+    /// workflow *category* (first Active / Done / Backlog state), so they track
+    /// whatever the workspace's column set is. They return `Response::Issue`
+    /// (a fresh snapshot) — the one deviation from writes-echo-Ref, because the
+    /// CLI needs the title to derive the git branch name.
+    IssueStart {
+        reff: String,
+    },
+    IssueDone {
+        reff: String,
+    },
+    IssueStop {
+        reff: String,
+    },
     IssueView {
         reff: String,
     },
@@ -132,7 +157,12 @@ pub enum Request {
         filter: Filter,
     },
     Board {
-        project: String,
+        /// Optional since the choose-project chain can supply the view project
+        /// (sole project / `project.default` / branch hint).
+        #[serde(default)]
+        project: Option<String>,
+        #[serde(default)]
+        project_hint: Option<String>,
     },
     History {
         reff: String,
@@ -151,6 +181,13 @@ pub enum Request {
     Activity {
         #[serde(default)]
         since: u64,
+    },
+    /// The durable, addressed-to-you inbox (S§8.1 `inbox.json`): remote
+    /// assignments/comments/status moves on your work, derived at import time.
+    /// `clear` stamps the read watermark after listing.
+    Inbox {
+        #[serde(default)]
+        clear: bool,
     },
     // ---- membership / ACL (P3, S§6) ----
     MemberAdd {
@@ -239,12 +276,12 @@ pub enum Request {
     Log {
         since: u64,
     },
-    /// One-shot long-poll fallback to `Subscribe` (S§7.5).
-    Wait {
-        since: u64,
-        timeout_ms: u64,
-    },
     Who,
+    /// Re-read the layered local settings (`lait config set` sends this
+    /// best-effort so a daemon-read key like `user.nick` applies live instead
+    /// of silently waiting for a restart). Transport-plane like `Stop` — not
+    /// part of the MCP tool surface.
+    ConfigReload,
     Stop,
 }
 
@@ -273,6 +310,12 @@ pub enum Response {
     Activity {
         events: Vec<ActivityEvent>,
         last: u64,
+    },
+    /// The inbox snapshot: entries newest-first; `unread` counts entries past
+    /// the read watermark.
+    Inbox {
+        entries: Vec<InboxEntry>,
+        unread: u64,
     },
     Projects {
         projects: Vec<ProjectDto>,
@@ -372,6 +415,14 @@ pub struct Doorbell {
     pub dirty_catalog: Vec<CatalogScope>,
     /// New feed rows exist — pull via `Activity{since}` (S§7.5). Never streamed.
     pub activity_advanced: bool,
+    /// New presence/join rows exist — pull via `Log{since}` (S§7.5). Never
+    /// streamed: like every other plane this is a dirty *flag*, not the events.
+    /// The presence plane rings independently of the tracker dirty-set, so a
+    /// peer coming online wakes a subscriber even when no doc moved.
+    /// `default` so a frame from a pre-plane daemon (stale across `lait update`)
+    /// still decodes (S§9 rule 1: fields are add-only, absent ⇒ default).
+    #[serde(default)]
+    pub presence_advanced: bool,
 }
 
 /// A catalog-structure dirty scope (SCHEMA §7, UI.md §4.2).
@@ -418,7 +469,9 @@ pub struct PresenceEntry {
 pub struct StatusInfo {
     pub id: String,
     pub nick: String,
-    pub room: String,
+    /// The workspace display name (synced catalog value; empty on a joiner
+    /// whose catalog hasn't arrived yet).
+    pub name: String,
     pub online_peers: usize,
     pub workspace: Option<String>,
     pub issues: usize,

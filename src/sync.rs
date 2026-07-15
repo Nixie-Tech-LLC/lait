@@ -25,9 +25,10 @@ use crate::tracker::{DirtySet, Tracker};
 
 /// The ALPN for the pairwise Loro-sync protocol. The trailing number is the
 /// protocol **epoch** — bump it for a change so breaking that peers of the old
-/// epoch must not even connect (QUIC's ALPN negotiation then refuses them at the
-/// transport, before any frame is exchanged). Epoch 1 introduced the in-band
-/// `protocol_version` handshake (below); epoch 0 had no version field.
+/// epoch must not even connect (QUIC's ALPN negotiation refuses them at the
+/// transport, before any frame is exchanged). Epoch 1 covers the
+/// workspace-identity rewrite (topic-from-workspace-id, WorkspaceTicket) AND the
+/// in-band `protocol_version` handshake below; epoch 0 had neither.
 pub const SYNC_ALPN: &[u8] = b"lait/sync/1";
 
 /// The sync protocol version this build **speaks**, exchanged in the `Pull`

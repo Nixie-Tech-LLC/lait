@@ -119,6 +119,14 @@ impl DirtySet {
 
 const ACTIVITY_RING: usize = 1000;
 
+/// The three work-state intents (`start`/`done`/`stop`, UI.md §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkAction {
+    Start,
+    Done,
+    Stop,
+}
+
 /// One issue doc a puller must fetch during catalog-first sync (A§8): the
 /// `doc_id` plus the puller's local version vector for it (empty ⇒ fetch all).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,11 +159,106 @@ pub struct Tracker {
     keyring: BTreeMap<u32, WorkspaceKey>,
 }
 
+/// Derive a project key from a human name: ≥2 words → uppercase initials (max
+/// 4), one word → its first 4 letters, empty → "PRJ". Always 1–4 ASCII letters,
+/// so `KEY-n` aliases and git-branch inference stay parseable.
+pub fn derive_project_key(name: &str) -> String {
+    let words: Vec<&str> = name
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let key: String = match words.len() {
+        0 => "PRJ".to_string(),
+        1 => words[0].chars().take(4).collect(),
+        _ => words
+            .iter()
+            .take(4)
+            .filter_map(|w| w.chars().next())
+            .collect(),
+    };
+    key.to_ascii_uppercase()
+}
+
+/// Found a fresh workspace in `store` — the `lait init` path, and the ONLY
+/// place a workspace comes into existence on this machine besides
+/// [`join_workspace_store`]. Mints the genesis with `me` as founding admin
+/// (S§6), creates the catalog carrying the display `name`, seals the epoch-0
+/// workspace key to ourselves, and seeds the first project (named after the
+/// workspace, key derived) so `lait new` works immediately. Errors if the store
+/// already holds a workspace. Returns the workspace id and the seeded project.
+pub fn found_workspace(
+    store: &Store,
+    me: &UserId,
+    name: &str,
+    clock: &dyn UlidSource,
+) -> Result<(WorkspaceId, ProjectDto)> {
+    if store.is_initialized() {
+        anyhow::bail!("store already initialized — this directory already holds a workspace");
+    }
+    let ws = WorkspaceId::mint(clock);
+    let cat = CatalogDoc::create(&ws, name)?;
+    // Seed the first project so a fresh workspace is usable on the very next
+    // command. Plain catalog data — a joiner never hits this path.
+    let project_name = if name.trim().is_empty() {
+        "Main"
+    } else {
+        name.trim()
+    };
+    let project_id = ProjectId::mint(clock);
+    let project_key = derive_project_key(project_name);
+    cat.add_project(&project_id, project_name, &project_key, "blue")?;
+    cat.doc().commit();
+    let genesis = Genesis {
+        workspace_id: ws.clone(),
+        founding_admins: vec![me.clone()],
+    };
+    store.write_genesis(&genesis)?;
+    store.save_catalog(&cat)?;
+    let membership = MembershipDoc::create(&ws)?;
+    let key = crypto::random_key();
+    if let Some(sealed) = crypto::seal_to(me, &key) {
+        membership.put_sealed(0, me, &sealed)?;
+    }
+    membership.doc().commit();
+    store.save_membership(&membership)?;
+    store.commit("init workspace");
+    let project = cat
+        .project(&project_id)
+        .ok_or_else(|| anyhow!("seeded project vanished"))?;
+    Ok((ws, project))
+}
+
+/// Bootstrap a store from a join ticket — the `lait join` path (A§6/A§10).
+/// Writes the ticket's genesis (the host is the founding admin whose signed ACL
+/// the joiner validates against) and **empty** catalog/membership docs, so
+/// importing the founder's ops adopts identical container ids (see
+/// [`CatalogDoc::empty`] — `create()` would mint conflicting containers).
+/// Errors if the store already holds a workspace; the CLI guarantees it doesn't.
+pub fn join_workspace_store(store: &Store, workspace: &str, founder: &str) -> Result<WorkspaceId> {
+    if store.is_initialized() {
+        anyhow::bail!("store already initialized — this directory already holds a workspace");
+    }
+    let ws_id = WorkspaceId::parse(workspace)
+        .ok_or_else(|| anyhow!("invalid workspace id in ticket: {workspace}"))?;
+    let founding_admins = UserId::parse(founder).map(|u| vec![u]).unwrap_or_default();
+    let genesis = Genesis {
+        workspace_id: ws_id.clone(),
+        founding_admins,
+    };
+    store.write_genesis(&genesis)?;
+    store.save_catalog(&CatalogDoc::empty())?;
+    store.save_membership(&MembershipDoc::empty())?;
+    store.commit("join workspace from ticket");
+    Ok(ws_id)
+}
+
 impl Tracker {
-    /// Open the tracker over a store, creating the workspace (genesis + catalog)
-    /// on first run. Performs the **load-time head recompute** (S§3.2): heads and
-    /// rows are recomputed from the real issue-doc frontiers, never trusted from
-    /// disk, so a crash between an issue commit and its row mirror self-heals.
+    /// Open the tracker over an **initialized** store — a missing catalog or
+    /// genesis is an error, never a founding event (workspaces are born only in
+    /// [`found_workspace`] / [`join_workspace_store`]). Performs the **load-time
+    /// head recompute** (S§3.2): heads and rows are recomputed from the real
+    /// issue-doc frontiers, never trusted from disk, so a crash between an issue
+    /// commit and its row mirror self-heals.
     pub fn open(
         store: Store,
         me: UserId,
@@ -163,47 +266,34 @@ impl Tracker {
         seed: [u8; 32],
         clock: Box<dyn UlidSource + Send + Sync>,
     ) -> Result<Self> {
-        let existing = store.load_catalog()?;
-        let (catalog, workspace_id, membership, genesis, fresh) = match existing {
-            Some(cat) => {
-                let ws = cat
-                    .workspace_id()
-                    .ok_or_else(|| anyhow!("catalog missing workspaceId"))?;
-                let membership = match store.load_membership()? {
-                    Some(m) => m,
-                    None => {
-                        let m = MembershipDoc::create(&ws)?;
-                        store.save_membership(&m)?;
-                        m
-                    }
-                };
-                let genesis = store.genesis()?.unwrap_or_else(|| Genesis {
-                    workspace_id: ws.clone(),
-                    founding_admins: vec![me.clone()],
-                });
-                (cat, ws, membership, genesis, false)
+        let catalog = store.load_catalog()?.ok_or_else(|| {
+            anyhow!(
+                "store not initialized — found no workspace here (run `lait init` or `lait join`)"
+            )
+        })?;
+        let genesis = store.genesis()?.ok_or_else(|| {
+            anyhow!("store missing genesis.json — corrupt or pre-rewrite store; re-init or re-join")
+        })?;
+        // A joiner's catalog is empty (no workspaceId) until the founder's ops
+        // arrive over sync; the genesis is the local root of truth. A catalog
+        // that DOES carry an id must agree with it.
+        let workspace_id = match catalog.workspace_id() {
+            Some(ws) if ws != genesis.workspace_id => {
+                anyhow::bail!(
+                    "catalog workspace {ws} does not match genesis {} — corrupt store",
+                    genesis.workspace_id
+                )
             }
+            Some(ws) => ws,
+            None => genesis.workspace_id.clone(),
+        };
+        let membership = match store.load_membership()? {
+            Some(m) => m,
             None => {
-                // fresh workspace — we are the founding admin (S§6). Mint the
-                // workspace key and seal it to ourselves at epoch 0.
-                let ws = WorkspaceId::mint(&*clock);
-                let cat = CatalogDoc::create(&ws)?;
-                cat.doc().commit();
-                let genesis = Genesis {
-                    workspace_id: ws.clone(),
-                    founding_admins: vec![me.clone()],
-                };
-                store.write_genesis(&genesis)?;
-                store.save_catalog(&cat)?;
-                let membership = MembershipDoc::create(&ws)?;
-                let key = crypto::random_key();
-                if let Some(sealed) = crypto::seal_to(&me, &key) {
-                    membership.put_sealed(0, &me, &sealed)?;
-                }
-                membership.doc().commit();
-                store.save_membership(&membership)?;
-                store.commit("init workspace");
-                (cat, ws, membership, genesis, true)
+                // Defensive only — both creation verbs write a membership doc.
+                let m = MembershipDoc::empty();
+                store.save_membership(&m)?;
+                m
             }
         };
 
@@ -224,9 +314,6 @@ impl Tracker {
             keyring: BTreeMap::new(),
         };
         tracker.refresh_keyring();
-        if fresh {
-            debug_assert!(tracker.current_key().is_some(), "founder must hold the key");
-        }
         tracker.recompute_all_rows()?;
         tracker.rebuild_aliases();
         Ok(tracker)
@@ -307,6 +394,26 @@ impl Tracker {
     pub fn workspace_id(&self) -> &WorkspaceId {
         &self.workspace_id
     }
+    /// The synced display name (empty on a joiner until the catalog arrives).
+    pub fn workspace_name(&self) -> String {
+        self.catalog.workspace_name()
+    }
+    /// Update the display nick (a `ConfigReload` applying `user.nick` live).
+    /// Affects future activity attribution; nothing durable to rewrite.
+    pub fn set_nick(&mut self, nick: String) {
+        self.my_nick = nick;
+    }
+    /// Advisory project snapshot for the machine-level workspace registry.
+    pub fn project_briefs(&self) -> Vec<crate::workspaces::ProjectBrief> {
+        self.catalog
+            .projects_list()
+            .into_iter()
+            .map(|p| crate::workspaces::ProjectBrief {
+                key: p.key,
+                name: p.name,
+            })
+            .collect()
+    }
     pub fn issue_count(&self) -> usize {
         self.catalog
             .all_rows()
@@ -343,25 +450,41 @@ impl Tracker {
             Request::IssueNew {
                 title,
                 project,
+                project_hint,
                 assignees,
                 priority,
                 labels,
                 body,
-            } => self.issue_new(title, project, assignees, priority, labels, body),
+            } => self.issue_new(
+                title,
+                project,
+                project_hint,
+                assignees,
+                priority,
+                labels,
+                body,
+            ),
             Request::IssueEdit {
                 reff,
                 title,
                 status,
                 priority,
-            } => self.issue_edit(reff, title, status, priority),
+                description,
+            } => self.issue_edit(reff, title, status, priority, description),
             Request::IssueMove { reff, project, pos } => self.issue_move(reff, project, pos),
             Request::Assign { reff, who, add } => self.assign(reff, who, add),
             Request::Label { reff, add, remove } => self.label(reff, add, remove),
             Request::Comment { reff, body } => self.comment(reff, body),
             Request::IssueDelete { reff } => self.issue_delete(reff),
+            Request::IssueStart { reff } => self.work_state(reff, WorkAction::Start),
+            Request::IssueDone { reff } => self.work_state(reff, WorkAction::Done),
+            Request::IssueStop { reff } => self.work_state(reff, WorkAction::Stop),
             Request::IssueView { reff } => self.issue_view(reff).map(|r| (r, None)),
             Request::List { project, filter } => self.list(project, filter).map(|r| (r, None)),
-            Request::Board { project } => self.board(project).map(|r| (r, None)),
+            Request::Board {
+                project,
+                project_hint,
+            } => self.board(project, project_hint).map(|r| (r, None)),
             Request::History { reff } => self.history(reff).map(|r| (r, None)),
             Request::ProjectNew { name, key } => self.project_new(name, key),
             Request::ProjectList => Ok((self.project_list(), None)),
@@ -397,16 +520,49 @@ impl Tracker {
         index::resolve_project(&self.catalog, input)
     }
 
-    /// The default project for a new issue when none is given: the only project,
-    /// else an error asking for one.
-    fn default_project(&self) -> Result<ProjectDto> {
+    /// Resolve the target/view project for a command. Precedence: explicit
+    /// `-p`/positional (miss = hard error) → environment hint (the CLI's
+    /// git-branch key — used only if it resolves, so a branch named `wip-2`
+    /// never breaks `new`) → configured `project.default` (user-chosen, so a
+    /// stale value errors loudly) → the sole project → a teaching error.
+    fn choose_project(
+        &self,
+        explicit: Option<&str>,
+        hint: Option<&str>,
+    ) -> std::result::Result<ProjectDto, Response> {
+        if let Some(p) = explicit {
+            return self
+                .resolve_project(p)
+                .ok_or_else(|| Response::not_found(format!("no project matches '{p}'")));
+        }
+        if let Some(h) = hint {
+            if let Some(pr) = self.resolve_project(h) {
+                return Ok(pr);
+            }
+        }
+        // Read fresh per request — no boot cache, so `lait config set` applies
+        // to the very next command with no daemon notify.
+        let settings = crate::config::Settings::load(Some(self.store.home_path()));
+        if let Some(dflt) = settings.default_project() {
+            return self.resolve_project(&dflt).ok_or_else(|| {
+                Response::err(format!(
+                    "project.default is '{dflt}' but no such project exists — fix it: `lait config set project.default <KEY>`"
+                ))
+            });
+        }
         let projects = self.catalog.projects_list();
         match projects.len() {
             1 => Ok(projects.into_iter().next().unwrap()),
-            0 => Err(anyhow!(
-                "no projects yet — create one first: `lait projects new <name> --key KEY`"
+            0 => Err(Response::err(
+                "no projects visible yet — still syncing, or create one: `lait projects new <name> --key <KEY>`",
             )),
-            _ => Err(anyhow!("more than one project — specify one with -p <KEY>")),
+            _ => {
+                let keys: Vec<&str> = projects.iter().map(|p| p.key.as_str()).collect();
+                Err(Response::err(format!(
+                    "more than one project ({}) — pass -p <KEY> or set a default: `lait config set project.default <KEY>`",
+                    keys.join(", ")
+                )))
+            }
         }
     }
 
@@ -417,6 +573,7 @@ impl Tracker {
         &mut self,
         title: String,
         project: Option<String>,
+        project_hint: Option<String>,
         assignees: Vec<String>,
         priority: Option<String>,
         labels: Vec<String>,
@@ -426,20 +583,9 @@ impl Tracker {
         if title.trim().is_empty() {
             return Ok((Response::err("title must not be empty"), None));
         }
-        let project = match project {
-            Some(p) => match self.resolve_project(&p) {
-                Some(pr) => pr,
-                None => {
-                    return Ok((
-                        Response::not_found(format!("no project matches '{p}'")),
-                        None,
-                    ))
-                }
-            },
-            None => match self.default_project() {
-                Ok(pr) => pr,
-                Err(e) => return Ok((Response::err(format!("{e:#}")), None)),
-            },
+        let project = match self.choose_project(project.as_deref(), project_hint.as_deref()) {
+            Ok(pr) => pr,
+            Err(resp) => return Ok((resp, None)),
         };
         let priority = match priority {
             Some(p) => match Priority::parse(&p) {
@@ -456,12 +602,18 @@ impl Tracker {
                 None => return Ok((Response::not_found(format!("no user matches '{a}'")), None)),
             }
         }
+        // Labels resolve-or-create (first use = creation, UI.md §2.2) — but the
+        // whole batch is validated before anything is minted, so a bad input
+        // later in the list can't leave stray labels behind.
+        if let Some(l) = labels.iter().find(|l| self.invalid_label_input(l)) {
+            return Ok((Response::not_found(format!("no label matches '{l}'")), None));
+        }
         let mut label_ids = Vec::new();
+        let mut created_label = false;
         for l in &labels {
-            match self.resolve_label(l) {
-                Some(id) => label_ids.push(id),
-                None => return Ok((Response::not_found(format!("no label matches '{l}'")), None)),
-            }
+            let (id, created) = self.resolve_or_create_label(l)?;
+            created_label |= created;
+            label_ids.push(id);
         }
 
         // ---- apply ----
@@ -501,9 +653,12 @@ impl Tracker {
 
         let reff = self.aliases.canonical_for(&doc_id);
         self.push_activity(Some(&doc_id), &reff, "created", vec![], &title);
-        let dirty = DirtySet::issue(&project.id, &doc_id).with_scope(CatalogScope::Boards {
+        let mut dirty = DirtySet::issue(&project.id, &doc_id).with_scope(CatalogScope::Boards {
             project: project.id.as_str().to_string(),
         });
+        if created_label {
+            dirty = dirty.with_scope(CatalogScope::Labels);
+        }
         Ok((Response::Ref { reff }, Some(dirty)))
     }
 
@@ -513,6 +668,7 @@ impl Tracker {
         title: Option<String>,
         status: Option<String>,
         priority: Option<String>,
+        description: Option<String>,
     ) -> Result<(Response, Option<DirtySet>)> {
         let doc_id = match self.resolve_issue(&reff) {
             Ok(id) => id,
@@ -531,7 +687,7 @@ impl Tracker {
             },
             None => None,
         };
-        if title.is_none() && status.is_none() && priority.is_none() {
+        if title.is_none() && status.is_none() && priority.is_none() && description.is_none() {
             return Ok((Response::err("nothing to edit"), None));
         }
 
@@ -573,6 +729,16 @@ impl Tracker {
                     to: Some(p.as_str().to_string()),
                 });
             }
+            if let Some(d) = &description {
+                // Full-buffer replace (P0, UI.md §5.3). Bodies are too big for
+                // the activity row — record the transition, elide the values.
+                issue.set_description(d)?;
+                changes.push(FieldChange {
+                    field: "description".into(),
+                    from: None,
+                    to: None,
+                });
+            }
             issue.commit();
         }
         // completion policy (S§5.7): entering a done-category status removes the
@@ -594,6 +760,105 @@ impl Tracker {
             project: project_id.as_str().to_string(),
         });
         Ok((Response::Ref { reff }, Some(dirty)))
+    }
+
+    /// One work-state transition (UI.md §2 `start`/`done`/`stop`): the fields a
+    /// single human intent moves — status by workflow *category* plus the
+    /// viewer's assignment — in ONE Loro commit = one activity row (S§7.1).
+    /// Returns a fresh `Response::Issue` snapshot (the CLI derives the git
+    /// branch name from the title); a no-op (already there) returns the
+    /// snapshot with no commit, no activity, no doorbell.
+    fn work_state(
+        &mut self,
+        reff: String,
+        action: WorkAction,
+    ) -> Result<(Response, Option<DirtySet>)> {
+        let doc_id = match self.resolve_issue(&reff) {
+            Ok(id) => id,
+            Err(resp) => return Ok((resp, None)),
+        };
+        let (cat, kind) = match action {
+            WorkAction::Start => (StatusCategory::Active, "started"),
+            WorkAction::Done => (StatusCategory::Done, "finished"),
+            WorkAction::Stop => (StatusCategory::Backlog, "stopped"),
+        };
+        let Some(target) = self.first_state_in(cat) else {
+            return Ok((
+                Response::err(format!(
+                    "this space's workflow has no {}-category status",
+                    cat.as_str()
+                )),
+                None,
+            ));
+        };
+        let me = self.me.clone();
+
+        let project_id;
+        let mut changes = Vec::new();
+        let status_transition: (String, String);
+        {
+            let issue = self
+                .issue(&doc_id)?
+                .ok_or_else(|| anyhow!("issue body not present"))?;
+            project_id = issue
+                .project_id()
+                .ok_or_else(|| anyhow!("issue has no project"))?;
+            let from = issue.status();
+            if from != target.id {
+                issue.set_status(&target.id)?;
+                changes.push(FieldChange {
+                    field: "status".into(),
+                    from: Some(from.clone()),
+                    to: Some(target.id.clone()),
+                });
+            }
+            status_transition = (from, target.id.clone());
+            let assigned_to_me = issue.assignees().contains(&me);
+            match action {
+                WorkAction::Start if !assigned_to_me => {
+                    issue.add_assignee(&me)?;
+                    changes.push(FieldChange {
+                        field: "assignees".into(),
+                        from: None,
+                        to: Some("@me".into()),
+                    });
+                }
+                WorkAction::Stop if assigned_to_me => {
+                    issue.remove_assignee(&me)?;
+                    changes.push(FieldChange {
+                        field: "assignees".into(),
+                        from: Some("@me".into()),
+                        to: None,
+                    });
+                }
+                _ => {}
+            }
+            if changes.is_empty() {
+                // Already exactly there — idempotent: no commit, no activity.
+                return self.issue_view(reff).map(|r| (r, None));
+            }
+            issue.commit();
+        }
+        // completion policy (S§5.7): entering a done-category status removes the
+        // doc from the board list; leaving one re-inserts it at the top.
+        {
+            let (from, to) = &status_transition;
+            let from_done = self.is_done_status(from);
+            let to_done = self.is_done_status(to);
+            if to_done && !from_done {
+                self.catalog.board_remove(&project_id, &doc_id)?;
+            } else if from_done && !to_done {
+                self.catalog.board_insert_top(&project_id, &doc_id)?;
+            }
+        }
+
+        self.persist_issue_and_row(&doc_id)?;
+        let canonical = self.aliases.canonical_for(&doc_id);
+        self.push_activity(Some(&doc_id), &canonical, kind, changes, "");
+        let dirty = DirtySet::issue(&project_id, &doc_id).with_scope(CatalogScope::Boards {
+            project: project_id.as_str().to_string(),
+        });
+        self.issue_view(canonical).map(|r| (r, Some(dirty)))
     }
 
     fn issue_move(
@@ -748,12 +1013,12 @@ impl Tracker {
             Ok(id) => id,
             Err(resp) => return Ok((resp, None)),
         };
-        let mut add_ids = Vec::new();
-        for l in &add {
-            match self.resolve_label(l) {
-                Some(id) => add_ids.push(id),
-                None => return Ok((Response::not_found(format!("no label matches '{l}'")), None)),
-            }
+        // Adds create the label on first use (labels are vocabulary, not
+        // ceremony — UI.md §2.2); removals still error on unknown (removing a
+        // label that never existed is a typo, not intent). Everything that can
+        // fail is validated BEFORE anything is created (validate-then-commit).
+        if let Some(l) = add.iter().find(|l| self.invalid_label_input(l)) {
+            return Ok((Response::not_found(format!("no label matches '{l}'")), None));
         }
         let mut remove_ids = Vec::new();
         for l in &remove {
@@ -761,6 +1026,13 @@ impl Tracker {
                 Some(id) => remove_ids.push(id),
                 None => return Ok((Response::not_found(format!("no label matches '{l}'")), None)),
             }
+        }
+        let mut created_any = false;
+        let mut add_ids = Vec::new();
+        for l in &add {
+            let (id, created) = self.resolve_or_create_label(l)?;
+            created_any |= created;
+            add_ids.push(id);
         }
         let project_id = {
             let issue = self
@@ -778,10 +1050,11 @@ impl Tracker {
         self.persist_issue_and_row(&doc_id)?;
         let reff = self.aliases.canonical_for(&doc_id);
         self.push_activity(Some(&doc_id), &reff, "labeled", vec![], "");
-        Ok((
-            Response::Ref { reff },
-            Some(DirtySet::issue(&project_id, &doc_id)),
-        ))
+        let mut dirty = DirtySet::issue(&project_id, &doc_id);
+        if created_any {
+            dirty = dirty.with_scope(CatalogScope::Labels);
+        }
+        Ok((Response::Ref { reff }, Some(dirty)))
     }
 
     fn comment(&mut self, reff: String, body: String) -> Result<(Response, Option<DirtySet>)> {
@@ -845,6 +1118,16 @@ impl Tracker {
         if name.trim().is_empty() || key.is_empty() {
             return Ok((Response::err("project name and key are required"), None));
         }
+        // 1–8 ASCII letters: anything else breaks `KEY-n` alias parsing and
+        // git-branch inference (both scan for one alphabetic run).
+        if key.len() > 8 || !key.chars().all(|c| c.is_ascii_alphabetic()) {
+            return Ok((
+                Response::err(format!(
+                    "bad project key '{key}' — use 1-8 ASCII letters (it becomes the KEY in KEY-1 refs)"
+                )),
+                None,
+            ));
+        }
         if self.catalog.project_by_key(&key).is_some() {
             return Ok((
                 Response::err(format!("project key '{key}' already exists")),
@@ -888,6 +1171,27 @@ impl Tracker {
             },
             Some(DirtySet::catalog(CatalogScope::Labels)),
         ))
+    }
+
+    /// Whether an ADD-path label input can never resolve or be created: a
+    /// `lbl_`-prefixed id that doesn't exist (an id reference is a pointer, and
+    /// a dangling pointer is a typo, not a new name), or an empty name. Checked
+    /// for the WHOLE batch before any creation, preserving validate-then-commit.
+    fn invalid_label_input(&self, input: &str) -> bool {
+        let name = input.trim();
+        (name.is_empty() || name.starts_with(LabelId::PREFIX))
+            && self.resolve_label(input).is_none()
+    }
+
+    /// Resolve a label for an ADD path, creating it on first use (gray). The
+    /// caller has already rejected [`Self::invalid_label_input`]s.
+    fn resolve_or_create_label(&mut self, input: &str) -> Result<(LabelId, bool)> {
+        if let Some(id) = self.resolve_label(input) {
+            return Ok((id, false));
+        }
+        let id = LabelId::mint(&*self.clock);
+        self.catalog.add_label(&id, input.trim(), "gray")?;
+        Ok((id, true))
     }
 
     fn resolve_label(&self, input: &str) -> Option<LabelId> {
@@ -940,6 +1244,15 @@ impl Tracker {
             .workflow_state(status)
             .map(|w| w.category == StatusCategory::Done)
             .unwrap_or(false)
+    }
+
+    /// The first workflow state in a category — where the work-state verbs land
+    /// (tracks whatever column set this space's workflow has).
+    fn first_state_in(&self, cat: StatusCategory) -> Option<crate::dto::WorkflowState> {
+        self.catalog
+            .workflow()
+            .into_iter()
+            .find(|w| w.category == cat)
     }
 
     /// Viewer-aware assignee summary (UI.md §5.1): "you", "you +2", "ab", "".
@@ -1030,11 +1343,10 @@ impl Tracker {
     /// rows whose `projectId == P`, in `boards[P]` order, deduplicated,
     /// belonging-but-unlisted appended, listed-but-not-belonging ignored; the
     /// Done column via the append rule ordered by wall-clock desc (S§5.7).
-    fn board(&self, project: String) -> Result<Response> {
-        let Some(project_dto) = self.resolve_project(&project) else {
-            return Ok(Response::not_found(format!(
-                "no project matches '{project}'"
-            )));
+    fn board(&self, project: Option<String>, project_hint: Option<String>) -> Result<Response> {
+        let project_dto = match self.choose_project(project.as_deref(), project_hint.as_deref()) {
+            Ok(pr) => pr,
+            Err(resp) => return Ok(resp),
         };
         let pid = &project_dto.id;
         let rows_by_doc: HashMap<String, RowMeta> = self
@@ -1281,48 +1593,6 @@ impl Tracker {
         h.update(&self.catalog.head().encode());
         h.update(&self.membership.head().encode());
         h.finalize().as_bytes().to_vec()
-    }
-
-    /// Whether this node's workspace is still empty (no projects, no docs) — a
-    /// freshly-minted workspace that may adopt a peer's on join.
-    pub fn is_empty_workspace(&self) -> bool {
-        self.catalog.projects_list().is_empty() && self.catalog.doc_ids().is_empty()
-    }
-
-    /// Adopt a workspace id from a join ticket (A§6/A§10): re-root an *empty*
-    /// workspace onto the ticket's genesis so its catalog can then converge with
-    /// the founder's over sync. Never clobbers a workspace that already holds
-    /// real data. Returns whether an adoption happened.
-    pub fn adopt_workspace(&mut self, ws: &str, founder: &str) -> Result<bool> {
-        let Some(ws_id) = WorkspaceId::parse(ws) else {
-            return Ok(false);
-        };
-        if ws_id == self.workspace_id || !self.is_empty_workspace() {
-            return Ok(false);
-        }
-        // The genesis trust root comes from the ticket: the founder (ticket host)
-        // is the founding admin whose signed ACL a joiner validates against (S§6).
-        let founding_admins = UserId::parse(founder).map(|u| vec![u]).unwrap_or_default();
-        let genesis = Genesis {
-            workspace_id: ws_id.clone(),
-            founding_admins,
-        };
-        // A joiner adopts EMPTY docs (not create()) so importing the founder's
-        // full catalog/membership yields identical container ids (see
-        // CatalogDoc::empty). Container init would otherwise conflict on merge.
-        let catalog = CatalogDoc::empty();
-        let membership = MembershipDoc::empty();
-        self.store.write_genesis(&genesis)?;
-        self.store.save_catalog(&catalog)?;
-        self.store.save_membership(&membership)?;
-        self.workspace_id = ws_id;
-        self.catalog = catalog;
-        self.membership = membership;
-        self.genesis = genesis;
-        self.keyring.clear(); // not a member yet — no key until the founder adds us
-        self.rebuild_aliases();
-        self.store.commit("adopt workspace from ticket");
-        Ok(true)
     }
 
     // ---- membership sync (plaintext, A§11 two-protocol split) ----
@@ -1709,6 +1979,17 @@ impl Tracker {
         let Some(bytes) = self.decrypt_payload(bytes) else {
             return Ok(None);
         };
+        // Capture the pre-import state relevant to *this viewer* — the only
+        // honest source for the inbox (S§8.1): remote ops carry no trusted
+        // actor, so "addressed to you" is detected as a state transition, not
+        // read from attribution. `None` ⇒ the doc is new to this node.
+        let prior = self.issues.get(&id).map(|i| {
+            (
+                i.assignees().contains(&self.me),
+                i.status(),
+                i.comments().len(),
+            )
+        });
         // ensure a doc exists to import into (new docs arrive as a snapshot).
         if !self.issues.contains_key(&id) {
             let doc = loro::LoroDoc::new();
@@ -1734,10 +2015,79 @@ impl Tracker {
         // a synced doc advances the activity feed (pulled, not streamed, S§7.5).
         let reff = self.aliases.canonical_for(&id);
         self.push_activity(Some(&id), &reff, "synced", vec![], "");
+        // Inbox entries carry the friendly `KEY-n` handle when one exists —
+        // they're read by a human scanning a summary line.
+        let inbox_reff = self.aliases.alias_for(&id).unwrap_or(reff);
+        self.derive_inbox_entries(&id, &inbox_reff, prior);
         match project_id {
             Some(p) => Ok(Some(DirtySet::issue(&p, &id))),
             None => Ok(None),
         }
+    }
+
+    /// Emit durable inbox entries for a just-imported doc: assignments to me,
+    /// new comments on my work or mentioning `@mynick`, and status moves on my
+    /// work. Backfill-bounded by construction: a brand-new-to-me doc (`prior ==
+    /// None`) contributes at most one `assigned` entry, never a comment/status
+    /// flood. Best-effort — inbox failure never affects the import.
+    fn derive_inbox_entries(
+        &mut self,
+        id: &DocId,
+        reff: &str,
+        prior: Option<(bool, String, usize)>,
+    ) {
+        let Some(issue) = self.issues.get(id) else {
+            return;
+        };
+        let me = &self.me;
+        let now = self.clock.now_ms() / 1000;
+        let title = issue.title();
+        let assignees = issue.assignees();
+        let assigned_to_me = assignees.contains(me);
+        let my_issue = assigned_to_me || issue.created_by().as_ref() == Some(me);
+        let entry = |kind: &str, detail: String, actor: Option<String>| crate::dto::InboxEntry {
+            ts: now,
+            kind: kind.into(),
+            reff: reff.to_string(),
+            doc_id: id.as_str().to_string(),
+            title: title.clone(),
+            detail,
+            actor,
+            actor_nick: None,
+        };
+        let mut entries = Vec::new();
+        match prior {
+            None => {
+                if assigned_to_me {
+                    entries.push(entry("assigned", "you were assigned".into(), None));
+                }
+            }
+            Some((was_assigned_to_me, prior_status, prior_comments)) => {
+                if !was_assigned_to_me && assigned_to_me {
+                    entries.push(entry("assigned", "you were assigned".into(), None));
+                }
+                let status = issue.status();
+                if status != prior_status && my_issue {
+                    entries.push(entry("status", format!("{prior_status} → {status}"), None));
+                }
+                let mention = format!("@{}", self.my_nick).to_ascii_lowercase();
+                for c in issue.comments().into_iter().skip(prior_comments) {
+                    if &c.author == me {
+                        continue;
+                    }
+                    let mentioned =
+                        !self.my_nick.is_empty() && c.body.to_ascii_lowercase().contains(&mention);
+                    if my_issue || mentioned {
+                        entries.push(entry(
+                            "comment",
+                            c.body.clone(),
+                            Some(c.author.as_str().to_string()),
+                        ));
+                    }
+                }
+            }
+        }
+        crate::inbox::append(self.store.home_path(), entries);
     }
 
     // ---- test/inspection helpers (used by integration invariant tests) ----
@@ -1831,8 +2181,26 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         let store = Store::open(&home).unwrap();
         // Distinct clock per node (seed-derived ms) so two nodes mint DIFFERENT
-        // workspace ids — otherwise the deterministic clock collides them and
-        // adoption (which requires a differing ws id) would no-op.
+        // workspace ids — otherwise the deterministic clock collides them.
+        let clock = FakeClock::new(1_000_000 + seed[0] as u64 * 100_000);
+        // Explicit founding (no lazy mint): seeds the "Testbed" workspace with
+        // its default TEST project, so trackers open like real founder stores.
+        found_workspace(&store, &user, "Testbed", &clock).unwrap();
+        let tracker = Tracker::open(store, user, "tester".into(), seed, Box::new(clock)).unwrap();
+        TestNode { tracker, home }
+    }
+
+    /// A node whose store was bootstrapped from a ticket (the `lait join` path):
+    /// genesis rooted on `ws`/`founder`, empty catalog/membership awaiting sync.
+    fn new_joiner_node_as(user: UserId, seed: [u8; 32], ws: &str, founder: &str) -> TestNode {
+        let home = std::env::temp_dir().join(format!(
+            "gc-trk-{}-{}",
+            std::process::id(),
+            DocId::mint(&crate::ids::SystemUlidSource)
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let store = Store::open(&home).unwrap();
+        join_workspace_store(&store, ws, founder).unwrap();
         let clock = FakeClock::new(1_000_000 + seed[0] as u64 * 100_000);
         let tracker = Tracker::open(store, user, "tester".into(), seed, Box::new(clock)).unwrap();
         TestNode { tracker, home }
@@ -1852,6 +2220,7 @@ mod tests {
         let (resp, dirty) = t.handle(Request::IssueNew {
             title: title.into(),
             project: Some("ENG".into()),
+            project_hint: None,
             assignees: vec![],
             priority: None,
             labels: vec![],
@@ -1899,6 +2268,7 @@ mod tests {
                 let (resp, dirty) = t.handle(Request::IssueNew {
                     title: format!("issue {i}"),
                     project: Some("ENG".into()),
+                    project_hint: None,
                     assignees: vec![],
                     priority: None,
                     labels: vec![],
@@ -1929,7 +2299,8 @@ mod tests {
         let tb = Instant::now();
         for _ in 0..k {
             let (r, _) = t.handle(Request::Board {
-                project: "ENG".into(),
+                project: Some("ENG".into()),
+                project_hint: None,
             });
             assert!(matches!(r, Response::Board(_)), "{r:?}");
         }
@@ -1994,6 +2365,7 @@ mod tests {
             title: None,
             status: Some("nonsense_status".into()),
             priority: None,
+            description: None,
         });
         assert!(matches!(resp, Response::Error { .. }), "{resp:?}");
         assert!(dirty.is_none(), "a rejected write must ring no doorbell");
@@ -2009,6 +2381,7 @@ mod tests {
             title: Some("x".into()),
             status: None,
             priority: None,
+            description: None,
         });
         assert!(matches!(resp, Response::Error { .. }));
         assert!(dirty.is_none());
@@ -2026,6 +2399,7 @@ mod tests {
             title: Some("t2".into()),
             status: Some("in_progress".into()),
             priority: Some("high".into()),
+            description: None,
         });
         assert!(matches!(resp, Response::Ref { .. }));
         assert_eq!(
@@ -2053,6 +2427,7 @@ mod tests {
             title: Some("changed".into()),
             status: Some("in_progress".into()),
             priority: None,
+            description: None,
         });
         let rows = match n
             .tracker
@@ -2159,7 +2534,8 @@ mod tests {
     fn board_key_aliases(t: &mut Tracker, project: &str) -> Vec<String> {
         match t
             .handle(Request::Board {
-                project: project.into(),
+                project: Some(project.into()),
+                project_hint: None,
             })
             .0
         {
@@ -2175,7 +2551,8 @@ mod tests {
     fn board_reffs(t: &mut Tracker, project: &str) -> Vec<String> {
         match t
             .handle(Request::Board {
-                project: project.into(),
+                project: Some(project.into()),
+                project_hint: None,
             })
             .0
         {
@@ -2228,11 +2605,13 @@ mod tests {
 
         let b_seed = [8u8; 32];
         let b_user = user_from_seed(b_seed);
-        let mut b = new_node_as(b_user.clone(), b_seed);
         let a_ws = a.tracker.workspace_str();
-        assert!(
-            b.tracker.adopt_workspace(&a_ws, me().as_str()).unwrap(),
-            "B adopts A's workspace"
+        // B's store is bootstrapped from the ticket (the `lait join` path).
+        let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, me().as_str());
+        assert_eq!(
+            b.tracker.workspace_str(),
+            a_ws,
+            "B is rooted on A's workspace"
         );
 
         // Before add: B syncs but cannot decrypt — sees only ciphertext.
@@ -2360,6 +2739,7 @@ mod tests {
             title: None,
             status: Some("done".into()),
             priority: None,
+            description: None,
         });
         // board movable list is now empty (bounded to the active set)...
         assert_eq!(board_len(&n.tracker), 0);
@@ -2367,7 +2747,8 @@ mod tests {
         let done_present = match n
             .tracker
             .handle(Request::Board {
-                project: "ENG".into(),
+                project: Some("ENG".into()),
+                project_hint: None,
             })
             .0
         {
@@ -2382,5 +2763,346 @@ mod tests {
         assert!(done_present, "done issue renders in the Done column");
         // and it is still counted as an existing issue.
         assert_eq!(n.tracker.issue_count(), 1);
+    }
+
+    #[test]
+    fn derive_project_key_shapes() {
+        assert_eq!(derive_project_key("Engineering"), "ENGI");
+        assert_eq!(derive_project_key("lait"), "LAIT");
+        assert_eq!(derive_project_key("my cool app"), "MCA");
+        assert_eq!(
+            derive_project_key("Media Automation Stack Thing Extra"),
+            "MAST"
+        );
+        assert_eq!(derive_project_key("x-1"), "X");
+        assert_eq!(derive_project_key("42"), "PRJ");
+        assert_eq!(derive_project_key(""), "PRJ");
+        // Always alias/branch-parseable: 1-8 ASCII letters.
+        for name in ["Engineering", "a b c d e f", "ünïcödé", "--- ---"] {
+            let k = derive_project_key(name);
+            assert!(
+                (1..=8).contains(&k.len()) && k.chars().all(|c| c.is_ascii_uppercase()),
+                "{name} → {k}"
+            );
+        }
+    }
+
+    #[test]
+    fn founding_seeds_a_usable_workspace() {
+        let mut n = new_node();
+        // The founder can create an issue immediately — no `projects new` first.
+        let (resp, dirty) = n.tracker.handle(Request::IssueNew {
+            title: "first".into(),
+            project: None,
+            project_hint: None,
+            assignees: vec![],
+            priority: None,
+            labels: vec![],
+            body: None,
+        });
+        assert!(matches!(resp, Response::Ref { .. }), "{resp:?}");
+        assert!(dirty.is_some());
+        assert_eq!(n.tracker.project_count(), 1, "exactly the seeded project");
+        assert_eq!(n.tracker.workspace_name(), "Testbed");
+        let seeded = &n.tracker.catalog().projects_list()[0];
+        assert_eq!(seeded.key, "TEST", "key derived from the workspace name");
+    }
+
+    #[test]
+    fn founding_twice_errors() {
+        let n = new_node();
+        let store = Store::open(&n.home).unwrap();
+        let err = found_workspace(&store, &me(), "Again", &FakeClock::new(1)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("already initialized"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn open_errors_on_an_uninitialized_store() {
+        let home = std::env::temp_dir().join(format!(
+            "gc-trk-noinit-{}-{}",
+            std::process::id(),
+            DocId::mint(&crate::ids::SystemUlidSource)
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let store = Store::open(&home).unwrap();
+        let err = match Tracker::open(
+            store,
+            me(),
+            "tester".into(),
+            ME_SEED,
+            Box::new(FakeClock::new(1)),
+        ) {
+            Ok(_) => panic!("open must not lazily found a workspace"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("not initialized"),
+            "no lazy mint: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn choose_project_chain() {
+        let mut n = new_node(); // seeded TEST project
+                                // Sole project: no -p needed.
+        let (resp, _) = n.tracker.handle(Request::Board {
+            project: None,
+            project_hint: None,
+        });
+        assert!(matches!(resp, Response::Board(_)), "{resp:?}");
+
+        with_project(&mut n.tracker); // + ENG → ambiguous
+        let (resp, _) = n.tracker.handle(Request::Board {
+            project: None,
+            project_hint: None,
+        });
+        let msg = match resp {
+            Response::Error { ref message, .. } => message.clone(),
+            other => panic!("expected teaching error, got {other:?}"),
+        };
+        assert!(msg.contains("TEST") && msg.contains("ENG"), "{msg}");
+        assert!(msg.contains("project.default"), "teaches the fix: {msg}");
+
+        // A resolvable hint (the CLI's git-branch key) breaks the tie…
+        let (resp, _) = n.tracker.handle(Request::Board {
+            project: None,
+            project_hint: Some("eng".into()),
+        });
+        assert!(
+            matches!(resp, Response::Board(_)),
+            "hint resolves: {resp:?}"
+        );
+        // …an unresolvable hint falls through silently (back to ambiguous).
+        let (resp, _) = n.tracker.handle(Request::Board {
+            project: None,
+            project_hint: Some("wip".into()),
+        });
+        assert!(matches!(resp, Response::Error { .. }), "{resp:?}");
+
+        // Explicit beats everything, and an explicit miss is a hard error.
+        let (resp, _) = n.tracker.handle(Request::Board {
+            project: Some("NOPE".into()),
+            project_hint: Some("eng".into()),
+        });
+        assert!(matches!(resp, Response::Error { .. }), "{resp:?}");
+
+        // A configured default resolves the ambiguity…
+        let mut store_cfg = crate::config::ConfigMap::default();
+        store_cfg.set("project.default", "ENG");
+        store_cfg
+            .save(&crate::config::store_config_path(&n.home))
+            .unwrap();
+        let (resp, _) = n.tracker.handle(Request::Board {
+            project: None,
+            project_hint: None,
+        });
+        assert!(matches!(resp, Response::Board(_)), "{resp:?}");
+        // …but a stale one errors loudly instead of silently rotting.
+        let mut store_cfg = crate::config::ConfigMap::default();
+        store_cfg.set("project.default", "GONE");
+        store_cfg
+            .save(&crate::config::store_config_path(&n.home))
+            .unwrap();
+        let (resp, _) = n.tracker.handle(Request::Board {
+            project: None,
+            project_hint: None,
+        });
+        let msg = match resp {
+            Response::Error { ref message, .. } => message.clone(),
+            other => panic!("expected stale-default error, got {other:?}"),
+        };
+        assert!(msg.contains("GONE"), "{msg}");
+    }
+
+    #[test]
+    fn work_state_verbs_are_atomic_and_idempotent() {
+        let mut n = new_node();
+        with_project(&mut n.tracker);
+        let reff = new_issue(&mut n.tracker, "flaky reconnect");
+        let me = me();
+
+        // start: one request = assignee + status in ONE commit / ONE activity row.
+        let before = n.tracker.activity_high_water();
+        let (resp, dirty) = n.tracker.handle(Request::IssueStart { reff: reff.clone() });
+        let v = match resp {
+            Response::Issue(v) => v,
+            other => panic!("start returns the fresh snapshot, got {other:?}"),
+        };
+        assert_eq!(v.status, "in_progress", "first Active-category state");
+        assert!(v.assignees.contains(&me), "start assigns the caller");
+        assert!(dirty.is_some());
+        assert_eq!(
+            n.tracker.activity_high_water(),
+            before + 1,
+            "one intent = one activity row"
+        );
+
+        // idempotent: already started → snapshot back, no commit, no doorbell.
+        let (resp, dirty) = n.tracker.handle(Request::IssueStart { reff: reff.clone() });
+        assert!(matches!(resp, Response::Issue(_)));
+        assert!(dirty.is_none(), "no-op start must not ring");
+        assert_eq!(n.tracker.activity_high_water(), before + 1);
+
+        // done: status only (assignee kept), board list emptied (S§5.7).
+        let (resp, _) = n.tracker.handle(Request::IssueDone { reff: reff.clone() });
+        let v = match resp {
+            Response::Issue(v) => v,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(v.status, "done");
+        assert!(v.assignees.contains(&me), "done keeps the assignee");
+
+        // stop: back to backlog, unassigned.
+        let (resp, _) = n.tracker.handle(Request::IssueStop { reff });
+        let v = match resp {
+            Response::Issue(v) => v,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(v.status, "backlog", "first Backlog-category state");
+        assert!(!v.assignees.contains(&me), "stop unassigns the caller");
+    }
+
+    #[test]
+    fn labels_are_created_on_first_use_for_adds_only() {
+        let mut n = new_node();
+        with_project(&mut n.tracker);
+        // Creating an issue with an unknown label mints it (gray).
+        let (resp, dirty) = n.tracker.handle(Request::IssueNew {
+            title: "tagged".into(),
+            project: Some("ENG".into()),
+            project_hint: None,
+            assignees: vec![],
+            priority: None,
+            labels: vec!["perf".into()],
+            body: None,
+        });
+        assert!(matches!(resp, Response::Ref { .. }), "{resp:?}");
+        assert!(
+            dirty.unwrap().dirty_catalog.contains(&CatalogScope::Labels),
+            "a minted label dirties the Labels scope"
+        );
+        assert!(
+            n.tracker.catalog().label_by_name("perf").is_some(),
+            "label exists after first use"
+        );
+
+        // `label <ref> +new` also creates; `-unknown` (remove) still errors.
+        let reff = new_issue(&mut n.tracker, "plain");
+        let (resp, _) = n.tracker.handle(Request::Label {
+            reff: reff.clone(),
+            add: vec!["ux".into()],
+            remove: vec![],
+        });
+        assert!(matches!(resp, Response::Ref { .. }), "{resp:?}");
+        assert!(n.tracker.catalog().label_by_name("ux").is_some());
+        let (resp, dirty) = n.tracker.handle(Request::Label {
+            reff,
+            add: vec![],
+            remove: vec!["never-existed".into()],
+        });
+        assert!(matches!(resp, Response::Error { .. }), "{resp:?}");
+        assert!(dirty.is_none());
+
+        // A dangling lbl_ id is a typo, not a new name — and creates nothing.
+        let count_before = n.tracker.catalog().labels_list().len();
+        let (resp, _) = n.tracker.handle(Request::IssueNew {
+            title: "typo".into(),
+            project: Some("ENG".into()),
+            project_hint: None,
+            assignees: vec![],
+            priority: None,
+            labels: vec!["lbl_00000000000000000000000000".into()],
+            body: None,
+        });
+        assert!(matches!(resp, Response::Error { .. }), "{resp:?}");
+        assert_eq!(n.tracker.catalog().labels_list().len(), count_before);
+    }
+
+    #[test]
+    fn inbox_derives_addressed_to_me_from_imports() {
+        let mut a = new_node(); // founder
+        with_project(&mut a.tracker);
+        let b_seed = [8u8; 32];
+        let b_user = user_from_seed(b_seed);
+        let a_ws = a.tracker.workspace_str();
+        let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, me().as_str());
+        let (resp, _) = a.tracker.member_add(&b_user, Role::Member);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+
+        // A files an issue assigned to B, then syncs: the doc is NEW to B, so
+        // backfill emits exactly ONE entry (assigned), no comment/status flood.
+        let (resp, _) = a.tracker.handle(Request::IssueNew {
+            title: "for bob".into(),
+            project: Some("ENG".into()),
+            project_hint: None,
+            assignees: vec![b_user.as_str().to_string()],
+            priority: None,
+            labels: vec![],
+            body: None,
+        });
+        let reff = match resp {
+            Response::Ref { reff } => reff,
+            other => panic!("{other:?}"),
+        };
+        sync_all(&mut a.tracker, &mut b.tracker);
+        let (entries, unread) = crate::inbox::list(&b.home);
+        assert_eq!(entries.len(), 1, "backfill-bounded: {entries:?}");
+        assert_eq!(entries[0].kind, "assigned");
+        assert_eq!(unread, 1);
+
+        // A comments + moves status; B's next import derives both, with the
+        // comment attributed to A's real key (the one honest author field).
+        let (resp, _) = a.tracker.handle(Request::Comment {
+            reff: reff.clone(),
+            body: "root cause found".into(),
+        });
+        assert!(matches!(resp, Response::Ref { .. }), "{resp:?}");
+        let (resp, _) = a.tracker.handle(Request::IssueEdit {
+            reff: reff.clone(),
+            title: None,
+            status: Some("in_progress".into()),
+            priority: None,
+            description: None,
+        });
+        assert!(matches!(resp, Response::Ref { .. }), "{resp:?}");
+        sync_all(&mut a.tracker, &mut b.tracker);
+        let (entries, _) = crate::inbox::list(&b.home);
+        assert_eq!(entries.len(), 3, "{entries:?}");
+        let comment = entries.iter().find(|e| e.kind == "comment").unwrap();
+        assert_eq!(comment.detail, "root cause found");
+        assert_eq!(comment.actor.as_deref(), Some(me().as_str()));
+        let status = entries.iter().find(|e| e.kind == "status").unwrap();
+        assert!(status.detail.contains("in_progress"), "{status:?}");
+
+        // A's own local mutations never enter A's inbox; and B's imports of an
+        // issue that isn't B's produce nothing.
+        assert!(crate::inbox::list(&a.home).0.is_empty());
+        new_issue(&mut a.tracker, "not bob's");
+        sync_all(&mut a.tracker, &mut b.tracker);
+        assert_eq!(
+            crate::inbox::list(&b.home).0.len(),
+            3,
+            "unrelated docs stay out"
+        );
+    }
+
+    #[test]
+    fn project_key_charset_is_validated() {
+        let mut n = new_node();
+        for bad in ["A-1", "MY KEY", "TOOLONGKEY", "42"] {
+            let (resp, dirty) = n.tracker.handle(Request::ProjectNew {
+                name: "X".into(),
+                key: bad.into(),
+            });
+            assert!(
+                matches!(resp, Response::Error { .. }),
+                "'{bad}' should be rejected, got {resp:?}"
+            );
+            assert!(dirty.is_none());
+        }
     }
 }

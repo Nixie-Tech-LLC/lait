@@ -99,20 +99,23 @@ jobs:
           # id is 64 lowercase hex chars
           id_out="$(bin id)"
           [[ "$id_out" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad id: $id_out"; exit 1; }
-          bin projects new "Engineering" --key ENG
+          # spaces are founded explicitly (no lazy mint); founding seeds a project
+          bin init --name Smoke
+          bin projects add ENG Engineering
           bin new "fix login race" -p ENG -P high >/dev/null
           bin new "add dark mode"  -p ENG -P low  >/dev/null
           # board shows both issues in Backlog
           board="$(bin board ENG)"; has "$board" "fix login race"; has "$board" "add dark mode"
-          # edit by KEY-n alias moves it to In Progress
-          bin edit ENG-1 --status in_progress
+          # the work loop: start assigns + activates; done completes (S§5.7)
+          start_out="$(bin start ENG-1 --no-branch)"; has "$start_out" "in_progress"
           board="$(bin board ENG)"; has "$board" "In Progress"; has "$board" "fix login race"
-          # completion removes it from the active board list into Done
-          bin edit ENG-2 --status done
+          bin done ENG-2 >/dev/null
           ls_out="$(bin ls)"; has "$ls_out" "fix login race"
           # activity feed records the transitions
-          act="$(bin activity)"; has "$act" "created"; has "$act" "edited"
-          bin stop || true
+          act="$(bin activity)"; has "$act" "created"; has "$act" "started"
+          # the machine registry lists the founded space
+          spaces_out="$(bin spaces)"; has "$spaces_out" "Smoke"
+          bin shutdown || true
           echo "P0 smoke flow OK on ${{ matrix.os }}"
 
       # Defense-in-depth beyond the cargo-deny ban: fail if the aws-lc-* rustls

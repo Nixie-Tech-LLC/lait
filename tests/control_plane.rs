@@ -70,6 +70,9 @@ impl Daemon {
         let child = Command::new(exe)
             .arg("daemon")
             .env("LAIT_HOME", home)
+            // Isolate the workspace registry per node: the daemon-boot upsert must land
+            // in a scratch config root, never the developer's real workspaces.json.
+            .env("LAIT_CONFIG_ROOT", home.join("cfgroot"))
             .env("LAIT_IDLE_SECS", "0")
             // Fast heartbeat: keep presence/announce catch-up snappy in tests.
             .env("LAIT_HEARTBEAT_SECS", "1")
@@ -101,6 +104,18 @@ impl Drop for Daemon {
     }
 }
 
+/// Found a workspace in `home` in-process, using the SAME identity the daemon
+/// will load (`<home>/secret.key`, since the daemon runs with `LAIT_HOME=home`).
+/// Workspaces are never minted lazily anymore — a daemon errors on an
+/// uninitialized store — so every home is founded before its daemon spawns.
+fn found_home(home: &Path) {
+    let key = lait::config::load_or_create_identity(home).expect("identity");
+    let me = lait::ids::UserId::from_key_string(key.public().to_string());
+    let store = lait::store::Store::open(home).expect("store");
+    lait::tracker::found_workspace(&store, &me, "test", &lait::ids::SystemUlidSource)
+        .expect("found workspace");
+}
+
 /// Seed a project + one issue and return the issue's canonical ref (e.g.
 /// `ENG-1`). Exercises the tracker mutation path that feeds the doorbell.
 async fn seed_project_and_issue(home: &Path) -> String {
@@ -123,6 +138,7 @@ async fn seed_project_and_issue(home: &Path) -> String {
         &Request::IssueNew {
             title: "t1".into(),
             project: Some("ENG".into()),
+            project_hint: None,
             assignees: vec![],
             priority: None,
             labels: vec![],
@@ -144,6 +160,7 @@ async fn seed_project_and_issue(home: &Path) -> String {
 #[tokio::test]
 async fn stale_since_after_restart_yields_reset() {
     let home = TempHome::new();
+    found_home(home.path());
     let _daemon = Daemon::spawn(home.path())
         .await
         .expect("daemon should come online");
@@ -175,6 +192,7 @@ async fn stale_since_after_restart_yields_reset() {
             title: None,
             status: Some("in_progress".into()),
             priority: None,
+            description: None,
         },
     )
     .await
@@ -208,6 +226,7 @@ async fn stale_since_after_restart_yields_reset() {
 #[tokio::test]
 async fn validate_then_commit_rings_no_doorbell() {
     let home = TempHome::new();
+    found_home(home.path());
     let _daemon = Daemon::spawn(home.path())
         .await
         .expect("daemon should come online");
@@ -234,6 +253,7 @@ async fn validate_then_commit_rings_no_doorbell() {
             title: None,
             status: Some("definitely-not-a-status".into()),
             priority: None,
+            description: None,
         },
     )
     .await

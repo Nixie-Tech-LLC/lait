@@ -1,11 +1,11 @@
 # Schema — lait data shapes
 
-> **Status:** design draft, pre-build. Companion to [`ARCHITECTURE.md`](./ARCHITECTURE.md);
-> section refs like (A§5) point there. Defines the concrete data shapes across three
-> layers and — more importantly — **what authority each field carries** and **which tool
-> enforces which invariant**. Where a shape is still a live decision it is flagged
-> **[DECISION]** with the chosen default in bold; flip any of them without reshaping the
-> rest.
+> **Status:** implemented (v0.4.8, `schemaVersion = 1`); this is the design of record.
+> Companion to [`ARCHITECTURE.md`](./ARCHITECTURE.md); section refs like (A§5) point
+> there. Defines the concrete data shapes across three layers and — more importantly —
+> **what authority each field carries** and **which tool enforces which invariant**.
+> Shapes that were live decisions are flagged **[DECISION]** with the **shipped default**
+> in bold; each is stated so it could be flipped without reshaping the rest.
 
 ## 1. Scope & the three-layer rule
 
@@ -40,7 +40,7 @@ of thing with one stability guarantee.
 | `UserId` | ed25519 public key | forever | **a member *is* a key.** Same bytes as the iroh `EndpointId`. Key of `assignees`, signer of ACL ops. |
 | iroh `EndpointId` | ed25519 public key | per identity | the node's transport identity; equals its `UserId`. |
 | Loro `PeerId` | `u64` | **per session** | internal to Loro's op addressing `(peerId, counter)`. **Never surfaced** as a user- or app-level id. A node may present many peerIds over its life. |
-| log `seq` | `u64` | **per daemon session**, monotonic | ring-buffer cursor for `activity`/`wait`/`watch`/`subscribe` (B§7). **Display/notification ordering only.** **Not durable** — resets to 0 on daemon restart; clients rebaseline via a `Reset` doorbell (B§7.5), never persist it. |
+| log `seq` | `u64` | **per daemon session**, monotonic | ring-buffer cursor for `activity`/`watch`/`subscribe` (B§7). **Display/notification ordering only.** **Not durable** — resets to 0 on daemon restart; clients rebaseline via a `Reset` doorbell (B§7.5), never persist it. |
 | Lamport / `Frontiers` | Loro op ids | causal | authoritative *merge* ordering. Distinct from `seq`. |
 | `KEY-n` alias | e.g. `ENG-142` | advisory | human handle; Catalog-assigned, **may collide and disambiguate** (§5.4). |
 
@@ -100,6 +100,7 @@ project/label config, board ordering, and the signed ACL log. Container-by-conta
 Catalog (root LoroMap)
   schemaVersion : value<u32>                         // §9 evolution gate
   workspaceId   : value<WorkspaceId>
+  name          : value<string>                      // display name — LWW, cosmetic (§4.1)
   docs      : LoroMap<DocId, DocMeta>                // authoritative *existence* set
   projects  : LoroMap<ProjectId, Project>
   boards    : LoroMap<ProjectId, LoroMovableList<DocId>>   // native board ORDER only
@@ -138,6 +139,17 @@ Project { id, workspaceId, name, key: string, color }   // key = the ENG in ENG-
 Label   { id, name, color }
 WorkflowState { id: StatusId, name, category: "backlog"|"active"|"done", color }
 ```
+
+### 4.1 Workspace `name` — cosmetic, never network identity
+
+The display name is a plain LWW register in the Catalog: set at founding (`lait init
+--name`, default the directory name), renameable later, synced like any config field.
+It carries **no authority and no network meaning** — the gossip topic derives from the
+`WorkspaceId` (`topic_for_workspace`, a domain-separated blake3 of the id), so renaming
+never re-topics a live workspace and never invalidates tickets. This deliberately
+replaces the retired "room" string (a folder-seeded name that doubled as the topic and
+could drift; see the decision log). A fresh joiner's catalog is empty until the
+founder's ops arrive, so the name may legitimately read as empty pre-sync.
 
 ## 5. Layer A — Issue document
 
@@ -292,7 +304,7 @@ InviteGrant {
   expires_at : u64,           // unix seconds; the redeemer checks freshness
   single_use : bool,          // one redemption vs. valid-until-expiry (a team link)
 }
-SignedInvite { issuer: PublicKey, grant: bytes(InviteGrant), sig }   // rides in the RoomTicket
+SignedInvite { issuer: PublicKey, grant: bytes(InviteGrant), sig }   // rides in the WorkspaceTicket
                                                                      // + the gossip JoinRequest
 ```
 
@@ -323,23 +335,34 @@ Newline-delimited JSON over the Unix socket, same transport as today. This is an
 ```rust
 // commands
 enum Request {
-  IssueNew  { title, project: Option<Ref>, assignees: Vec<UserRef>,
-              priority: Option<Priority>, labels: Vec<Ref>, body: Option<String> },
+  IssueNew  { title, project: Option<Ref>, project_hint: Option<String>,
+              assignees: Vec<UserRef>, priority: Option<Priority>,
+              labels: Vec<Ref>, body: Option<String> },
   IssueEdit { reff: Ref, patch: IssuePatch },      // title/status/priority
+  IssueStart{ reff: Ref }, IssueDone{ reff: Ref }, IssueStop{ reff: Ref },
+                                                    // work-state verbs: one intent =
+                                                    // ONE commit = one activity row;
+                                                    // targets by workflow CATEGORY;
+                                                    // return Response::Issue (the one
+                                                    // writes-echo-Ref deviation)
   IssueMove { reff: Ref, project: Option<Ref>, pos: Option<BoardPos> },
   Assign    { reff: Ref, who: Vec<UserRef>, add: bool },
   Label     { reff: Ref, add: Vec<Ref>, remove: Vec<Ref> },
   Comment   { reff: Ref, body: String },
   IssueView { reff: Ref },                          // lazy-loads the issue doc
+  IssueDelete { reff: Ref },                         // tombstone (§5.6)
   List      { project: Option<Ref>, filter: Filter },   // served from Catalog cache only
-  Board     { project: Ref },
+  Board     { project: Option<Ref>, project_hint: Option<String> },   // §7.6 chain
   History   { reff: Ref },                           // derived from Loro op history
   ProjectNew{ name, key }, ProjectList, LabelNew{ name, color }, LabelList,
   Activity  { since: u64 },                          // ex-Log; the feed is PULLED, §7.5
-  Wait      { since: u64, timeout_ms: u64 },         // kept verbatim (one-shot long-poll)
-  Subscribe { since: u64 },                          // §7.5 — streaming doorbells for the TUI
-  // P1+: Invite, Join, Connect, Peers, Sync   // P3: MemberAdd/Remove, KeyRotate
-  Status, Stop,
+  Inbox     { clear: bool },                         // durable addressed-to-you (§8.1)
+  Subscribe { since: u64 },                          // §7.5 — the one live channel (TUI + watch)
+  Diagnose  { expected_workspace: Option<WorkspaceId> },   // guided-join verifier (GUIDED-JOIN.md)
+  ConfigReload,                                      // transport-plane; re-read local settings
+  // transport (P1): Invite, Join, Connect, Who, SeedAdd/List/Remove
+  // membership (P3): MemberAdd/Remove, KeyRotate, Members, MemberRequests/Approve/Alias
+  Status, Id, Stop,
 }
 
 // snapshot projections (stable, versioned — NOT a dump of Layer A)
@@ -359,6 +382,7 @@ struct Doorbell {
   dirty_by_project: Map<ProjectId, Vec<DocId>>,   // issue-row plane — re-read these rows
   dirty_catalog:    Vec<CatalogScope>,     // structure plane: boards(proj)|projects|labels|workflow|acl
   activity_advanced: bool,                 // new feed rows exist — pull via Activity{since}
+  presence_advanced: bool,                 // new presence/join rows exist — pull via Log{since}
 }
 ```
 
@@ -392,8 +416,10 @@ struct Doorbell {
      — the row *is* the LWW winner. This is why reconciliation needs no correlation.
 
 5. **Streaming (`Subscribe`) and `Reset`.** `Subscribe{since}` turns the one-shot control
-   handler into a stream of `Doorbell` frames (above) until the client disconnects — the TUI's
-   live channel; `Wait` remains the one-shot long-poll fallback. Doorbells are **batched and
+   handler into a stream of `Doorbell` frames (above) until the client disconnects — the one
+   live channel (TUI and CLI `watch`; the `Wait` long-poll it superseded is deleted). The
+   `presence_advanced` plane rings on `EventLog` pushes (peer online/offline/join) independently
+   of the tracker dirty-set, so `watch` wakes even when no doc moved. Doorbells are **batched and
    project-keyed**: the daemon coalesces a whole sync-import transaction (+ a short local-edit
    debounce) into one frame carrying a *dirty set*, so the ring buffer holds ~1000 *batches*,
    not individual changes, and a client filters by visibility (re-reading only on-screen
@@ -402,13 +428,34 @@ struct Doorbell {
    daemon rings a **`Reset` doorbell** — as the first frame of every `Subscribe`, and whenever
    a client's `since` is stale or has fallen off the ring — meaning *rebaseline from a fresh
    `Board`/`List` snapshot*. A per-boot `epoch` lets a client detect a restart without a socket
-   drop. This is also the fix for the pre-existing `wait`/`watch` deafness across daemon
+   drop. This is also the fix for the pre-existing `watch` deafness across daemon
    restarts. The write path is **validate-then-commit**: a `Response::Error` is returned
    *before* any commit, so it guarantees nothing changed and no doorbell rang (there is no CAS,
    §7.2), which is what makes an optimistic client's rollback race-free.
 
 `Ref` and `UserRef` are resolved daemon-side: a `Ref` accepts a short `DocId` prefix, a
 `KEY-n` alias, or a project key; a `UserRef` accepts `@me`, a nick, or a key.
+
+### 7.6 The choose-project chain (`new` / `board`)
+
+Commands that need one *target/view* project resolve it daemon-side in a fixed
+precedence, in `Tracker::choose_project`:
+
+1. **explicit** `-p` / positional — a miss is a hard error ("user said X");
+2. **`project_hint`** — the project KEY the CLI extracted from the git branch
+   (`eng-142-fix` → `ENG`). Used **only if it resolves** to a real project;
+   otherwise it falls through silently ("environment suggests X" must never
+   break a command). MCP always sends `None` (agents have no branch);
+3. **`project.default`** — the store-config key, read fresh per request (no
+   boot cache, no reload protocol needed). Set-but-stale is a **hard error**
+   naming the fix (a user-chosen setting must not silently rot);
+4. **the sole project** when exactly one exists;
+5. a teaching error listing the keys and the `lait config set project.default`
+   one-liner.
+
+The two hint-free commands are deliberate: `ls -p` is a **pure filter** (a
+defaulted filter silently hides issues), and `move -p` is **explicit only**
+(a silently-inferred membership write is data damage).
 
 ## 8. Layer C — git repo layout & iroh framing
 
@@ -425,6 +472,60 @@ struct Doorbell {
 
 Only **public keys, signed ops, and Loro snapshots/updates** — **never secrets** (A§6).
 Commit boundaries are durability points, not sync units.
+
+**Store creation is explicit.** A `<repo>` (a `.lait/` home) is born only in `lait init`
+(founding: genesis minted here, first project seeded) or `lait join` (bootstrap from a
+ticket: the ticket's genesis + **empty** catalog/membership docs, so importing the
+founder's ops adopts identical container ids). Nothing else creates one; a command in a
+store-less directory errors with guidance. `Tracker::open` on an uninitialized store is
+an error, never a founding event.
+
+### 8.1 Machine-level local files (not Layer A — never synced, never trusted)
+
+Under the platform config root, beside the global `secret.key`:
+
+```
+workspaces.json    // the space registry: [{ workspace, name, path,
+                   //   origin: "founded"|"joined", host_nick, last_opened,
+                   //   projects: [{key,name}] }]
+                   // written by init / join / every daemon open; pure navigation
+                   // state (powers `lait spaces` + `-w`); advisory `name`/
+                   // `projects` snapshots; corrupt/absent ⇒ "no known spaces"
+config.json        // global settings layer (flat string map)
+```
+
+Inside each store home, beside `config.json`:
+
+```
+inbox.json         // the durable inbox: { read_up_to_ts,
+                   //   entries: [{ ts, kind: assigned|comment|status, reff,
+                   //     doc_id, title, detail, actor: Option<key> }] }
+                   // ≤200 newest; never synced; corrupt/absent ⇒ empty
+```
+
+**Inbox derivation is attribution-honest.** Entries are derived at sync-import time
+(`import_doc`) as *state transitions relevant to the viewer* — remote ops carry no
+trusted actor (non-goal 6), so `assigned`/`status` entries render actor-unknown; only
+`comment` entries carry an author (`actor` = the comment's in-doc key), whose display
+nick the daemon resolves at READ time (petname > live presence > short key — never
+persisted). Backfill is structurally bounded: a brand-new-to-this-node doc contributes
+at most one `assigned` entry, never a comment/status flood. The activity ring stays
+the per-session workspace firehose; the inbox is the durable, filtered, watermarked
+"addressed to you" — two different questions, deliberately two structures.
+
+Inside each store home: `config.json` — the store settings layer. `lait config` fronts
+the two layers git-style (store wins). Closed key table: `user.nick` (global+store,
+daemon-read → best-effort `ConfigReload` on set), `project.default` (store-only, read
+lazily per request, §7.6), `tui.theme` (global+store, `dark|light|auto`, client-read),
+`tui.tabs` (store-only, JSON `Vec<SavedTab>` — the TUI's saved view tabs, UI §5.2).
+One **open prefix**: `tui.key.<action-id>` (global+store) rebinds one TUI action; the
+config layer validates the prefix only, the TUI validates suffixes and warns (never
+gates) on unknown ones. The `workspace.*` namespace is **reserved** for future settings
+that sync through the Catalog. The old per-store `profile.json` is retired.
+
+**Ticket (wire, base32):** `WorkspaceTicket { workspace, name, host, host_nick,
+invite: Option<SignedInvite> }` — the topic is derived (`topic_for_workspace`), never
+shipped; `name` is a cosmetic preview for the joiner.
 
 **iroh framing (P1+, A§8):**
 - gossip announce / presence heartbeat: `{ workspaceId, catalogHead }` ("I have changes").
@@ -449,7 +550,7 @@ after it ships — the old ops live forever. Rules:
 4. **Renames are migrations,** written as ops (new key populated from old, old tombstoned),
    never edits to history.
 
-## 10. Open decisions (mirror of A§14)
+## 10. Decisions — shipped defaults (mirror of A§14)
 
 - **§5.1** `title` — **LWW value** (default) vs `LoroText`.
 - **§5.2** `assignees`/`labels` removal — **delete-key** (default) vs `false` tombstone.
@@ -464,3 +565,18 @@ after it ships — the old ops live forever. Rules:
   pulled activity feed. See `UI.md` §4.2–§4.3.
 - **§7.5** streaming `Subscribe` + batched, project-keyed doorbells + `Reset`/`epoch`
   rebaseline; `seq` per-session, not durable (§2) (all agreed). See `UI.md` §4.1–§4.2.
+- **§4.1** network identity — **topic derives from `WorkspaceId`**; the "room" string
+  (folder-seeded, drift-prone, three heal layers) is retired; display name is a synced LWW
+  register (agreed, workspace re-architecture).
+- **§8** workspace creation — **explicit only** (`init` founds + seeds a first project;
+  `join` bootstraps from the ticket); lazy mint and join-time adoption are removed
+  (agreed, workspace re-architecture).
+- **§7.6** project defaulting — explicit > branch hint (resolve-or-skip) >
+  `project.default` (resolve-or-error) > sole project > teaching error (agreed).
+- **§7** work-state verbs — `start`/`done`/`stop` bundle the fields one human intent
+  moves (status by workflow category + the viewer's assignment) into ONE commit; they
+  return `Response::Issue` so the CLI can derive the git branch (agreed, DX phase).
+- **§8.1** inbox — durable local `inbox.json` derived at import time,
+  attribution-honest (comments only carry an author), beside — never replacing — the
+  per-session activity ring (agreed, DX phase). Labels create on first use; project
+  creation is key-first (`projects add KEY [NAME]`); the surface noun is **space**.

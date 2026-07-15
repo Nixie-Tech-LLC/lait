@@ -85,8 +85,8 @@ pub struct DiagnosisView {
 pub struct DiagnoseInput<'a> {
     /// The workspace id this store is bound to, if any (`None` before genesis).
     pub workspace: Option<&'a str>,
-    /// The gossip room / topic name (the folder name by default).
-    pub room: &'a str,
+    /// The workspace's synced display name (may be empty on a pre-sync joiner).
+    pub name: &'a str,
     /// This node's ACL standing: `admin` | `member` | `pending`.
     pub membership: &'a str,
     /// Count of currently-online peers.
@@ -110,19 +110,22 @@ pub fn diagnose(input: DiagnoseInput<'_>) -> DiagnosisView {
     let workspace = match input.expected_workspace {
         Some(exp) if input.workspace != Some(exp) => DiagnosisGate::new(
             "workspace",
-            "workspace",
+            "space",
             GateState::Fail,
             format!(
-                "this directory is workspace {bound} (room {}), but the invite is for {exp} \
-                 — you're in a different store; cd to where you ran `lait join`",
-                input.room
+                "this directory is space {bound}, but the invite is for {exp} \
+                 — you're in a different store; cd to where you ran `lait join`, or target it with `-w`"
             ),
         ),
         _ => DiagnosisGate::new(
             "workspace",
-            "workspace",
+            "space",
             GateState::Pass,
-            format!("{bound}  (room {})", input.room),
+            if input.name.is_empty() {
+                bound.to_string()
+            } else {
+                format!("{bound}  ('{}')", input.name)
+            },
         ),
     };
 
@@ -251,11 +254,9 @@ fn summarize(blocked: Option<&DiagnosisGate>, projects: usize, issues: usize) ->
         None => {
             format!("you're in — {projects} project(s), {issues} issue(s) synced. get to work.")
         }
-        Some("workspace") => {
-            "wrong directory: this store is a different workspace than the invite. \
-             cd to where you ran `lait join`, or run `lait workspaces`."
-                .to_string()
-        }
+        Some("workspace") => "wrong directory: this store is a different space than the invite. \
+             cd to where you ran `lait join`, or run `lait spaces`."
+            .to_string(),
         Some("membership") => {
             "waiting for an admin to approve your join — the board is still encrypted.".to_string()
         }
@@ -274,7 +275,7 @@ mod tests {
     fn input() -> DiagnoseInput<'static> {
         DiagnoseInput {
             workspace: Some("ws_A"),
-            room: "lait",
+            name: "lait",
             membership: "member",
             online_peers: 1,
             projects: 2,

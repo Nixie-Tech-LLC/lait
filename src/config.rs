@@ -1,4 +1,4 @@
-//! On-disk state: identity and room/profile settings.
+//! On-disk state: identity, store discovery, and layered local settings.
 //!
 //! Two locations (DUR-5): a **global identity** (the `secret.key`, under the
 //! platform config dir) and a **per-repo workspace store** (the `.lait/`
@@ -6,6 +6,18 @@
 //! repo-bound store, like a single `git` `user.email` across many repos.
 //! `$LAIT_HOME` collapses both into one self-contained dir (tests, `--home`,
 //! advanced setups).
+//!
+//! Discovery **never creates a store**: workspaces come into being only through
+//! the two explicit verbs (`lait init` founds, `lait join` bootstraps from a
+//! ticket) via [`store_dir_for_init`]. Every other command resolves an existing
+//! store or fails with [`NoStoreHere`] — the silent decoy-store auto-create (and
+//! the directory-trap guard rail it required) is gone by design.
+//!
+//! Settings are git-style layered key/value maps ([`Settings`]): a global
+//! `config.json` under the config root and a per-store `config.json` inside
+//! `.lait/`, nearest (store) wins. Keys are validated against the static
+//! [`KEYS`] table; the `workspace.*` namespace is reserved for future settings
+//! synced through the Catalog.
 
 use std::{
     fs,
@@ -100,39 +112,42 @@ fn ensure_store_gitignore(store: &Path) {
     }
 }
 
-/// Seed a freshly-created repo store's profile so distinct repos default to
-/// distinct gossip rooms (the repo directory name) instead of all sharing
-/// `"default"` and colliding on one topic. No-op if a profile already exists.
-fn seed_repo_profile(store: &Path) {
-    if store.join("profile.json").exists() {
-        return;
-    }
-    let mut p = Profile::default();
-    if let Some(name) = store
-        .parent()
-        .and_then(|d| d.file_name())
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-    {
-        p.room = name.to_string();
-    }
-    let _ = p.save(store);
+/// Typed "no workspace store here" error, so callers (the app dispatcher) can
+/// tell "nothing to bind" apart from real I/O failures and print the guided
+/// error (`lait init` / `lait join` / `-w`) instead of a bare failure.
+#[derive(Debug)]
+pub struct NoStoreHere {
+    /// The directory discovery started from.
+    pub cwd: PathBuf,
 }
+impl std::fmt::Display for NoStoreHere {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no lait workspace found here (searched up from {})",
+            self.cwd.display()
+        )
+    }
+}
+impl std::error::Error for NoStoreHere {}
 
-/// Resolve the **workspace store** directory for this invocation (the per-repo
-/// `.lait/`). Precedence:
+/// Resolve the **existing** workspace store for this invocation — never
+/// creating one. Precedence:
 ///   1. an explicit named identity (`resume`/`--as`) — a self-contained home
-///      under the identity registry.
+///      under the identity registry (created on demand: it is an identity
+///      container, not a workspace).
 ///   2. `$LAIT_HOME` — explicit, self-contained override (identity + store
 ///      in one dir): `--home`, tests, advanced setups.
-///   3. `$LAIT_STORE` — internal pin passed to the daemon we spawn so it
-///      binds the exact store the CLI resolved, independent of its cwd.
-///   4. git-style discovery: walk up from the cwd for a `.lait/` and use it;
-///      otherwise auto-create `.lait/` in the cwd.
+///   3. `$LAIT_STORE` — pin set by the CLI for the daemon it spawns (and by
+///      `-w`), so both bind the exact store the CLI resolved, independent
+///      of cwd.
+///   4. git-style discovery: walk up from the cwd for a `.lait/`.
 ///
-/// The identity key is resolved separately ([`identity_dir`]) — global by
-/// default, so one identity spans every repo-bound store.
-pub fn resolve_home(explicit: Option<&str>) -> Result<PathBuf> {
+/// A discovery miss is a typed [`NoStoreHere`] error — stores are only born in
+/// [`store_dir_for_init`] (`lait init` / `lait join`). The identity key is
+/// resolved separately ([`identity_dir`]) — global by default, so one identity
+/// spans every repo-bound store.
+pub fn resolve_existing_store(explicit: Option<&str>) -> Result<PathBuf> {
     if let Some(name) = explicit {
         let (reg, _) = registry()?;
         let home = reg.home_for(name);
@@ -144,25 +159,41 @@ pub fn resolve_home(explicit: Option<&str>) -> Result<PathBuf> {
         fs::create_dir_all(&dir)?;
         return Ok(dir);
     }
-    let store = if let Some(p) = std::env::var_os("LAIT_STORE") {
+    if let Some(p) = std::env::var_os("LAIT_STORE") {
         let dir = PathBuf::from(p);
         fs::create_dir_all(&dir)?;
-        canonical(&dir)
-    } else {
-        let cwd = std::env::current_dir().context("get current dir")?;
-        let dir = match find_store_dir(&cwd) {
-            Some(s) => s,
-            None => {
-                let s = cwd.join(STORE_DIR);
-                fs::create_dir_all(&s)?;
-                s
-            }
-        };
-        canonical(&dir)
-    };
-    seed_repo_profile(&store);
+        return Ok(canonical(&dir));
+    }
+    let cwd = std::env::current_dir().context("get current dir")?;
+    match find_store_dir(&cwd) {
+        Some(s) => Ok(canonical(&s)),
+        None => Err(anyhow::Error::new(NoStoreHere { cwd })),
+    }
+}
+
+/// Create (or reuse) the `.lait/` store dir under `dir` — the raw creation
+/// primitive, ignoring `$LAIT_HOME` (used by `join --dir`, where the explicit
+/// argument must win).
+pub fn store_dir_under(dir: &Path) -> Result<PathBuf> {
+    let store = dir.join(STORE_DIR);
+    fs::create_dir_all(&store).with_context(|| format!("create store dir {}", store.display()))?;
+    let store = canonical(&store);
     ensure_store_gitignore(&store);
     Ok(store)
+}
+
+/// The store directory a creation verb (`init`/`join`) will populate: an
+/// explicit `$LAIT_HOME` if set, else `<dir>/.lait`. Creates the directory and
+/// drops the store `.gitignore`. Together with [`store_dir_under`], the ONLY
+/// paths that bring a store into existence.
+pub fn store_dir_for_init(dir: &Path) -> Result<PathBuf> {
+    if let Some(p) = std::env::var_os("LAIT_HOME") {
+        let d = PathBuf::from(p);
+        fs::create_dir_all(&d)?;
+        ensure_store_gitignore(&d);
+        return Ok(d);
+    }
+    store_dir_under(dir)
 }
 
 /// The directory holding this node's identity `secret.key`. A self-contained
@@ -285,6 +316,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn settings_store_layer_wins_over_global() {
+        let dir = std::env::temp_dir().join(format!("gc-settings-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut store = ConfigMap::default();
+        store.set("user.nick", "store-nick");
+        store.save(&store_config_path(&dir)).unwrap();
+        let s = Settings {
+            global: {
+                let mut g = ConfigMap::default();
+                g.set("user.nick", "global-nick");
+                g.set("project.default", "ENG");
+                g
+            },
+            store: ConfigMap::load(&store_config_path(&dir)),
+        };
+        assert_eq!(s.get("user.nick"), Some("store-nick"));
+        assert_eq!(s.get("project.default"), Some("ENG"));
+        assert_eq!(s.nick(), "store-nick");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_map_roundtrips_and_degrades_to_empty() {
+        let dir = std::env::temp_dir().join(format!("gc-cfgmap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.json");
+        assert!(ConfigMap::load(&p).0.is_empty(), "missing file → empty");
+        let mut m = ConfigMap::default();
+        m.set("user.nick", "x");
+        m.save(&p).unwrap();
+        assert_eq!(ConfigMap::load(&p).get("user.nick"), Some("x"));
+        fs::write(&p, "{corrupt").unwrap();
+        assert!(ConfigMap::load(&p).0.is_empty(), "corrupt file → empty");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn key_table_rejects_unknown_and_reserves_workspace_namespace() {
+        assert!(key_spec("user.nick").is_ok());
+        assert!(key_spec("project.default").is_ok());
+        let unknown = key_spec("user.nickk").unwrap_err().to_string();
+        assert!(unknown.contains("known keys"), "{unknown}");
+        let reserved = key_spec("workspace.name").unwrap_err().to_string();
+        assert!(reserved.contains("reserved"), "{reserved}");
+    }
+
+    #[test]
+    fn discovery_never_creates_but_init_path_does() {
+        let root = std::env::temp_dir().join(format!("gc-nostore-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        // Bare dir: discovery finds nothing and creates nothing.
+        assert_eq!(find_store_dir(&root), None);
+        assert!(!root.join(STORE_DIR).exists());
+        // The creation verb path mints the store + gitignore.
+        let store = store_dir_for_init(&root).unwrap();
+        assert!(store.is_dir());
+        assert!(store.join(".gitignore").exists());
+        // And discovery now binds it.
+        assert!(find_store_dir(&root).is_some());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn find_store_dir_walks_up_to_the_nearest_lait() {
         let root = std::env::temp_dir().join(format!("gc-disc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -378,45 +475,179 @@ pub fn load_or_create_identity(home: &Path) -> Result<SecretKey> {
     }
 }
 
-/// Profile/room settings, persisted to `profile.json`.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Profile {
-    /// Our display nickname.
-    pub nick: String,
-    /// The room name we share a gossip topic with (everyone using the same name
-    /// lands in the same topic). Becomes the per-workspace topic in the tracker.
-    pub room: String,
+// ---- layered local settings (`lait config`) ----
+
+/// Which layers a config key may be written to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyLayers {
+    /// Both the global and the per-store file (store wins on read).
+    GlobalAndStore,
+    /// Per-store only (`--global` is rejected).
+    StoreOnly,
 }
 
-impl Default for Profile {
-    fn default() -> Self {
-        Self {
-            nick: whoami_fallback(),
-            room: "default".to_string(),
-        }
-    }
+/// One row of the closed key table: `lait config` refuses names not listed
+/// here (typo safety — git's anything-goes is a support trap for a tool this
+/// young). Add a row to introduce a key.
+#[derive(Debug, Clone, Copy)]
+pub struct KeySpec {
+    pub name: &'static str,
+    pub layers: KeyLayers,
+    /// Whether a running daemon consumes this key (⇒ `config set` sends a
+    /// best-effort `ConfigReload` so the change is never a silent no-op).
+    pub daemon_read: bool,
+    pub help: &'static str,
+    /// The built-in fallback when unset at every layer, if one exists.
+    pub built_in: fn() -> Option<String>,
 }
 
-impl Profile {
-    fn path(home: &Path) -> PathBuf {
-        home.join("profile.json")
+/// The closed set of recognized config keys.
+pub const KEYS: &[KeySpec] = &[
+    KeySpec {
+        name: "user.nick",
+        layers: KeyLayers::GlobalAndStore,
+        daemon_read: true,
+        help: "Display nickname (presence, activity attribution).",
+        built_in: || Some(whoami_fallback()),
+    },
+    KeySpec {
+        name: "project.default",
+        layers: KeyLayers::StoreOnly,
+        daemon_read: false,
+        help: "Project key issue-creating commands fall back to when -p is omitted.",
+        built_in: || None,
+    },
+    KeySpec {
+        name: "tui.theme",
+        layers: KeyLayers::GlobalAndStore,
+        daemon_read: false,
+        help: "TUI theme: dark (default), light, or auto (COLORFGBG heuristic).",
+        built_in: || Some("dark".to_string()),
+    },
+    KeySpec {
+        name: "tui.tabs",
+        layers: KeyLayers::StoreOnly,
+        daemon_read: false,
+        help: "Saved board views (JSON array; pinned from the TUI with `P`).",
+        built_in: || None,
+    },
+];
+
+/// Keymap overrides: `tui.key.<action-id> = "<key>"` (e.g. `tui.key.open-palette
+/// = "ctrl+p"`). An open prefix rather than table rows — the set of action ids
+/// belongs to the TUI, which validates suffixes and warns (never gates) on
+/// unknown ones. Store or global layer.
+static TUI_KEY_PREFIX_SPEC: KeySpec = KeySpec {
+    name: "tui.key.*",
+    layers: KeyLayers::GlobalAndStore,
+    daemon_read: false,
+    help: "TUI keybinding override for one action (see the TUI help for action ids).",
+    built_in: || None,
+};
+
+/// Look up a key in the table. `workspace.*` names get the reserved-namespace
+/// error (future synced workspace settings); `tui.key.*` is an open prefix
+/// (validated by the TUI); anything else unknown lists the valid keys.
+pub fn key_spec(name: &str) -> Result<&'static KeySpec> {
+    if name.starts_with("workspace.") {
+        anyhow::bail!("'{name}' is reserved for synced workspace settings (not available yet)");
+    }
+    if name.starts_with("tui.key.") && name.len() > "tui.key.".len() {
+        return Ok(&TUI_KEY_PREFIX_SPEC);
+    }
+    KEYS.iter().find(|k| k.name == name).ok_or_else(|| {
+        let known: Vec<&str> = KEYS.iter().map(|k| k.name).collect();
+        anyhow!(
+            "unknown config key '{name}' — known keys: {} (+ tui.key.<action>)",
+            known.join(", ")
+        )
+    })
+}
+
+/// Path of the global settings file (`config_root/config.json`).
+pub fn global_config_path() -> Result<PathBuf> {
+    Ok(config_root()?.join("config.json"))
+}
+
+/// Path of a store's settings file (`.lait/config.json`).
+pub fn store_config_path(home: &Path) -> PathBuf {
+    home.join("config.json")
+}
+
+/// One settings file: a flat `key → value` string map, so `get`/`set`/`unset`
+/// need no struct churn as keys are added. Missing or corrupt files degrade to
+/// empty (settings are conveniences, never gates).
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ConfigMap(pub std::collections::BTreeMap<String, String>);
+
+impl ConfigMap {
+    pub fn load(path: &Path) -> Self {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
     }
 
-    pub fn load(home: &Path) -> Result<Self> {
-        let path = Self::path(home);
-        if !path.exists() {
-            let p = Self::default();
-            p.save(home)?;
-            return Ok(p);
-        }
-        let data = fs::read_to_string(&path).context("read profile")?;
-        serde_json::from_str(&data).context("parse profile")
-    }
-
-    pub fn save(&self, home: &Path) -> Result<()> {
-        let data = serde_json::to_string_pretty(self).context("serialize profile")?;
-        fs::write(Self::path(home), data).context("write profile")?;
+    /// Persist atomically (temp file + rename) so a concurrent reader — e.g. a
+    /// daemon handling `ConfigReload` — never sees a half-written file.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let json = serde_json::to_string_pretty(self).context("encode config")?;
+        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+        fs::write(&tmp, json).with_context(|| format!("write {}", tmp.display()))?;
+        fs::rename(&tmp, path).with_context(|| format!("commit {}", path.display()))?;
         Ok(())
+    }
+
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).map(|s| s.as_str())
+    }
+    pub fn set(&mut self, key: &str, value: &str) {
+        self.0.insert(key.to_string(), value.to_string());
+    }
+    /// Returns whether the key was present.
+    pub fn unset(&mut self, key: &str) -> bool {
+        self.0.remove(key).is_some()
+    }
+}
+
+/// The merged two-layer view: per-store `config.json` over the global one
+/// (nearest wins, like git). Load is cheap (two small files); daemon paths that
+/// need a per-request fresh value (e.g. `project.default`) just re-load.
+#[derive(Debug, Default)]
+pub struct Settings {
+    pub global: ConfigMap,
+    pub store: ConfigMap,
+}
+
+impl Settings {
+    /// Load both layers for a store. `home = None` loads only the global layer
+    /// (e.g. `lait config --global` outside any workspace).
+    pub fn load(home: Option<&Path>) -> Self {
+        let global = global_config_path()
+            .map(|p| ConfigMap::load(&p))
+            .unwrap_or_default();
+        let store = home
+            .map(|h| ConfigMap::load(&store_config_path(h)))
+            .unwrap_or_default();
+        Settings { global, store }
+    }
+
+    /// Effective value: store layer, then global. No built-in fallback — use
+    /// the key's `built_in` for that, so display code can annotate `(default)`.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.store.get(key).or_else(|| self.global.get(key))
+    }
+
+    /// The effective display nickname (built-in: `$USER`/`$USERNAME`/"anon").
+    pub fn nick(&self) -> String {
+        self.get("user.nick")
+            .map(str::to_string)
+            .unwrap_or_else(whoami_fallback)
+    }
+
+    /// The configured default project key, if any.
+    pub fn default_project(&self) -> Option<String> {
+        self.get("project.default").map(str::to_string)
     }
 }
 

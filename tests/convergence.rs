@@ -284,7 +284,7 @@ proptest! {
     ) {
         // Shared base catalog: one project + K issues already on the board.
         let ws = WorkspaceId::mint(&SystemUlidSource);
-        let base = CatalogDoc::create(&ws).unwrap();
+        let base = CatalogDoc::create(&ws, "test").unwrap();
         let project = ProjectId::mint(&SystemUlidSource);
         base.add_project(&project, "Engineering", "ENG", "blue").unwrap();
 
@@ -371,7 +371,7 @@ proptest! {
         registrations in prop::collection::vec(0u8..3, 0..30),
     ) {
         let ws = WorkspaceId::mint(&SystemUlidSource);
-        let base = CatalogDoc::create(&ws).unwrap();
+        let base = CatalogDoc::create(&ws, "test").unwrap();
         let project = ProjectId::mint(&SystemUlidSource);
         base.add_project(&project, "Engineering", "ENG", "blue").unwrap();
         base.doc().commit();

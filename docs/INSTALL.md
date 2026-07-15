@@ -88,7 +88,7 @@ admin admits it.
 docker compose up -d --build          # from the repo root
 docker compose exec seed lait id      # copy the node id
 # from an admin node:  lait members add <that-id>
-docker compose exec seed lait seed add <room-ticket>   # adopt a workspace to serve
+docker compose exec seed lait join <invite-ticket>     # bootstrap the workspace to serve
 ```
 
 See [`docker-compose.yml`](../docker-compose.yml) for details. iroh handles NAT
@@ -121,10 +121,14 @@ Supported shells: `bash`, `zsh`, `fish`, `powershell`, `elvish`.
 ## After installing
 
 ```sh
-lait projects new "Engineering" --key ENG
-lait new "fix login race" -p ENG -P high
+cd your-project
+lait init                                  # found a space here (seeds a project)
+lait new "fix login race" -P high --start  # file it + claim it + branch
 lait tui
 ```
+
+Joining a teammate's space instead? `lait join <their-invite-link>` — it creates
+the store and verifies the whole handshake. See the README's scenarios.
 
 Register the MCP server with an AI agent in one step:
 

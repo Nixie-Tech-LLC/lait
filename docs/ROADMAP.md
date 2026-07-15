@@ -5,6 +5,11 @@
 > Each phase lands green under the hardened CI gate and integrates forward so the
 > end state is **one** runnable product. Status is tracked inline (`done` /
 > `in progress` / `todo`).
+>
+> **Current state (v0.4.8):** P0–P3 are done and verified multi-node; P4 is
+> released and shipping (P4 release engineering is done end-to-end — see
+> [`CHANGELOG.md`](../CHANGELOG.md) for per-version detail — with security review
+> and multi-seed hardening the remaining deferrals).
 
 ## Definition of Done (the whole package)
 
@@ -15,7 +20,8 @@ rebaselines on Reset), edits echo optimistically, presence reads honestly; chang
 propagate live P2P with no central server; a seed backfills offline peers; workspace
 data is E2EE with working membership add/remove + key rotation; an agent drives it
 over MCP. Green on Linux/macOS/Windows; release artifacts (incl. Windows) + a
-self-updater build; a tagged RC is prepared with notes (human pushes the public tag).
+self-updater build; tagged releases publish to every channel. **Met and shipping as
+of v0.4.8.**
 
 ## CI gate (blocking, matrix {ubuntu, macos, windows})
 
@@ -56,9 +62,9 @@ Loro data model + catalog + git store + fast TUI + Layer-B façade + MCP.
   + CRDT convergence proptests (LWW / map-union / movable-list / docs grow-set).
 - **done** e2e smoke on the real binary, wired into CI per-OS.
 
-## P1 — iroh live P2P sync + seed + three-state presence — **in progress**
+## P1 — iroh live P2P sync + seed + three-state presence — **done**
 
-Done so far: the **catalog-first pull** sync protocol (`sync.rs`, custom ALPN) —
+Landed: the **catalog-first pull** sync protocol (`sync.rs`, custom ALPN) —
 one Catalog VV-diff → changed-`head` set → per-doc VV-diff, multiplexed and
 deadlock-free; gossip `Announce{workspace, catalog_head}` as the trigger, with
 pull-on-neighbor-up + heartbeat re-announce; ticket-carried **workspace adoption**
@@ -67,7 +73,8 @@ doorbell batching (one coalesced frame per sync-import); three-state presence
 (`Payload::Presence{nick,state}`, input-driven online/away; `who` reports it); the
 TUI ambient sync indicator (peers online). **Verified live: two real nodes converge
 both directions over iroh in ~2s, no central server** (manual + `tests/two_node_sync.rs`).
-Remaining: promotable seed role hardening, TUI peers panel, RIBLT escape-hatch (deferred).
+The promotable seed role shipped (`lait daemon --seed`; `seed`/`remote` pin registry,
+DUR-1/3/4). Deferred: the RIBLT escape-hatch and further multi-seed hardening.
 
 - Catalog-first sync: gossip announce `{workspaceId, catalogHead}`; on a head change,
   exchange a Catalog VV-diff → the changed-`DocMeta.head` set → per-doc VV-diffs
@@ -136,19 +143,25 @@ Remaining: promotable seed role hardening, TUI peers panel, RIBLT escape-hatch (
 > encrypted on the wire, so the ACL/keys must be readable to bootstrap decryption
 > (recorded here + in the code).
 
-## P4 — Agent/MCP hardening + release engineering — **release candidate prepared**
+## P4 — Agent/MCP hardening + release engineering — **shipped (v0.4.x); hardening ongoing**
 
 - **done** Agent-native MCP surface (full tracker + membership tools) generated/
   checked against the Layer-B DTOs (`tests/mcp_parity.rs`); MCP handshake verified.
-- **done** Release engineering: version bumped to **0.3.0**; `dist plan` produces
-  all target OS/arches **incl. x86_64-pc-windows-msvc**, shell + PowerShell
-  installers, and a per-target self-updater; the Windows `.zip` + updater +
-  checksum were **built and the packaged binary verified** (`lait 0.3.0`,
-  ran the tracker flow). `CHANGELOG.md` drafts the release notes.
-- **prepared, human-gated**: a `v0.3.0` tag is ready; pushing the public tag (which
-  triggers the GitHub Release publish) is the single step left to a human.
+- **done** Release engineering, end to end. `dist plan` produces all target
+  OS/arches **incl. x86_64-pc-windows-msvc**, with shell + PowerShell installers
+  and a native in-place self-updater (`lait update`, pure-Rust). A version tag now
+  builds, releases, and publishes to **every channel automatically** — GitHub
+  Release, Homebrew, Scoop, winget, `cargo binstall`, and crates.io — plus a
+  rolling `dev` prerelease on every merge to `main`. Per-version detail lives in
+  [`CHANGELOG.md`](../CHANGELOG.md).
+- **done** Onboarding hardening beyond the original P4 scope: the guided-join
+  verifier (`lait doctor`, [`GUIDED-JOIN.md`](./GUIDED-JOIN.md)) and one-step invite
+  passes (Pattern A, [`GUIDED-JOIN.md`](./GUIDED-JOIN.md) / S§6.1) both landed.
+- **shipped**: the project renamed `groupchat → lait` (v0.4.0) and has released
+  through **v0.4.8**; the public tag that publishes each GitHub Release is the one
+  step a human still drives.
 - Deferred/logged: multi-seed hardening, an independent security review of the
-  research-grade E2EE, and TUI theming/resize polish.
+  research-grade E2EE, and the receipt/tier hardening in [`HARDENING.md`](./HARDENING.md).
 
 ## Merge strategy
 

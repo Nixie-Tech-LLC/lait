@@ -92,6 +92,9 @@ fn spawn(home: &Path) -> Proc {
     let child = Command::new(bin())
         .arg("daemon")
         .env("LAIT_HOME", home)
+        // Isolate the workspace registry per node: the daemon-boot upsert must land
+        // in a scratch config root, never the developer's real workspaces.json.
+        .env("LAIT_CONFIG_ROOT", home.join("cfgroot"))
         // Disable idle shutdown so the restart, not a timer, is what we test.
         .env("LAIT_IDLE_SECS", "0")
         // Run the protocol on a fast heartbeat so catch-up/absence windows are
@@ -160,12 +163,36 @@ fn poll_peer_persisted(home: &Path, id: &str, timeout: Duration) -> bool {
     .is_some()
 }
 
+/// Found a workspace in `home` in-process, using the SAME identity the daemon
+/// will load (`<home>/secret.key`, since the daemon runs with `LAIT_HOME=home`).
+/// Workspaces are never minted lazily anymore — a daemon errors on an
+/// uninitialized store — so every founder home goes through this first.
+fn found_home(home: &Path) {
+    let key = lait::config::load_or_create_identity(home).expect("identity");
+    let me = lait::ids::UserId::from_key_string(key.public().to_string());
+    let store = lait::store::Store::open(home).expect("store");
+    lait::tracker::found_workspace(&store, &me, "test", &lait::ids::SystemUlidSource)
+        .expect("found workspace");
+}
+
+/// Bootstrap a joiner store from a ticket (the client half of `lait join`), so
+/// its daemon boots already bound to the host's workspace — the daemon-side
+/// Connect/Join no longer adopts a foreign workspace. Restarts are unaffected:
+/// the store stays initialized.
+fn join_home(home: &Path, ticket: &str) {
+    let t: lait::proto::WorkspaceTicket = ticket.parse().expect("parse ticket");
+    let store = lait::store::Store::open(home).expect("store");
+    lait::tracker::join_workspace_store(&store, &t.workspace, &t.host.to_string())
+        .expect("bootstrap joiner store");
+}
+
 fn new_issue(home: &Path, title: &str) -> Response {
     req(
         home,
         Request::IssueNew {
             title: title.into(),
             project: Some("ENG".into()),
+            project_hint: None,
             assignees: vec![],
             priority: None,
             labels: vec![],
@@ -178,10 +205,10 @@ fn new_issue(home: &Path, title: &str) -> Response {
 fn restarted_daemon_rejoins_from_persisted_peers() {
     let a_home = tmp_home("a");
     let b_home = tmp_home("b");
+    found_home(&a_home);
     let a = spawn(&a_home);
-    let mut b = spawn(&b_home);
 
-    // A founds the workspace and files the first issue.
+    // A (the founder) adds a project and files the first issue.
     assert!(
         matches!(
             req(
@@ -200,7 +227,8 @@ fn restarted_daemon_rejoins_from_persisted_peers() {
         "A: first issue"
     );
 
-    // B connects via A's ticket, and A grants B membership so B can decrypt.
+    // B bootstraps its store from A's ticket BEFORE its daemon first starts,
+    // then connects, and A grants B membership so B can decrypt.
     let ticket = match req(
         &a_home,
         Request::Invite {
@@ -212,6 +240,8 @@ fn restarted_daemon_rejoins_from_persisted_peers() {
         Response::Text { text } => text.trim().to_string(),
         other => panic!("A: invite returned {other:?}"),
     };
+    join_home(&b_home, &ticket);
+    let mut b = spawn(&b_home);
     assert!(
         matches!(
             req(&b_home, Request::Connect { ticket }),

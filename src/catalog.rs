@@ -30,6 +30,7 @@ use crate::loro_ext as lx;
 const ROOT: &str = "catalog";
 const K_SCHEMA: &str = "schemaVersion";
 const K_WORKSPACE: &str = "workspaceId";
+const K_NAME: &str = "name";
 const C_DOCS: &str = "docs";
 const C_PROJECTS: &str = "projects";
 const C_BOARDS: &str = "boards";
@@ -68,12 +69,14 @@ pub struct CatalogDoc {
 }
 
 impl CatalogDoc {
-    /// Create a fresh Catalog for a workspace, seeding schema + default workflow.
-    pub fn create(workspace_id: &WorkspaceId) -> Result<Self> {
+    /// Create a fresh Catalog for a workspace, seeding schema + display name +
+    /// default workflow.
+    pub fn create(workspace_id: &WorkspaceId, name: &str) -> Result<Self> {
         let doc = LoroDoc::new();
         let root = doc.get_map(ROOT);
         root.insert(K_SCHEMA, SCHEMA_VERSION as i64)?;
         root.insert(K_WORKSPACE, workspace_id.as_str())?;
+        root.insert(K_NAME, name)?;
         root.insert_container(C_DOCS, LoroMap::new())?;
         root.insert_container(C_PROJECTS, LoroMap::new())?;
         root.insert_container(C_BOARDS, LoroMap::new())?;
@@ -167,6 +170,17 @@ impl CatalogDoc {
 
     pub fn workspace_id(&self) -> Option<WorkspaceId> {
         lx::get_str(&self.root(), K_WORKSPACE).and_then(|s| WorkspaceId::parse(&s))
+    }
+    /// The workspace's human display name — a synced LWW register, purely
+    /// cosmetic: renaming never re-topics (the gossip topic derives from the
+    /// workspace id) and never invalidates tickets. Empty until the founder's
+    /// catalog arrives on a fresh joiner.
+    pub fn workspace_name(&self) -> String {
+        lx::get_str(&self.root(), K_NAME).unwrap_or_default()
+    }
+    pub fn set_workspace_name(&self, name: &str) -> Result<()> {
+        self.root().insert(K_NAME, name)?;
+        Ok(())
     }
     pub fn schema_version(&self) -> u32 {
         lx::get_u64(&self.root(), K_SCHEMA).unwrap_or(0) as u32
@@ -544,7 +558,7 @@ mod tests {
 
     fn cat() -> (CatalogDoc, WorkspaceId, ProjectId) {
         let w = ws();
-        let c = CatalogDoc::create(&w).unwrap();
+        let c = CatalogDoc::create(&w, "test").unwrap();
         let p = ProjectId::mint(&SystemUlidSource);
         c.add_project(&p, "Engineering", "ENG", "blue").unwrap();
         c.doc().commit();

@@ -48,7 +48,7 @@ use tokio::{
 };
 
 use crate::{
-    config::{acquire_daemon_lock, load_or_create_identity, Profile},
+    config::{acquire_daemon_lock, load_or_create_identity, Settings},
     control::{
         control_name, Doorbell, Event as LogEvent, EventKind, PresenceEntry, Request, Response,
         StatusInfo,
@@ -57,14 +57,15 @@ use crate::{
     ids::{SystemUlidSource, UserId},
     index::{resolve_user_dir, KnownUser, UserResolution},
     presence::PeerState,
-    proto::{topic_for_room, InviteGrant, Payload, RoomTicket, SignedInvite, SignedMessage},
+    proto::{InviteGrant, Payload, SignedInvite, SignedMessage, WorkspaceTicket},
     store::Store,
     tracker::{DirtySet, Tracker},
 };
 
-// Presence-probe ALPN. Bumped in lockstep with the gossip epoch
-// (proto::GOSSIP_PROTOCOL) so a version skew that partitions gossip also
-// partitions the liveness probe, rather than leaving cross-epoch peers half-visible.
+// Presence-probe ALPN. Bumped to /1 in lockstep with the epoch-1 wire changes
+// (the workspace-identity rewrite + the sync `protocol_version` handshake) and
+// the gossip topic tag, so a version skew that partitions sync/gossip also
+// partitions the liveness probe rather than leaving cross-epoch peers half-visible.
 const PRESENCE_ALPN: &[u8] = b"lait/presence/1";
 const HEARTBEAT: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -352,13 +353,9 @@ impl ProtocolHandler for SyncHandler {
 pub struct EventLog {
     seq: u64,
     events: VecDeque<LogEvent>,
-    notify: Arc<Notify>,
 }
 
 impl EventLog {
-    pub fn notify(&self) -> Arc<Notify> {
-        self.notify.clone()
-    }
     pub fn push(&mut self, kind: EventKind, id: String, nick: String, text: String) {
         self.seq += 1;
         self.events.push_back(LogEvent {
@@ -372,7 +369,6 @@ impl EventLog {
         while self.events.len() > 1000 {
             self.events.pop_front();
         }
-        self.notify.notify_waiters();
     }
     pub fn since(&self, since: u64) -> (Vec<LogEvent>, u64) {
         let out: Vec<LogEvent> = self
@@ -421,11 +417,19 @@ fn subscribe_should_reset(cursor: u64, oldest: u64) -> bool {
 /// Cheaply-cloneable shared presence state.
 #[derive(Debug, Clone)]
 pub struct Shared {
-    pub nick: String,
-    pub room: String,
+    /// Our display nick. Mutable so a `ConfigReload` (from `lait config set
+    /// user.nick`) applies live instead of waiting for a restart. There is no
+    /// room here: the gossip topic is a pure function of the workspace id.
+    pub nick: Arc<Mutex<String>>,
     pub my_id: EndpointId,
     pub presence: Arc<Mutex<HashMap<EndpointId, Peer>>>,
     pub events: Arc<Mutex<EventLog>>,
+}
+
+impl Shared {
+    fn nick(&self) -> String {
+        self.nick.lock().unwrap().clone()
+    }
 }
 
 /// The running node.
@@ -493,6 +497,7 @@ impl Node {
                 display.clone(),
                 format!("{display} is online"),
             );
+            self.ring_presence_doorbell();
         }
         display
     }
@@ -557,6 +562,7 @@ impl Node {
             display.clone(),
             format!("{display} is online"),
         );
+        self.ring_presence_doorbell();
     }
 
     fn announce_offline(&self, id: EndpointId, left: bool) {
@@ -571,6 +577,7 @@ impl Node {
             .lock()
             .unwrap()
             .push(EventKind::Presence, id.to_string(), display, text);
+        self.ring_presence_doorbell();
     }
 
     async fn reaper_loop(self: Arc<Self>) {
@@ -629,6 +636,7 @@ impl Node {
                     display.clone(),
                     format!("{display} joined the room"),
                 );
+                self.ring_presence_doorbell();
                 // Pattern A: if the joiner presented a valid pre-authorization and
                 // we're an admin who can seal, admit them now — no manual approve.
                 // On any failure we simply leave the request pending (the event
@@ -762,20 +770,25 @@ impl Node {
         Ok(())
     }
 
-    /// Adopt a ticket's workspace (if we're empty, A§6/A§10), join its gossip
-    /// topic, announce, and eagerly pull from the host to backfill.
-    async fn adopt_and_join(self: &Arc<Self>, ticket: &RoomTicket) -> Result<()> {
-        if !ticket.workspace.is_empty() {
-            let founder = ticket.host.to_string();
-            let _ = self
-                .tracker
-                .lock()
-                .unwrap()
-                .adopt_workspace(&ticket.workspace, &founder);
+    /// Connect to the bound workspace's mesh through a ticket: join the topic,
+    /// broadcast our join request, announce, and eagerly pull from the host to
+    /// backfill. The store was already bootstrapped by the CLI
+    /// ([`crate::tracker::join_workspace_store`]) — a ticket for a *different*
+    /// workspace is a hard error, never an adoption: a daemon is only ever
+    /// subscribed to its own workspace's topic, so split-brain is structurally
+    /// impossible.
+    async fn connect_workspace(self: &Arc<Self>, ticket: &WorkspaceTicket) -> Result<()> {
+        let bound = self.tracker.lock().unwrap().workspace_str();
+        if ticket.workspace != bound {
+            anyhow::bail!(
+                "this store is bound to space {bound}, but the invite is for {} — \
+                 run `lait join` from a directory that isn't already a space",
+                ticket.workspace
+            );
         }
         self.join_topic(ticket.topic(), vec![ticket.host]).await?;
         self.broadcast(Payload::JoinRequest {
-            nick: self.shared.nick.clone(),
+            nick: self.shared.nick(),
             // Echo the ticket's pre-authorization (if any) so an admin receiver can
             // auto-seal us the key without a manual approve (Pattern A).
             invite: ticket.invite.clone(),
@@ -791,9 +804,9 @@ impl Node {
     /// admin approves us we hold ciphertext and aren't on the board (UI.md §8).
     /// So we tell the joiner the truth and point at the one next step, instead of
     /// implying success. If we resolved to an already-member (a re-join), say so.
-    fn join_message(&self, ticket: &RoomTicket) -> String {
+    fn join_message(&self, ticket: &WorkspaceTicket) -> String {
         let host = if ticket.host_nick.is_empty() {
-            "the workspace admin".to_string()
+            "the space admin".to_string()
         } else {
             ticket.host_nick.clone()
         };
@@ -805,7 +818,7 @@ impl Node {
             // automatic once an admin node processes the request (typically ~a
             // couple seconds). Tell the truth without implying a manual step.
             format!(
-                "joining {host}'s workspace with an invite pass \u{2014} you should be admitted \
+                "joining {host}'s space with an invite pass \u{2014} you should be admitted \
                  automatically in a moment, then your board decrypts and syncs.\n\
                  run `lait status` to confirm you're in."
             )
@@ -819,18 +832,26 @@ impl Node {
         }
     }
 
-    /// Pin a seed (A§10). Accepts two forms: a full `RoomTicket` (adopt the
-    /// workspace, join, and backfill — the primary path), or a bare endpoint id
-    /// (pin only, for a peer we already share a workspace with). Either way the
-    /// pin is persisted so future restarts always dial and backfill from it.
+    /// Pin a seed (A§10). Accepts two forms: a full `WorkspaceTicket` for the
+    /// workspace this store is bound to (connect + backfill — the primary path),
+    /// or a bare endpoint id (pin only, for a peer we already share a workspace
+    /// with). A ticket for a *foreign* workspace is an error — join it first.
+    /// Either way the pin is persisted so restarts always dial and backfill.
     async fn seed_add(self: &Arc<Self>, arg: &str) -> Result<Response> {
         // Try the ticket form first; a bare id will not decode as a ticket.
-        if let Ok(ticket) = arg.parse::<RoomTicket>() {
+        if let Ok(ticket) = arg.parse::<WorkspaceTicket>() {
             let id = ticket.host;
             if id == self.shared.my_id {
                 return Ok(Response::err("that ticket points at this node's own id"));
             }
-            self.adopt_and_join(&ticket).await?;
+            let bound = self.tracker.lock().unwrap().workspace_str();
+            if ticket.workspace != bound {
+                return Ok(Response::err(format!(
+                    "that ticket is for a different space ({}) — join it first: `lait join <ticket>`",
+                    ticket.workspace
+                )));
+            }
+            self.connect_workspace(&ticket).await?;
             let newly = upsert_seed(
                 &self.home,
                 SeedRecord {
@@ -842,7 +863,7 @@ impl Node {
             self.clone().trigger_pull(id);
             return Ok(Response::Ok {
                 message: Some(format!(
-                    "{} seed {id} \u{2014} adopted workspace, backfilling",
+                    "{} seed {id} \u{2014} backfilling",
                     if newly { "pinned" } else { "updated" }
                 )),
             });
@@ -925,7 +946,7 @@ impl Node {
             interval.tick().await;
             if let Err(e) = self
                 .broadcast(Payload::Presence {
-                    nick: self.shared.nick.clone(),
+                    nick: self.shared.nick(),
                     state: self.my_presence_state(),
                 })
                 .await
@@ -958,8 +979,49 @@ impl Node {
         }
     }
 
+    /// Signal shutdown to **every** waiter. The `shutdown` Notify has multiple
+    /// tasks parked on it (the main accept loop *and* each Subscribe stream), so
+    /// a bare `notify_one` could hand its single permit to a subscriber and leave
+    /// the accept loop running — a daemon that answered "shutting down" and then
+    /// didn't (the zombie: its pipe instance keeps accepting connects nobody
+    /// serves). `notify_waiters` wakes everyone currently parked; the follow-up
+    /// `notify_one` stores a permit for a waiter that hadn't re-parked yet.
+    fn signal_shutdown(&self) {
+        self.shutdown.notify_waiters();
+        self.shutdown.notify_one();
+    }
+
+    /// Ring the presence plane — a peer joined or changed presence. Carries no
+    /// tracker dirty-set: the `EventLog` moved, not a doc. Subscribers re-read
+    /// `Log{since}`. This is what lets a stream wake on presence at all; the
+    /// tracker `DirtySet` paths below never touch the `EventLog`.
+    fn ring_presence_doorbell(&self) {
+        let mut d = self.doorbell.lock().unwrap();
+        d.seq += 1;
+        let frame = Doorbell {
+            epoch: d.epoch,
+            seq: d.seq,
+            reset: false,
+            presence_advanced: true,
+            ..Default::default()
+        };
+        d.ring.push_back(frame);
+        while d.ring.len() > DOORBELL_RING {
+            d.ring.pop_front();
+        }
+        drop(d);
+        self.doorbell_notify.notify_waiters();
+    }
+
     /// Stamp a tracker [`DirtySet`] into a doorbell and wake every parked stream.
     fn ring_doorbell(&self, dirty: DirtySet) {
+        // Project config moved (local edit or sync import) — keep the machine
+        // registry's advisory project snapshot fresh. Every ring_doorbell call
+        // site has already released the tracker lock, so the re-lock inside is
+        // safe.
+        let projects_moved = dirty
+            .dirty_catalog
+            .contains(&crate::control::CatalogScope::Projects);
         let mut d = self.doorbell.lock().unwrap();
         d.seq += 1;
         let frame = Doorbell {
@@ -969,6 +1031,7 @@ impl Node {
             dirty_by_project: dirty.dirty_by_project,
             dirty_catalog: dirty.dirty_catalog,
             activity_advanced: dirty.activity_advanced,
+            presence_advanced: false,
         };
         d.ring.push_back(frame);
         while d.ring.len() > DOORBELL_RING {
@@ -976,6 +1039,9 @@ impl Node {
         }
         drop(d);
         self.doorbell_notify.notify_waiters();
+        if projects_moved {
+            self.refresh_registry_row();
+        }
     }
 
     /// Our own key as a [`UserId`] (the endpoint id is the ed25519 key, S§2).
@@ -1150,6 +1216,7 @@ impl Node {
             Request::IssueNew {
                 title,
                 project,
+                project_hint,
                 assignees,
                 priority,
                 labels,
@@ -1162,6 +1229,7 @@ impl Node {
                 Request::IssueNew {
                     title,
                     project,
+                    project_hint,
                     assignees: out,
                     priority,
                     labels,
@@ -1202,6 +1270,9 @@ impl Node {
             Request::IssueNew { .. }
             | Request::IssueEdit { .. }
             | Request::IssueMove { .. }
+            | Request::IssueStart { .. }
+            | Request::IssueDone { .. }
+            | Request::IssueStop { .. }
             | Request::Assign { .. }
             | Request::Label { .. }
             | Request::Comment { .. }
@@ -1353,7 +1424,7 @@ impl Node {
                     .filter(|p| p.presence.is_online())
                     .count();
                 let me = self.my_userid();
-                let (workspace, issues, projects, membership) = {
+                let (workspace, name, issues, projects, membership) = {
                     let t = self.tracker.lock().unwrap();
                     let acl = t.acl_state();
                     let membership = if acl.is_admin(&me) {
@@ -1365,6 +1436,7 @@ impl Node {
                     };
                     (
                         Some(t.workspace_id().to_string()),
+                        t.workspace_name(),
                         t.issue_count(),
                         t.project_count(),
                         membership.to_string(),
@@ -1373,8 +1445,8 @@ impl Node {
                 let pending_requests = self.pending_join_requests().len();
                 Ok(Response::Status(Box::new(StatusInfo {
                     id: self.shared.my_id.to_string(),
-                    nick: self.shared.nick.clone(),
-                    room: self.shared.room.clone(),
+                    nick: self.shared.nick(),
+                    name,
                     online_peers,
                     workspace,
                     issues,
@@ -1395,7 +1467,7 @@ impl Node {
                     .filter(|p| p.presence.is_online())
                     .count();
                 let me = self.my_userid();
-                let (workspace, issues, projects, membership) = {
+                let (workspace, name, issues, projects, membership) = {
                     let t = self.tracker.lock().unwrap();
                     let acl = t.acl_state();
                     let membership = if acl.is_admin(&me) {
@@ -1407,6 +1479,7 @@ impl Node {
                     };
                     (
                         t.workspace_id().to_string(),
+                        t.workspace_name(),
                         t.issue_count(),
                         t.project_count(),
                         membership.to_string(),
@@ -1414,7 +1487,7 @@ impl Node {
                 };
                 let view = crate::diagnose::diagnose(crate::diagnose::DiagnoseInput {
                     workspace: Some(workspace.as_str()),
-                    room: self.shared.room.as_str(),
+                    name: name.as_str(),
                     membership: membership.as_str(),
                     online_peers,
                     projects,
@@ -1431,7 +1504,10 @@ impl Node {
                 reusable,
                 ttl_hours,
             } => {
-                let workspace = self.tracker.lock().unwrap().workspace_str();
+                let (workspace, name) = {
+                    let t = self.tracker.lock().unwrap();
+                    (t.workspace_str(), t.workspace_name())
+                };
                 // Default: embed a signed, single-use pre-authorization so the
                 // joiner is auto-admitted (Pattern A). `--require-approval` mints a
                 // grant-less ticket that falls back to the manual approve flow.
@@ -1444,11 +1520,11 @@ impl Node {
                         InviteGrant::mint(workspace.clone(), now_secs(), ttl_secs, !reusable);
                     SignedInvite::sign(&self.secret_key, &grant).ok()
                 };
-                let ticket = RoomTicket {
-                    room: self.shared.room.clone(),
-                    host: self.shared.my_id,
-                    host_nick: self.shared.nick.clone(),
+                let ticket = WorkspaceTicket {
                     workspace,
+                    name,
+                    host: self.shared.my_id,
+                    host_nick: self.shared.nick(),
                     invite,
                 };
                 Ok(Response::Text {
@@ -1456,22 +1532,12 @@ impl Node {
                 })
             }
             Request::Join { ticket } | Request::Connect { ticket } => {
-                let ticket: RoomTicket = ticket.parse().context("parse room ticket")?;
-                self.adopt_and_join(&ticket).await?;
-                // Record where this workspace now lives (store path → workspace) so
-                // a joiner who later runs commands from a different directory can be
-                // pointed back here instead of silently binding a decoy store — the
-                // directory trap (docs/GUIDED-JOIN.md §B). Best-effort: a registry
-                // write failure must never fail the join itself.
-                if let Err(e) = crate::workspaces::upsert(crate::workspaces::WorkspaceEntry {
-                    workspace: ticket.workspace.clone(),
-                    room: ticket.room.clone(),
-                    path: self.home.display().to_string(),
-                    host_nick: ticket.host_nick.clone(),
-                    last_seen: now_secs(),
-                }) {
-                    tracing::warn!("workspace registry upsert failed: {e:#}");
-                }
+                let ticket: WorkspaceTicket = ticket.parse().context("parse workspace ticket")?;
+                // The CLI already bootstrapped this store from the ticket
+                // (`tracker::join_workspace_store`) and registered it; the
+                // daemon's part is transport only — connect, request admission,
+                // backfill.
+                self.connect_workspace(&ticket).await?;
                 Ok(Response::Ok {
                     message: Some(self.join_message(&ticket)),
                 })
@@ -1514,27 +1580,6 @@ impl Node {
                 let (events, last) = self.shared.events.lock().unwrap().since(since);
                 Ok(Response::Events { events, last })
             }
-            Request::Wait { since, timeout_ms } => {
-                let timeout_ms = timeout_ms.clamp(0, 300_000);
-                let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
-                let notify = self.shared.events.lock().unwrap().notify();
-                loop {
-                    let notified = notify.notified();
-                    tokio::pin!(notified);
-                    notified.as_mut().enable();
-                    let (events, last) = self.shared.events.lock().unwrap().since(since);
-                    if !events.is_empty() {
-                        return Ok(Response::Events { events, last });
-                    }
-                    tokio::select! {
-                        _ = &mut notified => continue,
-                        _ = tokio::time::sleep_until(deadline) => {
-                            let (events, last) = self.shared.events.lock().unwrap().since(since);
-                            return Ok(Response::Events { events, last });
-                        }
-                    }
-                }
-            }
             Request::Who => {
                 let peers = self
                     .shared
@@ -1564,16 +1609,88 @@ impl Node {
                     .collect();
                 Ok(Response::Who { peers })
             }
+            Request::Inbox { clear } => {
+                let (mut entries, unread) = crate::inbox::list(&self.home);
+                if clear {
+                    crate::inbox::mark_read(&self.home, now_secs());
+                }
+                // Resolve actor keys to display nicks at READ time (never
+                // persisted): local petname > live presence nick > short key.
+                let aliases = load_aliases(&self.home);
+                let presence = self.shared.presence.lock().unwrap();
+                for e in entries.iter_mut() {
+                    let Some(actor) = e.actor.clone() else {
+                        continue;
+                    };
+                    let pet = aliases
+                        .iter()
+                        .find(|a| a.key == actor)
+                        .map(|a| a.name.clone())
+                        .filter(|n| !n.is_empty());
+                    let pres = presence
+                        .iter()
+                        .find(|(id, _)| id.to_string() == actor)
+                        .map(|(_, p)| p.nick.clone())
+                        .filter(|n| !n.is_empty());
+                    let short: String = actor.chars().take(8).collect();
+                    e.actor_nick = Some(pet.or(pres).unwrap_or(short));
+                }
+                drop(presence);
+                Ok(Response::Inbox { entries, unread })
+            }
+            Request::ConfigReload => {
+                // Re-read the layered settings so a daemon-read key set via
+                // `lait config` applies live (never a silent wait-for-restart).
+                let settings = Settings::load(Some(&self.home));
+                let nick = settings.nick();
+                *self.shared.nick.lock().unwrap() = nick.clone();
+                self.tracker.lock().unwrap().set_nick(nick.clone());
+                // Broadcast the new nick right away so peers don't wait a
+                // heartbeat to see it.
+                let me = self.clone();
+                tokio::spawn(async move {
+                    me.broadcast(Payload::Hello {
+                        nick: me.shared.nick(),
+                    })
+                    .await
+                    .ok();
+                });
+                Ok(Response::Ok {
+                    message: Some(format!("config reloaded (nick: {nick})")),
+                })
+            }
             Request::Stop => {
-                let s = self.shutdown.clone();
+                let me = self.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(100)).await;
-                    s.notify_one();
+                    me.signal_shutdown();
                 });
                 Ok(Response::Ok {
                     message: Some("shutting down".to_string()),
                 })
             }
+        }
+    }
+
+    /// Refresh this store's row in the machine-level workspace registry —
+    /// advisory navigation state (name + project keys for `lait workspaces`).
+    /// Best-effort: registry failure never affects daemon operation. The
+    /// registry's merge keeps `origin`/`host_nick` from the init/join upsert.
+    fn refresh_registry_row(&self) {
+        let (workspace, name, projects) = {
+            let t = self.tracker.lock().unwrap();
+            (t.workspace_str(), t.workspace_name(), t.project_briefs())
+        };
+        if let Err(e) = crate::workspaces::upsert(crate::workspaces::WorkspaceEntry {
+            workspace,
+            name,
+            path: self.home.display().to_string(),
+            origin: crate::workspaces::Origin::default(),
+            host_nick: String::new(),
+            last_opened: now_secs(),
+            projects,
+        }) {
+            tracing::debug!("workspace registry refresh failed: {e:#}");
         }
     }
 
@@ -1615,7 +1732,7 @@ impl Node {
             let idle_for = self.last_active.lock().unwrap().elapsed();
             if should_idle_shutdown(active, idle_for, self.idle_window, self.is_mesh_member()) {
                 tracing::info!("idle {idle_for:?} with no clients — shutting down");
-                self.shutdown.notify_one();
+                self.signal_shutdown();
                 break;
             }
         }
@@ -1739,22 +1856,40 @@ async fn write_line_half<T: serde::Serialize>(
 pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     let _daemon_lock = acquire_daemon_lock(&home)?;
 
-    // Identity is global by default (DUR-5); store (profile/repo/lock/socket) is
+    // Identity is global by default (DUR-5); store (repo/lock/socket/config) is
     // this per-repo home. `$LAIT_HOME` collapses both back into `home`.
     let secret_key = load_or_create_identity(&crate::config::identity_dir()?)?;
-    let profile = Profile::load(&home)?;
+    let settings = Settings::load(Some(&home));
+    let nick = settings.nick();
 
-    // Tracker core (P0): open the git-backed store and load/create the workspace.
+    // Tracker core (P0): open the git-backed store. The store must already be
+    // initialized (`lait init` / `lait join`) — a daemon never founds a
+    // workspace as a side effect of starting.
     let store = Store::open(&home)?;
     let me = UserId::from_key_string(secret_key.public().to_string());
     let identity_seed = secret_key.to_bytes();
     let tracker = Tracker::open(
         store,
         me,
-        profile.nick.clone(),
+        nick.clone(),
         identity_seed,
         Box::new(SystemUlidSource),
     )?;
+    // Register/refresh this store in the machine-level workspace registry so
+    // founders and joiners alike show up in `lait workspaces` and resolve via
+    // `-w`. Best-effort (navigation state, never a gate); the merge keeps the
+    // origin/host_nick recorded by `lait init`/`lait join`.
+    if let Err(e) = crate::workspaces::upsert(crate::workspaces::WorkspaceEntry {
+        workspace: tracker.workspace_str(),
+        name: tracker.workspace_name(),
+        path: home.display().to_string(),
+        origin: crate::workspaces::Origin::default(),
+        host_nick: String::new(),
+        last_opened: now_secs(),
+        projects: tracker.project_briefs(),
+    }) {
+        tracing::warn!("workspace registry upsert failed: {e:#}");
+    }
     let tracker = Arc::new(Mutex::new(tracker));
 
     let memory_lookup = MemoryLookup::new();
@@ -1768,8 +1903,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     let gossip = Gossip::builder().spawn(endpoint.clone());
 
     let shared = Shared {
-        nick: profile.nick.clone(),
-        room: profile.room.clone(),
+        nick: Arc::new(Mutex::new(nick)),
         my_id,
         presence: Arc::new(Mutex::new(HashMap::new())),
         events: Arc::new(Mutex::new(EventLog::default())),
@@ -1788,7 +1922,9 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
 
     endpoint.online().await;
 
-    let topic = topic_for_room(&profile.room);
+    // The topic is a pure function of the workspace id — no user-settable
+    // network name, so a cold boot can never subscribe to the wrong topic.
+    let topic = crate::proto::topic_for_workspace(&tracker.lock().unwrap().workspace_str());
     // Seed gossip bootstrap from previously-seen peers so a restart actively
     // rejoins the mesh instead of waiting to be re-announced to (DUR-1), unioned
     // with the explicit, sticky seed pins (A§10) so a restart always dials its
@@ -1844,7 +1980,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     tokio::spawn(node.clone().idle_shutdown_loop());
 
     node.broadcast(Payload::Hello {
-        nick: node.shared.nick.clone(),
+        nick: node.shared.nick(),
     })
     .await
     .ok();
@@ -1864,7 +2000,14 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         .create_tokio()
         .context("bind control channel")?;
 
-    tracing::info!("lait daemon online as {my_id} in room '{}'", profile.room);
+    {
+        let t = node.tracker.lock().unwrap();
+        tracing::info!(
+            "lait daemon online as {my_id} in space '{}' ({})",
+            t.workspace_name(),
+            t.workspace_str()
+        );
+    }
 
     let shutdown = node.shutdown.clone();
     loop {
@@ -1882,22 +2025,37 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         }
     }
 
+    // Stop accepting control connections immediately: the pipe/socket server
+    // instance must go away with the loop, or a client that connects during
+    // teardown parks forever on a server that will never answer.
+    drop(listener);
+
     node.persist_known_peers();
     // Flush any mutations marked since the last checkpoint tick, so a clean
     // shutdown (e.g. idle-out) leaves the git history current rather than a few
     // seconds behind (the data itself is already fsync-durable regardless).
     node.tracker.lock().unwrap().checkpoint();
-    node.broadcast(Payload::Bye {
-        nick: node.shared.nick.clone(),
+
+    // The rest of the teardown is courtesy (Bye broadcast, router close) — it
+    // must never keep a "shutting down" daemon alive. A gossip/endpoint close
+    // that hangs past the deadline gets abandoned; state is already durable.
+    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+        node.broadcast(Payload::Bye {
+            nick: node.shared.nick(),
+        })
+        .await
+        .ok();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        node.router.shutdown().await.ok();
     })
-    .await
-    .ok();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    .await;
 
     #[cfg(unix)]
     let _ = std::fs::remove_file(crate::config::socket_path(&home));
-    node.router.shutdown().await.ok();
-    Ok(())
+    // Hard guarantee: "stop" means the process exits. Anything still running
+    // (a wedged endpoint task, a non-tokio thread) would otherwise leave a
+    // zombie whose half-dead control channel hangs every later client.
+    std::process::exit(0);
 }
 
 #[cfg(test)]

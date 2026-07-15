@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use lait::control::{request, Request, Response};
 use lait::diagnose::GateState;
-use lait::workspaces::WorkspaceEntry;
+use lait::workspaces::{Origin, WorkspaceEntry};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_lait")
@@ -119,6 +119,28 @@ fn gate_state(v: &lait::diagnose::DiagnosisView, id: &str) -> GateState {
         .state
 }
 
+/// Found a workspace in `home` in-process, using the SAME identity the daemon
+/// will load (`<home>/secret.key`, since the daemon runs with `LAIT_HOME=home`).
+/// Workspaces are never minted lazily anymore — a daemon errors on an
+/// uninitialized store — so every founder home goes through this first.
+fn found_home(home: &Path) {
+    let key = lait::config::load_or_create_identity(home).expect("identity");
+    let me = lait::ids::UserId::from_key_string(key.public().to_string());
+    let store = lait::store::Store::open(home).expect("store");
+    lait::tracker::found_workspace(&store, &me, "test", &lait::ids::SystemUlidSource)
+        .expect("found workspace");
+}
+
+/// Bootstrap a joiner store from a ticket (the client half of `lait join`), so
+/// its daemon boots already bound to the host's workspace — the daemon-side
+/// Connect/Join no longer adopts a foreign workspace.
+fn join_home(home: &Path, ticket: &str) {
+    let t: lait::proto::WorkspaceTicket = ticket.parse().expect("parse ticket");
+    let store = lait::store::Store::open(home).expect("store");
+    lait::tracker::join_workspace_store(&store, &t.workspace, &t.host.to_string())
+        .expect("bootstrap joiner store");
+}
+
 fn ticket_for(home: &Path, require_approval: bool) -> String {
     match req(
         home,
@@ -139,11 +161,12 @@ fn ticket_for(home: &Path, require_approval: bool) -> String {
 /// work" arc the whole change exists to make honest.
 #[test]
 fn diagnose_tracks_join_lifecycle_from_pending_to_all_pass() {
-    let a = spawn_daemon(&unique("life-a"), &unique("life-cfg-a"));
-    let b = spawn_daemon(&unique("life-b"), &unique("life-cfg-b"));
-
-    // A founds a workspace with a project (so the synced gate has something to
-    // converge once B is in).
+    // A founds a workspace (in-process, same identity as its daemon), then its
+    // daemon adds a project (so the synced gate has something to converge once
+    // B is in).
+    let a_home = unique("life-a");
+    found_home(&a_home);
+    let a = spawn_daemon(&a_home, &unique("life-cfg-a"));
     assert!(matches!(
         req(
             &a.home,
@@ -155,8 +178,12 @@ fn diagnose_tracks_join_lifecycle_from_pending_to_all_pass() {
         Response::Ref { .. }
     ));
 
-    // B joins via a require-approval ticket → lands pending.
+    // B bootstraps its store from a require-approval ticket BEFORE its daemon
+    // first starts, then connects → lands pending.
     let ticket = ticket_for(&a.home, true);
+    let b_home = unique("life-b");
+    join_home(&b_home, &ticket);
+    let b = spawn_daemon(&b_home, &unique("life-cfg-b"));
     assert!(matches!(
         req(&b.home, Request::Connect { ticket }),
         Response::Ok { .. }
@@ -224,7 +251,9 @@ fn diagnose_tracks_join_lifecycle_from_pending_to_all_pass() {
 /// command in the wrong folder" case the `join` tail catches.
 #[test]
 fn diagnose_flags_expected_workspace_mismatch() {
-    let a = spawn_daemon(&unique("mm-a"), &unique("mm-cfg-a"));
+    let a_home = unique("mm-a");
+    found_home(&a_home);
+    let a = spawn_daemon(&a_home, &unique("mm-cfg-a"));
 
     // A real workspace exists (A is admin), but we assert we expected a different
     // one — as the join tail would if the cwd bound the wrong store.
@@ -256,18 +285,23 @@ fn diagnose_flags_expected_workspace_mismatch() {
 /// so the CLI can later route a lost joiner back to the right directory.
 #[test]
 fn join_records_the_workspace_registry_entry() {
-    let a = spawn_daemon(&unique("reg-a"), &unique("reg-cfg-a"));
-    let b_home = unique("reg-b");
-    let b_cfg = unique("reg-cfg-b");
-    let b = spawn_daemon(&b_home, &b_cfg);
+    let a_home = unique("reg-a");
+    found_home(&a_home);
+    let a = spawn_daemon(&a_home, &unique("reg-cfg-a"));
 
     let ticket = ticket_for(&a.home, false); // default Pattern A (auto-approve)
+    let b_home = unique("reg-b");
+    join_home(&b_home, &ticket);
+    let b_cfg = unique("reg-cfg-b");
+    let b = spawn_daemon(&b_home, &b_cfg);
     assert!(matches!(
         req(&b.home, Request::Connect { ticket }),
         Response::Ok { .. }
     ));
 
-    // The daemon writes workspaces.json under B's config root on join.
+    // Every daemon boot upserts its store into workspaces.json under its config
+    // root — so B's row exists as soon as its daemon is up (origin defaults to
+    // joined; the CLI-side `lait join` would have stamped host_nick too).
     let reg_file = b_cfg.join("workspaces.json");
     let found = poll_until(Duration::from_secs(10), || {
         let txt = std::fs::read_to_string(&reg_file).ok()?;
@@ -281,7 +315,11 @@ fn join_records_the_workspace_registry_entry() {
         entry.workspace.starts_with("ws_"),
         "entry carries the workspace id"
     );
-    assert!(!entry.room.is_empty(), "entry carries the room");
+    assert_eq!(
+        entry.origin,
+        Origin::Joined,
+        "a bootstrapped joiner registers as joined, not founded"
+    );
 
     drop(a);
     drop(b);
@@ -300,10 +338,12 @@ fn read_command_in_empty_dir_refuses_to_create_a_decoy_store() {
     // Seed the registry with a workspace the user "joined" elsewhere.
     let entry = WorkspaceEntry {
         workspace: "ws_01JGUARDTESTWORKSPACEID".into(),
-        room: "lait".into(),
+        name: "guardws".into(),
         path: "/some/other/place/.lait".into(),
+        origin: Origin::Joined,
         host_nick: "alice".into(),
-        last_seen: 42,
+        last_opened: 42,
+        projects: vec![],
     };
     std::fs::write(
         cfg.join("workspaces.json"),
@@ -329,12 +369,18 @@ fn read_command_in_empty_dir_refuses_to_create_a_decoy_store() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("no lait workspace in this directory"),
+        stderr.contains("no lait space in this directory"),
         "guard must explain why, got stderr: {stderr}"
     );
+    // The listing is human navigation state: the workspace NAME and its path
+    // (not the raw ws id).
     assert!(
-        stderr.contains("ws_01JGUARDTESTWORKSPACEID"),
-        "guard must point at the registered workspace, got stderr: {stderr}"
+        stderr.contains("guardws"),
+        "guard must list the registered workspace by name, got stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("/some/other/place/.lait"),
+        "guard must point at the registered store path, got stderr: {stderr}"
     );
     assert!(
         !cwd.join(".lait").exists(),
@@ -343,4 +389,116 @@ fn read_command_in_empty_dir_refuses_to_create_a_decoy_store() {
 
     let _ = std::fs::remove_dir_all(&cfg);
     let _ = std::fs::remove_dir_all(&cwd);
+}
+
+/// The same refusal holds with an EMPTY registry: a store-needing command in a
+/// bare directory never creates anything — it exits non-zero and points the user
+/// at the creation verbs (`lait init` / `lait join`).
+#[test]
+fn read_command_with_empty_registry_still_refuses_and_suggests_creation_verbs() {
+    let cfg = unique("guard0-cfg");
+    let cwd = unique("guard0-cwd");
+
+    let out = Command::new(bin())
+        .arg("projects")
+        .current_dir(&cwd)
+        .env("LAIT_CONFIG_ROOT", &cfg)
+        .env_remove("LAIT_HOME")
+        .env_remove("LAIT_STORE")
+        .output()
+        .expect("spawn `lait projects`");
+
+    assert!(
+        !out.status.success(),
+        "a read command with no workspace anywhere must exit non-zero, got {:?}",
+        out.status.code()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no lait space in this directory"),
+        "guard must explain why, got stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("lait init") && stderr.contains("lait join"),
+        "with nothing registered, the guard must suggest init/join, got stderr: {stderr}"
+    );
+    assert!(
+        !cwd.join(".lait").exists(),
+        "the guard must NOT leave a decoy .lait/ behind"
+    );
+
+    let _ = std::fs::remove_dir_all(&cfg);
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
+/// `lait join` in a directory already bound to a DIFFERENT workspace is a hard
+/// error (exit 2) — never adopt, never wipe. This shells the real binary because
+/// it is the pre-daemon store-resolution path.
+#[test]
+fn join_binary_refuses_a_directory_bound_to_another_workspace() {
+    // A real host to mint a ticket for workspace A…
+    let a_home = unique("bind-a");
+    found_home(&a_home);
+    let a = spawn_daemon(&a_home, &unique("bind-cfg-a"));
+    let ticket = ticket_for(&a.home, false);
+
+    // …and a directory already bound to a different workspace C.
+    let c_home = unique("bind-c");
+    found_home(&c_home);
+
+    let join_cfg = unique("bind-cfg-join");
+    let out = Command::new(bin())
+        .args(["join", &ticket])
+        .env("LAIT_HOME", &c_home)
+        .env("LAIT_CONFIG_ROOT", &join_cfg)
+        .output()
+        .expect("spawn `lait join`");
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "joining into a store bound to another workspace must exit 2, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("the invite is for"),
+        "the refusal must name the mismatch, got stderr: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&c_home);
+    let _ = std::fs::remove_dir_all(&join_cfg);
+    drop(a);
+}
+
+/// `stop` must terminate the daemon even while a Subscribe stream is parked on
+/// the shutdown Notify. The zombie regression: `notify_one` could hand its
+/// single permit to the parked subscriber instead of the accept loop, leaving a
+/// daemon that answered "shutting down" running forever with a half-dead
+/// control channel that hangs every later client.
+#[test]
+fn stop_kills_the_daemon_even_with_a_live_subscriber() {
+    let d_home = unique("stop-a");
+    found_home(&d_home);
+    let mut d = spawn_daemon(&d_home, &unique("stop-cfg-a"));
+
+    // Park a real subscriber server-side: read the first (Reset) frame so the
+    // daemon's stream task is provably inside its shutdown/doorbell select.
+    let rt = rt();
+    let _sub = rt.block_on(async {
+        let mut sub = lait::control::subscribe(&d.home, 0)
+            .await
+            .expect("subscribe");
+        sub.next().await.expect("first frame").expect("reset frame");
+        sub
+    });
+
+    assert!(matches!(req(&d.home, Request::Stop), Response::Ok { .. }));
+    let exited = poll_until(Duration::from_secs(10), || {
+        d.child.try_wait().ok().flatten()
+    });
+    assert!(
+        exited.is_some(),
+        "daemon must exit after stop even with a live subscriber"
+    );
 }

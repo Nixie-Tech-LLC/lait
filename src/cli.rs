@@ -10,11 +10,11 @@ use std::{io::Write, path::Path, process::Stdio, time::Duration};
 use anyhow::{anyhow, Context, Result};
 
 use crate::{
-    control::{request, ErrorKind, Event, EventKind, Request, Response},
+    control::{self, request, ErrorKind, Event, EventKind, Request, Response},
     diagnose::{DiagnosisView, GateState},
     dto::{BoardView, IssueView, Priority, Row},
-    proto::RoomTicket,
-    workspaces::{self, WorkspaceEntry},
+    proto::WorkspaceTicket,
+    workspaces::{self, StorePresence, WorkspaceEntry},
 };
 
 /// Output mode threaded from the global `--json` / `--no-color` flags.
@@ -59,6 +59,14 @@ fn paint(on: bool, code: &str, s: &str) -> String {
 pub async fn ensure_daemon(home: &Path) -> Result<()> {
     if request(home, &Request::Status).await.is_ok() {
         return Ok(());
+    }
+    // A daemon can only open an initialized store — fail fast with guidance
+    // instead of spawning a doomed process and timing out 20s later.
+    if !crate::store::initialized_at(home) {
+        return Err(anyhow!(
+            "no space at {} — found one with `lait init`, or join one with `lait join <link>`",
+            home.display()
+        ));
     }
     let exe = std::env::current_exe().context("locate own executable")?;
     // Pin the resolved store for the spawned daemon so it binds the exact same
@@ -173,7 +181,12 @@ pub async fn run_join(home: &Path, ticket: String, out: Out) -> Result<()> {
     // Parse client-side to recover the intended workspace before the ticket is
     // moved into the request. A malformed ticket simply yields no expectation; the
     // daemon returns the real parse error.
-    let expected = ticket.parse::<RoomTicket>().ok().map(|t| t.workspace);
+    let parsed = ticket.parse::<WorkspaceTicket>().ok();
+    // A pass-carrying ticket (Pattern A) admits automatically within seconds, so
+    // a pending membership is worth polling out; a pass-less ticket waits on a
+    // human admin and would only stall the readout.
+    let has_pass = parsed.as_ref().is_some_and(|t| t.invite.is_some());
+    let expected = parsed.map(|t| t.workspace);
     let resp = client(home, Request::Join { ticket }).await?;
     match &resp {
         Response::Ok { message } => {
@@ -194,20 +207,280 @@ pub async fn run_join(home: &Path, ticket: String, out: Out) -> Result<()> {
     }
     // Human tail: the gate readout. Best-effort — a verifier hiccup must not make a
     // successful join look failed, so we degrade to a hint rather than erroring.
-    match client(
-        home,
-        Request::Diagnose {
-            expected_workspace: expected,
-        },
-    )
-    .await
-    {
-        Ok(diag) => {
-            print_diagnosis_or(&diag, out);
+    //
+    // Polled, not one-shot: right after `join` returns, admission (Pattern A's
+    // auto-seal) and the gossip handshake are still in flight, so a t=0 snapshot
+    // reads "waiting on a peer" moments before everything passes — the verifier
+    // itself becoming the unreliable reporter. We re-diagnose until the gates
+    // settle (all pass, or a Fail-state blocker that time won't clear) or a
+    // deadline, and report the settled truth.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut last: Option<Response> = None;
+    loop {
+        match client(
+            home,
+            Request::Diagnose {
+                expected_workspace: expected.clone(),
+            },
+        )
+        .await
+        {
+            Ok(diag) => {
+                let settled = match &diag {
+                    Response::Diagnosis(v) => match v.blocked_on.as_deref() {
+                        None => true,
+                        // `workspace` is the one Fail-state blocker (wrong
+                        // directory/store) — waiting can't clear it.
+                        Some("workspace") => true,
+                        // Pending membership clears itself only under a pass
+                        // (Pattern A auto-seal); pass-less waits on a human.
+                        Some("membership") => !has_pass,
+                        // peer / synced — convergence in flight; keep polling.
+                        Some(_) => false,
+                    },
+                    // Not a diagnosis (daemon error) — nothing to wait out.
+                    _ => true,
+                };
+                let expired = tokio::time::Instant::now() >= deadline;
+                if settled || expired {
+                    print_diagnosis_or(&diag, out);
+                    break;
+                }
+                last = Some(diag);
+            }
+            Err(e) => {
+                // Degrade to the freshest readout we have, or a hint.
+                match &last {
+                    Some(diag) => print_diagnosis_or(diag, out),
+                    None => eprintln!("(joined; run `lait doctor` for status — {e:#})"),
+                }
+                break;
+            }
         }
-        Err(e) => eprintln!("(joined; run `lait doctor` for status — {e:#})"),
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
     Ok(())
+}
+
+/// One-line issue summary for the work-state verbs: `MP-3  fix login  in_progress`.
+/// Prefers the friendly `KEY-n` handle; the collision-free short id is `--json`'s.
+fn workstate_line(v: &crate::dto::IssueView) -> String {
+    let handle = v.key_alias.as_deref().unwrap_or(&v.reff);
+    format!("{handle}  {}  {}", v.title, v.status)
+}
+
+/// A git branch name for an issue: lowercased `KEY-n` + a hyphenated title slug
+/// (≤40 chars of slug). Predictable by design — `done`/`show` infer the issue
+/// back out of it, and so do agents (UI.md §2.2).
+fn branch_name_for(v: &crate::dto::IssueView) -> String {
+    let handle = v
+        .key_alias
+        .clone()
+        .unwrap_or_else(|| v.reff.clone())
+        .to_ascii_lowercase();
+    let mut slug = String::new();
+    for c in v.title.to_ascii_lowercase().chars() {
+        if slug.len() >= 40 {
+            break;
+        }
+        if c.is_ascii_alphanumeric() {
+            slug.push(c);
+        } else if !slug.ends_with('-') && !slug.is_empty() {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        handle
+    } else {
+        format!("{handle}-{slug}")
+    }
+}
+
+/// Create + checkout the issue's branch, best-effort: outside a git work-tree
+/// this silently does nothing; inside one, an existing branch is switched to and
+/// any failure is a warning — a branch hiccup must never fail the `start`.
+fn checkout_issue_branch(v: &crate::dto::IssueView, out: Out) {
+    let in_repo = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !in_repo {
+        return;
+    }
+    let name = branch_name_for(v);
+    // `switch -c` for a fresh branch; if it already exists, plain `switch`.
+    let created = std::process::Command::new("git")
+        .args(["switch", "-c", &name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let ok = created
+        || std::process::Command::new("git")
+            .args(["switch", &name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+    if !out.json {
+        if ok {
+            println!(
+                "{}",
+                paint(
+                    out.color,
+                    ansi::DIM,
+                    &format!(
+                        "{} branch '{name}'",
+                        if created {
+                            "switched to new"
+                        } else {
+                            "switched to"
+                        }
+                    )
+                )
+            );
+        } else {
+            eprintln!("(could not create/switch branch '{name}' — continue manually)");
+        }
+    }
+}
+
+/// `lait start`: claim + activate + branch. The daemon does the atomic
+/// state move; the branch is client-side sugar on top (skippable, best-effort).
+pub async fn run_start(home: &Path, reff: String, no_branch: bool, out: Out) -> Result<()> {
+    let resp = client(home, Request::IssueStart { reff }).await?;
+    match &resp {
+        Response::Issue(v) => {
+            if out.json {
+                print_response(&resp, out);
+            } else {
+                println!("{}  · you", workstate_line(v));
+            }
+            if !no_branch {
+                checkout_issue_branch(v, out);
+            }
+            Ok(())
+        }
+        other => {
+            let code = print_response(other, out);
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `lait done` / `lait stop`: the branchless work-state verbs.
+pub async fn run_workstate(home: &Path, req: Request, out: Out) -> Result<()> {
+    let resp = client(home, req).await?;
+    match &resp {
+        Response::Issue(v) => {
+            if out.json {
+                print_response(&resp, out);
+            } else {
+                println!("{}", workstate_line(v));
+            }
+            Ok(())
+        }
+        other => {
+            let code = print_response(other, out);
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `lait new --start`: file the issue, then claim it (two honest commits).
+pub async fn run_new_start(home: &Path, new_req: Request, out: Out) -> Result<()> {
+    let resp = client(home, new_req).await?;
+    match &resp {
+        Response::Ref { reff } => {
+            if !out.json {
+                println!("{reff}");
+            }
+            run_start(home, reff.clone(), false, out).await
+        }
+        other => {
+            let code = print_response(other, out);
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Bare `lait` — the FOCUS view: unread inbox summary + your open issues.
+/// Must answer "what's addressed to me / what am I on" faster than a browser
+/// tab could open, and its empty states name the next command.
+pub async fn run_focus(home: &Path, out: Out) -> Result<()> {
+    let inbox = client(home, Request::Inbox { clear: false }).await?;
+    let mine = request(
+        home,
+        &Request::List {
+            project: None,
+            filter: crate::control::Filter {
+                mine: true,
+                status: None,
+                label: None,
+                all: false,
+            },
+        },
+    )
+    .await?;
+    if out.json {
+        // Machine focus = the two DTOs on two lines (each independently stable).
+        print_response(&inbox, out);
+        print_response(&mine, out);
+        return Ok(());
+    }
+    if let Response::Inbox { entries, unread } = &inbox {
+        if *unread > 0 {
+            let heads: Vec<String> = entries
+                .iter()
+                .take(3)
+                .map(|e| format!("{} {}", inbox_line_verb(e), e.reff))
+                .collect();
+            println!(
+                "{} {}",
+                paint(out.color, ansi::CYAN, &format!("Inbox ({unread}):")),
+                heads.join(" · ")
+            );
+        }
+    }
+    match &mine {
+        Response::List { rows } if rows.is_empty() => {
+            println!("nothing assigned to you — grab something: `lait ls`, or file one: `lait new \"...\"`");
+        }
+        Response::List { rows } => {
+            for r in rows {
+                println!("  {}  {:<10}  {}", r.reff, r.status, r.title);
+            }
+        }
+        other => {
+            print_response(other, out);
+        }
+    }
+    Ok(())
+}
+
+/// The inbox verb phrase for a summary line ("assigned you", "commented on"…).
+fn inbox_line_verb(e: &crate::dto::InboxEntry) -> String {
+    let who = e.actor_nick.clone().unwrap_or_else(|| "someone".into());
+    match e.kind.as_str() {
+        "assigned" => format!("{who} assigned you"),
+        "comment" => format!("{who} commented on"),
+        _ => format!("{who} moved"),
+    }
 }
 
 /// Render a `Diagnosis` response, or fall back gracefully if the daemon returned
@@ -221,56 +494,119 @@ fn print_diagnosis_or(resp: &Response, out: Out) {
     }
 }
 
-/// `lait workspaces`: list the joined-workspace registry (store-free navigation
-/// state). Honours `--json`.
-pub fn print_workspaces(out: Out) {
+/// Live status of one registry entry: `missing` (store gone from disk), `up`
+/// (a daemon answers on its control channel), or `idle` (store present, no
+/// daemon). The probe is a short-deadline `Status` round-trip — never a spawn.
+async fn workspace_status(e: &WorkspaceEntry) -> &'static str {
+    if workspaces::presence(e) == StorePresence::Missing {
+        return "missing";
+    }
+    let up = tokio::time::timeout(
+        Duration::from_millis(300),
+        request(Path::new(&e.path), &Request::Status),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false);
+    if up {
+        "up"
+    } else {
+        "idle"
+    }
+}
+
+/// `lait workspaces`: every workspace on this machine (founded and joined),
+/// with live status. Honours `--json`.
+pub async fn print_workspaces(out: Out) {
     let entries = workspaces::list();
+    let mut statuses = Vec::with_capacity(entries.len());
+    for e in &entries {
+        statuses.push(workspace_status(e).await);
+    }
     if out.json {
+        let rows: Vec<serde_json::Value> = entries
+            .iter()
+            .zip(&statuses)
+            .map(|(e, s)| {
+                let mut v = serde_json::to_value(e).unwrap_or_default();
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("status".into(), serde_json::json!(s));
+                }
+                v
+            })
+            .collect();
         println!(
             "{}",
-            serde_json::to_string(&serde_json::json!({ "workspaces": entries }))
+            serde_json::to_string(&serde_json::json!({ "spaces": rows }))
                 .unwrap_or_else(|_| "{}".into())
         );
         return;
     }
     if entries.is_empty() {
-        println!("(no joined workspaces yet — run `lait join <link>`)");
+        println!("(no spaces yet — `lait init` to found one, or `lait join <link>`)");
         return;
     }
-    for e in &entries {
+    for (e, status) in entries.iter().zip(&statuses) {
+        let short: String = e.workspace.chars().take(12).collect();
+        let code = match *status {
+            "up" => ansi::GREEN,
+            "idle" => ansi::DIM,
+            _ => ansi::RED,
+        };
+        let name = if e.name.is_empty() {
+            "(unnamed)"
+        } else {
+            &e.name
+        };
+        let projects = if e.projects.is_empty() {
+            String::new()
+        } else {
+            let keys: Vec<&str> = e.projects.iter().map(|p| p.key.as_str()).collect();
+            format!("  [{}]", keys.join(", "))
+        };
         let nick = if e.host_nick.is_empty() {
             String::new()
         } else {
             format!("  (from {})", e.host_nick)
         };
-        println!("{}  room {:<12}{}", e.workspace, e.room, nick);
+        println!(
+            "{name}  {short}  {}  {}{projects}{nick}",
+            e.origin,
+            paint(out.color, code, status),
+        );
         println!("  {}", paint(out.color, ansi::DIM, &e.path));
     }
 }
 
-/// The directory-trap guard message: shown when a read-only command is run in a
-/// directory with no workspace but the registry knows of ones the user joined.
-/// Points them at the real locations instead of silently binding a decoy store.
-pub fn warn_no_workspace_here(known: &[WorkspaceEntry], out: Out) {
-    eprintln!("no lait workspace in this directory — refusing to create an empty one here.");
-    eprintln!();
-    eprintln!("you've joined {} workspace(s):", known.len());
-    for e in known {
-        let nick = if e.host_nick.is_empty() {
-            String::new()
-        } else {
-            format!(" (from {})", e.host_nick)
-        };
+/// The universal "no workspace here" error: any store-needing command run in a
+/// directory with no discoverable `.lait/` gets this instead of a silently
+/// minted decoy store. Points at the creation verbs and every known workspace.
+pub fn err_no_store_here(out: Out) {
+    eprintln!("no lait space in this directory (nothing is created implicitly).");
+    let known = workspaces::list();
+    if !known.is_empty() {
+        eprintln!();
+        eprintln!("spaces on this machine:");
+        for e in &known {
+            let name = if e.name.is_empty() {
+                "(unnamed)"
+            } else {
+                &e.name
+            };
+            eprintln!(
+                "  {} {name}  \u{2192}  {}",
+                paint(out.color, ansi::DIM, "\u{2022}"),
+                e.path
+            );
+        }
+        eprintln!();
         eprintln!(
-            "  {} {}{}  \u{2192}  {}",
-            paint(out.color, ansi::DIM, "\u{2022}"),
-            e.workspace,
-            nick,
-            e.path
+            "cd into one, target one from here with `-w <name>`, or `lait spaces` for details."
         );
+    } else {
+        eprintln!();
+        eprintln!("found a space here with `lait init`, or join one with `lait join <link>`.");
     }
-    eprintln!();
-    eprintln!("cd into one of those directories, or run `lait workspaces` to see them again.");
 }
 
 /// Print a response; return the process exit code it implies.
@@ -305,9 +641,41 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
             print_board(b, out);
             0
         }
+        Response::Inbox { entries, unread } => {
+            if entries.is_empty() {
+                println!("inbox zero — nothing addressed to you. the backlog is `lait ls`.");
+                return 0;
+            }
+            // Newest-first + a ts watermark ⇒ exactly the first `unread` are unread.
+            for (i, e) in entries.iter().enumerate() {
+                let mark = if (i as u64) < *unread { "•" } else { " " };
+                let detail = if e.detail.is_empty() {
+                    String::new()
+                } else {
+                    format!("  — {}", e.detail)
+                };
+                println!(
+                    "{} {}  {}  {}{}",
+                    paint(out.color, ansi::CYAN, mark),
+                    e.reff,
+                    inbox_line_verb(e),
+                    e.title,
+                    detail
+                );
+            }
+            println!(
+                "{}",
+                paint(
+                    out.color,
+                    ansi::DIM,
+                    &format!("({unread} unread — `lait inbox --clear` to mark read)")
+                )
+            );
+            0
+        }
         Response::Activity { events, .. } => {
             if events.is_empty() {
-                println!("(no activity)");
+                println!("(no activity yet — it fills as the space moves: `lait new \"...\"`)");
             }
             for e in events {
                 let changes = if e.changes.is_empty() {
@@ -334,7 +702,7 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
         }
         Response::Projects { projects } => {
             if projects.is_empty() {
-                println!("(no projects — create one: `lait projects new <name> --key KEY`)");
+                println!("(no projects — create one: `lait projects add KEY`)");
                 // A just-joined peer sees this too, but should wait for sync, not
                 // create — point them at the verifier so an empty board is legible.
                 println!(
@@ -420,7 +788,13 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
         Response::Status(s) => {
             println!("id:        {}", s.id);
             println!("nick:      {}", s.nick);
-            println!("workspace: {}", s.workspace.as_deref().unwrap_or("(none)"));
+            let ws_line = match (s.name.is_empty(), s.workspace.as_deref()) {
+                (false, Some(ws)) => format!("{} ({ws})", s.name),
+                (true, Some(ws)) => ws.to_string(),
+                (false, None) => s.name.clone(),
+                (true, None) => "(none)".to_string(),
+            };
+            println!("space:     {ws_line}");
             if !s.membership.is_empty() {
                 let code = if s.membership == "pending" {
                     ansi::YELLOW
@@ -429,7 +803,6 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
                 };
                 println!("you:       {}", paint(out.color, code, &s.membership));
             }
-            println!("room:      {}", s.room);
             println!("issues:    {}", s.issues);
             println!("projects:  {}", s.projects);
             println!("online:    {} peer(s)", s.online_peers);
@@ -528,7 +901,9 @@ fn prio_badge(p: Priority, color: bool) -> String {
 
 fn print_rows(rows: &[Row], out: Out) {
     if rows.is_empty() {
-        println!("(no issues)");
+        println!(
+            "(no issues here — file one: `lait new \"...\"`, or `lait ls --all` to include done)"
+        );
         return;
     }
     for r in rows {
@@ -650,16 +1025,32 @@ pub async fn run_invite(
         return Ok(());
     }
     let link = token
-        .parse::<RoomTicket>()
+        .parse::<WorkspaceTicket>()
         .map(|t| t.link())
         .unwrap_or_else(|_| format!("lait://join/{token}"));
     println!("{token}");
     println!("{link}");
-    match render_qr(&link) {
-        Ok(q) => println!("\n{q}"),
-        Err(e) => eprintln!("(qr unavailable: {e:#})"),
+    let copied = copy_to_clipboard(&token);
+    // The QR is a scan-on-your-phone convenience; an invite ticket is long, so the
+    // matrix can be taller/wider than the terminal. Render it only when it fits —
+    // otherwise it explodes the scrollback for no gain (the link is right above and
+    // on the clipboard). Suppress with $LAIT_NO_QR for a clean, QR-free invite.
+    if std::env::var_os("LAIT_NO_QR").is_none() {
+        match render_qr(&link) {
+            Ok(q) => {
+                let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                let qw = q.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+                let qh = q.lines().count();
+                if qw <= cols as usize && qh + 3 <= rows as usize {
+                    println!("\n{q}");
+                } else {
+                    println!("(QR omitted — too large for this terminal; use the link above)");
+                }
+            }
+            Err(e) => eprintln!("(qr unavailable: {e:#})"),
+        }
     }
-    if copy_to_clipboard(&token) {
+    if copied {
         println!("(copied to clipboard)");
     }
     // Tell the host what this ticket actually does, so the mental model matches
@@ -687,7 +1078,8 @@ pub async fn run_invite(
 
 /// Copy `s` to the system clipboard, best-effort, using the platform's native
 /// tool: `clip` (Windows), `pbcopy` (macOS), or `wl-copy`/`xclip` (Linux).
-fn copy_to_clipboard(s: &str) -> bool {
+/// `pub(crate)` so the interactive members picker can copy a fresh invite link.
+pub(crate) fn copy_to_clipboard(s: &str) -> bool {
     #[cfg(target_os = "windows")]
     let candidates: &[(&str, &[&str])] = &[
         ("clip", &[]),
@@ -720,10 +1112,14 @@ fn copy_to_clipboard(s: &str) -> bool {
     false
 }
 
-/// Render a scannable QR of the invite link as terminal half-block glyphs.
-fn render_qr(data: &str) -> Result<String> {
-    use qrcode::{render::unicode, QrCode};
-    let code = QrCode::new(data.as_bytes()).context("build QR code")?;
+/// Render a scannable QR of the invite link as terminal half-block glyphs. Uses
+/// the lowest error-correction level (`L`) so a long invite ticket yields the
+/// smallest module count — the QR still scans, but takes far fewer lines than the
+/// default level. `pub(crate)`: the TUI invite panel renders the same QR.
+pub(crate) fn render_qr(data: &str) -> Result<String> {
+    use qrcode::{render::unicode, EcLevel, QrCode};
+    let code = QrCode::with_error_correction_level(data.as_bytes(), EcLevel::L)
+        .context("build QR code")?;
     Ok(code
         .render::<unicode::Dense1x2>()
         .dark_color(unicode::Dense1x2::Light)
@@ -735,17 +1131,17 @@ fn render_qr(data: &str) -> Result<String> {
 /// Open the OS default mail client with a prefilled invite (mailto). lait sends
 /// nothing itself — it just hands the URL to the platform handler.
 fn open_mail_invite(addr: &str, link: &str) -> Result<()> {
-    let subject = "Invitation to my lait workspace";
+    let subject = "Invitation to my lait space";
     let body = format!(
-        "You're invited to my lait workspace.\n\n\
+        "You're invited to my lait space.\n\n\
          1. Install lait\n   \
          macOS/Linux:  curl --proto '=https' --tlsv1.2 -LsSf \
          https://github.com/Nixie-Tech-LLC/lait/releases/latest/download/lait-installer.sh | sh\n   \
          Windows:      powershell -c \"irm \
          https://github.com/Nixie-Tech-LLC/lait/releases/latest/download/lait-installer.ps1 | iex\"\n\n\
-         2. Join the workspace\n   lait join {link}\n\n\
+         2. Join the space\n   lait join {link}\n\n\
          The link carries a one-time pass, so that admits you automatically and \
-         your device gets the workspace key (run `lait status` to see when you're \
+         your device gets the space key (run `lait status` to see when you're \
          in). lait is local-first and end-to-end encrypted.\n"
     );
     let mailto = format!(
@@ -911,14 +1307,29 @@ fn desktop_notify(e: &Event) {
 }
 
 /// Foreground presence-notification runner (the `watch` command).
+///
+/// Parks on a streaming [`Request::Subscribe`] and treats the doorbell purely as
+/// a **wake signal**: a frame carries a dirty *flag*, never the events, so each
+/// `presence_advanced` ring is followed by a `Log{since}` re-read for the
+/// authoritative rows (UI.md §4.2).
+///
+/// Two cursors are in play and they are **not** interchangeable: `cursor` is an
+/// `EventLog` seq (what `Log{since}` filters on), while the doorbell carries its
+/// own per-session `seq`. We never compare them. The doorbell's `epoch` is the
+/// one field that matters here — a change means the daemon restarted, which
+/// resets the `EventLog` seq to 0 (S§2), voiding our cursor. Rebaselining to 0
+/// on an epoch change is what keeps `watch` from going deaf across a restart:
+/// the old `Wait` poll loop held its stale high-water and silently matched
+/// nothing forever (S§7.5).
 pub async fn watch(
     home: &Path,
     since: Option<u64>,
     exec: Option<String>,
     notify: bool,
-    timeout_ms: u64,
 ) -> Result<()> {
     ensure_daemon(home).await?;
+    // Default to the current high-water: `watch` follows from now, not from the
+    // start of the daemon's history.
     let mut cursor = match since {
         Some(n) => n,
         None => match request(home, &Request::Log { since: 0 }).await? {
@@ -927,17 +1338,11 @@ pub async fn watch(
         },
     };
     eprintln!("watching from seq {cursor} (Ctrl-C to stop)\u{2026}");
+
+    let mut epoch: Option<u64> = None;
     loop {
-        let resp = match request(
-            home,
-            &Request::Wait {
-                since: cursor,
-                timeout_ms,
-            },
-        )
-        .await
-        {
-            Ok(r) => r,
+        let mut sub = match control::subscribe(home, 0).await {
+            Ok(s) => s,
             Err(e) => {
                 eprintln!("watch: {e}; reconnecting\u{2026}");
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -945,18 +1350,49 @@ pub async fn watch(
                 continue;
             }
         };
-        if let Response::Events { events, last } = resp {
-            for e in &events {
-                print_event(e);
-                if let Some(cmd) = &exec {
-                    run_hook(cmd, e);
+        loop {
+            let frame = match sub.next().await {
+                Ok(Some(f)) => f,
+                // EOF or a broken stream: the daemon stopped or restarted. Drop
+                // to the outer loop, which respawns it and re-subscribes.
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("watch: {e}; reconnecting\u{2026}");
+                    break;
                 }
-                if notify {
-                    desktop_notify(e);
-                }
+            };
+            // A new epoch ⇒ a new daemon ⇒ the EventLog seq restarted at 0, so
+            // anything we remember is from a log that no longer exists.
+            if epoch.is_some_and(|prev| prev != frame.epoch) {
+                eprintln!("watch: daemon restarted; rebaselining\u{2026}");
+                cursor = 0;
             }
-            cursor = last.max(cursor);
+            epoch = Some(frame.epoch);
+            // `reset` covers first-frame + doorbell ring-overrun. Our EventLog
+            // cursor survives both (only an epoch change voids it), so a reset
+            // is just another reason to re-read.
+            if !(frame.presence_advanced || frame.reset) {
+                continue;
+            }
+            match request(home, &Request::Log { since: cursor }).await {
+                Ok(Response::Events { events, last }) => {
+                    for e in &events {
+                        print_event(e);
+                        if let Some(cmd) = &exec {
+                            run_hook(cmd, e);
+                        }
+                        if notify {
+                            desktop_notify(e);
+                        }
+                    }
+                    cursor = last.max(cursor);
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("watch: {e}"),
+            }
         }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = ensure_daemon(home).await;
     }
 }
 
