@@ -1,8 +1,8 @@
 # SERVE — the local HTTP surface (`lait serve`)
 
-Status: **API complete, client pending**. The loopback gate, the N-daemon supervisor,
-and the full CRUD surface are implemented and tested end to end; the served client is a
-placeholder shell pending the React app. See [Next](#next).
+Status: **shipped**. The loopback gate, the N-daemon supervisor, the full CRUD surface,
+and a keyboard-first React client are implemented and verified end to end — including
+across three real nodes over iroh. See [Next](#next) for what is deliberately not done.
 
 ## Why this exists
 
@@ -252,11 +252,57 @@ sequences for navigation with a 1s timeout, bare letters for actions, `?` for he
 typing, bare keys belong to the field; modified chords and `Escape` still get through,
 because a text box you cannot leave is worse than a shortcut that does not fire.
 
+## The client
+
+Five surfaces, reachable by `g`-sequences and by the palette:
+
+| View | Key | What it is |
+|---|---|---|
+| **Issues** (default) | `g l` | A grouped list. The density is the feature: 32px rows, fixed column rhythm, sticky group headers. |
+| **Board** | `g b` | The same fetch laid out sideways — `BoardView.columns` are already status buckets in board order, so the two views cannot disagree and switching costs no round trip. |
+| **Inbox** | `g i` | What happened *to you*. Derived at sync-import and persisted, so unlike the activity ring it survives a restart. |
+| **Activity** | `g a` | What happened in the space. Pulled, never pushed — the doorbell only sets `activity_advanced`. |
+| **Members** | `g m` | Roster, join requests, invite. |
+
+Plus: an issue detail pane co-visible beside the list (the TUI's "peek" — a third
+panel, so it never steals the keymap), `/` to filter, `mod+b` for the sidebar,
+`mod+k` for the palette, `?` for everything.
+
+### Filtering: ours for text, the daemon's for meaning
+
+Text is live and client-side — title/ref/alias, no round trip. **`mine` and `label`
+are server truth and are never re-implemented client-side**: the client asks `list`
+with a `Filter`, keeps the doc-ids, and intersects the board by doc-id (UI.md §5.2).
+Guessing at "mine" locally would be a second implementation of an authorization
+question, wrong in exactly the cases that matter; a label is a `LabelId` the daemon
+resolved, not a string we matched. The split is visible in the UI: what you type is
+in the box, what the daemon decides is in a menu.
+
+Two traps worth keeping named, both with tests: a `null` allowed-set means *the
+daemon was not asked*, which is not *nothing qualifies* — conflating them renders an
+unfiltered board as empty, and it looks exactly like having no issues. And columns
+stay even when they empty out, because a status that exists is a column that exists.
+
+### Attribution stays honest
+
+The inbox names an author for comments and says "someone" for assignments and status
+changes, because the doc records *what* changed, not *who* — a deliberate non-goal of
+the schema (S non-goal 6), not a gap to fill in. The members screen leads with the
+**key**, in mono, at full width, and renders the nick as the claim it is: the key is
+authenticated, the nick is self-asserted, and you approve by key having confirmed it
+out-of-band. A UI that led with the nick would invite exactly the mistake the ACL
+cannot catch.
+
 ## Next
 
 - **Replace the shell with the React app**, embedded in the binary so `lait serve`
   stays one self-contained artifact and the SPA stays same-origin — which is what
   makes the `Origin` allowlist enforceable in the first place.
+- **Optimistic updates.** Every write currently waits for the doorbell before it
+  shows. That is correct and never lies, but it is a round trip you can feel. The
+  TUI's overlay is the design to port: `(doc_id, field) -> value`, invalidated by any
+  doorbell for that doc — correlation-free, no request ids, no rollback log. Add the
+  TTL the terminal version could do without.
 - **Notifications** belong to the *daemon*, not the tab. `http://localhost` is a
   secure context so the Notification API works, but a tab only fires while it is
   open; the always-on component is the daemon. The browser should badge; the daemon
