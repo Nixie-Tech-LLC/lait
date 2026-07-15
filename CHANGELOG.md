@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased — the daily-loop DX pass (spaces, start/done/stop, inbox)
+
+Shaped by a blind design exercise (Linear-style and Jira-style teams designing
+this CLI from the same capability spec): both independently reinvented our
+explicit-create + registry architecture, and exposed the gaps this pass closes.
+
+- **`spaces`.** The user-facing noun is now *space*: `lait spaces [ls|forget|prune]`
+  (`workspaces` kept as an alias), global `-w/--space` selector, all messages
+  reworded. Internal identifiers and architecture docs keep "workspace".
+- **Work-state verbs.** `lait start [ref]` = assign yourself + first
+  active-category status + create/checkout `key-n-slug` (one commit = one
+  activity row; `--no-branch` to skip; branch step silently skipped outside
+  git). `lait done` / `lait stop` close the loop — refs infer from the branch,
+  so the daily cycle is `lait` → `start` → work → `done` with no ref typed.
+  `new --start` files and claims in one line. The daemon off-switch is renamed
+  **`shutdown`** (`stop` the word belongs to the work loop).
+- **A durable inbox.** `lait inbox [--clear]`: remote assignments, comments on
+  your work, `@nick` mentions, and status moves on your issues — derived at
+  sync-import time (attribution-honest: comments carry their real author,
+  everything else renders actor-unknown rather than guessing), persisted to
+  `inbox.json` with a read watermark, so unread items survive daemon restarts.
+  Sits beside `activity` (the workspace firehose). TUI shows an unread badge.
+- **Bare `lait` is your focus** — unread inbox summary + your open issues —
+  instead of help.
+- **Fewer nouns.** Labels are created on first use (`-l perf` just works;
+  removals still error on unknown). Project creation is key-first:
+  `projects add OPS ["Operations"]` (name defaults to the key; `new` aliased).
+  Help is bucketed: the first screen leads with the daily loop; registries and
+  node plumbing sink to the bottom. Empty outputs always name the next command.
+- MCP gains `issue_start` / `issue_done` / `issue_stop` / `inbox` tools — an
+  agent works an issue exactly like a human (claim → comment → done).
+
 ## Unreleased — workspace & project re-architecture (BREAKING)
 
 > **Clean break.** Stores, invite tickets, and the wire protocol all changed;

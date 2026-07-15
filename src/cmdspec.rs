@@ -36,6 +36,9 @@ pub enum Dispatch {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Special {
     Init,
+    Start,
+    Done,
+    Stop,
     Id,
     Daemon,
     Mcp,
@@ -73,6 +76,9 @@ pub struct Spec {
     /// A long-running networked service (`daemon`, `mcp`) that must keep Rust's
     /// default SIGPIPE-ignored so a dropped socket returns EPIPE, not a kill.
     pub service: bool,
+    /// Help-screen bucket (clap `display_order`): the first screen leads with
+    /// the daily loop, registries and node plumbing sink to the bottom.
+    pub order: usize,
 }
 
 impl Spec {
@@ -93,6 +99,7 @@ impl Spec {
             customize: None,
             dispatch: Dispatch::Request(f),
             service: false,
+            order: ORDER_DEFAULT,
         }
     }
 
@@ -108,6 +115,7 @@ impl Spec {
             customize: None,
             dispatch: Dispatch::Special(s),
             service: false,
+            order: ORDER_DEFAULT,
         }
     }
 
@@ -283,8 +291,9 @@ pub fn build_cli(specs: &[Spec]) -> Command {
     let mut root = Command::new("lait")
         .version(env!("LAIT_VERSION_LONG"))
         .about("A local-first, peer-to-peer issue tracker")
-        .subcommand_required(true)
-        .arg_required_else_help(true)
+        // No subcommand required: bare `lait` is the FOCUS view (inbox + your
+        // active issues, UI.md §2) — the most valuable keystroke goes to the
+        // most-asked question, not to help. `lait help` / `-h` still work.
         .arg(
             Arg::new("home")
                 .long("home")
@@ -295,14 +304,15 @@ pub fn build_cli(specs: &[Spec]) -> Command {
         .arg(
             Arg::new("workspace")
                 .short('w')
-                .long("workspace")
+                .long("space")
+                .alias("workspace")
                 .global(true)
                 .action(ArgAction::Set)
                 .conflicts_with("home")
                 .value_name("SEL")
                 .help(
-                    "Select a workspace by name, ws_ id (or prefix), or path — from any \
-                     directory (see `lait workspaces`).",
+                    "Select a space by name, ws_ id (or prefix), or path — from any \
+                     directory (see `lait spaces`).",
                 ),
         )
         .arg(
@@ -325,8 +335,14 @@ pub fn build_cli(specs: &[Spec]) -> Command {
     root
 }
 
+/// Help buckets (see `Spec.order`). Within a bucket, declaration order holds.
+const ORDER_DAILY: usize = 10; // the loop: new/start/done/stop/inbox/show/board/ls…
+const ORDER_SHARE: usize = 20; // init/join/invite/spaces/members/doctor/status
+const ORDER_DEFAULT: usize = 30; // registries, settings
+const ORDER_NODE: usize = 40; // daemon/remote/mcp/plumbing
+
 fn build_sub(s: &Spec) -> Command {
-    let mut c = Command::new(s.name).about(s.about);
+    let mut c = Command::new(s.name).about(s.about).display_order(s.order);
     for a in s.aliases {
         c = c.alias(*a);
     }
@@ -457,8 +473,9 @@ fn infer_ref_from_git_branch() -> Option<String> {
 }
 
 /// Resolve an optional issue-ref arg: explicit value, else the git-branch
-/// inference, else a clear error.
-fn resolve_reff(m: &ArgMatches) -> Result<String> {
+/// inference, else a clear error. `pub(crate)` — the work-state Specials
+/// (`start`/`done`/`stop`) resolve their ref in `app::run`.
+pub(crate) fn resolve_reff(m: &ArgMatches) -> Result<String> {
     match opt_str(m, "reff") {
         Some(r) => Ok(r),
         None => infer_ref_from_git_branch().ok_or_else(|| {
@@ -467,6 +484,16 @@ fn resolve_reff(m: &ArgMatches) -> Result<String> {
                  (name it like `eng-142-short-desc`). Pass a ref explicitly, e.g. `lait show ENG-142`."
             )
         }),
+    }
+}
+
+/// "OPS" → "Ops": the default project name when `projects add` gets only a key.
+fn title_case(key: &str) -> String {
+    let lower = key.to_ascii_lowercase();
+    let mut c = lower.chars();
+    match c.next() {
+        Some(f) => f.to_ascii_uppercase().to_string() + c.as_str(),
+        None => lower,
     }
 }
 
@@ -500,11 +527,11 @@ fn project_hint(m: &ArgMatches) -> Option<String> {
 /// The full CLI surface as data. Built once per invocation in `app::run`.
 pub fn specs() -> Vec<Spec> {
     use ArgSpec as A;
-    vec![
+    let mut v = vec![
         // ---- workspace founding ----
         Spec::special(
             "init",
-            "Found a new workspace here (mints the genesis; seeds a first project).",
+            "Found a new space here (mints the genesis; seeds a first project).",
             vec![
                 A::val("name", "Workspace display name (default: this directory's name)."),
                 A::val("nick", "Display nickname (sugar for `lait config set user.nick`)."),
@@ -526,6 +553,10 @@ pub fn specs() -> Vec<Spec> {
                     .short('l')
                     .long("label"),
                 A::val("body", "Issue body/description.").short('b'),
+                A::flag(
+                    "start",
+                    "Also start it: assign yourself, set it active, create+checkout its branch.",
+                ),
             ],
             |m| {
                 Ok(Request::IssueNew {
@@ -536,6 +567,37 @@ pub fn specs() -> Vec<Spec> {
                     priority: opt_str(m, "priority"),
                     labels: multi(m, "labels"),
                     body: opt_str(m, "body"),
+                })
+            },
+        ),
+        Spec::special(
+            "start",
+            "Claim an issue and get moving: assign yourself, set it active, create+checkout its branch.",
+            vec![
+                A::pos_opt("reff", "Issue ref (default: the current branch's issue)."),
+                A::flag("no_branch", "Skip the git branch step.").long("no-branch"),
+            ],
+            Special::Start,
+        ),
+        Spec::special(
+            "done",
+            "Finish an issue (ref optional — inferred from the git branch).",
+            vec![A::pos_opt("reff", "Issue ref.")],
+            Special::Done,
+        ),
+        Spec::special(
+            "stop",
+            "Put an issue down gracefully: back to backlog, unassign yourself.",
+            vec![A::pos_opt("reff", "Issue ref.")],
+            Special::Stop,
+        ),
+        Spec::req(
+            "inbox",
+            "Things addressed to you: assignments, comments on your work, @mentions.",
+            vec![A::flag("clear", "Mark everything read after listing.")],
+            |m| {
+                Ok(Request::Inbox {
+                    clear: flag(m, "clear"),
                 })
             },
         ),
@@ -722,19 +784,19 @@ pub fn specs() -> Vec<Spec> {
         Spec {
             subs: vec![
                 Spec::req(
-                    "new",
-                    "Create a project.",
+                    "add",
+                    "Create a project: `projects add OPS [\"Operations\"]` (name defaults to the key).",
                     vec![
-                        A::pos("name", "Project name."),
-                        A::val("key", "Short KEY (e.g. ENG).").required(),
+                        A::pos("key", "Short KEY (e.g. ENG) — becomes the KEY in KEY-1 refs."),
+                        A::pos_opt("name", "Project name (default: the key, title-cased)."),
                     ],
                     |m| {
-                        Ok(Request::ProjectNew {
-                            name: req_str(m, "name"),
-                            key: req_str(m, "key"),
-                        })
+                        let key = req_str(m, "key");
+                        let name = opt_str(m, "name").unwrap_or_else(|| title_case(&key));
+                        Ok(Request::ProjectNew { name, key })
                     },
-                ),
+                )
+                .alias(&["new"]),
                 Spec::req("ls", "List projects.", vec![], |_| Ok(Request::ProjectList)),
             ],
             ..Spec::req("projects", "Manage the project registry.", vec![], |_| {
@@ -767,7 +829,7 @@ pub fn specs() -> Vec<Spec> {
             subs: vec![
                 Spec::req(
                     "add",
-                    "Add a member (admin-only). Seals the workspace key to them.",
+                    "Add a member (admin-only). Seals the space key to them.",
                     vec![
                         A::pos(
                             "who",
@@ -788,7 +850,7 @@ pub fn specs() -> Vec<Spec> {
                 ),
                 Spec::req(
                     "remove",
-                    "Remove a member (admin-only) and rotate the workspace key.",
+                    "Remove a member (admin-only) and rotate the space key.",
                     vec![A::pos("who", "A user ref.")],
                     |m| {
                         Ok(Request::MemberRemove {
@@ -833,7 +895,7 @@ pub fn specs() -> Vec<Spec> {
                 .alias(&["alias"]),
                 Spec::req(
                     "rotate-key",
-                    "Rotate the workspace key (admin-only).",
+                    "Rotate the space key (admin-only).",
                     vec![],
                     |_| Ok(Request::KeyRotate),
                 ),
@@ -841,7 +903,7 @@ pub fn specs() -> Vec<Spec> {
             ],
             ..Spec::req(
                 "members",
-                "Manage workspace membership (the signed ACL, P3). `members` lists.",
+                "Manage space membership (the signed ACL, P3). `members` lists.",
                 vec![],
                 |_| Ok(Request::Members),
             )
@@ -877,13 +939,13 @@ pub fn specs() -> Vec<Spec> {
             subs: vec![
                 Spec::special(
                     "ls",
-                    "List known workspaces with status (default).",
+                    "List known spaces with status (default).",
                     vec![],
                     Special::Workspaces,
                 ),
                 Spec::special(
                     "forget",
-                    "Deregister a workspace (registry only — never touches the store on disk).",
+                    "Deregister a space (registry only — never touches the store on disk).",
                     vec![A::pos("sel", "A store path, ws_ id, or unique id prefix.")],
                     Special::WorkspacesForget,
                 ),
@@ -895,11 +957,12 @@ pub fn specs() -> Vec<Spec> {
                 ),
             ],
             ..Spec::special(
-                "workspaces",
-                "Every workspace on this machine: name, id, origin, status, projects, path.",
+                "spaces",
+                "Every space on this machine: name, id, origin, status, projects, path.",
                 vec![],
                 Special::Workspaces,
             )
+            .alias(&["workspaces"])
         },
         Spec {
             subs: vec![
@@ -987,12 +1050,12 @@ pub fn specs() -> Vec<Spec> {
                     .help("Server name in the client config."),
             )
         }),
-        Spec::req("status", "Show node and workspace status.", vec![], |_| {
+        Spec::req("status", "Show node and space status.", vec![], |_| {
             Ok(Request::Status)
         }),
         Spec::special(
             "invite",
-            "Print a base32 ticket (+ QR) others use to join your workspace.",
+            "Print a base32 ticket (+ QR) others use to join your space.",
             vec![
                 A::val(
                     "email",
@@ -1019,11 +1082,11 @@ pub fn specs() -> Vec<Spec> {
         ),
         Spec::special(
             "join",
-            "Join a workspace from an invite link (creates the store here, or at --dir).",
+            "Join a space from an invite link (creates the store here, or at --dir).",
             vec![
                 A::pos("ticket", "The invite link / ticket from `lait invite`."),
                 A::val("nick", "Set your display name as you join."),
-                A::val("dir", "Create the joined workspace's store under this directory."),
+                A::val("dir", "Create the joined space's store under this directory."),
             ],
             Special::Join,
         )
@@ -1032,7 +1095,7 @@ pub fn specs() -> Vec<Spec> {
             subs: vec![
                 Spec::req(
                     "add",
-                    "Pin a remote for this workspace (an invite link for it, or an endpoint id).",
+                    "Pin a remote for this space (an invite link for it, or an endpoint id).",
                     vec![A::pos("target", "An invite link or an endpoint id.")],
                     |m| {
                         Ok(Request::SeedAdd {
@@ -1108,7 +1171,9 @@ pub fn specs() -> Vec<Spec> {
             vec![],
             Special::Update,
         ),
-        Spec::req("stop", "Stop the running daemon.", vec![], |_| {
+        // `stop` the word belongs to the work loop (put an issue down); the
+        // daemon's off-switch is `shutdown`.
+        Spec::req("shutdown", "Stop the running daemon.", vec![], |_| {
             Ok(Request::Stop)
         }),
         Spec::special(
@@ -1131,7 +1196,23 @@ pub fn specs() -> Vec<Spec> {
             vec![],
             Special::Man,
         ),
-    ]
+    ];
+    // Help buckets in one greppable place: the first help screen leads with the
+    // daily loop; registries/settings follow; node plumbing sinks to the bottom.
+    // Within a bucket, declaration order holds.
+    for s in &mut v {
+        s.order = match s.name {
+            "new" | "start" | "done" | "stop" | "inbox" | "show" | "board" | "ls" | "edit"
+            | "move" | "assign" | "label" | "comment" | "delete" | "history" | "activity"
+            | "tui" => ORDER_DAILY,
+            "init" | "join" | "invite" | "spaces" | "members" | "doctor" | "status" | "who" => {
+                ORDER_SHARE
+            }
+            "projects" | "labels" | "config" | "profiles" | "resume" => ORDER_DEFAULT,
+            _ => ORDER_NODE,
+        };
+    }
+    v
 }
 
 #[cfg(test)]

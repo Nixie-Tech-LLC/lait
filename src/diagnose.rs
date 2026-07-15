@@ -110,16 +110,16 @@ pub fn diagnose(input: DiagnoseInput<'_>) -> DiagnosisView {
     let workspace = match input.expected_workspace {
         Some(exp) if input.workspace != Some(exp) => DiagnosisGate::new(
             "workspace",
-            "workspace",
+            "space",
             GateState::Fail,
             format!(
-                "this directory is workspace {bound}, but the invite is for {exp} \
+                "this directory is space {bound}, but the invite is for {exp} \
                  — you're in a different store; cd to where you ran `lait join`, or target it with `-w`"
             ),
         ),
         _ => DiagnosisGate::new(
             "workspace",
-            "workspace",
+            "space",
             GateState::Pass,
             if input.name.is_empty() {
                 bound.to_string()
@@ -254,11 +254,9 @@ fn summarize(blocked: Option<&DiagnosisGate>, projects: usize, issues: usize) ->
         None => {
             format!("you're in — {projects} project(s), {issues} issue(s) synced. get to work.")
         }
-        Some("workspace") => {
-            "wrong directory: this store is a different workspace than the invite. \
-             cd to where you ran `lait join`, or run `lait workspaces`."
-                .to_string()
-        }
+        Some("workspace") => "wrong directory: this store is a different space than the invite. \
+             cd to where you ran `lait join`, or run `lait spaces`."
+            .to_string(),
         Some("membership") => {
             "waiting for an admin to approve your join — the board is still encrypted.".to_string()
         }

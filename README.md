@@ -152,21 +152,22 @@ A dev binary reports its commit so it's unmistakable from a tagged release:
 
 ```bash
 cd my-project
-lait init                                    # found a workspace here (named after the
+lait init                                    # found a space here (named after the
                                              # directory, first project seeded)
-lait new "fix login race" -P high            # → prints iss_… (and e.g. MP-1)
-lait new "add dark mode"  -P low
+lait new "fix login race" -P high --start    # file it AND claim it: assigned to you,
+                                             # in progress, on branch mp-1-fix-login-race
+# ...code, commit...
+lait done                                    # ✓ — the ref comes from the branch
+lait                                         # bare lait = your focus: inbox + your issues
+lait start MP-2                              # claim the next one (branch created)
+lait comment "looking into it"               # ref inferred from the branch too
 lait board                                   # workflow columns × ordered rows
-lait projects new "Design" --key DSN         # more projects when you need them
-lait edit MP-1 --status in_progress          # refer by KEY-n or iss_ prefix
-lait assign MP-1 @me
-lait comment MP-1 "looking into it"
-lait show MP-1                               # full issue: body, comments, meta
-lait ls --mine                               # your open issues
-lait activity                                # workspace transition feed
+lait new "polish header" -l ux               # labels are created on first use
+lait projects add DSN "Design"               # more projects when you need them
+lait inbox                                   # what's addressed to you (durable)
 lait tui                                     # full-screen interactive board
-lait workspaces                              # every workspace on this machine
-lait -w my-project board                     # target a workspace from anywhere
+lait spaces                                  # every space on this machine
+lait -w my-project board                     # target a space from anywhere
 lait config set project.default DSN          # default project for `new`/`board`
 ```
 
@@ -208,7 +209,10 @@ lait edit --status in_progress
 
 | Command | Description |
 |---|---|
-| `new <title> [-p PROJ] [-a USER…] [-P PRIO] [-l LABEL…] [-b BODY]` | Create an issue (`-p` optional: branch key → `project.default` → sole project) |
+| `new <title> [-p PROJ] [-a USER…] [-P PRIO] [-l LABEL…] [-b BODY] [--start]` | Create an issue (`-p` optional: branch key → `project.default` → sole project; unknown labels created on first use) |
+| `start [ref] [--no-branch]` | Claim + activate + branch: assign yourself, first active status, checkout `key-n-slug` |
+| `done [ref]` · `stop [ref]` | Finish (first done status) · put down gracefully (backlog, unassigned). Refs infer from the branch |
+| `inbox [--clear]` | Durable addressed-to-you: assignments, comments on your work, @mentions |
 | `ls [-p PROJ] [--mine] [--status S] [--label L] [--all]` | List rows from the catalog cache (`-p` is a pure filter) |
 | `board [PROJ]` | Render a project's board (positional optional, same chain as `new`) |
 | `show <ref>` | Full issue (lazily loads the issue doc) |
@@ -224,15 +228,15 @@ Registries + node:
 
 | Command | Description |
 |---|---|
-| `init [--name N] [--nick N]` | Found a workspace here (mints the genesis, seeds a first project) |
-| `workspaces [ls \| forget <sel> \| prune]` | Every workspace on this machine: name, origin, status, path |
+| `init [--name N] [--nick N]` | Found a space here (mints the genesis, seeds a first project) |
+| `spaces [ls \| forget <sel> \| prune]` | Every space on this machine: name, origin, status, path |
 | `config [get \| set \| unset \| ls]` | Layered local settings (`user.nick`, `project.default`); store wins over global |
-| `projects [new <name> --key KEY \| ls]` | Manage the project registry |
+| `projects [add KEY [NAME] \| ls]` | Manage the project registry (name defaults to the key) |
 | `labels [new <name> --color C \| ls]` | Manage the label registry |
 | `members [add \| remove \| requests \| approve \| name \| rotate-key \| ls]` | Manage E2EE membership (signed ACL); `add` seals the key, `remove` rotates it, `approve` admits a pending joiner, `name` sets a local label for a key |
 | `activity [--since N]` | Workspace-wide recent transitions |
 | `tui` | Launch the full-screen board |
-| `status` · `id` · `stop` | Node/workspace status · endpoint id · stop daemon |
+| `status` · `id` · `shutdown` | Node/space status · endpoint id · stop the daemon |
 | `invite [--require-approval] [--reusable] [--ttl-hours N]` · `join <link> [--dir D]` | Invite a teammate; `join` creates the joiner's store (cwd or `--dir`) and the default pass admits them automatically (add `--require-approval` for the gated `members requests`/`members approve` flow) |
 | `who` · `watch` | Peers online · follow the event stream |
 | `profiles` / `resume <name>` | List profiles / switch to a named profile (each a separate identity + store) |

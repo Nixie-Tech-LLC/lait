@@ -103,6 +103,8 @@ struct App {
     /// Whether the configured `project.default` was applied to `project_idx`
     /// (first successful project load only — Tab cycling then owns it).
     applied_default_project: bool,
+    /// Unread-inbox badge for the header (refreshed on doorbell activity).
+    inbox_unread: u64,
     board: Option<BoardView>,
     list: Vec<Row>,
     col_idx: usize,
@@ -132,6 +134,7 @@ impl App {
             projects: Vec::new(),
             project_idx: 0,
             applied_default_project: false,
+            inbox_unread: 0,
             board: None,
             list: Vec::new(),
             col_idx: 0,
@@ -324,6 +327,15 @@ impl App {
         Ok(())
     }
 
+    /// Refresh the header's inbox-unread badge (cheap; the durable file read is
+    /// daemon-side). Best-effort — a hiccup just keeps the old count.
+    async fn refresh_inbox_count(&mut self) {
+        if let Ok(Response::Inbox { unread, .. }) = self.req(Request::Inbox { clear: false }).await
+        {
+            self.inbox_unread = unread;
+        }
+    }
+
     /// Apply a doorbell: clear overlays for dirty docs, re-read affected views
     /// (UI.md §4.2–§4.3). Doorbells are dirty-notices — the client re-reads.
     async fn on_doorbell(&mut self, db: Doorbell) -> Result<()> {
@@ -332,6 +344,7 @@ impl App {
             self.overlay = Overlay::default();
             self.reload_projects().await?;
             self.refresh_current().await?;
+            self.refresh_inbox_count().await;
             return Ok(());
         }
         for docs in db.dirty_by_project.values() {
@@ -343,6 +356,10 @@ impl App {
         // single-project workspace always intersects; the visibility filter
         // (UI.md §4.2) is a P1 optimisation once multiple projects sync.
         self.refresh_current().await?;
+        // Inbox entries only arise from imports, which ring activity_advanced.
+        if db.activity_advanced {
+            self.refresh_inbox_count().await;
+        }
         Ok(())
     }
 }
@@ -354,6 +371,7 @@ pub async fn run(home: &Path) -> Result<()> {
     app.reload_projects().await?;
     app.reload_board().await?;
     app.reload_activity().await?;
+    app.refresh_inbox_count().await;
 
     let mut terminal = init_terminal()?;
     let mut sub = crate::control::subscribe(home, 0).await.ok();
@@ -774,7 +792,7 @@ fn draw_header(f: &mut ratatui::Frame, app: &App, area: Rect) {
         View::Members => "members",
         View::Detail => "detail",
         View::Doctor => "doctor",
-        View::Workspaces => "workspaces",
+        View::Workspaces => "spaces",
         View::Help => "help",
     };
     // Sync indicator (UI.md §8): peers online / offline.
@@ -783,12 +801,21 @@ fn draw_header(f: &mut ratatui::Frame, app: &App, area: Rect) {
     } else {
         ("○ offline".to_string(), Color::DarkGray)
     };
+    let inbox = if app.inbox_unread > 0 {
+        Span::styled(
+            format!("   inbox {}", app.inbox_unread),
+            Style::default().fg(Color::Cyan),
+        )
+    } else {
+        Span::raw(String::new())
+    };
     let line = Line::from(vec![
         Span::styled(proj, Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(format!("   [{view}]   ")),
         Span::styled(sync_txt, Style::default().fg(sync_color)),
+        inbox,
         Span::styled(
-            "   [?] help  [1/2/3/4] views  [d]octor [w]orkspaces  [c] new  [q] quit",
+            "   [?] help  [1/2/3/4] views  [d]octor [w] spaces  [c] new  [q] quit",
             Style::default().fg(Color::DarkGray),
         ),
     ]);
@@ -1067,7 +1094,7 @@ fn draw_workspaces(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     if app.workspaces.is_empty() {
         lines.push(Line::from(
-            "(no joined workspaces yet — run `lait join <link>`)",
+            "(no spaces yet — `lait init` or `lait join <link>`)",
         ));
     }
     for (i, e) in app.workspaces.iter().enumerate() {
@@ -1109,7 +1136,7 @@ fn draw_workspaces(f: &mut ratatui::Frame, app: &App, area: Rect) {
     }
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Workspaces — joined boards  [j/k] move  [Esc] back ");
+        .title(" Spaces  [j/k] move  [Esc] back ");
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 

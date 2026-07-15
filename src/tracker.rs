@@ -119,6 +119,14 @@ impl DirtySet {
 
 const ACTIVITY_RING: usize = 1000;
 
+/// The three work-state intents (`start`/`done`/`stop`, UI.md §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkAction {
+    Start,
+    Done,
+    Stop,
+}
+
 /// One issue doc a puller must fetch during catalog-first sync (A§8): the
 /// `doc_id` plus the puller's local version vector for it (empty ⇒ fetch all).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -467,6 +475,9 @@ impl Tracker {
             Request::Label { reff, add, remove } => self.label(reff, add, remove),
             Request::Comment { reff, body } => self.comment(reff, body),
             Request::IssueDelete { reff } => self.issue_delete(reff),
+            Request::IssueStart { reff } => self.work_state(reff, WorkAction::Start),
+            Request::IssueDone { reff } => self.work_state(reff, WorkAction::Done),
+            Request::IssueStop { reff } => self.work_state(reff, WorkAction::Stop),
             Request::IssueView { reff } => self.issue_view(reff).map(|r| (r, None)),
             Request::List { project, filter } => self.list(project, filter).map(|r| (r, None)),
             Request::Board {
@@ -590,12 +601,18 @@ impl Tracker {
                 None => return Ok((Response::not_found(format!("no user matches '{a}'")), None)),
             }
         }
+        // Labels resolve-or-create (first use = creation, UI.md §2.2) — but the
+        // whole batch is validated before anything is minted, so a bad input
+        // later in the list can't leave stray labels behind.
+        if let Some(l) = labels.iter().find(|l| self.invalid_label_input(l)) {
+            return Ok((Response::not_found(format!("no label matches '{l}'")), None));
+        }
         let mut label_ids = Vec::new();
+        let mut created_label = false;
         for l in &labels {
-            match self.resolve_label(l) {
-                Some(id) => label_ids.push(id),
-                None => return Ok((Response::not_found(format!("no label matches '{l}'")), None)),
-            }
+            let (id, created) = self.resolve_or_create_label(l)?;
+            created_label |= created;
+            label_ids.push(id);
         }
 
         // ---- apply ----
@@ -635,9 +652,12 @@ impl Tracker {
 
         let reff = self.aliases.canonical_for(&doc_id);
         self.push_activity(Some(&doc_id), &reff, "created", vec![], &title);
-        let dirty = DirtySet::issue(&project.id, &doc_id).with_scope(CatalogScope::Boards {
+        let mut dirty = DirtySet::issue(&project.id, &doc_id).with_scope(CatalogScope::Boards {
             project: project.id.as_str().to_string(),
         });
+        if created_label {
+            dirty = dirty.with_scope(CatalogScope::Labels);
+        }
         Ok((Response::Ref { reff }, Some(dirty)))
     }
 
@@ -728,6 +748,105 @@ impl Tracker {
             project: project_id.as_str().to_string(),
         });
         Ok((Response::Ref { reff }, Some(dirty)))
+    }
+
+    /// One work-state transition (UI.md §2 `start`/`done`/`stop`): the fields a
+    /// single human intent moves — status by workflow *category* plus the
+    /// viewer's assignment — in ONE Loro commit = one activity row (S§7.1).
+    /// Returns a fresh `Response::Issue` snapshot (the CLI derives the git
+    /// branch name from the title); a no-op (already there) returns the
+    /// snapshot with no commit, no activity, no doorbell.
+    fn work_state(
+        &mut self,
+        reff: String,
+        action: WorkAction,
+    ) -> Result<(Response, Option<DirtySet>)> {
+        let doc_id = match self.resolve_issue(&reff) {
+            Ok(id) => id,
+            Err(resp) => return Ok((resp, None)),
+        };
+        let (cat, kind) = match action {
+            WorkAction::Start => (StatusCategory::Active, "started"),
+            WorkAction::Done => (StatusCategory::Done, "finished"),
+            WorkAction::Stop => (StatusCategory::Backlog, "stopped"),
+        };
+        let Some(target) = self.first_state_in(cat) else {
+            return Ok((
+                Response::err(format!(
+                    "this space's workflow has no {}-category status",
+                    cat.as_str()
+                )),
+                None,
+            ));
+        };
+        let me = self.me.clone();
+
+        let project_id;
+        let mut changes = Vec::new();
+        let status_transition: (String, String);
+        {
+            let issue = self
+                .issue(&doc_id)?
+                .ok_or_else(|| anyhow!("issue body not present"))?;
+            project_id = issue
+                .project_id()
+                .ok_or_else(|| anyhow!("issue has no project"))?;
+            let from = issue.status();
+            if from != target.id {
+                issue.set_status(&target.id)?;
+                changes.push(FieldChange {
+                    field: "status".into(),
+                    from: Some(from.clone()),
+                    to: Some(target.id.clone()),
+                });
+            }
+            status_transition = (from, target.id.clone());
+            let assigned_to_me = issue.assignees().contains(&me);
+            match action {
+                WorkAction::Start if !assigned_to_me => {
+                    issue.add_assignee(&me)?;
+                    changes.push(FieldChange {
+                        field: "assignees".into(),
+                        from: None,
+                        to: Some("@me".into()),
+                    });
+                }
+                WorkAction::Stop if assigned_to_me => {
+                    issue.remove_assignee(&me)?;
+                    changes.push(FieldChange {
+                        field: "assignees".into(),
+                        from: Some("@me".into()),
+                        to: None,
+                    });
+                }
+                _ => {}
+            }
+            if changes.is_empty() {
+                // Already exactly there — idempotent: no commit, no activity.
+                return self.issue_view(reff).map(|r| (r, None));
+            }
+            issue.commit();
+        }
+        // completion policy (S§5.7): entering a done-category status removes the
+        // doc from the board list; leaving one re-inserts it at the top.
+        {
+            let (from, to) = &status_transition;
+            let from_done = self.is_done_status(from);
+            let to_done = self.is_done_status(to);
+            if to_done && !from_done {
+                self.catalog.board_remove(&project_id, &doc_id)?;
+            } else if from_done && !to_done {
+                self.catalog.board_insert_top(&project_id, &doc_id)?;
+            }
+        }
+
+        self.persist_issue_and_row(&doc_id)?;
+        let canonical = self.aliases.canonical_for(&doc_id);
+        self.push_activity(Some(&doc_id), &canonical, kind, changes, "");
+        let dirty = DirtySet::issue(&project_id, &doc_id).with_scope(CatalogScope::Boards {
+            project: project_id.as_str().to_string(),
+        });
+        self.issue_view(canonical).map(|r| (r, Some(dirty)))
     }
 
     fn issue_move(
@@ -882,12 +1001,12 @@ impl Tracker {
             Ok(id) => id,
             Err(resp) => return Ok((resp, None)),
         };
-        let mut add_ids = Vec::new();
-        for l in &add {
-            match self.resolve_label(l) {
-                Some(id) => add_ids.push(id),
-                None => return Ok((Response::not_found(format!("no label matches '{l}'")), None)),
-            }
+        // Adds create the label on first use (labels are vocabulary, not
+        // ceremony — UI.md §2.2); removals still error on unknown (removing a
+        // label that never existed is a typo, not intent). Everything that can
+        // fail is validated BEFORE anything is created (validate-then-commit).
+        if let Some(l) = add.iter().find(|l| self.invalid_label_input(l)) {
+            return Ok((Response::not_found(format!("no label matches '{l}'")), None));
         }
         let mut remove_ids = Vec::new();
         for l in &remove {
@@ -895,6 +1014,13 @@ impl Tracker {
                 Some(id) => remove_ids.push(id),
                 None => return Ok((Response::not_found(format!("no label matches '{l}'")), None)),
             }
+        }
+        let mut created_any = false;
+        let mut add_ids = Vec::new();
+        for l in &add {
+            let (id, created) = self.resolve_or_create_label(l)?;
+            created_any |= created;
+            add_ids.push(id);
         }
         let project_id = {
             let issue = self
@@ -912,10 +1038,11 @@ impl Tracker {
         self.persist_issue_and_row(&doc_id)?;
         let reff = self.aliases.canonical_for(&doc_id);
         self.push_activity(Some(&doc_id), &reff, "labeled", vec![], "");
-        Ok((
-            Response::Ref { reff },
-            Some(DirtySet::issue(&project_id, &doc_id)),
-        ))
+        let mut dirty = DirtySet::issue(&project_id, &doc_id);
+        if created_any {
+            dirty = dirty.with_scope(CatalogScope::Labels);
+        }
+        Ok((Response::Ref { reff }, Some(dirty)))
     }
 
     fn comment(&mut self, reff: String, body: String) -> Result<(Response, Option<DirtySet>)> {
@@ -1034,6 +1161,27 @@ impl Tracker {
         ))
     }
 
+    /// Whether an ADD-path label input can never resolve or be created: a
+    /// `lbl_`-prefixed id that doesn't exist (an id reference is a pointer, and
+    /// a dangling pointer is a typo, not a new name), or an empty name. Checked
+    /// for the WHOLE batch before any creation, preserving validate-then-commit.
+    fn invalid_label_input(&self, input: &str) -> bool {
+        let name = input.trim();
+        (name.is_empty() || name.starts_with(LabelId::PREFIX))
+            && self.resolve_label(input).is_none()
+    }
+
+    /// Resolve a label for an ADD path, creating it on first use (gray). The
+    /// caller has already rejected [`Self::invalid_label_input`]s.
+    fn resolve_or_create_label(&mut self, input: &str) -> Result<(LabelId, bool)> {
+        if let Some(id) = self.resolve_label(input) {
+            return Ok((id, false));
+        }
+        let id = LabelId::mint(&*self.clock);
+        self.catalog.add_label(&id, input.trim(), "gray")?;
+        Ok((id, true))
+    }
+
     fn resolve_label(&self, input: &str) -> Option<LabelId> {
         let input = input.trim();
         if input.starts_with(LabelId::PREFIX) {
@@ -1084,6 +1232,15 @@ impl Tracker {
             .workflow_state(status)
             .map(|w| w.category == StatusCategory::Done)
             .unwrap_or(false)
+    }
+
+    /// The first workflow state in a category — where the work-state verbs land
+    /// (tracks whatever column set this space's workflow has).
+    fn first_state_in(&self, cat: StatusCategory) -> Option<crate::dto::WorkflowState> {
+        self.catalog
+            .workflow()
+            .into_iter()
+            .find(|w| w.category == cat)
     }
 
     /// Viewer-aware assignee summary (UI.md §5.1): "you", "you +2", "ab", "".
@@ -1810,6 +1967,17 @@ impl Tracker {
         let Some(bytes) = self.decrypt_payload(bytes) else {
             return Ok(None);
         };
+        // Capture the pre-import state relevant to *this viewer* — the only
+        // honest source for the inbox (S§8.1): remote ops carry no trusted
+        // actor, so "addressed to you" is detected as a state transition, not
+        // read from attribution. `None` ⇒ the doc is new to this node.
+        let prior = self.issues.get(&id).map(|i| {
+            (
+                i.assignees().contains(&self.me),
+                i.status(),
+                i.comments().len(),
+            )
+        });
         // ensure a doc exists to import into (new docs arrive as a snapshot).
         if !self.issues.contains_key(&id) {
             let doc = loro::LoroDoc::new();
@@ -1835,10 +2003,79 @@ impl Tracker {
         // a synced doc advances the activity feed (pulled, not streamed, S§7.5).
         let reff = self.aliases.canonical_for(&id);
         self.push_activity(Some(&id), &reff, "synced", vec![], "");
+        // Inbox entries carry the friendly `KEY-n` handle when one exists —
+        // they're read by a human scanning a summary line.
+        let inbox_reff = self.aliases.alias_for(&id).unwrap_or(reff);
+        self.derive_inbox_entries(&id, &inbox_reff, prior);
         match project_id {
             Some(p) => Ok(Some(DirtySet::issue(&p, &id))),
             None => Ok(None),
         }
+    }
+
+    /// Emit durable inbox entries for a just-imported doc: assignments to me,
+    /// new comments on my work or mentioning `@mynick`, and status moves on my
+    /// work. Backfill-bounded by construction: a brand-new-to-me doc (`prior ==
+    /// None`) contributes at most one `assigned` entry, never a comment/status
+    /// flood. Best-effort — inbox failure never affects the import.
+    fn derive_inbox_entries(
+        &mut self,
+        id: &DocId,
+        reff: &str,
+        prior: Option<(bool, String, usize)>,
+    ) {
+        let Some(issue) = self.issues.get(id) else {
+            return;
+        };
+        let me = &self.me;
+        let now = self.clock.now_ms() / 1000;
+        let title = issue.title();
+        let assignees = issue.assignees();
+        let assigned_to_me = assignees.contains(me);
+        let my_issue = assigned_to_me || issue.created_by().as_ref() == Some(me);
+        let entry = |kind: &str, detail: String, actor: Option<String>| crate::dto::InboxEntry {
+            ts: now,
+            kind: kind.into(),
+            reff: reff.to_string(),
+            doc_id: id.as_str().to_string(),
+            title: title.clone(),
+            detail,
+            actor,
+            actor_nick: None,
+        };
+        let mut entries = Vec::new();
+        match prior {
+            None => {
+                if assigned_to_me {
+                    entries.push(entry("assigned", "you were assigned".into(), None));
+                }
+            }
+            Some((was_assigned_to_me, prior_status, prior_comments)) => {
+                if !was_assigned_to_me && assigned_to_me {
+                    entries.push(entry("assigned", "you were assigned".into(), None));
+                }
+                let status = issue.status();
+                if status != prior_status && my_issue {
+                    entries.push(entry("status", format!("{prior_status} → {status}"), None));
+                }
+                let mention = format!("@{}", self.my_nick).to_ascii_lowercase();
+                for c in issue.comments().into_iter().skip(prior_comments) {
+                    if &c.author == me {
+                        continue;
+                    }
+                    let mentioned =
+                        !self.my_nick.is_empty() && c.body.to_ascii_lowercase().contains(&mention);
+                    if my_issue || mentioned {
+                        entries.push(entry(
+                            "comment",
+                            c.body.clone(),
+                            Some(c.author.as_str().to_string()),
+                        ));
+                    }
+                }
+            }
+        }
+        crate::inbox::append(self.store.home_path(), entries);
     }
 
     // ---- test/inspection helpers (used by integration invariant tests) ----
@@ -2662,6 +2899,177 @@ mod tests {
             other => panic!("expected stale-default error, got {other:?}"),
         };
         assert!(msg.contains("GONE"), "{msg}");
+    }
+
+    #[test]
+    fn work_state_verbs_are_atomic_and_idempotent() {
+        let mut n = new_node();
+        with_project(&mut n.tracker);
+        let reff = new_issue(&mut n.tracker, "flaky reconnect");
+        let me = me();
+
+        // start: one request = assignee + status in ONE commit / ONE activity row.
+        let before = n.tracker.activity_high_water();
+        let (resp, dirty) = n.tracker.handle(Request::IssueStart { reff: reff.clone() });
+        let v = match resp {
+            Response::Issue(v) => v,
+            other => panic!("start returns the fresh snapshot, got {other:?}"),
+        };
+        assert_eq!(v.status, "in_progress", "first Active-category state");
+        assert!(v.assignees.contains(&me), "start assigns the caller");
+        assert!(dirty.is_some());
+        assert_eq!(
+            n.tracker.activity_high_water(),
+            before + 1,
+            "one intent = one activity row"
+        );
+
+        // idempotent: already started → snapshot back, no commit, no doorbell.
+        let (resp, dirty) = n.tracker.handle(Request::IssueStart { reff: reff.clone() });
+        assert!(matches!(resp, Response::Issue(_)));
+        assert!(dirty.is_none(), "no-op start must not ring");
+        assert_eq!(n.tracker.activity_high_water(), before + 1);
+
+        // done: status only (assignee kept), board list emptied (S§5.7).
+        let (resp, _) = n.tracker.handle(Request::IssueDone { reff: reff.clone() });
+        let v = match resp {
+            Response::Issue(v) => v,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(v.status, "done");
+        assert!(v.assignees.contains(&me), "done keeps the assignee");
+
+        // stop: back to backlog, unassigned.
+        let (resp, _) = n.tracker.handle(Request::IssueStop { reff });
+        let v = match resp {
+            Response::Issue(v) => v,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(v.status, "backlog", "first Backlog-category state");
+        assert!(!v.assignees.contains(&me), "stop unassigns the caller");
+    }
+
+    #[test]
+    fn labels_are_created_on_first_use_for_adds_only() {
+        let mut n = new_node();
+        with_project(&mut n.tracker);
+        // Creating an issue with an unknown label mints it (gray).
+        let (resp, dirty) = n.tracker.handle(Request::IssueNew {
+            title: "tagged".into(),
+            project: Some("ENG".into()),
+            project_hint: None,
+            assignees: vec![],
+            priority: None,
+            labels: vec!["perf".into()],
+            body: None,
+        });
+        assert!(matches!(resp, Response::Ref { .. }), "{resp:?}");
+        assert!(
+            dirty.unwrap().dirty_catalog.contains(&CatalogScope::Labels),
+            "a minted label dirties the Labels scope"
+        );
+        assert!(
+            n.tracker.catalog().label_by_name("perf").is_some(),
+            "label exists after first use"
+        );
+
+        // `label <ref> +new` also creates; `-unknown` (remove) still errors.
+        let reff = new_issue(&mut n.tracker, "plain");
+        let (resp, _) = n.tracker.handle(Request::Label {
+            reff: reff.clone(),
+            add: vec!["ux".into()],
+            remove: vec![],
+        });
+        assert!(matches!(resp, Response::Ref { .. }), "{resp:?}");
+        assert!(n.tracker.catalog().label_by_name("ux").is_some());
+        let (resp, dirty) = n.tracker.handle(Request::Label {
+            reff,
+            add: vec![],
+            remove: vec!["never-existed".into()],
+        });
+        assert!(matches!(resp, Response::Error { .. }), "{resp:?}");
+        assert!(dirty.is_none());
+
+        // A dangling lbl_ id is a typo, not a new name — and creates nothing.
+        let count_before = n.tracker.catalog().labels_list().len();
+        let (resp, _) = n.tracker.handle(Request::IssueNew {
+            title: "typo".into(),
+            project: Some("ENG".into()),
+            project_hint: None,
+            assignees: vec![],
+            priority: None,
+            labels: vec!["lbl_00000000000000000000000000".into()],
+            body: None,
+        });
+        assert!(matches!(resp, Response::Error { .. }), "{resp:?}");
+        assert_eq!(n.tracker.catalog().labels_list().len(), count_before);
+    }
+
+    #[test]
+    fn inbox_derives_addressed_to_me_from_imports() {
+        let mut a = new_node(); // founder
+        with_project(&mut a.tracker);
+        let b_seed = [8u8; 32];
+        let b_user = user_from_seed(b_seed);
+        let a_ws = a.tracker.workspace_str();
+        let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, me().as_str());
+        let (resp, _) = a.tracker.member_add(&b_user, Role::Member);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+
+        // A files an issue assigned to B, then syncs: the doc is NEW to B, so
+        // backfill emits exactly ONE entry (assigned), no comment/status flood.
+        let (resp, _) = a.tracker.handle(Request::IssueNew {
+            title: "for bob".into(),
+            project: Some("ENG".into()),
+            project_hint: None,
+            assignees: vec![b_user.as_str().to_string()],
+            priority: None,
+            labels: vec![],
+            body: None,
+        });
+        let reff = match resp {
+            Response::Ref { reff } => reff,
+            other => panic!("{other:?}"),
+        };
+        sync_all(&mut a.tracker, &mut b.tracker);
+        let (entries, unread) = crate::inbox::list(&b.home);
+        assert_eq!(entries.len(), 1, "backfill-bounded: {entries:?}");
+        assert_eq!(entries[0].kind, "assigned");
+        assert_eq!(unread, 1);
+
+        // A comments + moves status; B's next import derives both, with the
+        // comment attributed to A's real key (the one honest author field).
+        let (resp, _) = a.tracker.handle(Request::Comment {
+            reff: reff.clone(),
+            body: "root cause found".into(),
+        });
+        assert!(matches!(resp, Response::Ref { .. }), "{resp:?}");
+        let (resp, _) = a.tracker.handle(Request::IssueEdit {
+            reff: reff.clone(),
+            title: None,
+            status: Some("in_progress".into()),
+            priority: None,
+        });
+        assert!(matches!(resp, Response::Ref { .. }), "{resp:?}");
+        sync_all(&mut a.tracker, &mut b.tracker);
+        let (entries, _) = crate::inbox::list(&b.home);
+        assert_eq!(entries.len(), 3, "{entries:?}");
+        let comment = entries.iter().find(|e| e.kind == "comment").unwrap();
+        assert_eq!(comment.detail, "root cause found");
+        assert_eq!(comment.actor.as_deref(), Some(me().as_str()));
+        let status = entries.iter().find(|e| e.kind == "status").unwrap();
+        assert!(status.detail.contains("in_progress"), "{status:?}");
+
+        // A's own local mutations never enter A's inbox; and B's imports of an
+        // issue that isn't B's produce nothing.
+        assert!(crate::inbox::list(&a.home).0.is_empty());
+        new_issue(&mut a.tracker, "not bob's");
+        sync_all(&mut a.tracker, &mut b.tracker);
+        assert_eq!(
+            crate::inbox::list(&b.home).0.len(),
+            3,
+            "unrelated docs stay out"
+        );
     }
 
     #[test]

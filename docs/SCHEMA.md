@@ -339,6 +339,12 @@ enum Request {
               assignees: Vec<UserRef>, priority: Option<Priority>,
               labels: Vec<Ref>, body: Option<String> },
   IssueEdit { reff: Ref, patch: IssuePatch },      // title/status/priority
+  IssueStart{ reff: Ref }, IssueDone{ reff: Ref }, IssueStop{ reff: Ref },
+                                                    // work-state verbs: one intent =
+                                                    // ONE commit = one activity row;
+                                                    // targets by workflow CATEGORY;
+                                                    // return Response::Issue (the one
+                                                    // writes-echo-Ref deviation)
   IssueMove { reff: Ref, project: Option<Ref>, pos: Option<BoardPos> },
   Assign    { reff: Ref, who: Vec<UserRef>, add: bool },
   Label     { reff: Ref, add: Vec<Ref>, remove: Vec<Ref> },
@@ -350,6 +356,7 @@ enum Request {
   History   { reff: Ref },                           // derived from Loro op history
   ProjectNew{ name, key }, ProjectList, LabelNew{ name, color }, LabelList,
   Activity  { since: u64 },                          // ex-Log; the feed is PULLED, §7.5
+  Inbox     { clear: bool },                         // durable addressed-to-you (§8.1)
   Subscribe { since: u64 },                          // §7.5 — the one live channel (TUI + watch)
   Diagnose  { expected_workspace: Option<WorkspaceId> },   // guided-join verifier (GUIDED-JOIN.md)
   ConfigReload,                                      // transport-plane; re-read local settings
@@ -478,14 +485,33 @@ an error, never a founding event.
 Under the platform config root, beside the global `secret.key`:
 
 ```
-workspaces.json    // the workspace registry: [{ workspace, name, path,
+workspaces.json    // the space registry: [{ workspace, name, path,
                    //   origin: "founded"|"joined", host_nick, last_opened,
                    //   projects: [{key,name}] }]
                    // written by init / join / every daemon open; pure navigation
-                   // state (powers `lait workspaces` + `-w`); advisory `name`/
-                   // `projects` snapshots; corrupt/absent ⇒ "no known workspaces"
+                   // state (powers `lait spaces` + `-w`); advisory `name`/
+                   // `projects` snapshots; corrupt/absent ⇒ "no known spaces"
 config.json        // global settings layer (flat string map)
 ```
+
+Inside each store home, beside `config.json`:
+
+```
+inbox.json         // the durable inbox: { read_up_to_ts,
+                   //   entries: [{ ts, kind: assigned|comment|status, reff,
+                   //     doc_id, title, detail, actor: Option<key> }] }
+                   // ≤200 newest; never synced; corrupt/absent ⇒ empty
+```
+
+**Inbox derivation is attribution-honest.** Entries are derived at sync-import time
+(`import_doc`) as *state transitions relevant to the viewer* — remote ops carry no
+trusted actor (non-goal 6), so `assigned`/`status` entries render actor-unknown; only
+`comment` entries carry an author (`actor` = the comment's in-doc key), whose display
+nick the daemon resolves at READ time (petname > live presence > short key — never
+persisted). Backfill is structurally bounded: a brand-new-to-this-node doc contributes
+at most one `assigned` entry, never a comment/status flood. The activity ring stays
+the per-session workspace firehose; the inbox is the durable, filtered, watermarked
+"addressed to you" — two different questions, deliberately two structures.
 
 Inside each store home: `config.json` — the store settings layer. `lait config` fronts
 the two layers git-style (store wins). Closed key table: `user.nick` (global+store,
@@ -543,3 +569,10 @@ after it ships — the old ops live forever. Rules:
   (agreed, workspace re-architecture).
 - **§7.6** project defaulting — explicit > branch hint (resolve-or-skip) >
   `project.default` (resolve-or-error) > sole project > teaching error (agreed).
+- **§7** work-state verbs — `start`/`done`/`stop` bundle the fields one human intent
+  moves (status by workflow category + the viewer's assignment) into ONE commit; they
+  return `Response::Issue` so the CLI can derive the git branch (agreed, DX phase).
+- **§8.1** inbox — durable local `inbox.json` derived at import time,
+  attribution-honest (comments only carry an author), beside — never replacing — the
+  per-session activity ring (agreed, DX phase). Labels create on first use; project
+  creation is key-first (`projects add KEY [NAME]`); the surface noun is **space**.

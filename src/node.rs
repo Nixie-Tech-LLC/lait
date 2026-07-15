@@ -777,8 +777,8 @@ impl Node {
         let bound = self.tracker.lock().unwrap().workspace_str();
         if ticket.workspace != bound {
             anyhow::bail!(
-                "this store is bound to workspace {bound}, but the invite is for {} — \
-                 run `lait join` from a directory that isn't already a workspace",
+                "this store is bound to space {bound}, but the invite is for {} — \
+                 run `lait join` from a directory that isn't already a space",
                 ticket.workspace
             );
         }
@@ -802,7 +802,7 @@ impl Node {
     /// implying success. If we resolved to an already-member (a re-join), say so.
     fn join_message(&self, ticket: &WorkspaceTicket) -> String {
         let host = if ticket.host_nick.is_empty() {
-            "the workspace admin".to_string()
+            "the space admin".to_string()
         } else {
             ticket.host_nick.clone()
         };
@@ -814,7 +814,7 @@ impl Node {
             // automatic once an admin node processes the request (typically ~a
             // couple seconds). Tell the truth without implying a manual step.
             format!(
-                "joining {host}'s workspace with an invite pass \u{2014} you should be admitted \
+                "joining {host}'s space with an invite pass \u{2014} you should be admitted \
                  automatically in a moment, then your board decrypts and syncs.\n\
                  run `lait status` to confirm you're in."
             )
@@ -843,7 +843,7 @@ impl Node {
             let bound = self.tracker.lock().unwrap().workspace_str();
             if ticket.workspace != bound {
                 return Ok(Response::err(format!(
-                    "that ticket is for a different workspace ({}) — join it first: `lait join <ticket>`",
+                    "that ticket is for a different space ({}) — join it first: `lait join <ticket>`",
                     ticket.workspace
                 )));
             }
@@ -1255,6 +1255,9 @@ impl Node {
             Request::IssueNew { .. }
             | Request::IssueEdit { .. }
             | Request::IssueMove { .. }
+            | Request::IssueStart { .. }
+            | Request::IssueDone { .. }
+            | Request::IssueStop { .. }
             | Request::Assign { .. }
             | Request::Label { .. }
             | Request::Comment { .. }
@@ -1590,6 +1593,35 @@ impl Node {
                     })
                     .collect();
                 Ok(Response::Who { peers })
+            }
+            Request::Inbox { clear } => {
+                let (mut entries, unread) = crate::inbox::list(&self.home);
+                if clear {
+                    crate::inbox::mark_read(&self.home, now_secs());
+                }
+                // Resolve actor keys to display nicks at READ time (never
+                // persisted): local petname > live presence nick > short key.
+                let aliases = load_aliases(&self.home);
+                let presence = self.shared.presence.lock().unwrap();
+                for e in entries.iter_mut() {
+                    let Some(actor) = e.actor.clone() else {
+                        continue;
+                    };
+                    let pet = aliases
+                        .iter()
+                        .find(|a| a.key == actor)
+                        .map(|a| a.name.clone())
+                        .filter(|n| !n.is_empty());
+                    let pres = presence
+                        .iter()
+                        .find(|(id, _)| id.to_string() == actor)
+                        .map(|(_, p)| p.nick.clone())
+                        .filter(|n| !n.is_empty());
+                    let short: String = actor.chars().take(8).collect();
+                    e.actor_nick = Some(pet.or(pres).unwrap_or(short));
+                }
+                drop(presence);
+                Ok(Response::Inbox { entries, unread })
             }
             Request::ConfigReload => {
                 // Re-read the layered settings so a daemon-read key set via
@@ -1956,7 +1988,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     {
         let t = node.tracker.lock().unwrap();
         tracing::info!(
-            "lait daemon online as {my_id} in workspace '{}' ({})",
+            "lait daemon online as {my_id} in space '{}' ({})",
             t.workspace_name(),
             t.workspace_str()
         );

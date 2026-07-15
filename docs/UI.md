@@ -52,13 +52,20 @@ same refactor-freedom the contract buys the CLI and MCP.
 
 ## 2. CLI command surface
 
-Invocation: `lait [--home DIR] [-w SEL] [--json] [--no-color] <command> [args]`. `--home`
-selects a self-contained node (`$LAIT_HOME`); `-w/--workspace` selects a workspace **from
-any directory** by name, `ws_` id (or unique prefix), or path — resolved through the
-workspace registry to a store path (precedence: `--home` > `-w` > cwd discovery);
-`--json` switches every command to the versioned DTO (§2.3); the daemon is auto-spawned
-on first use (existing `ensure_daemon`). Commands never create a store implicitly: in a
-directory with no workspace they error with guidance (`init`/`join`/`-w`).
+Invocation: `lait [--home DIR] [-w SEL] [--json] [--no-color] [<command> [args]]`.
+**Bare `lait` is the focus view**: your unread inbox summary + your open issues — the
+most valuable keystroke answers "what's addressed to me / what am I on", never help.
+`--home` selects a self-contained node (`$LAIT_HOME`); `-w/--space` (alias
+`--workspace`) selects a **space** from any directory by name, `ws_` id (or unique
+prefix), or path — resolved through the registry to a store path (precedence: `--home`
+> `-w` > cwd discovery); `--json` switches every command to the versioned DTO (§2.3);
+the daemon is auto-spawned on first use (existing `ensure_daemon`). Commands never
+create a store implicitly: in a directory with no space they error with guidance
+(`init`/`join`/`-w`).
+
+> **Vocabulary:** the user-facing noun is **space**; the architecture documents keep
+> the internal term *workspace* (`WorkspaceId`, the Catalog's `workspaceId`, the
+> `workspace` doctor-gate id). Same thing, two altitudes.
 
 ### 2.1 Command table
 
@@ -68,7 +75,11 @@ Verbs act on **issues**; plural nouns manage **registries**. Each maps to exactl
 | Command | `Request` (S§7) | Description |
 |---|---|---|
 | `init [--name N] [--nick N]` | — | **Found a workspace here** (`cwd/.lait`): mints the genesis, names it (default: the directory), seeds a first project so `new` works immediately. Errors inside an existing workspace. |
-| `new <title> [-p PROJ] [-a USER…] [-P PRIO] [-l LABEL…] [-b BODY]` | `IssueNew` | Create an issue; echoes the resolved handle (`Response::Ref`). `-p` optional — the S§7.6 chain (branch key → `project.default` → sole project). |
+| `new <title> [-p PROJ] [-a USER…] [-P PRIO] [-l LABEL…] [-b BODY] [--start]` | `IssueNew` | Create an issue; echoes the resolved handle (`Response::Ref`). `-p` optional — the S§7.6 chain (branch key → `project.default` → sole project). Unknown `-l` labels are **created on first use** (vocabulary, not ceremony). `--start` chains straight into the work loop. |
+| `start [ref] [--no-branch]` | `IssueStart` | **Claim + activate + branch** in one intent: assign yourself, move to the first Active-category status (one commit = one activity row), then create+checkout `key-n-slug`. Ref inferred from the branch when omitted; branch step is best-effort, skipped outside git. Returns the fresh `Response::Issue` (the one writes-echo-Ref deviation — the CLI needs the title for the slug). |
+| `done [ref]` | `IssueDone` | Finish: first Done-category status (assignee kept, S§5.7 board removal). Ref inferred from the branch — the loop closes with no ref typed. |
+| `stop [ref]` | `IssueStop` | Put it down gracefully: first Backlog-category status, unassign yourself. |
+| `inbox [--clear]` | `Inbox` | The **durable, addressed-to-you** inbox (S§8.1): remote assignments, comments on your work, `@nick` mentions, status moves — newest-first with an unread watermark. Sits BESIDE `activity` (the workspace firehose): two different questions, two commands. |
 | `ls [-p PROJ] [--mine] [--status S] [--label L] [--all]` | `List` | List rows from the Catalog cache only (no issue-doc loads). `-p` is a pure filter (never defaulted); `--all` includes done/tombstoned. |
 | `board [PROJ]` | `Board` | Render the project's columns (workflow states × ordered rows). Positional optional — the S§7.6 chain. |
 | `show <ref>` | `IssueView` | Full issue — **lazy-loads the issue doc**. Body, comments, activity. |
@@ -79,17 +90,17 @@ Verbs act on **issues**; plural nouns manage **registries**. Each maps to exactl
 | `comment <ref> [BODY]` | `Comment` | Append a comment (immutable body, S§5.3). No arg → open `$EDITOR`. |
 | `delete <ref>` | `IssueDelete` | Tombstone an issue (S§5.6); it stays in `docs` for history/backfill, `ls`/`board` hide it. |
 | `history <ref>` | `History` | The issue's derived activity/time-travel feed (free from Loro op history, A§5). |
-| `projects [new <name> --key KEY \| ls]` | `ProjectNew`/`ProjectList` | Manage the project registry (`Catalog.projects`). |
+| `projects [add KEY [NAME] \| ls]` | `ProjectNew`/`ProjectList` | Manage the project registry (`Catalog.projects`). Key-first, name optional (defaults to the title-cased key); `new` kept as an alias of the same shape. |
 | `labels [new <name> --color C \| ls]` | `LabelNew`/`LabelList` | Manage the label registry (`Catalog.labels`). |
 | `members [add\|remove\|requests\|approve\|name\|rotate-key\|ls]` | `MemberAdd`/`MemberRemove`/… | Manage E2EE membership (the signed ACL, S§6): `add` seals the key, `remove` rotates it, `approve` admits a pending joiner, `name` sets a local alias (§8, P3). |
 | `activity [--since N]` | `Activity` | Workspace-wide recent transitions (ex-`log`; ring-buffer `seq`). |
 | `watch [--since N] [--exec CMD] [--notify]` | `Subscribe`-stream | Follow forever; run a hook / desktop-notify per event. The scripting primitive. |
 | `tui` | — | Launch the full-screen board (§4). |
 | `doctor` (alias `verify`) | `Diagnose` | Guided-join verifier: names the one onboarding gate that's blocking ([`GUIDED-JOIN.md`](./GUIDED-JOIN.md)). Auto-tails `join`. |
-| `workspaces [ls\|forget <sel>\|prune]` | — | Every workspace on this machine (founded + joined): name, id, origin, live status (`up`/`idle`/`missing`), project keys, path. `forget` deregisters (never touches disk); `prune` drops missing entries. |
+| `spaces [ls\|forget <sel>\|prune]` (alias `workspaces`) | — | Every space on this machine (founded + joined): name, id, origin, live status (`up`/`idle`/`missing`), project keys, path. `forget` deregisters (never touches disk); `prune` drops missing entries. |
 | `config [get\|set\|unset\|ls]` | — | Layered local settings, git-style: global `config.json` + per-store `config.json` (store wins). Keys: `user.nick` (daemon-read → live `ConfigReload` on set), `project.default`; `workspace.*` reserved for future synced settings. Daemon-free. |
 | `profiles` (alias `agents`) · `resume <name>` | — | List / switch named profiles (each a separate identity + store). |
-| `status` · `stop` · `id` | `Status`/`Stop`/`Id` | Node/workspace status; stop the daemon; print the endpoint id. |
+| `status` · `shutdown` · `id` | `Status`/`Stop`/`Id` | Node/space status; stop the daemon (`stop` the word belongs to the work loop); print the endpoint id. |
 | `invite` · `join [--dir D]` (alias `connect`) · `who` · `remote` (alias `seed`) | (P1 transport, §8/A§8) | The networking surface: invite/join a workspace, list peers, pin a seed. `join` **creates** the joiner's store (cwd or `--dir`) from the ticket before the daemon runs; joining from a directory bound to a different workspace is a hard exit-2 error. |
 
 ### 2.2 Notable behaviors

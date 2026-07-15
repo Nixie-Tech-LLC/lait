@@ -52,7 +52,7 @@ fn resolve_workspace_selector(sel: &str) -> Result<std::path::PathBuf> {
             p.join(".lait")
         } else {
             return Err(anyhow!(
-                "no initialized workspace store at '{sel}' (or under '{sel}/.lait')"
+                "no initialized space store at '{sel}' (or under '{sel}/.lait')"
             ));
         };
         return Ok(store);
@@ -74,7 +74,7 @@ fn resolve_workspace_selector(sel: &str) -> Result<std::path::PathBuf> {
             let e = matches[0];
             if workspaces::presence(e) == workspaces::StorePresence::Missing {
                 return Err(anyhow!(
-                    "workspace '{}' is registered at {} but the store is gone — run `lait workspaces prune`",
+                    "space '{}' is registered at {} but the store is gone — run `lait spaces prune`",
                     sel,
                     e.path
                 ));
@@ -93,7 +93,7 @@ fn resolve_workspace_selector(sel: &str) -> Result<std::path::PathBuf> {
                 })
                 .collect();
             Err(anyhow!(
-                "no workspace matches '{sel}' — known: {} (see `lait workspaces`)",
+                "no space matches '{sel}' — known: {} (see `lait spaces`)",
                 if known.is_empty() {
                     "(none)".to_string()
                 } else {
@@ -132,10 +132,9 @@ pub async fn run() -> Result<()> {
             std::process::exit(code);
         }
     };
-    let (leaf, m) =
-        cmdspec::resolve(&specs, &matches).ok_or_else(|| anyhow!("no subcommand given"))?;
+    let resolved = cmdspec::resolve(&specs, &matches);
 
-    if !leaf.service {
+    if !resolved.as_ref().is_some_and(|(l, _)| l.service) {
         reset_sigpipe();
     }
 
@@ -150,6 +149,28 @@ pub async fn run() -> Result<()> {
             && !json
             && std::env::var_os("NO_COLOR").is_none()
             && std::io::stdout().is_terminal(),
+    };
+
+    // Bare `lait` = the FOCUS view (inbox + your active issues, UI.md §2): the
+    // most valuable keystroke answers "what's addressed to me / what am I on",
+    // not help. Global flags (--home/-w/--json) still apply.
+    let Some((leaf, m)) = resolved else {
+        if let Some(h) = matches.get_one::<String>("home") {
+            std::env::set_var("LAIT_HOME", h);
+        }
+        if let Some(sel) = matches.get_one::<String>("workspace") {
+            let store = resolve_workspace_selector(sel)?;
+            std::env::set_var("LAIT_STORE", &store);
+        }
+        let home = match config::resolve_existing_store(None) {
+            Ok(h) => h,
+            Err(e) if e.downcast_ref::<config::NoStoreHere>().is_some() => {
+                crate::cli::err_no_store_here(out);
+                std::process::exit(1);
+            }
+            Err(e) => return Err(e),
+        };
+        return crate::cli::run_focus(&home, out).await;
     };
 
     // Stateless install surfaces (completions / man): generated from the live
@@ -222,7 +243,7 @@ pub async fn run() -> Result<()> {
             if !crate::store::initialized_at(&home) {
                 crate::cli::emit_ok(
                     &format!(
-                        "identity '{name}' has no workspace yet — `lait init` to found one, or `lait join <link>`"
+                        "identity '{name}' has no space yet — `lait init` to found one, or `lait join <link>`"
                     ),
                     out,
                 );
@@ -296,9 +317,27 @@ pub async fn run() -> Result<()> {
         // The uniform path: build one Request and round-trip the daemon.
         Dispatch::Request(f) => {
             let req = f(m)?;
-            crate::cli::run(&home, req, out).await?;
+            // `new --start` chains the create into the work loop: file it, then
+            // claim it (two honest commits = two activity rows, S§7.1).
+            if leaf.name == "new" && m.get_flag("start") {
+                crate::cli::run_new_start(&home, req, out).await?;
+            } else {
+                crate::cli::run(&home, req, out).await?;
+            }
         }
         Dispatch::Special(s) => match s {
+            Special::Start => {
+                let reff = cmdspec::resolve_reff(m)?;
+                crate::cli::run_start(&home, reff, m.get_flag("no_branch"), out).await?
+            }
+            Special::Done => {
+                let reff = cmdspec::resolve_reff(m)?;
+                crate::cli::run_workstate(&home, Request::IssueDone { reff }, out).await?
+            }
+            Special::Stop => {
+                let reff = cmdspec::resolve_reff(m)?;
+                crate::cli::run_workstate(&home, Request::IssueStop { reff }, out).await?
+            }
             Special::Id => {
                 let key = load_or_create_identity(&config::identity_dir()?)?;
                 crate::cli::emit_text(&key.public().to_string(), out);
@@ -392,10 +431,10 @@ async fn run_init(m: &ArgMatches, out: Out) -> Result<()> {
     if let Some(existing) = config::existing_home() {
         if crate::store::initialized_at(&existing) {
             eprintln!(
-                "already inside a workspace — its store is at {}",
+                "already inside a space — its store is at {}",
                 existing.display()
             );
-            eprintln!("to found another workspace, run `lait init` in a different directory.");
+            eprintln!("to found another space, run `lait init` in a different directory.");
             std::process::exit(1);
         }
     }
@@ -430,19 +469,19 @@ async fn run_init(m: &ArgMatches, out: Out) -> Result<()> {
             name: project.name.clone(),
         }],
     }) {
-        eprintln!("(workspace registry update failed: {e:#})");
+        eprintln!("(space registry update failed: {e:#})");
     }
     if out.json {
         crate::cli::emit_ok(
             &format!(
-                "founded workspace '{name}' ({ws}) with project {} at {}",
+                "founded space '{name}' ({ws}) with project {} at {}",
                 project.key,
                 home.display()
             ),
             out,
         );
     } else {
-        println!("founded workspace '{name}' ({ws})");
+        println!("founded space '{name}' ({ws})");
         println!("id:      {}", key.public());
         println!(
             "project: {} ({}) — `lait new \"...\"` files into it",
@@ -466,7 +505,7 @@ fn dir_display_name(home: &std::path::Path) -> String {
     dir.file_name()
         .and_then(|s| s.to_str())
         .filter(|s| !s.is_empty())
-        .unwrap_or("workspace")
+        .unwrap_or("space")
         .to_string()
 }
 
@@ -491,7 +530,7 @@ async fn run_join_cli(m: &ArgMatches, out: Out) -> Result<()> {
             .or_else(|| std::env::var_os("HOME"))
             .is_some_and(|h| std::path::Path::new(&h) == cwd);
         if is_home || cwd.parent().is_none() {
-            eprintln!("refusing to create a workspace store in {} — pass --dir <path> (or cd into the project directory first).", cwd.display());
+            eprintln!("refusing to create a space store in {} — pass --dir <path> (or cd into the project directory first).", cwd.display());
             std::process::exit(1);
         }
         config::store_dir_for_init(&cwd)?
@@ -505,7 +544,7 @@ async fn run_join_cli(m: &ArgMatches, out: Out) -> Result<()> {
             Some(g) if g.workspace_id.to_string() == ticket.workspace => {}
             Some(g) => {
                 eprintln!(
-                    "this directory holds workspace {} — the invite is for {}.",
+                    "this directory holds space {} — the invite is for {}.",
                     g.workspace_id, ticket.workspace
                 );
                 eprintln!("run `lait join` from another directory, or pass --dir <path>.");
@@ -544,7 +583,7 @@ async fn run_join_cli(m: &ArgMatches, out: Out) -> Result<()> {
         last_opened: now_secs(),
         projects: vec![],
     }) {
-        eprintln!("(workspace registry update failed: {e:#})");
+        eprintln!("(space registry update failed: {e:#})");
     }
 
     // Daemon leg: spawn against the exact bootstrapped store, then the guided
@@ -617,7 +656,7 @@ async fn run_config(dispatch: &Dispatch, m: &ArgMatches, out: Out) -> Result<()>
                 config::global_config_path()?
             } else {
                 let h = home.ok_or_else(|| {
-                    anyhow!("not inside a workspace — cd into one, use -w, or pass --global")
+                    anyhow!("not inside a space — cd into one, use -w, or pass --global")
                 })?;
                 config::store_config_path(&h)
             };

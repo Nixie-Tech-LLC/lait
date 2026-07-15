@@ -64,7 +64,7 @@ pub async fn ensure_daemon(home: &Path) -> Result<()> {
     // instead of spawning a doomed process and timing out 20s later.
     if !crate::store::initialized_at(home) {
         return Err(anyhow!(
-            "no workspace at {} — found one with `lait init`, or join one with `lait join <link>`",
+            "no space at {} — found one with `lait init`, or join one with `lait join <link>`",
             home.display()
         ));
     }
@@ -262,6 +262,227 @@ pub async fn run_join(home: &Path, ticket: String, out: Out) -> Result<()> {
     Ok(())
 }
 
+/// One-line issue summary for the work-state verbs: `MP-3  fix login  in_progress`.
+/// Prefers the friendly `KEY-n` handle; the collision-free short id is `--json`'s.
+fn workstate_line(v: &crate::dto::IssueView) -> String {
+    let handle = v.key_alias.as_deref().unwrap_or(&v.reff);
+    format!("{handle}  {}  {}", v.title, v.status)
+}
+
+/// A git branch name for an issue: lowercased `KEY-n` + a hyphenated title slug
+/// (≤40 chars of slug). Predictable by design — `done`/`show` infer the issue
+/// back out of it, and so do agents (UI.md §2.2).
+fn branch_name_for(v: &crate::dto::IssueView) -> String {
+    let handle = v
+        .key_alias
+        .clone()
+        .unwrap_or_else(|| v.reff.clone())
+        .to_ascii_lowercase();
+    let mut slug = String::new();
+    for c in v.title.to_ascii_lowercase().chars() {
+        if slug.len() >= 40 {
+            break;
+        }
+        if c.is_ascii_alphanumeric() {
+            slug.push(c);
+        } else if !slug.ends_with('-') && !slug.is_empty() {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        handle
+    } else {
+        format!("{handle}-{slug}")
+    }
+}
+
+/// Create + checkout the issue's branch, best-effort: outside a git work-tree
+/// this silently does nothing; inside one, an existing branch is switched to and
+/// any failure is a warning — a branch hiccup must never fail the `start`.
+fn checkout_issue_branch(v: &crate::dto::IssueView, out: Out) {
+    let in_repo = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !in_repo {
+        return;
+    }
+    let name = branch_name_for(v);
+    // `switch -c` for a fresh branch; if it already exists, plain `switch`.
+    let created = std::process::Command::new("git")
+        .args(["switch", "-c", &name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let ok = created
+        || std::process::Command::new("git")
+            .args(["switch", &name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+    if !out.json {
+        if ok {
+            println!(
+                "{}",
+                paint(
+                    out.color,
+                    ansi::DIM,
+                    &format!(
+                        "{} branch '{name}'",
+                        if created {
+                            "switched to new"
+                        } else {
+                            "switched to"
+                        }
+                    )
+                )
+            );
+        } else {
+            eprintln!("(could not create/switch branch '{name}' — continue manually)");
+        }
+    }
+}
+
+/// `lait start`: claim + activate + branch. The daemon does the atomic
+/// state move; the branch is client-side sugar on top (skippable, best-effort).
+pub async fn run_start(home: &Path, reff: String, no_branch: bool, out: Out) -> Result<()> {
+    let resp = client(home, Request::IssueStart { reff }).await?;
+    match &resp {
+        Response::Issue(v) => {
+            if out.json {
+                print_response(&resp, out);
+            } else {
+                println!("{}  · you", workstate_line(v));
+            }
+            if !no_branch {
+                checkout_issue_branch(v, out);
+            }
+            Ok(())
+        }
+        other => {
+            let code = print_response(other, out);
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `lait done` / `lait stop`: the branchless work-state verbs.
+pub async fn run_workstate(home: &Path, req: Request, out: Out) -> Result<()> {
+    let resp = client(home, req).await?;
+    match &resp {
+        Response::Issue(v) => {
+            if out.json {
+                print_response(&resp, out);
+            } else {
+                println!("{}", workstate_line(v));
+            }
+            Ok(())
+        }
+        other => {
+            let code = print_response(other, out);
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `lait new --start`: file the issue, then claim it (two honest commits).
+pub async fn run_new_start(home: &Path, new_req: Request, out: Out) -> Result<()> {
+    let resp = client(home, new_req).await?;
+    match &resp {
+        Response::Ref { reff } => {
+            if !out.json {
+                println!("{reff}");
+            }
+            run_start(home, reff.clone(), false, out).await
+        }
+        other => {
+            let code = print_response(other, out);
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Bare `lait` — the FOCUS view: unread inbox summary + your open issues.
+/// Must answer "what's addressed to me / what am I on" faster than a browser
+/// tab could open, and its empty states name the next command.
+pub async fn run_focus(home: &Path, out: Out) -> Result<()> {
+    let inbox = client(home, Request::Inbox { clear: false }).await?;
+    let mine = request(
+        home,
+        &Request::List {
+            project: None,
+            filter: crate::control::Filter {
+                mine: true,
+                status: None,
+                label: None,
+                all: false,
+            },
+        },
+    )
+    .await?;
+    if out.json {
+        // Machine focus = the two DTOs on two lines (each independently stable).
+        print_response(&inbox, out);
+        print_response(&mine, out);
+        return Ok(());
+    }
+    if let Response::Inbox { entries, unread } = &inbox {
+        if *unread > 0 {
+            let heads: Vec<String> = entries
+                .iter()
+                .take(3)
+                .map(|e| format!("{} {}", inbox_line_verb(e), e.reff))
+                .collect();
+            println!(
+                "{} {}",
+                paint(out.color, ansi::CYAN, &format!("Inbox ({unread}):")),
+                heads.join(" · ")
+            );
+        }
+    }
+    match &mine {
+        Response::List { rows } if rows.is_empty() => {
+            println!("nothing assigned to you — grab something: `lait ls`, or file one: `lait new \"...\"`");
+        }
+        Response::List { rows } => {
+            for r in rows {
+                println!("  {}  {:<10}  {}", r.reff, r.status, r.title);
+            }
+        }
+        other => {
+            print_response(other, out);
+        }
+    }
+    Ok(())
+}
+
+/// The inbox verb phrase for a summary line ("assigned you", "commented on"…).
+fn inbox_line_verb(e: &crate::dto::InboxEntry) -> String {
+    let who = e.actor_nick.clone().unwrap_or_else(|| "someone".into());
+    match e.kind.as_str() {
+        "assigned" => format!("{who} assigned you"),
+        "comment" => format!("{who} commented on"),
+        _ => format!("{who} moved"),
+    }
+}
+
 /// Render a `Diagnosis` response, or fall back gracefully if the daemon returned
 /// some other variant (e.g. an error) to the tail request.
 fn print_diagnosis_or(resp: &Response, out: Out) {
@@ -316,13 +537,13 @@ pub async fn print_workspaces(out: Out) {
             .collect();
         println!(
             "{}",
-            serde_json::to_string(&serde_json::json!({ "workspaces": rows }))
+            serde_json::to_string(&serde_json::json!({ "spaces": rows }))
                 .unwrap_or_else(|_| "{}".into())
         );
         return;
     }
     if entries.is_empty() {
-        println!("(no workspaces yet — `lait init` to found one, or `lait join <link>`)");
+        println!("(no spaces yet — `lait init` to found one, or `lait join <link>`)");
         return;
     }
     for (e, status) in entries.iter().zip(&statuses) {
@@ -361,11 +582,11 @@ pub async fn print_workspaces(out: Out) {
 /// directory with no discoverable `.lait/` gets this instead of a silently
 /// minted decoy store. Points at the creation verbs and every known workspace.
 pub fn err_no_store_here(out: Out) {
-    eprintln!("no lait workspace in this directory (nothing is created implicitly).");
+    eprintln!("no lait space in this directory (nothing is created implicitly).");
     let known = workspaces::list();
     if !known.is_empty() {
         eprintln!();
-        eprintln!("workspaces on this machine:");
+        eprintln!("spaces on this machine:");
         for e in &known {
             let name = if e.name.is_empty() {
                 "(unnamed)"
@@ -380,11 +601,11 @@ pub fn err_no_store_here(out: Out) {
         }
         eprintln!();
         eprintln!(
-            "cd into one, target one from here with `-w <name>`, or `lait workspaces` for details."
+            "cd into one, target one from here with `-w <name>`, or `lait spaces` for details."
         );
     } else {
         eprintln!();
-        eprintln!("found a workspace here with `lait init`, or join one with `lait join <link>`.");
+        eprintln!("found a space here with `lait init`, or join one with `lait join <link>`.");
     }
 }
 
@@ -420,9 +641,41 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
             print_board(b, out);
             0
         }
+        Response::Inbox { entries, unread } => {
+            if entries.is_empty() {
+                println!("inbox zero — nothing addressed to you. the backlog is `lait ls`.");
+                return 0;
+            }
+            // Newest-first + a ts watermark ⇒ exactly the first `unread` are unread.
+            for (i, e) in entries.iter().enumerate() {
+                let mark = if (i as u64) < *unread { "•" } else { " " };
+                let detail = if e.detail.is_empty() {
+                    String::new()
+                } else {
+                    format!("  — {}", e.detail)
+                };
+                println!(
+                    "{} {}  {}  {}{}",
+                    paint(out.color, ansi::CYAN, mark),
+                    e.reff,
+                    inbox_line_verb(e),
+                    e.title,
+                    detail
+                );
+            }
+            println!(
+                "{}",
+                paint(
+                    out.color,
+                    ansi::DIM,
+                    &format!("({unread} unread — `lait inbox --clear` to mark read)")
+                )
+            );
+            0
+        }
         Response::Activity { events, .. } => {
             if events.is_empty() {
-                println!("(no activity)");
+                println!("(no activity yet — it fills as the space moves: `lait new \"...\"`)");
             }
             for e in events {
                 let changes = if e.changes.is_empty() {
@@ -449,7 +702,7 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
         }
         Response::Projects { projects } => {
             if projects.is_empty() {
-                println!("(no projects — create one: `lait projects new <name> --key KEY`)");
+                println!("(no projects — create one: `lait projects add KEY`)");
                 // A just-joined peer sees this too, but should wait for sync, not
                 // create — point them at the verifier so an empty board is legible.
                 println!(
@@ -541,7 +794,7 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
                 (false, None) => s.name.clone(),
                 (true, None) => "(none)".to_string(),
             };
-            println!("workspace: {ws_line}");
+            println!("space:     {ws_line}");
             if !s.membership.is_empty() {
                 let code = if s.membership == "pending" {
                     ansi::YELLOW
@@ -855,17 +1108,17 @@ fn render_qr(data: &str) -> Result<String> {
 /// Open the OS default mail client with a prefilled invite (mailto). lait sends
 /// nothing itself — it just hands the URL to the platform handler.
 fn open_mail_invite(addr: &str, link: &str) -> Result<()> {
-    let subject = "Invitation to my lait workspace";
+    let subject = "Invitation to my lait space";
     let body = format!(
-        "You're invited to my lait workspace.\n\n\
+        "You're invited to my lait space.\n\n\
          1. Install lait\n   \
          macOS/Linux:  curl --proto '=https' --tlsv1.2 -LsSf \
          https://github.com/Nixie-Tech-LLC/lait/releases/latest/download/lait-installer.sh | sh\n   \
          Windows:      powershell -c \"irm \
          https://github.com/Nixie-Tech-LLC/lait/releases/latest/download/lait-installer.ps1 | iex\"\n\n\
-         2. Join the workspace\n   lait join {link}\n\n\
+         2. Join the space\n   lait join {link}\n\n\
          The link carries a one-time pass, so that admits you automatically and \
-         your device gets the workspace key (run `lait status` to see when you're \
+         your device gets the space key (run `lait status` to see when you're \
          in). lait is local-first and end-to-end encrypted.\n"
     );
     let mailto = format!(

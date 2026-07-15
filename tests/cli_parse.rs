@@ -267,3 +267,98 @@ fn invite_require_approval_conflicts_with_pass_tuning() {
 fn unknown_subcommand_is_a_usage_error() {
     assert!(parse_to_request(&["lait", "frobnicate"]).is_err());
 }
+
+#[test]
+fn work_state_verbs_are_special_dispatch() {
+    // start/done/stop are Special (branch creation + custom rendering live in
+    // app/cli) — parse_to_request must refuse them by name, and the ref must
+    // parse as an optional positional.
+    for verb in ["start", "done", "stop"] {
+        let err = parse_to_request(&["lait", verb, "ENG-1"])
+            .expect_err("work-state verbs are special-dispatch");
+        assert!(err.to_string().contains(verb), "{err}");
+    }
+    // --no-branch is a legal flag on start only.
+    let cli = build_cli(&specs());
+    assert!(cli
+        .try_get_matches_from(["lait", "start", "ENG-1", "--no-branch"])
+        .is_ok());
+}
+
+#[test]
+fn inbox_parses_with_and_without_clear() {
+    parses_to(&["lait", "inbox"], Request::Inbox { clear: false });
+    parses_to(
+        &["lait", "inbox", "--clear"],
+        Request::Inbox { clear: true },
+    );
+}
+
+#[test]
+fn projects_add_is_key_first_with_defaulted_name() {
+    parses_to(
+        &["lait", "projects", "add", "OPS"],
+        Request::ProjectNew {
+            name: "Ops".into(),
+            key: "OPS".into(),
+        },
+    );
+    parses_to(
+        &["lait", "projects", "add", "OPS", "Operations"],
+        Request::ProjectNew {
+            name: "Operations".into(),
+            key: "OPS".into(),
+        },
+    );
+    // `new` survives as an alias of the SAME shape.
+    parses_to(
+        &["lait", "projects", "new", "DSN", "Design"],
+        Request::ProjectNew {
+            name: "Design".into(),
+            key: "DSN".into(),
+        },
+    );
+}
+
+#[test]
+fn spaces_and_flag_aliases_resolve() {
+    // `spaces` is the command; `workspaces` stays as a muscle-memory alias.
+    let cli = build_cli(&specs());
+    assert!(cli.clone().try_get_matches_from(["lait", "spaces"]).is_ok());
+    assert!(cli
+        .clone()
+        .try_get_matches_from(["lait", "workspaces"])
+        .is_ok());
+    // Global selector: --space is primary, --workspace the hidden alias, -w short.
+    for flag in ["--space", "--workspace"] {
+        assert!(
+            cli.clone()
+                .try_get_matches_from(["lait", flag, "demo", "ls"])
+                .is_ok(),
+            "{flag} should parse"
+        );
+    }
+    assert!(cli
+        .clone()
+        .try_get_matches_from(["lait", "-w", "demo", "ls"])
+        .is_ok());
+}
+
+#[test]
+fn bare_invocation_parses_as_focus() {
+    // Bare `lait` (with global flags allowed) must parse with NO subcommand —
+    // app::run turns that into the focus view instead of help.
+    let cli = build_cli(&specs());
+    let m = cli
+        .clone()
+        .try_get_matches_from(["lait"])
+        .expect("bare lait parses");
+    assert!(m.subcommand().is_none());
+    assert!(cli.try_get_matches_from(["lait", "--json"]).is_ok());
+}
+
+#[test]
+fn daemon_off_switch_is_shutdown() {
+    // `stop` now belongs to the work loop; the daemon's off-switch is `shutdown`.
+    parses_to(&["lait", "shutdown"], Request::Stop);
+}

@@ -21,8 +21,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::diagnose::DiagnosisView;
 use crate::dto::{
-    ActivityEvent, BoardView, Candidate, IssueView, JoinRequestDto, LabelDto, MemberDto,
-    ProjectDto, Row, SeedDto,
+    ActivityEvent, BoardView, Candidate, InboxEntry, IssueView, JoinRequestDto, LabelDto,
+    MemberDto, ProjectDto, Row, SeedDto,
 };
 
 /// The OS name of the control channel for a home (unix socket / Windows named
@@ -128,6 +128,21 @@ pub enum Request {
     IssueDelete {
         reff: String,
     },
+    /// Work-state verbs (UI.md §2): each is ONE commit = one activity row,
+    /// bundling the fields a single human intent moves. Targets are picked by
+    /// workflow *category* (first Active / Done / Backlog state), so they track
+    /// whatever the workspace's column set is. They return `Response::Issue`
+    /// (a fresh snapshot) — the one deviation from writes-echo-Ref, because the
+    /// CLI needs the title to derive the git branch name.
+    IssueStart {
+        reff: String,
+    },
+    IssueDone {
+        reff: String,
+    },
+    IssueStop {
+        reff: String,
+    },
     IssueView {
         reff: String,
     },
@@ -162,6 +177,13 @@ pub enum Request {
     Activity {
         #[serde(default)]
         since: u64,
+    },
+    /// The durable, addressed-to-you inbox (S§8.1 `inbox.json`): remote
+    /// assignments/comments/status moves on your work, derived at import time.
+    /// `clear` stamps the read watermark after listing.
+    Inbox {
+        #[serde(default)]
+        clear: bool,
     },
     // ---- membership / ACL (P3, S§6) ----
     MemberAdd {
@@ -284,6 +306,12 @@ pub enum Response {
     Activity {
         events: Vec<ActivityEvent>,
         last: u64,
+    },
+    /// The inbox snapshot: entries newest-first; `unread` counts entries past
+    /// the read watermark.
+    Inbox {
+        entries: Vec<InboxEntry>,
+        unread: u64,
     },
     Projects {
         projects: Vec<ProjectDto>,

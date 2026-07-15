@@ -333,7 +333,7 @@ fn seed_add_with_foreign_workspace_ticket_errors() {
     };
     match req(&c_home, Request::SeedAdd { arg: ticket }) {
         Response::Error { message, .. } => assert!(
-            message.contains("different workspace"),
+            message.contains("different space"),
             "the refusal should name the mismatch, got: {message}"
         ),
         other => panic!("seed add with a foreign ticket must error, got {other:?}"),

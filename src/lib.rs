@@ -29,6 +29,7 @@ pub mod crypto;
 pub mod diagnose;
 pub mod dto;
 pub mod ids;
+pub mod inbox;
 pub mod index;
 pub mod install;
 pub mod issue;

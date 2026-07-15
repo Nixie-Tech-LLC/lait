@@ -369,7 +369,7 @@ fn read_command_in_empty_dir_refuses_to_create_a_decoy_store() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("no lait workspace in this directory"),
+        stderr.contains("no lait space in this directory"),
         "guard must explain why, got stderr: {stderr}"
     );
     // The listing is human navigation state: the workspace NAME and its path
@@ -415,7 +415,7 @@ fn read_command_with_empty_registry_still_refuses_and_suggests_creation_verbs() 
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("no lait workspace in this directory"),
+        stderr.contains("no lait space in this directory"),
         "guard must explain why, got stderr: {stderr}"
     );
     assert!(

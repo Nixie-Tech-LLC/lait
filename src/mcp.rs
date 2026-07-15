@@ -32,6 +32,10 @@ pub const REQUIRED_TRACKER_COMMANDS: &[&str] = &[
     "issue_new",
     "issue_edit",
     "issue_move",
+    "issue_start",
+    "issue_done",
+    "issue_stop",
+    "inbox",
     "assign",
     "label",
     "comment",
@@ -58,6 +62,10 @@ pub const MCP_TOOL_NAMES: &[&str] = &[
     "issue_new",
     "issue_edit",
     "issue_move",
+    "issue_start",
+    "issue_done",
+    "issue_stop",
+    "inbox",
     "assign",
     "label",
     "comment",
@@ -110,6 +118,13 @@ pub struct IssueNewArgs {
     /// Optional body/description.
     #[serde(default)]
     pub body: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InboxArgs {
+    /// Mark everything read after listing.
+    #[serde(default)]
+    pub clear: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -325,6 +340,50 @@ impl LaitMcp {
             body: a.body,
         })
         .await
+    }
+
+    #[tool(
+        description = "Start working an issue: assign yourself + move it to the first \
+                       active-category status, atomically. Returns the fresh issue snapshot."
+    )]
+    async fn issue_start(
+        &self,
+        Parameters(a): Parameters<RefArg>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::IssueStart { reff: a.reff }).await
+    }
+
+    #[tool(
+        description = "Finish an issue: move it to the first done-category status (assignee \
+                       kept). Returns the fresh issue snapshot."
+    )]
+    async fn issue_done(
+        &self,
+        Parameters(a): Parameters<RefArg>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::IssueDone { reff: a.reff }).await
+    }
+
+    #[tool(
+        description = "Put an issue down: back to the first backlog-category status, \
+                       unassign yourself. Returns the fresh issue snapshot."
+    )]
+    async fn issue_stop(
+        &self,
+        Parameters(a): Parameters<RefArg>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::IssueStop { reff: a.reff }).await
+    }
+
+    #[tool(
+        description = "The durable inbox: remote assignments/comments/status moves addressed \
+                       to this node, newest first with an unread count. clear=true marks all read."
+    )]
+    async fn inbox(
+        &self,
+        Parameters(a): Parameters<InboxArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::Inbox { clear: a.clear }).await
     }
 
     #[tool(description = "Edit an issue's title/status/priority (one commit = one activity row).")]
