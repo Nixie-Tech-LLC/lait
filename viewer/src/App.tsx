@@ -6,6 +6,7 @@ import { ConfirmRequired, LaitError, rpc, spaces as fetchSpaces } from "./api";
 import { useDoorbell } from "./doorbell";
 import { contribute, registry, type AppApi, type Ctx } from "./core/registry";
 import { useKeys } from "./core/useKeys";
+import { IssueDetail } from "./ui/IssueDetail";
 import { IssueList } from "./ui/IssueList";
 import { Palette } from "./ui/Palette";
 import { Shortcuts } from "./ui/Shortcuts";
@@ -32,6 +33,9 @@ export function App() {
   const [overlay, setOverlay] = useState<Overlay>(null);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  const [detail, setDetail] = useState(true);
+  // Bumped on every doorbell for this space: the detail pane re-reads off it.
+  const [revision, setRevision] = useState(0);
   const sidebar = usePanelRef();
 
   const space = spaces.find((s) => s.id === current) ?? null;
@@ -95,10 +99,12 @@ export function App() {
         if (!d) {
           void loadSpaces();
           void loadBoard(current);
+          setRevision((r) => r + 1);
           return;
         }
         if (d.space !== current) return;
         void loadBoard(current);
+        setRevision((r) => r + 1);
         if (d.dirty_catalog.length) void loadSpaces();
       },
       [current, loadBoard, loadSpaces],
@@ -125,6 +131,7 @@ export function App() {
       openPalette: () => setOverlay("palette"),
       closePalette: () => setOverlay(null),
       toggleShortcuts: () => setOverlay((o) => (o === "shortcuts" ? null : "shortcuts")),
+      toggleDetail: () => setDetail((d) => !d),
       toggleSidebar: () => {
         const p = sidebar.current;
         if (!p) return;
@@ -269,13 +276,35 @@ export function App() {
               board={board}
               selection={selection}
               onSelect={api.select}
-              onOpen={api.select}
+              onOpen={() => setDetail(true)}
               onCreate={() => run("issue.create")}
               readOnly={readOnly}
             />
           ) : null}
         </div>
       </Panel>
+
+      {detail && selection && current && board && (
+        <>
+          <Separator className="bg-line data-[state=dragging]:bg-accent hover:bg-accent/60 relative w-px outline-none transition-colors">
+            <span className="absolute inset-y-0 -left-[3px] w-[7px]" />
+          </Separator>
+          <Panel id="detail" defaultSize="30%" minSize="260px" maxSize="50%">
+            <IssueDetail
+              // Remount on a different issue: a stale draft must not survive into
+              // the next one, and `key` says that in one line.
+              key={selection}
+              spaceId={current}
+              reff={selection}
+              states={board.columns.map((c) => c.state)}
+              readOnly={readOnly}
+              revision={revision}
+              onError={setError}
+              onDelete={api.deleteIssue}
+            />
+          </Panel>
+        </>
+      )}
 
       {overlay === "palette" && <Palette ctx={ctx} onClose={() => setOverlay(null)} />}
       {overlay === "shortcuts" && <Shortcuts ctx={ctx} onClose={() => setOverlay(null)} />}

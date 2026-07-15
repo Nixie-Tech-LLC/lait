@@ -44,6 +44,7 @@ export interface AppApi {
   closePalette(): void;
   toggleShortcuts(): void;
   toggleSidebar(): void;
+  toggleDetail(): void;
   toast(message: string): void;
   refresh(): void;
   select(reff: string | null): void;

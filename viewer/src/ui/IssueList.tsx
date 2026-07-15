@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { Plus } from "lucide-react";
 
 import type { BoardColumn, BoardView, Row } from "../types";
+import { catalogColor } from "./colors";
 import { PriorityIcon, StatusIcon } from "./icons";
 
 /**
@@ -83,7 +84,7 @@ function Group({
       {/* Sticky so you never lose which bucket you are reading — the one piece of
           context a long list silently takes away. */}
       <header className="bg-raised/95 border-line sticky top-0 z-10 flex h-9 items-center gap-2 border-b px-4 backdrop-blur-sm">
-        <StatusIcon category={col.state.category} color={col.state.color} />
+        <StatusIcon category={col.state.category} color={catalogColor(col.state.color)} />
         <h2 className="text-base font-semibold">{col.state.name}</h2>
         <span className="text-mute text-sm tabular-nums">{rows.length}</span>
         {!readOnly && (
@@ -155,7 +156,7 @@ function IssueRow({
       <span className="text-mute w-20 shrink-0 truncate font-mono text-xs tabular-nums">
         {row.key_alias ?? row.reff}
       </span>
-      <StatusIcon category={state.state.category} color={state.state.color} />
+      <StatusIcon category={state.state.category} color={catalogColor(state.state.color)} />
       <span className="min-w-0 flex-1 truncate">{row.title}</span>
       {row.assignee_summary && (
         <span className="text-mute shrink-0 text-xs">{row.assignee_summary}</span>

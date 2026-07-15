@@ -70,6 +70,16 @@ export const coreCommands = contribute({
       run: (c) => c.app.moveSelection(-1),
     },
 
+    {
+      id: "view.detail",
+      title: "Toggle issue detail",
+      group: "View",
+      // Linear binds space to peek, and the muscle memory is worth inheriting.
+      keys: ["space"],
+      when: (c) => !c.overlay && hasSelection(c),
+      run: (c) => c.app.toggleDetail(),
+    },
+
     // ---- issues -----------------------------------------------------------
     {
       id: "issue.create",
