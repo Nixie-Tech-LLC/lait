@@ -12,6 +12,7 @@ import {
 
 import { ConfirmRequired, LaitError, rpc, spaces as fetchSpaces } from "./api";
 import { useDoorbell } from "./doorbell";
+import { coalesce } from "./core/coalesce";
 import { contribute, registry, type AppApi, type Ctx, type View } from "./core/registry";
 import { useKeys } from "./core/useKeys";
 import { Activity } from "./ui/Activity";
@@ -76,7 +77,10 @@ export function App() {
   const overlay = useRef(new Overlay());
   const [predicted, setPredicted] = useState(0);
   /** Monotonic load token — see `loadBoard`. A generalisation of an `alive` flag:
-   *  it also orders two loads of the *same* space, which `alive` cannot. */
+   *  it also orders two loads of the *same* space, which `alive` cannot. Bumped
+   *  when a load is *requested*, not when it starts: once requests coalesce, the
+   *  request is the thing that supersedes, and a run that starts later already
+   *  carries the newer args. */
   const boardSeq = useRef(0);
   /** Last doorbell epoch seen per space — the daemon-boot nonce (UI.md §4.1). */
   const epochs = useRef(new Map<string, number>());
@@ -104,7 +108,7 @@ export function App() {
     [shown],
   );
 
-  const loadSpaces = useCallback(async () => {
+  const loadSpacesRaw = useCallback(async () => {
     try {
       const { spaces } = await fetchSpaces();
       setSpaces(spaces);
@@ -135,14 +139,14 @@ export function App() {
    * Backs off rather than hammering, and gives up after a few tries so a genuinely
    * dead space says so instead of spinning forever.
    */
-  const loadBoard = useCallback(async (id: string | null): Promise<void> => {
+  const loadBoardRaw = useCallback(async (id: string | null): Promise<void> => {
     // Only the newest load may commit. Two doorbells in quick succession issue
     // two loads, and the one that resolves *last* is not the one issued last —
     // so an older board could silently overwrite a newer one, and nothing would
     // correct it until the next ring. The retry below makes it worse by holding a
     // load open for ~2.8s, long enough to land on a space you have since left and
     // paint its error over the one you are looking at.
-    const seq = ++boardSeq.current;
+    const seq = boardSeq.current;
     const stale = () => seq !== boardSeq.current;
 
     if (!id) return setBoard(null);
@@ -166,6 +170,29 @@ export function App() {
       }
     }
   }, []);
+
+  /**
+   * The two re-reads a doorbell fans out to, coalesced.
+   *
+   * A ring is per commit, not per user action, so a sync burst asked for the same
+   * board ten times in a couple hundred milliseconds. The `seq` guard kept the
+   * *answers* honest, but the questions were all still asked. See `core/coalesce.ts`
+   * for why this is one-in-flight-plus-one-trailing rather than a plain throttle —
+   * the trailing run is what makes the read postdate the news that provoked it.
+   *
+   * Bumping `boardSeq` here rather than inside the run is what lets a queued request
+   * cut a doomed one short: a load for the space you just left sees `stale()` at its
+   * next check and returns without painting, and a retry chain mid-backoff stops
+   * waiting out its ~2.8s once there is a newer question to answer.
+   */
+  const loadBoard = useMemo(() => {
+    const run = coalesce(loadBoardRaw);
+    return (id: string | null): Promise<void> => {
+      boardSeq.current++;
+      return run(id);
+    };
+  }, [loadBoardRaw]);
+  const loadSpaces = useMemo(() => coalesce(loadSpacesRaw), [loadSpacesRaw]);
 
   useEffect(() => {
     void loadSpaces();
