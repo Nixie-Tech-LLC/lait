@@ -111,13 +111,31 @@ export function App() {
     }
   }, []);
 
-  const loadBoard = useCallback(async (id: string | null) => {
+  /**
+   * Load the board, and keep trying.
+   *
+   * A failed load must not be terminal. The daemon this space talks to can
+   * restart under us — someone runs `lait shutdown`, an update swaps the binary,
+   * two processes race to respawn it — and the failure lasts milliseconds. But
+   * nothing would re-trigger the load: doorbells arrive through the very
+   * attachment that just broke, so a transient error froze the view and left a
+   * stale banner over it until the user thought to press `r`. The error was
+   * honest; its permanence was the bug.
+   *
+   * Backs off rather than hammering, and gives up after a few tries so a genuinely
+   * dead space says so instead of spinning forever.
+   */
+  const loadBoard = useCallback(async (id: string | null, attempt = 0): Promise<void> => {
     if (!id) return setBoard(null);
     try {
       const r = await rpc(id, { cmd: "board", project: null });
       setBoard(r.kind === "board" ? r : null);
       setError(null);
     } catch (e) {
+      if (attempt < 3) {
+        await new Promise((r) => window.setTimeout(r, 400 * 2 ** attempt));
+        return loadBoard(id, attempt + 1);
+      }
       setBoard(null);
       setError(e instanceof Error ? e.message : String(e));
     }

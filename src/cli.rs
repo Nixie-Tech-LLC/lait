@@ -343,6 +343,23 @@ fn mark_verified(home: &Path) {
     }
 }
 
+/// Forget that `home`'s daemon was verified, so the next [`ensure_daemon`] probes
+/// again instead of trusting the memo.
+///
+/// The memo is only sound because a CLI process resolves one store and exits: it
+/// cannot outlive the daemon it verified, so re-probing would be pure cost. A
+/// long-lived supervisor breaks that assumption — `lait serve` can watch a daemon
+/// stop and then be asked for it again, and a stale entry there does not mean
+/// "already fine", it means **"never respawn this"**, which is exactly wrong. The
+/// symptom is a connect error that no retry can clear.
+///
+/// So the one caller that can outlive a daemon says so when it notices.
+pub(crate) fn forget_verified(home: &Path) {
+    if let Ok(mut s) = VERIFIED_DAEMONS.get_or_init(VerifiedSet::default).lock() {
+        s.remove(home);
+    }
+}
+
 /// Ensure a daemon is running for this home dir, spawning one if needed.
 ///
 /// Uses whatever identity this process would use — i.e. `$LAIT_HOME` if set,
@@ -435,6 +452,27 @@ pub async fn ensure_daemon_as(home: &Path, identity: Option<&Path>) -> Result<()
         // the common failures (lock held, bind failure) each cost the full 20s
         // and then blame a timeout.
         if let Ok(Some(status)) = child.try_wait() {
+            // But *our* child dying is not the same as no daemon. Two processes
+            // can race to spawn one for the same home: the loser exits saying
+            // "another lait daemon is already running" while the winner's is up
+            // and answering. Losing that race is success — the home has the daemon
+            // it needs, it just isn't ours — so ask before blaming. Rare between
+            // two CLI invocations; routine once `lait serve` is in the mix, since
+            // it holds several homes and reacts to doorbells while you type.
+            //
+            // Ask for a moment, not once: the winner is starting at the same
+            // instant our loser gives up, so a single immediate probe usually
+            // arrives too early and blames a daemon that is seconds from
+            // answering. A lost race resolves in milliseconds; a genuinely broken
+            // spawn (bind failure, held lock) still fails in about a second rather
+            // than the full 20 this check exists to avoid.
+            for _ in 0..12 {
+                if request(home, &Request::Status).await.is_ok() {
+                    mark_verified(home);
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
             return Err(daemon_exited_error(status, &log_path));
         }
     }

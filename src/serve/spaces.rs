@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -239,6 +240,14 @@ async fn status(entry: &WorkspaceEntry) -> &'static str {
 /// the shared fan-in. Dropping it aborts the pump.
 struct Attached {
     home: PathBuf,
+    /// Cleared by the pump before it announces its own death.
+    ///
+    /// Set explicitly rather than inferred from the `JoinHandle`, because the pump
+    /// has to send its farewell `reset` *before* it returns — so at the moment the
+    /// client reacts to that reset, `is_finished()` is still false and we would
+    /// hand back the very attachment we are trying to replace. `is_finished` is
+    /// still checked as well: a panicking task never reaches the store.
+    alive: Arc<AtomicBool>,
     pump: tokio::task::JoinHandle<()>,
 }
 
@@ -359,7 +368,21 @@ impl Supervisor {
         let (home, identity) = self.resolve(id)?;
         let mut attached = self.attached.lock().await;
         if let Some(a) = attached.get(id) {
-            return Ok(a.home.clone());
+            // A live attachment is reusable; a dead one is a trap. When the
+            // space's daemon stops, its pump ends — and if the entry outlives it,
+            // every later attach short-circuits onto a corpse and the doorbells
+            // for that space never come back. The failure is silent, which is the
+            // worst part: the browser's own stream to `serve` is still open, so
+            // the UI reports itself live while going quietly stale forever.
+            if a.alive.load(Ordering::Acquire) && !a.pump.is_finished() {
+                return Ok(a.home.clone());
+            }
+            attached.remove(id);
+            // The daemon this pump was reading is gone, so `ensure_daemon`'s
+            // verified-memo is now a lie — and a stale entry there does not mean
+            // "already fine", it means "never respawn this". Clear it, or the
+            // re-attach below short-circuits and we connect to nothing.
+            crate::cli::forget_verified(&home);
         }
         // A self-contained home *is* its own identity dir, so pinning it to
         // `home` is the whole fix. `Own` keeps inheriting our env, which is
@@ -373,12 +396,15 @@ impl Supervisor {
         let tx = self.doorbells.clone();
         let space = id.to_string();
         let pump_home = home.clone();
+        let alive = Arc::new(AtomicBool::new(true));
+        let pump_alive = alive.clone();
         let pump = tokio::spawn(async move {
             // `since: 0` asks for a full rebaseline, matching a fresh TUI attach.
             let mut sub = match control::subscribe(&pump_home, 0).await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(space = %space, error = %e, "subscribe failed");
+                    pump_alive.store(false, Ordering::Release);
                     return;
                 }
             };
@@ -393,10 +419,9 @@ impl Supervisor {
                             doorbell,
                         });
                     }
-                    // EOF: the daemon stopped. Detaching here (rather than
-                    // looping to reconnect) keeps the restart policy in one
-                    // place — the next request re-attaches through
-                    // `ensure_daemon`, which already owns the heal path.
+                    // EOF: the daemon stopped. We do not reconnect here — the
+                    // restart policy lives in `ensure_daemon`, which owns the heal
+                    // path, and `attach` re-runs it once it notices this pump died.
                     Ok(None) => break,
                     Err(e) => {
                         tracing::warn!(space = %space, error = %e, "doorbell stream ended");
@@ -404,12 +429,30 @@ impl Supervisor {
                     }
                 }
             }
+
+            pump_alive.store(false, Ordering::Release);
+
+            // Say so on the way out, or the repair deadlocks: `attach` only
+            // notices a dead pump when something asks it to attach, and the thing
+            // that would ask is a re-read triggered by a doorbell that is never
+            // coming. A `reset` is precisely "your position is invalid, rebaseline
+            // from a fresh snapshot" (UI.md §4.1) — so the client re-reads, the
+            // re-read attaches, and attaching revives the stream. The loop closes
+            // itself without this task knowing anything about repair.
+            let _ = tx.send(SpaceDoorbell {
+                space,
+                doorbell: Doorbell {
+                    reset: true,
+                    ..Default::default()
+                },
+            });
         });
 
         attached.insert(
             id.to_string(),
             Arc::new(Attached {
                 home: home.clone(),
+                alive,
                 pump,
             }),
         );
