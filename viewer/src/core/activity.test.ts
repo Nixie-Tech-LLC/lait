@@ -1,13 +1,17 @@
 /**
  * Attribution.
  *
- * The one invariant here is worth more than the phrasing: **`synced` must never
- * carry a name.** `push_activity` stamps `actor: Some(self.me)` on every event it
- * records, including the one that fires when a *teammate's* change arrives over the
- * wire — so rendering `actor_nick` literally credits you with alice's edit. The
- * schema calls in-doc attribution advisory (S non-goal 6) and the inbox already
- * refuses to guess (`actor: None` for everything but comments). This is the same
- * refusal, on the other surface.
+ * Two invariants, both load-bearing, both burned by a real bug:
+ *
+ * 1. **`synced` never carries a name — even with a resolver.** In the workspace
+ *    Activity feed a remote change is one synthetic event stamped with the *local*
+ *    node's key, so resolving that key would credit you with a teammate's edit.
+ * 2. **History attribution reads `actor`, not `actor_nick`.** The durable history
+ *    feed leaves `actor_nick` empty and puts the real committer's key in `actor`;
+ *    a client that reads `actor_nick` for the name shows nothing. (This is exactly
+ *    what regressed when the engine moved history onto the oplog — the guard in
+ *    `tests/viewer_read_contract` catches it engine-side; these tests pin the
+ *    client half.)
  */
 
 import { describe, expect, it } from "vitest";
@@ -15,35 +19,58 @@ import { describe, expect, it } from "vitest";
 import type { ActivityEvent } from "../types";
 import { describeChanges, describeEvent, isAttributable } from "./activity";
 
+const ALICE = "a".repeat(64);
+const BOB = "b".repeat(64);
+
 const ev = (over: Partial<ActivityEvent> = {}): ActivityEvent => ({
   seq: 1,
   doc_id: "doc1",
   reff: "ENG-1",
   kind: "edited",
   changes: [],
-  actor: "a".repeat(64),
-  actor_nick: "alice",
+  actor: ALICE,
+  // Empty, mirroring the durable-history feed. Local Activity-feed ops still
+  // populate it, which the fallback below covers.
+  actor_nick: "",
   text: "",
   ts: 1000,
   collision: false,
   ...over,
 });
 
+/** A stand-in for the UI's member resolver: known keys get names, others a stub. */
+const resolve = (key: string) => (key === ALICE ? "alice" : key === BOB ? "bob" : "someone");
+
 describe("attribution", () => {
-  it("never names an actor for a synced event, even though the DTO carries one", () => {
-    // The trap: `actor_nick` is populated and looks perfectly usable. It is the
-    // *local* node's nick, and the change was someone else's.
-    const e = ev({ kind: "synced", actor_nick: "alice" });
-    expect(e.actor_nick).toBe("alice"); // the DTO says so…
-    expect(describeEvent(e).actor).toBeNull(); // …and we decline to repeat it
-    expect(describeEvent(e).phrase).toBe("changed by a peer");
+  it("never names a synced event, even with a resolver that would name its key", () => {
+    // The load-bearing invariant. `actor` is the local node's key, which the
+    // resolver *could* name — that is precisely the trap.
+    const e = ev({ kind: "synced", actor: ALICE });
+    expect(describeEvent(e, resolve).actor).toBeNull();
+    expect(describeEvent(e, resolve).phrase).toBe("changed by a peer");
   });
 
-  it("names the actor for an operation this node really performed", () => {
-    expect(describeEvent(ev({ kind: "started" })).actor).toBe("alice");
+  it("resolves the real committer from `actor`, not `actor_nick`", () => {
+    // The durable-history shape: actor_nick empty, actor is the key. Reading
+    // actor_nick (as the client used to) would show no name; resolving actor works.
+    const e = ev({ kind: "edited", actor: BOB, actor_nick: "" });
+    expect(describeEvent(e, resolve).actor).toBe("bob");
   });
 
-  it("treats an empty nick as no name rather than printing a blank", () => {
+  it("attributes a teammate's change to the teammate, not the viewer", () => {
+    // The whole point of durable, attributed history: a change alice made shows as
+    // alice on bob's machine, because her key travels with the op.
+    const e = ev({ kind: "started", actor: ALICE });
+    expect(describeEvent(e, resolve).actor).toBe("alice");
+  });
+
+  it("falls back to actor_nick when no resolver is supplied", () => {
+    // The Activity feed's local ops still populate actor_nick; a caller without a
+    // member list (or a defensive one) should still get a name.
+    expect(describeEvent(ev({ actor_nick: "alice" })).actor).toBe("alice");
+  });
+
+  it("yields no name when neither a resolver nor a nick is available", () => {
     expect(describeEvent(ev({ actor_nick: "" })).actor).toBeNull();
     expect(describeEvent(ev({ actor_nick: "   " })).actor).toBeNull();
   });
@@ -57,8 +84,6 @@ describe("attribution", () => {
 
 describe("phrasing", () => {
   it("supplies words for the kinds the daemon sends bare", () => {
-    // These arrive with `text: ""` and `changes: []` — only `kind` is populated,
-    // so a UI that renders the struct literally prints a name and nothing else.
     for (const kind of ["assigned", "unassigned", "labeled", "moved", "deleted"]) {
       const { phrase } = describeEvent(ev({ kind }));
       expect(phrase).not.toBe("");
@@ -72,11 +97,11 @@ describe("phrasing", () => {
   });
 
   it("falls back to the raw kind rather than dropping an event it doesn't know", () => {
-    // `Request` is add-only (S§9 rule 1): a future verb will show up here before
-    // this table learns about it. Showing "frobnicated" beats showing nothing.
     expect(describeEvent(ev({ kind: "frobnicated" })).phrase).toBe("frobnicated");
   });
+});
 
+describe("changes", () => {
   it("renders changes as from → to", () => {
     const e = ev({ changes: [{ field: "status", from: "backlog", to: "done" }] });
     expect(describeChanges(e)).toBe("status: backlog → done");
@@ -85,5 +110,25 @@ describe("phrasing", () => {
   it("shows an em dash for a field that had no previous value", () => {
     const e = ev({ changes: [{ field: "priority", from: null, to: "high" }] });
     expect(describeChanges(e)).toBe("priority: — → high");
+  });
+
+  it("drops no-op changes — the durable `created` event lists empty containers", () => {
+    // A `created` event projects every field; ones created empty read `— → —`
+    // (comments, an empty description) and are noise that hides the real change.
+    const e = ev({
+      kind: "created",
+      changes: [
+        { field: "status", from: null, to: "backlog" },
+        { field: "comments", from: null, to: null },
+        { field: "description", from: null, to: null },
+      ],
+    });
+    expect(describeChanges(e)).toBe("status: — → backlog");
+  });
+
+  it("keeps a change whose value genuinely changed to empty", () => {
+    // `x → —` is a real transition (a field cleared); only `— → —` is a no-op.
+    const e = ev({ changes: [{ field: "title", from: "old", to: null }] });
+    expect(describeChanges(e)).toBe("title: old → —");
   });
 });

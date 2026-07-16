@@ -24,6 +24,14 @@
 //! `types.ts` outright (ts-rs) and diffing a regeneration in CI, exactly as the
 //! `viewer` job already does for the asset bundle, is the better end state; this is
 //! the cheap half that makes the current file honest in the meantime.
+//!
+//! **Scope, and its blind spot.** This guards the *write* surface — Request field
+//! *names* — and nothing more. It does not check *Response* shapes, and it does not
+//! check the *semantics* of a field (what value the daemon puts there). That gap is
+//! not hypothetical: durable history changed `ActivityEvent.actor`/`actor_nick`
+//! semantics under the viewer and this test was blind to it. The behavioral pin for
+//! that class lives in `tracker.rs::tests::history_is_the_contract_the_viewer_reads`
+//! — it drives a real tracker and asserts the read-DTO values the client depends on.
 
 use std::collections::{BTreeMap, BTreeSet};
 

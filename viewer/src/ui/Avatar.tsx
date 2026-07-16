@@ -3,6 +3,21 @@ import { User } from "lucide-react";
 import type { MemberDto } from "../types";
 import { avatarColor } from "./colors";
 import { cn } from "./primitives";
+import { short } from "./time";
+
+/**
+ * A member's display name — the one naming rule, shared.
+ *
+ * `you` for yourself, the local petname if one is set, the key's head otherwise.
+ * Never a nick off the wire: `MemberDto.alias` is local and never synced, which is
+ * exactly why it can be trusted (Members.tsx). Shared rather than re-declared,
+ * because the timeline, the activity feed, and the detail footer all name the same
+ * people and must not drift on how.
+ */
+export function memberName(key: string, member: MemberDto | undefined): string {
+  if (member?.me) return "you";
+  return member?.alias.trim() || short(key);
+}
 
 /**
  * A member, as a circle.

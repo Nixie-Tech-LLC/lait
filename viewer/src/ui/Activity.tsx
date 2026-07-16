@@ -2,8 +2,9 @@ import { useEffect, useState } from "react";
 import { AlertTriangle } from "lucide-react";
 
 import { rpc } from "../api";
-import { describeChanges, describeEvent } from "../core/activity";
-import type { ActivityEvent } from "../types";
+import { describeChanges, describeEvent, type NameResolver } from "../core/activity";
+import type { ActivityEvent, MemberDto } from "../types";
+import { memberName } from "./Avatar";
 import { when } from "./time";
 
 /**
@@ -18,24 +19,28 @@ import { when } from "./time";
  * fields is *one* entry with three changes rather than three entries. The feed's
  * granularity is the command surface's, by design.
  *
- * **Who did it is `core/activity.ts`'s call, not this file's.** This used to render
- * `{actor_nick} {text}` straight from the struct, which was wrong twice: most kinds
- * carry no `text` at all (so the row was a bare name), and `actor` is stamped with
- * the *local* identity on every event — including `synced`, the one that fires when
- * a teammate's change arrives. The feed was crediting you with other people's edits.
+ * **Who did it is `core/activity.ts`'s call, not this file's.** This feed is the
+ * per-session ring: local ops stamp their own key, and a remote change arrives as one
+ * synthetic `synced` event stamped with *this* node's key — so `synced` is rendered
+ * without a name, or the feed would credit you with a teammate's edit. Names for the
+ * rest are resolved from the member list, same rule as the durable per-issue history.
  */
 export function Activity({
   spaceId,
+  members,
   revision,
   onError,
   onOpen,
 }: {
   spaceId: string;
+  members: MemberDto[];
   revision: number;
   onError: (m: string) => void;
   onOpen: (reff: string) => void;
 }) {
   const [events, setEvents] = useState<ActivityEvent[] | null>(null);
+  const resolveName: NameResolver = (key) =>
+    memberName(key, members.find((m) => m.key === key));
 
   useEffect(() => {
     let alive = true;
@@ -69,7 +74,7 @@ export function Activity({
           <span className="text-mute w-20 shrink-0 truncate font-mono text-xs tabular-nums">
             {e.reff}
           </span>
-          <Line event={e} />
+          <Line event={e} resolveName={resolveName} />
           {/* A concurrent overwrite is worth flagging but never worth blocking on
               (A§9): last-writer-wins already resolved it; you just get told. */}
           {e.collision && (
@@ -85,8 +90,8 @@ export function Activity({
   );
 }
 
-function Line({ event }: { event: ActivityEvent }) {
-  const { actor, phrase } = describeEvent(event);
+function Line({ event, resolveName }: { event: ActivityEvent; resolveName: NameResolver }) {
+  const { actor, phrase } = describeEvent(event, resolveName);
   const changes = describeChanges(event);
   return (
     <span className="min-w-0 flex-1">

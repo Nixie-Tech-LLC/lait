@@ -1,9 +1,20 @@
 import { useCallback, useEffect, useState } from "react";
 import QRCode from "qrcode";
-import { Check, Copy, KeyRound, Link2, Pencil, ShieldCheck, UserPlus, X } from "lucide-react";
+import {
+  Check,
+  Copy,
+  KeyRound,
+  Link2,
+  Pencil,
+  ShieldAlert,
+  ShieldCheck,
+  UserPlus,
+  X,
+} from "lucide-react";
 
 import { ConfirmRequired, rpc } from "../api";
-import type { JoinRequestDto, MemberDto } from "../types";
+import type { JoinRequestDto, MemberDto, MemberLogEntry } from "../types";
+import { memberName } from "./Avatar";
 import { when } from "./time";
 import * as ask from "./dialogs";
 import { Button, IconButton } from "./primitives";
@@ -34,6 +45,7 @@ export function Members({
 }) {
   const [members, setMembers] = useState<MemberDto[]>([]);
   const [requests, setRequests] = useState<JoinRequestDto[]>([]);
+  const [log, setLog] = useState<MemberLogEntry[]>([]);
   const [ticket, setTicket] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
@@ -52,6 +64,14 @@ export function Members({
       // A non-admin can't list requests, and that's not an error worth shouting
       // about — they simply don't get the section.
       setRequests([]);
+    }
+    try {
+      const l = await rpc(spaceId, { cmd: "member_log" });
+      if (l.kind === "member_log") setLog(l.entries);
+    } catch {
+      // The audit log is a nicety, not load-bearing for the roster; a failure just
+      // hides the section rather than breaking the page.
+      setLog([]);
     }
   }, [spaceId, onError]);
 
@@ -225,8 +245,63 @@ export function Members({
         {isAdmin && !readOnly && (
           <Invite spaceId={spaceId} ticket={ticket} setTicket={setTicket} onError={onError} />
         )}
+
+        {log.length > 0 && <MemberLog entries={log} members={members} />}
       </div>
     </div>
+  );
+}
+
+/**
+ * The membership audit log.
+ *
+ * The one feed in lait whose author is **cryptographically verified**: `actor`
+ * signed the op, and the signature covers it (unlike in-doc activity, which is
+ * advisory). That is why it belongs here and not in the activity feed — it is the
+ * record of who changed *access*, which is exactly the thing you want to be sure of.
+ *
+ * An `authorized: false` row is shown, not hidden. A rejected op is a real event —
+ * someone tried something the ACL refused — and quietly dropping it would defeat the
+ * point of having an audit trail at all.
+ */
+function MemberLog({ entries, members }: { entries: MemberLogEntry[]; members: MemberDto[] }) {
+  const name = (key: string) => memberName(key, members.find((m) => m.key === key));
+  const PHRASE: Record<string, string> = {
+    add_member: "added",
+    remove_member: "removed",
+    set_role: "set the role of",
+    add_agent: "sponsored agent",
+    unknown: "(unrecognized op)",
+  };
+
+  return (
+    <section>
+      <h2 className="text-mute mb-2 text-2xs font-semibold tracking-wider uppercase">
+        Access log · {entries.length}
+      </h2>
+      <ul className="border-line divide-line divide-y rounded border">
+        {/* Newest first — an audit log answers "what just changed access". */}
+        {[...entries].reverse().map((e) => (
+          <li key={e.op} className="flex items-center gap-2 p-2.5 text-sm">
+            <span className="min-w-0 flex-1">
+              <span className="font-medium">{name(e.actor)}</span>{" "}
+              <span className="text-dim">{PHRASE[e.kind] ?? e.kind}</span>
+              {e.subject && <span className="font-medium"> {name(e.subject)}</span>}
+              {e.role && <span className="text-mute"> as {e.role}</span>}
+            </span>
+            {!e.authorized && (
+              <span
+                className="text-danger flex items-center gap-1 text-2xs"
+                title="Replay rejected this op as unauthorized or undecodable"
+              >
+                <ShieldAlert className="size-3" />
+                rejected
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 

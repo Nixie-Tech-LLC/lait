@@ -3899,4 +3899,85 @@ mod tests {
             assert!(dirty.is_none());
         }
     }
+
+    /// The read contract the **web viewer** depends on, pinned so an engine change
+    /// can't silently rot it.
+    ///
+    /// This exists because it already happened once. The engine moved per-issue
+    /// history from a session ring onto the durable oplog, which changed how an
+    /// `ActivityEvent` attributes: `actor` became the real per-op key and
+    /// `actor_nick` went empty. The viewer read `actor_nick` for the display name,
+    /// so every history row lost its author — and nothing caught it, because
+    /// `tests/viewer_parity.rs` guards *Request field names*, never *Response
+    /// semantics*. This is the missing half: a behavioral pin on the values the
+    /// client reads. If one of these assertions fails, a viewer that depends on it
+    /// (`viewer/src/core/activity.ts`) needs updating in the same change.
+    #[test]
+    fn history_is_the_contract_the_viewer_reads() {
+        let mut n = new_node();
+        with_project(&mut n.tracker);
+        let reff = new_issue(&mut n.tracker, "fix login");
+        n.tracker.handle(Request::IssueEdit {
+            reff: reff.clone(),
+            title: None,
+            status: Some("in_progress".into()),
+            priority: None,
+            description: None,
+        });
+        n.tracker.handle(Request::Comment {
+            reff: reff.clone(),
+            body: "on it".into(),
+        });
+
+        let (resp, _) = n.tracker.handle(Request::History { reff });
+        let events = match resp {
+            Response::Activity { events, .. } => events,
+            other => panic!("History must reply Activity, got {other:?}"),
+        };
+        assert!(
+            !events.is_empty(),
+            "a created+edited+commented issue has history"
+        );
+
+        for e in &events {
+            // 1. Attribution travels in `actor` (a key the client resolves), NOT in
+            //    `actor_nick`. The viewer's describeEvent resolves `actor`; if this
+            //    flips, it shows no name. This is the exact regression, pinned.
+            assert!(
+                !e.actor_nick.is_empty() || e.actor.is_some(),
+                "event {:?} has neither actor nor actor_nick — viewer would show no author",
+                e.kind
+            );
+            if let Some(actor) = &e.actor {
+                assert_eq!(
+                    actor.as_str().len(),
+                    64,
+                    "actor must be a full key the viewer can resolve to a member: {actor:?}"
+                );
+            }
+
+            // 2. Durable history carries real timestamps (the viewer renders `when(ts)`).
+            assert_ne!(
+                e.ts, 0,
+                "history event {:?} has ts 0 — not a durable op",
+                e.kind
+            );
+
+            // 3. No synthetic `synced` in per-issue history. The viewer's
+            //    synced->no-name special case is for the workspace Activity feed
+            //    only; a `synced` here would make it drop a real author.
+            assert_ne!(
+                e.kind, "synced",
+                "per-issue history must be real ops, not a synced marker"
+            );
+        }
+
+        // 4. The states the viewer walks are present as real ops, each attributed.
+        let created = events.iter().find(|e| e.kind == "created");
+        assert!(created.is_some(), "history includes the `created` op");
+        assert!(
+            created.unwrap().actor.is_some(),
+            "even `created` carries a resolvable actor — the viewer names it"
+        );
+    }
 }

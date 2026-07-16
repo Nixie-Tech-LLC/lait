@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, CircleDot, Info, Trash2 } from "lucide-react";
+import { AlertTriangle, Ban, CircleDot, CornerDownRight, GitMerge, Info, Trash2 } from "lucide-react";
 
 import { rpc } from "../api";
-import { describeChanges, describeEvent } from "../core/activity";
+import { describeChanges, describeEvent, type NameResolver } from "../core/activity";
 import type { Field as PredictField } from "../core/overlay";
 import type { IssueField } from "../core/registry";
 import {
+  type GraphView,
+  type LinkDto,
+  type Row,
   PRIORITY_ORDER,
   tsToDate,
   type ActivityEvent,
@@ -16,7 +19,7 @@ import {
   type ProjectDto,
   type WorkflowState,
 } from "../types";
-import { Avatar, AvatarStack } from "./Avatar";
+import { Avatar, AvatarStack, memberName as nameOf } from "./Avatar";
 import { catalogColor } from "./colors";
 import { PriorityIcon, StatusIcon } from "./icons";
 import { Combobox } from "./Picker";
@@ -49,6 +52,7 @@ export function IssueDetail({
   onError,
   onDelete,
   onPredict,
+  onNavigate,
   revision,
 }: {
   spaceId: string;
@@ -66,11 +70,14 @@ export function IssueDetail({
   onDelete: (reff: string) => void;
   /** Predict `(doc, field)` locally, then send. The doorbell retires the guess. */
   onPredict: (doc: string, field: PredictField, value: string, send: () => Promise<unknown>) => void;
+  /** Select another issue — following a graph edge (parent, sub-issue, blocker). */
+  onNavigate: (reff: string) => void;
   /** Bumped by the doorbell; re-reads without this pane knowing why. */
   revision: number;
 }) {
   const [issue, setIssue] = useState<IssueView | null>(null);
   const [events, setEvents] = useState<ActivityEvent[]>([]);
+  const [graph, setGraph] = useState<GraphView | null>(null);
   const [draft, setDraft] = useState("");
   const [comment, setComment] = useState("");
   const titleRef = useRef<HTMLTextAreaElement>(null);
@@ -82,11 +89,12 @@ export function IssueDetail({
         // Both halves of the story, in one trip. `history` is a separate `Request`
         // because the activity ring is not part of the issue document — see the
         // Timeline note on what that costs.
-        const [view, hist] = await Promise.all([
+        const [view, hist, gr] = await Promise.all([
           rpc(spaceId, { cmd: "issue_view", reff }),
-          // A failed history must not take the issue down with it: the pane is
-          // still useful without a timeline, and the ring is the expendable half.
+          // A failed history/graph must not take the issue down with it: the pane is
+          // still useful without them, and both are secondary to the issue itself.
           rpc(spaceId, { cmd: "history", reff }).catch(() => null),
+          rpc(spaceId, { cmd: "issue_graph", reff }).catch(() => null),
         ]);
         if (!alive) return;
         if (view.kind === "issue") {
@@ -94,6 +102,7 @@ export function IssueDetail({
           setDraft(view.title);
         }
         setEvents(hist?.kind === "activity" ? hist.events : []);
+        setGraph(gr?.kind === "graph" ? gr : null);
       } catch (e) {
         if (alive) onError(e instanceof Error ? e.message : String(e));
       }
@@ -393,6 +402,8 @@ export function IssueDetail({
           onSave={(description) => void edit({ description })}
         />
 
+        {graph && <Relations graph={graph} onNavigate={onNavigate} />}
+
         <Timeline events={events} comments={issue.comments} memberOf={memberOf} />
 
         {!readOnly && (
@@ -427,19 +438,6 @@ export function IssueDetail({
   );
 }
 
-/**
- * A member's display name.
- *
- * `you` for yourself, the petname if one is set, the key's head otherwise. Never a
- * nick off the wire: `MemberDto.alias` is local and never synced, which is the
- * whole reason it can be trusted (Members.tsx).
- */
-function nameOf(key: string, m: MemberDto | undefined): string {
-  if (m?.me) return "you";
-  const alias = m?.alias.trim();
-  return alias || short(key);
-}
-
 /** A property row. The `group/prop` is what reveals the trigger's chevron. */
 function Prop({ label, children }: { label: string; children: React.ReactNode }) {
   return (
@@ -463,6 +461,148 @@ function LabelChip({ name, labels }: { name: string; labels: LabelDto[] }) {
   );
 }
 
+/**
+ * The issue graph — parent, sub-issues, blockers, links — read from `GraphView`.
+ *
+ * Read-only for now: every edge here is navigable (click to open that issue), which
+ * is the thing that was impossible before — the structure existed in the engine and
+ * the browser couldn't see it. *Creating* edges (`IssueLink`/`IssueParent`) wants an
+ * issue-search picker that doesn't exist yet, so it's a deliberate follow-up rather
+ * than a half-built control here.
+ *
+ * `blocked_by` is the daemon's transitive computation (issues that block this one and
+ * are still open), not just direct `blocks` edges — so it's shown as its own line,
+ * separate from the raw links, and only when non-empty because "not blocked" is the
+ * normal case and deserves no row.
+ */
+function Relations({ graph, onNavigate }: { graph: GraphView; onNavigate: (reff: string) => void }) {
+  const blocks = graph.links.filter((l) => l.kind === "blocks");
+  const related = graph.links.filter((l) => l.kind === "relates");
+  const dupes = graph.links.filter((l) => l.kind === "duplicates");
+
+  const empty =
+    !graph.parent &&
+    graph.children.length === 0 &&
+    graph.blocked_by.length === 0 &&
+    graph.links.length === 0;
+  if (empty) return null;
+
+  return (
+    <section className="border-line flex flex-col gap-3 border-t pt-3">
+      {graph.parent && (
+        <RelGroup label="Parent">
+          <RelRow row={graph.parent} icon={<GitMerge className="size-3" />} onNavigate={onNavigate} />
+        </RelGroup>
+      )}
+
+      {graph.children.length > 0 && (
+        <RelGroup label={`Sub-issues · ${graph.children.length}`}>
+          {graph.children.map((r) => (
+            <RelRow
+              key={r.reff}
+              row={r}
+              icon={<CornerDownRight className="size-3" />}
+              onNavigate={onNavigate}
+            />
+          ))}
+        </RelGroup>
+      )}
+
+      {graph.blocked_by.length > 0 && (
+        <RelGroup label="Blocked by" tone="warn">
+          {graph.blocked_by.map((r) => (
+            <RelRow
+              key={r.reff}
+              row={r}
+              icon={<Ban className="text-warn size-3" />}
+              onNavigate={onNavigate}
+            />
+          ))}
+        </RelGroup>
+      )}
+
+      {blocks.length > 0 && <LinkGroup label="Blocks" links={blocks} onNavigate={onNavigate} />}
+      {related.length > 0 && (
+        <LinkGroup label="Related" links={related} onNavigate={onNavigate} />
+      )}
+      {dupes.length > 0 && <LinkGroup label="Duplicates" links={dupes} onNavigate={onNavigate} />}
+    </section>
+  );
+}
+
+function RelGroup({
+  label,
+  tone,
+  children,
+}: {
+  label: string;
+  tone?: "warn";
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="flex flex-col gap-1">
+      <h3
+        className={`text-2xs font-semibold tracking-wider uppercase ${tone === "warn" ? "text-warn" : "text-mute"}`}
+      >
+        {label}
+      </h3>
+      {children}
+    </div>
+  );
+}
+
+/** A `relates`/`duplicates` edge can point either way; `direction` is `in`/`out`. */
+function LinkGroup({
+  label,
+  links,
+  onNavigate,
+}: {
+  label: string;
+  links: LinkDto[];
+  onNavigate: (reff: string) => void;
+}) {
+  return (
+    <RelGroup label={label}>
+      {links.map((l) => (
+        <RelRow
+          key={`${l.direction}-${l.row.reff}`}
+          row={l.row}
+          icon={
+            <span className="text-mute text-2xs" title={l.direction === "in" ? "incoming" : "outgoing"}>
+              {l.direction === "in" ? "←" : "→"}
+            </span>
+          }
+          onNavigate={onNavigate}
+        />
+      ))}
+    </RelGroup>
+  );
+}
+
+/** One navigable edge: click opens that issue in this same pane. */
+function RelRow({
+  row,
+  icon,
+  onNavigate,
+}: {
+  row: Row;
+  icon: React.ReactNode;
+  onNavigate: (reff: string) => void;
+}) {
+  return (
+    <button
+      onClick={() => onNavigate(row.reff)}
+      className="hover:bg-hover -mx-1 flex items-center gap-2 rounded px-1 py-0.5 text-left text-sm"
+    >
+      <span className="flex size-3 shrink-0 items-center justify-center">{icon}</span>
+      <span className="text-mute w-16 shrink-0 truncate font-mono text-2xs tabular-nums">
+        {row.key_alias ?? row.reff}
+      </span>
+      <span className="min-w-0 flex-1 truncate">{row.title}</span>
+    </button>
+  );
+}
+
 type Entry =
   | { at: number; order: number; kind: "comment"; comment: CommentDto }
   | { at: number; order: number; kind: "event"; event: ActivityEvent };
@@ -470,22 +610,25 @@ type Entry =
 /**
  * Comments and activity, in one chronological stream.
  *
- * The two halves come from different places and are trustworthy to different
- * degrees, which is the whole design of this component:
+ * The two halves come from different places, and the events one changed under this
+ * pane: `Request::History` now reads the issue's oplog **on disk** (`engine::history`)
+ * rather than a session ring. So the timeline is durable — it survives daemon
+ * restarts — and every event carries the *real* committer in `actor`, a teammate
+ * included. The daemon leaves `actor_nick` empty, so the name is resolved here
+ * against the member list (see `describeEvent`); reading `actor_nick` — as this used
+ * to — now shows nothing.
  *
- * - **Comments come from the issue document.** They sync, they carry a real author,
- *   and they are complete on every node.
- * - **Events come from the activity ring** — in memory, per daemon session, dead on
- *   restart (SCHEMA.md §43). They are this node's log of its own operations.
+ * - **Comments come from the issue document.** They sync and carry a real author.
+ * - **Events come from the durable oplog.** Real actors, real timestamps, no
+ *   synthetic `synced` marker (that belongs to the workspace Activity feed).
  *
- * So `commented` events are dropped: a comment is already rendered from the
- * document, and the event is only ever the local half of the same fact. Rendering
- * both double-prints every comment you wrote and none that anyone else did.
+ * `commented` events are dropped: a comment is already rendered from the document,
+ * so keeping its event too would double-print it.
  *
- * The visual weight follows the same split. A comment is a card with a face on it;
- * an event is one muted line. That is Better Stack's timeline and Linear's, and it
- * is right for the same reason in both: the events are context, the comments are the
- * conversation, and a timeline that draws them alike makes you read the furniture.
+ * The visual weight follows the split. A comment is a card with a face; an event is
+ * one muted line. That is Better Stack's timeline and Linear's, for the same reason
+ * in both: the events are context, the comments are the conversation, and drawing
+ * them alike makes you read the furniture.
  */
 function Timeline({
   events,
@@ -496,6 +639,9 @@ function Timeline({
   comments: CommentDto[];
   memberOf: (key: string) => MemberDto | undefined;
 }) {
+  // The naming policy lives here, where the member list is: a key becomes an alias,
+  // "you", or a short prefix. `describeEvent` only decides *whether* there is a name.
+  const resolveName: NameResolver = (key) => nameOf(key, memberOf(key));
   const entries = useMemo<Entry[]>(() => {
     const out: Entry[] = [
       ...comments.map((c, i) => ({ at: c.ts, order: i, kind: "comment" as const, comment: c })),
@@ -514,10 +660,10 @@ function Timeline({
       <h3 className="text-mute flex items-center gap-1.5 text-2xs font-semibold tracking-wider uppercase">
         Activity
         {comments.length > 0 && <span className="normal-case">· {comments.length} comments</span>}
-        {/* Said once, quietly, rather than not at all. The ring is not an audit
-            log and the pane should not imply it is one. */}
+        {/* Said once, quietly. This feed is durable and attributed now — worth
+            saying, because it wasn't before. */}
         <span
-          title="Comments are part of the issue and sync to everyone. The rest is this daemon's log since it started — a teammate's edit shows up only as 'changed by a peer', because the schema doesn't record who made it."
+          title="This issue's full history, read from its change log on disk — it survives restarts and shows who made each change. (The workspace-wide Activity view is a lighter, per-session feed.)"
           className="cursor-help"
         >
           <Info className="size-3" />
@@ -534,7 +680,7 @@ function Timeline({
             member={memberOf(entry.comment.author)}
           />
         ) : (
-          <Event key={`e${entry.order}`} event={entry.event} />
+          <Event key={`e${entry.order}`} event={entry.event} resolveName={resolveName} />
         ),
       )}
     </section>
@@ -568,8 +714,8 @@ function Comment({ comment: c, member }: { comment: CommentDto; member: MemberDt
   );
 }
 
-function Event({ event: e }: { event: ActivityEvent }) {
-  const { actor, phrase } = describeEvent(e);
+function Event({ event: e, resolveName }: { event: ActivityEvent; resolveName: NameResolver }) {
+  const { actor, phrase } = describeEvent(e, resolveName);
   const changes = describeChanges(e);
 
   return (

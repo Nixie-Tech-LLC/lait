@@ -878,7 +878,13 @@ export function App() {
               onError={setError}
             />
           ) : view === "activity" ? (
-            <Activity spaceId={current} revision={revision} onError={setError} onOpen={api.select} />
+            <Activity
+              spaceId={current}
+              members={members}
+              revision={revision}
+              onError={setError}
+              onOpen={api.select}
+            />
           ) : shown && view === "board" ? (
             <Board
               board={shown}
@@ -930,6 +936,7 @@ export function App() {
               onError={setError}
               onDelete={api.deleteIssue}
               onPredict={api.predict}
+              onNavigate={api.select}
             />
           </Panel>
         </>

@@ -126,6 +126,33 @@ export interface FieldChange {
   to: string | null;
 }
 
+/** One edge in the issue graph — `dto.rs` `LinkDto`. */
+export interface LinkDto {
+  /** `blocks` | `relates` | `duplicates`. */
+  kind: string;
+  /** `out` | `in` — whether this issue is the source or the target of the edge. */
+  direction: string;
+  row: Row;
+}
+
+/**
+ * An issue's graph neighborhood — `dto.rs` `GraphView`, reply to `IssueGraph`.
+ *
+ * Read from the catalog *structure* doc without opening any issue doc, so it is
+ * cheap. `parent`/`children` are the sub-issue tree (a tree-move CRDT, so concurrent
+ * reparents can't converge to a cycle); `blocked_by` is the transitive set of open
+ * issues that block this one, computed by the daemon (not just direct `blocks` edges).
+ */
+export interface GraphView {
+  schema_version: number;
+  reff: string;
+  doc_id: string;
+  parent: Row | null;
+  children: Row[];
+  links: LinkDto[];
+  blocked_by: Row[];
+}
+
 export interface ActivityEvent {
   seq: number;
   doc_id: string | null;
@@ -169,6 +196,29 @@ export interface MemberDto {
   me: boolean;
   /** Local petname; never synced. The trusted half of the identity model. */
   alias: string;
+}
+
+/**
+ * One entry in the membership audit log — `dto.rs` `MemberLogEntry`.
+ *
+ * Unlike in-doc activity attribution (advisory, non-goal 6), `actor` here is
+ * **verified**: the signature covers the op, so this is who really signed it.
+ * `authorized` is the replay verdict — `false` means the op was rejected as
+ * unauthorized or couldn't be decoded, which is a real thing to be able to see.
+ */
+export interface MemberLogEntry {
+  /** The op's content-address (its signed-DAG node id). */
+  op: string;
+  /** The signing author's key — verified, not claimed. */
+  actor: string;
+  /** `add_member` | `remove_member` | `set_role` | `add_agent` | `unknown`. */
+  kind: string;
+  /** The key the op acts on. Absent for an undecodable op. */
+  subject?: string | null;
+  /** `admin` | `member`, for role-bearing ops. */
+  role?: string | null;
+  /** Whether replay honored the op. `false` = unauthorized or undecodable. */
+  authorized: boolean;
 }
 
 export interface JoinRequestDto {
@@ -327,6 +377,7 @@ export type Request =
   | { cmd: "list"; project?: string | null; filter?: Filter }
   | { cmd: "board"; project?: string | null; project_hint?: string | null }
   | { cmd: "history"; reff: string }
+  | { cmd: "issue_graph"; reff: string }
   | { cmd: "project_new"; name: string; key: string }
   | { cmd: "project_list" }
   | { cmd: "label_new"; name: string; color?: string | null }
@@ -338,6 +389,7 @@ export type Request =
   | { cmd: "key_rotate" }
   | { cmd: "members" }
   | { cmd: "member_requests" }
+  | { cmd: "member_log" }
   | { cmd: "member_approve"; who: string; as_name?: string | null }
   | { cmd: "member_alias"; who: string; name: string }
   | { cmd: "status" }
@@ -363,11 +415,13 @@ export type Response =
   | ({ kind: "issue" } & IssueView)
   | { kind: "list"; rows: Row[] }
   | ({ kind: "board" } & BoardView)
+  | ({ kind: "graph" } & GraphView)
   | { kind: "activity"; events: ActivityEvent[]; last: number }
   | { kind: "inbox"; entries: InboxEntry[]; unread: number }
   | { kind: "projects"; projects: ProjectDto[] }
   | { kind: "labels"; labels: LabelDto[] }
   | { kind: "members"; members: MemberDto[] }
+  | { kind: "member_log"; entries: MemberLogEntry[] }
   | { kind: "join_requests"; requests: JoinRequestDto[] }
   | { kind: "seeds"; seeds: SeedDto[] }
   /** A ref resolved to several — a first-class outcome (exit 2), never an error. */
