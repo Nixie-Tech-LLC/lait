@@ -1,0 +1,159 @@
+@import "tailwindcss";
+
+/**
+ * The design system — one file, and the only place a colour or a spacing value is
+ * decided.
+ *
+ * Tailwind v4's `@theme` *is* CSS custom properties: every token below emits a
+ * `--color-*` variable **and** generates the utility that reads it. So there is no
+ * second source of truth to keep in sync — `bg-raised` and `var(--color-raised)`
+ * are the same token, and a redesign is an edit to this block rather than a sweep
+ * through components.
+ *
+ * Light/dark is `light-dark()` rather than duplicated palettes. It reads from
+ * `color-scheme`, so the whole theme flips by setting one property — the media
+ * query handles the default and `[data-theme]` handles a manual override, both
+ * without restating a single colour.
+ */
+
+@theme {
+  /* Semantic, not literal: components ask for `raised` or `line`, never a hex.
+     Renaming a shade must not mean touching a component. */
+  --color-bg: light-dark(#ffffff, #0b0b0d);
+  --color-raised: light-dark(#fafafa, #131316);
+  --color-hover: light-dark(#f2f2f4, #1a1a1f);
+  --color-active: light-dark(#e9e9ee, #202027);
+  --color-line: light-dark(#e6e6ea, #26262d);
+  --color-line-strong: light-dark(#d2d2d9, #34343d);
+
+  --color-fg: light-dark(#17171a, #e9e9ec);
+  --color-dim: light-dark(#5c5c66, #a0a0aa);
+  --color-mute: light-dark(#8b8b95, #6e6e78);
+
+  --color-accent: light-dark(#2f6bff, #5b8cff);
+  --color-accent-fg: #ffffff;
+  --color-danger: light-dark(#d1242f, #f0616d);
+  --color-ok: light-dark(#1a7f37, #3fb950);
+  --color-warn: light-dark(#9a6700, #d29922);
+
+  /* Priority + status accents, so a glyph never hard-codes a colour. */
+  --color-urgent: light-dark(#d1242f, #f0616d);
+  --color-high: light-dark(#c2410c, #fb923c);
+  --color-medium: light-dark(#a16207, #facc15);
+  --color-low: light-dark(#64748b, #94a3b8);
+
+  /* A 4px rhythm. `p-2` is 8px, `gap-3` is 12px — the scale the tracker's density
+     depends on; rows are tight and the spacing has to be predictable. */
+  --spacing: 4px;
+
+  --radius-sm: 4px;
+  --radius-DEFAULT: 6px;
+  --radius-lg: 10px;
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  /* Dense-UI type scale: 13px is the body size a tracker actually reads at. */
+  --text-2xs: 10px;
+  --text-2xs--line-height: 14px;
+  --text-xs: 11px;
+  --text-xs--line-height: 16px;
+  --text-sm: 12px;
+  --text-sm--line-height: 16px;
+  --text-base: 13px;
+  --text-base--line-height: 20px;
+  --text-lg: 15px;
+  --text-lg--line-height: 22px;
+
+  --ease-out: cubic-bezier(0.2, 0, 0.2, 1);
+  --shadow-overlay: light-dark(0 8px 30px rgb(0 0 0 / 0.12), 0 8px 30px rgb(0 0 0 / 0.5));
+}
+
+/* Dark by default; the OS decides unless the user overrode it. `color-scheme` is
+   the single switch every `light-dark()` above reads — and it also fixes native
+   scrollbars and form controls for free, which a class-based dark mode does not. */
+:root {
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+  }
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-bg text-fg font-sans text-base antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* A keyboard-first app must never hide focus — but it should not paint rings on
+     mouse clicks either. `:focus-visible` is exactly that distinction, and it is
+     why no component sets `outline: none`. */
+  :focus-visible {
+    @apply outline-accent rounded-sm outline-2 outline-offset-2;
+  }
+
+  /*
+    Buttons get the hand.
+
+    Nothing gives them one: `<button>` inherits `cursor: auto`, which resolves to
+    the arrow, and Tailwind's preflight deliberately doesn't touch it (it follows
+    the UA default rather than overriding it). Every app adds this itself.
+
+    Here rather than in the Button variant, because the rule is about *anything
+    clickable*, not about one component: Radix renders triggers as bare `<button>`
+    elements, cmdk and the dropdowns render `[role]`-carrying divs, and none of
+    them route through our `cva`. A component-level `cursor-pointer` would be a
+    rule each new control has to remember — and the one that forgets is the one
+    that feels broken.
+
+    Scoped to enabled controls only. A disabled button offering a hand is the UI
+    promising something it won't do. (Our `Button` also sets
+    `disabled:pointer-events-none`, so the hand can't even be provoked.)
+
+    Two exceptions are deliberate, and both keep `cursor-default` on purpose —
+    they are not oversights to tidy up:
+
+    - **Issue rows and board cards.** Clicking one *selects*, it does not navigate.
+      Native lists don't offer a hand for selection, and a list that does reads as
+      a page of links rather than a set of records.
+    - **Menu and palette items.** Same reason, and native menus agree. These carry
+      `role="menuitem"`/`role="option"` rather than `role="button"`, so the rule
+      above doesn't reach them anyway — the explicit class states the intent.
+
+    The sidebar's space entries *do* get the hand: switching space is navigation,
+    not selection within a view.
+  */
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  label[for],
+  summary {
+    cursor: pointer;
+  }
+
+  ::selection {
+    @apply bg-accent/25;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

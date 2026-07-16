@@ -1,10 +1,13 @@
 //! lait: a local-first, peer-to-peer issue tracker.
 //!
-//! One binary, three roles:
+//! One binary, four roles:
 //!   * `lait daemon` runs the node (endpoint, gossip room, presence, and —
 //!     the tracker core — the Loro-CRDT catalog + issue documents, git-backed).
-//!   * `lait <cmd>` / `lait tui` are CLI/TUI clients driving the daemon
-//!     over a local IPC control channel.
+//!   * `lait <cmd>` is the CLI client, driving the daemon over a local IPC
+//!     control channel.
+//!   * `lait serve` binds that same façade to loopback HTTP + SSE so a browser
+//!     can be a client too ([`serve`], `docs/SERVE.md`). The only surface global
+//!     to the machine: it supervises one daemon per space.
 //!   * `lait mcp` exposes the same Layer-B façade as MCP tools for an agent.
 //!
 //! The crate is split lib + bin so integration tests, doctests, and the MCP/DTO
@@ -34,6 +37,7 @@ pub mod inbox;
 pub mod index;
 pub mod install;
 pub mod issue;
+pub mod list_picker;
 pub mod loro_ext;
 pub mod mcp;
 pub mod members_ui;
@@ -42,8 +46,8 @@ pub mod node;
 pub mod presence;
 pub mod proto;
 pub mod registry;
+pub mod serve;
 pub mod store;
 pub mod sync;
 pub mod tracker;
-pub mod tui;
 pub mod workspaces;

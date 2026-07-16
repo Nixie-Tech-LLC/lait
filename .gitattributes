@@ -4,3 +4,13 @@
 *.sh text eol=lf
 # The Dockerfile is run on Linux; a CRLF can break RUN lines / shebangs.
 Dockerfile text eol=lf
+
+# The web client's build output, committed on purpose: `include_dir!` embeds it at
+# compile time so `cargo install lait` needs no npm (docs/SERVE.md). Mark it
+# generated so it collapses in diffs and stays out of language stats — review the
+# source in `viewer/`, never this. LF-pinned so the bundle is byte-identical
+# across platforms and CI's rebuild-and-diff check doesn't fire on line endings.
+src/serve/assets/** linguist-generated=true
+src/serve/assets/** text eol=lf
+# `npm ci` needs the lockfile byte-stable across platforms.
+viewer/package-lock.json text eol=lf

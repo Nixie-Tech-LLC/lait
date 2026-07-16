@@ -1,0 +1,9 @@
+node_modules
+*.tsbuildinfo
+.vite
+*.log
+
+# NOTE: the build output is NOT ignored, and it is not here — vite writes it to
+# `../src/serve/assets`, which is committed on purpose. `cargo install lait` must
+# not need npm, and the published crate excludes this directory entirely, so the
+# bundle has to live under `src/` and be in git. See docs/SERVE.md.

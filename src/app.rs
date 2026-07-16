@@ -14,7 +14,7 @@
 //! its bespoke `Special` handler (below). Completions/man still generate from the
 //! same live tree (`cmdspec::build_cli`).
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::ArgMatches;
 use clap_complete::{generate, Shell};
 
@@ -289,6 +289,19 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
             }
             return crate::cli::run(&home, Request::Status, out).await;
         }
+        // `serve` is global to the machine, not bound to one store: it reads the
+        // workspace registry and attaches each space's daemon lazily, so it must
+        // not resolve (or demand) a store in the cwd — running it from anywhere
+        // is the point.
+        Dispatch::Special(Special::Serve) => {
+            let port = m
+                .get_one::<String>("port")
+                .map(|p| p.parse::<u16>())
+                .transpose()
+                .context("--port must be a number 0-65535")?
+                .unwrap_or(crate::serve::DEFAULT_PORT);
+            return crate::serve::run(port, m.get_flag("open")).await;
+        }
         // The workspace registry + config: pure local state, no store/daemon.
         Dispatch::Special(Special::Workspaces) => {
             crate::cli::print_workspaces(out).await;
@@ -364,7 +377,19 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
             }
             // `new --start` chains the create into the work loop: file it, then
             // claim it (two honest commits = two activity rows, S§7.1).
-            if leaf.name == "new" && m.get_flag("start") {
+            //
+            // Ask for `start` in a way that can answer "there is no such arg".
+            // `leaf.name` is only the *last* path segment, so `labels new` answers
+            // to "new" as much as the top-level verb does — and `get_flag` on a
+            // leaf that never declared the arg is a panic, not a `false`. That is
+            // exactly what `lait labels new <name>` did.
+            let wants_start = m
+                .try_get_one::<bool>("start")
+                .ok()
+                .flatten()
+                .copied()
+                .unwrap_or(false);
+            if leaf.name == "new" && wants_start {
                 crate::cli::run_new_start(&home, req, out).await?;
             } else if leaf.name == "members" && !out.json && std::io::stdout().is_terminal() {
                 // Bare `lait members` in an interactive terminal opens the modal
@@ -415,7 +440,6 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
                 let out_s = install::install_mcp(client, scope, &name, print)?;
                 println!("{out_s}");
             }
-            Special::Tui => crate::tui::run(&home).await?,
             Special::Invite => {
                 let email = m.get_one::<String>("email").cloned();
                 let require_approval = m.get_flag("require_approval");
@@ -463,6 +487,7 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
             | Special::ConfigList
             | Special::Init
             | Special::Join
+            | Special::Serve
             | Special::Update => {
                 unreachable!("handled before home resolution")
             }

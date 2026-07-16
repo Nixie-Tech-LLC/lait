@@ -125,8 +125,9 @@ MP-1
 
 From there, three views: bare `lait` is your **focus** (unread inbox + what
 you're working on, in under 50 ms), `lait board` prints the columns, and
-`lait tui` is the full-screen live board. Nothing needs the network — it's
-your tracker; teammates come later (scenario 2) or never.
+`lait serve` opens your spaces in a browser — every space on this machine, live.
+Nothing needs the network — it's your tracker; teammates come later (scenario 2)
+or never.
 
 ### 2 · Two of you: onboarding is one link
 
@@ -288,7 +289,7 @@ Registries + node:
 | `labels [new <name> --color C \| ls]` | Manage the label registry |
 | `members [add \| remove \| requests \| approve \| name \| rotate-key \| ls]` | Manage E2EE membership (signed ACL); `add` seals the key, `remove` rotates it, `approve` admits a pending joiner, `name` sets a local label for a key |
 | `activity [--since N]` | Workspace-wide recent transitions |
-| `tui` | Launch the full-screen board |
+| `serve [--port N] [--open]` | Open your spaces in a browser (loopback-only) |
 | `status` · `id` · `shutdown` | Node/space status · endpoint id · stop the daemon |
 | `invite [--require-approval] [--reusable] [--ttl-hours N]` · `join <link> [--dir D]` | Invite a teammate; `join` creates the joiner's store (cwd or `--dir`) and the default pass admits them automatically (add `--require-approval` for the gated `members requests`/`members approve` flow) |
 | `who` · `watch` | Peers online · follow the event stream |

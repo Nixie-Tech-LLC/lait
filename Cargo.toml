@@ -63,8 +63,10 @@ loro = "=1.13.6"
 # randomness for ULID minting (app-minted DocId/ProjectId/… ids).
 getrandom = "0.3"
 
-# TUI (ratatui + crossterm) — the interactive board client. crossterm is the
-# portable backend (all three OSes), matching the cross-platform bar.
+# Terminal rendering for the inline `lait members` picker (`members_ui`), and the
+# width probe the invite QR uses. The full-screen TUI these were introduced for is
+# gone — the browser is the interactive surface now (docs/SERVE.md) — but the
+# members picker is a CLI ergonomic in its own right, so both stay.
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 
@@ -120,13 +122,32 @@ directories = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# `lait serve` — the local HTTP surface (SERVE.md). axum is a thin router over
+# hyper + tower + http, all three of which are already in the tree transitively
+# (iroh, self_update), so the adapter buys routing and SSE rather than a new
+# stack. `tokio-stream`'s `sync` feature is the `broadcast::Receiver` -> `Stream`
+# bridge the doorbell multiplex needs.
+axum = "0.8"
+tokio-stream = { version = "0.1", features = ["sync"] }
+# The web client, compiled into the binary. `include_dir` reads `src/serve/assets`
+# at compile time, which is why the built bundle is COMMITTED and lives under
+# `src/` rather than in the excluded `viewer/`: `cargo install lait` must not need
+# npm (same reproducibility bar `build.rs` holds by never shelling out to git),
+# and the published crate drops `viewer/` entirely. See docs/SERVE.md.
+include_dir = "0.7"
+
 # mcp server (stdio)
 rmcp = { version = "1.7", features = ["server", "macros", "transport-io"] }
+# Already in the tree via rmcp (which `mcp.rs` derives against). Declared directly
+# so `control::Request` can describe its own shape, which is what lets
+# `tests/viewer_parity.rs` check the hand-written TS mirror against it instead of
+# trusting it. Same "generate/check, don't hand-maintain twice" rule as
+# `mcp_parity.rs`.
+schemars = "1"
 # Native `lait update`: GitHub-release self-updater. `ureq` backend + `rustls`
 # keeps it pure-Rust (no reqwest/native-tls/OpenSSL C dep); gzip/zip extraction
 # only (no xz), matching the `.tar.gz` release archives.
 self_update = { version = "0.44.0", default-features = false, features = ["ureq", "rustls", "archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate"] }
-tui-textarea = "0.7"
 
 # unix-only: reset SIGPIPE to default so piping CLI output to head/less/grep
 # exits cleanly instead of panicking (Rust ignores SIGPIPE by default). Already
@@ -150,6 +171,10 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 # property-based convergence testing (random op sequences across N peers).
 proptest = "1"
+# `ServiceExt::oneshot` — drive `serve`'s real router in-process, so the gate's
+# ordering and precedence are tested through the thing that implements them
+# rather than a copy of it. No port, no daemon.
+tower = { version = "0.5", features = ["util"] }
 
 # The profile that 'dist' will build with
 [profile.dist]

@@ -36,8 +36,23 @@ pub struct DaemonChild {
 /// `log` is the daemon's own diagnosis when a spawn fails ("another lait daemon
 /// is already running for this home…"), which is the whole error message on that
 /// path — so it is a real file, not a null sink.
-pub fn spawn(exe: &Path, home: &Path, log: Option<std::fs::File>) -> io::Result<DaemonChild> {
-    imp::spawn(exe, home, log)
+/// Spawn the daemon for `home`.
+///
+/// `identity` pins which `secret.key` it runs on, passed as `--home` rather than
+/// an env var: identity does not follow the store (`config::identity_dir` reads
+/// `$LAIT_HOME` and never `$LAIT_STORE`), and the Windows path below hands the
+/// child our own env block, so an env override there would have to be
+/// process-wide. `None` means "inherit whatever identity this process would use",
+/// which is right for every caller that resolved its own store — i.e. every CLI
+/// invocation. `lait serve` is the exception: it supervises several homes at once
+/// and cannot speak for them through its own env.
+pub fn spawn(
+    exe: &Path,
+    home: &Path,
+    log: Option<std::fs::File>,
+    identity: Option<&Path>,
+) -> io::Result<DaemonChild> {
+    imp::spawn(exe, home, log, identity)
 }
 
 impl DaemonChild {
@@ -56,7 +71,12 @@ mod imp {
     use super::*;
     use std::process::{Command, Stdio};
 
-    pub fn spawn(exe: &Path, home: &Path, log: Option<std::fs::File>) -> io::Result<DaemonChild> {
+    pub fn spawn(
+        exe: &Path,
+        home: &Path,
+        log: Option<std::fs::File>,
+        identity: Option<&Path>,
+    ) -> io::Result<DaemonChild> {
         let stderr = match log {
             Some(f) => Stdio::from(f),
             None => Stdio::null(),
@@ -65,13 +85,18 @@ mod imp {
         // same store regardless of its cwd (DUR-5). `LAIT_HOME`, when set
         // (self-contained / --home / resume), is inherited from our env and
         // takes precedence, so this is a no-op in that mode.
-        let child = Command::new(exe)
-            .arg("daemon")
+        let mut cmd = Command::new(exe);
+        cmd.arg("daemon")
             .env("LAIT_STORE", home)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(stderr)
-            .spawn()?;
+            .stderr(stderr);
+        // `--home` is a global flag the child turns into its own `LAIT_HOME`,
+        // which `identity_dir` reads and `LAIT_STORE` cannot override.
+        if let Some(identity) = identity {
+            cmd.arg("--home").arg(identity);
+        }
+        let child = cmd.spawn()?;
         Ok(DaemonChild { child })
     }
 
@@ -131,7 +156,12 @@ mod imp {
         }
     }
 
-    pub fn spawn(exe: &Path, home: &Path, log: Option<std::fs::File>) -> io::Result<DaemonChild> {
+    pub fn spawn(
+        exe: &Path,
+        home: &Path,
+        log: Option<std::fs::File>,
+        identity: Option<&Path>,
+    ) -> io::Result<DaemonChild> {
         // Pin the resolved store for the spawned daemon so it binds the exact
         // same store regardless of its cwd (DUR-5). Set on *our* env rather than
         // a child-only override, so the daemon can inherit our block wholesale
@@ -202,7 +232,13 @@ mod imp {
         // `CreateProcessW` may write to the command line buffer, so it is ours and
         // mutable. Quoted because a path with a space would otherwise split; a
         // Windows path cannot contain `"`, so there is nothing else to escape.
-        let mut cmdline = wide(OsStr::new(&format!("\"{}\" daemon", exe.display())));
+        // `--home` rather than an env override: the block below is inherited
+        // wholesale, so an env pin would have to be process-wide and would race
+        // any other spawn in flight. An argv is the child's alone.
+        let mut cmdline = wide(OsStr::new(&match identity {
+            Some(id) => format!("\"{}\" daemon --home \"{}\"", exe.display(), id.display()),
+            None => format!("\"{}\" daemon", exe.display()),
+        }));
 
         let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: every pointer is valid for the call. `bInheritHandles` must be

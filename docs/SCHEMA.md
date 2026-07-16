@@ -357,7 +357,7 @@ enum Request {
   ProjectNew{ name, key }, ProjectList, LabelNew{ name, color }, LabelList,
   Activity  { since: u64 },                          // ex-Log; the feed is PULLED, §7.5
   Inbox     { clear: bool },                         // durable addressed-to-you (§8.1)
-  Subscribe { since: u64 },                          // §7.5 — the one live channel (TUI + watch)
+  Subscribe { since: u64 },                          // §7.5 — the one live channel (serve + watch)
   Diagnose  { expected_workspace: Option<WorkspaceId> },   // guided-join verifier (GUIDED-JOIN.md)
   ConfigReload,                                      // transport-plane; re-read local settings
   Hello     { protocol_version: u32 },               // §7.7 — version handshake, sent first
@@ -420,7 +420,8 @@ struct Doorbell {
 
 5. **Streaming (`Subscribe`) and `Reset`.** `Subscribe{since}` turns the one-shot control
    handler into a stream of `Doorbell` frames (above) until the client disconnects — the one
-   live channel (TUI and CLI `watch`; the `Wait` long-poll it superseded is deleted). The
+   live channel (`lait serve`'s SSE multiplex and CLI `watch`; the `Wait` long-poll it
+   superseded is deleted). The
    `presence_advanced` plane rings on `EventLog` pushes (peer online/offline/join) independently
    of the tracker dirty-set, so `watch` wakes even when no doc moved. Doorbells are **batched and
    project-keyed**: the daemon coalesces a whole sync-import transaction (+ a short local-edit
@@ -543,12 +544,13 @@ the per-session workspace firehose; the inbox is the durable, filtered, watermar
 Inside each store home: `config.json` — the store settings layer. `lait config` fronts
 the two layers git-style (store wins). Closed key table: `user.nick` (global+store,
 daemon-read → best-effort `ConfigReload` on set), `project.default` (store-only, read
-lazily per request, §7.6), `tui.theme` (global+store, `dark|light|auto`, client-read),
-`tui.tabs` (store-only, JSON `Vec<SavedTab>` — the TUI's saved view tabs, UI §5.2).
-One **open prefix**: `tui.key.<action-id>` (global+store) rebinds one TUI action; the
-config layer validates the prefix only, the TUI validates suffixes and warns (never
-gates) on unknown ones. The `workspace.*` namespace is **reserved** for future settings
-that sync through the Catalog. The old per-store `profile.json` is retired.
+lazily per request, §7.6). The `workspace.*` namespace is **reserved** for future
+settings that sync through the Catalog. The old per-store `profile.json` is retired.
+
+The `tui.*` keys (`tui.theme`, `tui.tabs`, and the open `tui.key.<action-id>` rebinding
+prefix) went with the TUI. The web client keeps the same *shape* — rebind by stable
+action id, warn rather than gate — but its overrides live client-side (SERVE.md); if
+they ever want a home on disk, this table is where a `web.key.*` prefix would go.
 
 **Ticket (wire, base32):** `WorkspaceTicket { workspace, name, host, host_nick,
 invite: Option<SignedInvite> }` — the topic is derived (`topic_for_workspace`), never

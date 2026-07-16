@@ -1,0 +1,377 @@
+/**
+ * TypeScript mirrors of the engine's Layer-B contract — `src/dto.rs` (the DTOs)
+ * and `src/control.rs` (the `Request`/`Response` envelopes).
+ *
+ * These are hand-maintained on purpose, mirroring a projection that is itself
+ * hand-maintained: "not an automatic dump of the Loro layout — a storage refactor
+ * must not break these" (dto.rs). Drift here is silent, so two rules:
+ *
+ * - **Timestamps are unix SECONDS**, not millis. The previous viewer passed
+ *   `created_at` straight to `new Date(ms)` and rendered every issue as 1970.
+ *   Use `tsToDate` and never construct a Date from these directly.
+ * - **`SCHEMA_VERSION` does not move for renames.** It is still 1 across the
+ *   `StatusInfo.room` → `name` rename that broke the old viewer's sidebar, so a
+ *   version check would not have caught it. Only reading dto.rs catches it.
+ */
+
+/** dto.rs `SCHEMA_VERSION` — every top-level DTO carries it. */
+export const SCHEMA_VERSION = 1;
+
+/** Unix seconds → Date. The one place the units are converted. */
+export const tsToDate = (ts: number): Date => new Date(ts * 1000);
+
+// ---- plain domain enums -----------------------------------------------------
+
+export type Priority = "none" | "low" | "medium" | "high" | "urgent";
+export type StatusCategory = "backlog" | "active" | "done";
+
+/** Priority order, low → high. Mirrors the Rust enum's `Ord`. */
+export const PRIORITY_ORDER: readonly Priority[] = ["none", "low", "medium", "high", "urgent"];
+
+/** UI.md §5.1 board badge: `·U/H/M/L·`. */
+export const PRIORITY_BADGE: Record<Priority, string> = {
+  none: "-",
+  low: "L",
+  medium: "M",
+  high: "H",
+  urgent: "U",
+};
+
+export interface WorkflowState {
+  id: string;
+  name: string;
+  category: StatusCategory;
+  color: string;
+}
+
+// ---- projections ------------------------------------------------------------
+
+export interface ProjectDto {
+  id: string;
+  name: string;
+  key: string;
+  color: string;
+}
+
+export interface LabelDto {
+  id: string;
+  name: string;
+  color: string;
+}
+
+/**
+ * One board/list row — the `DocMeta` cache, never the issue doc.
+ * `provisional` means the row is known but its body hasn't arrived (UI.md §3.3).
+ */
+export interface Row {
+  reff: string;
+  doc_id: string;
+  project_id: string;
+  key_alias: string | null;
+  title: string;
+  status: string;
+  priority: Priority;
+  assignee_summary: string;
+  tombstone: boolean;
+  provisional: boolean;
+}
+
+export interface BoardColumn {
+  state: WorkflowState;
+  rows: Row[];
+}
+
+export interface BoardView {
+  schema_version: number;
+  project: ProjectDto;
+  columns: BoardColumn[];
+}
+
+export interface CommentDto {
+  author: string;
+  author_nick: string | null;
+  /** Unix seconds. */
+  ts: number;
+  body: string;
+}
+
+export interface IssueView {
+  schema_version: number;
+  reff: string;
+  doc_id: string;
+  workspace_id: string;
+  project_id: string;
+  project_key: string | null;
+  key_alias: string | null;
+  title: string;
+  description: string;
+  status: string;
+  priority: Priority;
+  assignees: string[];
+  labels: string[];
+  label_names: string[];
+  comments: CommentDto[];
+  created_by: string;
+  /** Unix seconds. */
+  created_at: number;
+  provisional: boolean;
+}
+
+export interface FieldChange {
+  field: string;
+  from: string | null;
+  to: string | null;
+}
+
+export interface ActivityEvent {
+  seq: number;
+  doc_id: string | null;
+  reff: string;
+  kind: string;
+  changes: FieldChange[];
+  actor: string | null;
+  actor_nick: string;
+  text: string;
+  /** Unix seconds. */
+  ts: number;
+  /** Non-blocking LWW collision note (A§9). */
+  collision: boolean;
+}
+
+/** A ref that resolved to several issues (UI.md §3.2). A first-class outcome, not an error. */
+export interface Candidate {
+  reff: string;
+  key_alias: string | null;
+  title: string;
+}
+
+export interface InboxEntry {
+  /** Unix seconds — the read-watermark axis. */
+  ts: number;
+  /** `assigned` | `comment` | `status`. */
+  kind: string;
+  reff: string;
+  doc_id: string;
+  title: string;
+  detail: string;
+  /** Comments only — the one in-doc field with a real author. `null` = actor unknown. */
+  actor?: string | null;
+  actor_nick?: string | null;
+}
+
+export interface MemberDto {
+  key: string;
+  /** "admin" | "member" — from the signed ACL graph. */
+  role: string;
+  me: boolean;
+  /** Local petname; never synced. The trusted half of the identity model. */
+  alias: string;
+}
+
+export interface JoinRequestDto {
+  /** ed25519 key (64-hex) — feed straight to `members approve`. Note: `key`, not `id`. */
+  key: string;
+  /** Advisory nick they announced — an unverified claim. */
+  nick: string;
+  ts: number;
+}
+
+export interface SeedDto {
+  id: string;
+  nick: string;
+  workspace: string;
+  state: string;
+  online: boolean;
+}
+
+export interface PresenceEntry {
+  id: string;
+  nick: string;
+  state: string;
+}
+
+export interface Event {
+  seq: number;
+  kind: string;
+  id: string;
+  nick: string;
+  text: string;
+  ts: number;
+}
+
+/**
+ * `control.rs` `StatusInfo`.
+ *
+ * The shape the old viewer got wrong: there is no `room` (it is `name`),
+ * `workspace` is nullable, and `membership`/`pending_requests` are new — the
+ * latter two being how a *pending* joiner learns they are pending rather than
+ * staring at an empty board.
+ */
+export interface StatusInfo {
+  id: string;
+  nick: string;
+  /** Workspace display name. (Was `room` in the pre-v0.4.2 shape.) */
+  name: string;
+  online_peers: number;
+  workspace: string | null;
+  issues: number;
+  projects: number;
+  /** `admin` | `member` | `pending`. */
+  membership: string;
+  pending_requests: number;
+}
+
+// ---- the supervisor surface (serve-level, not control-plane) ----------------
+
+/** Whose key a space's daemon signs with (`serve::spaces::SpaceIdentity`). */
+export type SpaceIdentity = { kind: "own" } | { kind: "agent"; name: string };
+
+export interface ProjectBrief {
+  key: string;
+  name: string;
+}
+
+export interface SpaceRow {
+  id: string;
+  workspace: string;
+  name: string;
+  path: string;
+  origin: string;
+  last_opened: number;
+  /** `up` | `idle` | `missing`. */
+  status: "up" | "idle" | "missing";
+  identity: SpaceIdentity;
+  projects: ProjectBrief[];
+}
+
+export interface SpacesReply {
+  spaces: SpaceRow[];
+}
+
+/** An agent's space is observable, not operable — writes are refused server-side. */
+export const isReadOnly = (s: SpaceRow): boolean => s.identity.kind === "agent";
+
+// ---- the doorbell -----------------------------------------------------------
+
+export type CatalogScope = { scope: string; project?: string | null };
+
+/**
+ * A dirty-set frame, tagged with the space it rang for.
+ *
+ * Never state: the client re-reads the authoritative projection and never patches
+ * from the frame (UI.md §4.2). `reset` — or an `epoch` change, which is a daemon
+ * restart — means rebaseline from scratch; `App` treats them identically.
+ *
+ * `activity_advanced` and `presence_advanced` are carried faithfully but not yet
+ * read: this client re-reads on any ring rather than per dirty scope. See
+ * `doorbell.ts`.
+ */
+export interface SpaceDoorbell {
+  space: string;
+  epoch: number;
+  seq: number;
+  reset: boolean;
+  dirty_by_project: Record<string, string[]>;
+  dirty_catalog: CatalogScope[];
+  activity_advanced: boolean;
+  presence_advanced: boolean;
+}
+
+// ---- the control-plane envelopes -------------------------------------------
+
+/** A board position for `issue_move` — `control.rs` `BoardPos`, tagged by `at`. */
+export type BoardPos =
+  | { at: "top" }
+  | { at: "bottom" }
+  | { at: "before"; reff: string }
+  | { at: "after"; reff: string };
+
+export interface Filter {
+  mine?: boolean;
+  status?: string | null;
+  label?: string | null;
+  /** Include done + tombstoned rows (UI.md §2.2). */
+  all?: boolean;
+}
+
+/**
+ * `control.rs` `Request`, internally tagged by `cmd`.
+ *
+ * Field names are the Rust ones, verbatim — several are *not* what the CLI flag
+ * suggests, and guessing them is how the old viewer broke. The ones that bite:
+ * `issue_edit` takes `description` (not `body`); `assign` takes `add: bool` (not
+ * `remove`); `label` takes `add[]`/`remove[]` (not the CLI's `+x -y` tokens — the
+ * daemon wants them already split); and the `--as NAME` flag is `as_name`,
+ * because `as` is a Rust keyword.
+ *
+ * Anything `#[serde(default)]` in Rust is optional here. `subscribe`, `connect`,
+ * `seed_add`, `seed_remove`, `config_reload` and `stop` are deliberately absent:
+ * `subscribe` is refused on the RPC path (use the doorbell stream), and the rest
+ * have no browser surface yet — add them here when they grow one.
+ */
+export type Request =
+  | { cmd: "issue_new"; title: string; project?: string | null; project_hint?: string | null; assignees?: string[]; priority?: Priority | null; labels?: string[]; body?: string | null }
+  | { cmd: "issue_edit"; reff: string; title?: string | null; status?: string | null; priority?: string | null; description?: string | null }
+  | { cmd: "issue_move"; reff: string; project?: string | null; pos?: BoardPos | null }
+  | { cmd: "assign"; reff: string; who: string[]; add?: boolean }
+  | { cmd: "label"; reff: string; add?: string[]; remove?: string[] }
+  | { cmd: "comment"; reff: string; body: string }
+  | { cmd: "issue_delete"; reff: string }
+  | { cmd: "issue_start"; reff: string }
+  | { cmd: "issue_done"; reff: string }
+  | { cmd: "issue_stop"; reff: string }
+  | { cmd: "issue_view"; reff: string }
+  | { cmd: "list"; project?: string | null; filter?: Filter }
+  | { cmd: "board"; project?: string | null; project_hint?: string | null }
+  | { cmd: "history"; reff: string }
+  | { cmd: "project_new"; name: string; key: string }
+  | { cmd: "project_list" }
+  | { cmd: "label_new"; name: string; color?: string | null }
+  | { cmd: "label_list" }
+  | { cmd: "activity"; since?: number }
+  | { cmd: "inbox"; clear?: boolean }
+  | { cmd: "member_add"; who: string; admin?: boolean; as_name?: string | null }
+  | { cmd: "member_remove"; who: string }
+  | { cmd: "key_rotate" }
+  | { cmd: "members" }
+  | { cmd: "member_requests" }
+  | { cmd: "member_approve"; who: string; as_name?: string | null }
+  | { cmd: "member_alias"; who: string; name: string }
+  | { cmd: "status" }
+  | { cmd: "diagnose"; expected_workspace?: string | null }
+  | { cmd: "id" }
+  | { cmd: "invite"; require_approval?: boolean; reusable?: boolean; ttl_hours?: number | null }
+  | { cmd: "join"; ticket: string }
+  | { cmd: "seed_list" }
+  | { cmd: "log"; since: number }
+  | { cmd: "who" };
+
+/**
+ * `control.rs` `Response`, internally tagged by `kind`.
+ *
+ * The newtype variants (`Issue(Box<IssueView>)`, `Board(Box<BoardView>)`,
+ * `Status(Box<StatusInfo>)`, `Diagnosis(..)`) serialize **flattened** under an
+ * internal tag — hence the intersections rather than a nested payload field.
+ */
+export type Response =
+  | { kind: "hello"; protocol_version: number }
+  | { kind: "ok"; message: string | null }
+  | { kind: "ref"; reff: string }
+  | ({ kind: "issue" } & IssueView)
+  | { kind: "list"; rows: Row[] }
+  | ({ kind: "board" } & BoardView)
+  | { kind: "activity"; events: ActivityEvent[]; last: number }
+  | { kind: "inbox"; entries: InboxEntry[]; unread: number }
+  | { kind: "projects"; projects: ProjectDto[] }
+  | { kind: "labels"; labels: LabelDto[] }
+  | { kind: "members"; members: MemberDto[] }
+  | { kind: "join_requests"; requests: JoinRequestDto[] }
+  | { kind: "seeds"; seeds: SeedDto[] }
+  /** A ref resolved to several — a first-class outcome (exit 2), never an error. */
+  | { kind: "candidates"; candidates: Candidate[]; near_miss_for: string | null }
+  | ({ kind: "status" } & StatusInfo)
+  | { kind: "diagnosis"; [k: string]: unknown }
+  | { kind: "text"; text: string }
+  | { kind: "events"; events: Event[]; last: number }
+  | { kind: "who"; peers: PresenceEntry[] }
+  | { kind: "error"; message: string; error_kind: "error" | "not_found" };

@@ -215,7 +215,15 @@ fn paint(on: bool, code: &str, s: &str) -> String {
 /// Deliberately keyed on the `Request` rather than the command name: this is the
 /// single list of what lait asks before doing, so adding a destructive verb means
 /// adding it here, not remembering to prompt at a call site.
-fn destructive_question(req: &Request) -> Option<String> {
+/// The question a destructive verb must answer before it runs, or `None` if the
+/// verb destroys nothing.
+///
+/// Keyed on the `Request` so the list lives in exactly one place, whatever asks
+/// it. The CLI asks on a TTY (`confirm_destructive`); `lait serve` hands the same
+/// string to the browser to put in a modal. A second copy of this list, phrased
+/// slightly differently, is how two surfaces end up disagreeing about what is
+/// dangerous.
+pub(crate) fn destructive_question(req: &Request) -> Option<String> {
     match req {
         // The ref is inferred from the git branch when omitted, so this is the
         // one verb that can destroy something you never named.
@@ -335,13 +343,53 @@ fn mark_verified(home: &Path) {
     }
 }
 
+/// Forget that `home`'s daemon was verified, so the next [`ensure_daemon`] probes
+/// again instead of trusting the memo.
+///
+/// The memo is only sound because a CLI process resolves one store and exits: it
+/// cannot outlive the daemon it verified, so re-probing would be pure cost. A
+/// long-lived supervisor breaks that assumption — `lait serve` can watch a daemon
+/// stop and then be asked for it again, and a stale entry there does not mean
+/// "already fine", it means **"never respawn this"**, which is exactly wrong. The
+/// symptom is a connect error that no retry can clear.
+///
+/// So the one caller that can outlive a daemon says so when it notices.
+pub(crate) fn forget_verified(home: &Path) {
+    if let Ok(mut s) = VERIFIED_DAEMONS.get_or_init(VerifiedSet::default).lock() {
+        s.remove(home);
+    }
+}
+
 /// Ensure a daemon is running for this home dir, spawning one if needed.
 ///
-/// The three outcomes of [`control::probe`] are kept distinct on purpose. Only
-/// `Absent` may spawn: a daemon that is listening but unintelligible already
-/// holds this home's lock, so spawning a second one produces a child that dies
-/// instantly and a wait for a daemon that was never going to answer.
+/// Uses whatever identity this process would use — i.e. `$LAIT_HOME` if set,
+/// else the global `secret.key`. That is right for every caller that resolved
+/// its own store, which is every CLI invocation. A caller that supervises
+/// *several* homes at once cannot rely on its own env and must say which
+/// identity it means: see [`ensure_daemon_as`].
 pub async fn ensure_daemon(home: &Path) -> Result<()> {
+    ensure_daemon_as(home, None).await
+}
+
+/// Ensure a daemon is running for `home`, pinning the identity it runs as.
+///
+/// `identity: Some(dir)` spawns the daemon with `LAIT_HOME=dir`, which makes
+/// [`crate::config::identity_dir`] resolve there and the daemon sign with
+/// *that* home's `secret.key`.
+///
+/// This exists because identity does not follow the store. `identity_dir` reads
+/// `$LAIT_HOME` and nothing else — never `$LAIT_STORE` — so pointing a spawn at a
+/// self-contained home's store while `LAIT_HOME` is unset opens that store under
+/// the *global* key, silently ignoring the `secret.key` sitting inside it. For a
+/// named agent's home that is not a subtle mismatch: the workspace key is sealed
+/// to the agent's X25519 key, so the daemon cannot unwrap it, and it would
+/// announce the wrong identity as a peer in the agent's workspace.
+///
+/// One process resolving one store never notices, because its own env already
+/// says which identity it is. `lait serve` holds N homes across *two* identity
+/// kinds at once and cannot express that through a process-global env var, so
+/// the choice becomes an argument.
+pub async fn ensure_daemon_as(home: &Path, identity: Option<&Path>) -> Result<()> {
     if already_verified(home) {
         return Ok(());
     }
@@ -379,7 +427,16 @@ pub async fn ensure_daemon(home: &Path) -> Result<()> {
     // on Windows a plain spawn would also give it every other inheritable handle
     // we own — including a captured caller's stdout pipe, which then never sees
     // EOF. See `daemon_spawn`.
-    let mut child = crate::daemon_spawn::spawn(&exe, home, log).context("spawn daemon")?;
+    //
+    // `identity` rides as an argv (`--home`), not an env var. On Windows the
+    // spawn deliberately hands the child our *own* env block so the OS keeps it
+    // correctly sorted — which means an env override there would be a
+    // process-wide `set_var`. That is fine for `LAIT_STORE` in a CLI that
+    // resolves one store and exits, and wrong for `lait serve`, which holds N
+    // homes across two identity kinds at once and would race itself. An argument
+    // is scoped to the child by construction.
+    let mut child =
+        crate::daemon_spawn::spawn(&exe, home, log, identity).context("spawn daemon")?;
     for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(200)).await;
         if request(home, &Request::Status).await.is_ok() {
@@ -389,6 +446,27 @@ pub async fn ensure_daemon(home: &Path) -> Result<()> {
         // the common failures (lock held, bind failure) each cost the full 20s
         // and then blame a timeout.
         if let Ok(Some(status)) = child.try_wait() {
+            // But *our* child dying is not the same as no daemon. Two processes
+            // can race to spawn one for the same home: the loser exits saying
+            // "another lait daemon is already running" while the winner's is up
+            // and answering. Losing that race is success — the home has the daemon
+            // it needs, it just isn't ours — so ask before blaming. Rare between
+            // two CLI invocations; routine once `lait serve` is in the mix, since
+            // it holds several homes and reacts to doorbells while you type.
+            //
+            // Ask for a moment, not once: the winner is starting at the same
+            // instant our loser gives up, so a single immediate probe usually
+            // arrives too early and blames a daemon that is seconds from
+            // answering. A lost race resolves in milliseconds; a genuinely broken
+            // spawn (bind failure, held lock) still fails in about a second rather
+            // than the full 20 this check exists to avoid.
+            for _ in 0..12 {
+                if request(home, &Request::Status).await.is_ok() {
+                    mark_verified(home);
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
             return Err(daemon_exited_error(status, &log_path));
         }
     }

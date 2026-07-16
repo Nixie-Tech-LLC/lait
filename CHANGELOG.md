@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased — the browser is the interactive surface; the TUI is gone
+
+**Breaking: `lait tui` no longer exists.** `lait serve` replaces it — a keyboard-first
+board in a browser, over the same Layer-B control plane. Also removed: the `tui.theme`,
+`tui.tabs`, and `tui.key.<action-id>` config keys. Nothing else about the CLI, the
+daemon, or the wire changed.
+
+- **`lait serve` — the control plane over loopback HTTP + SSE.** The engine's contract
+  has always been `control.rs`, but every client so far was a local process that could
+  speak a named pipe; a browser cannot. This is the one adapter that closes the gap —
+  the same `Request`/`Response`, the same `Doorbell` stream, re-bound to a socket a
+  browser can reach. The engine grew a port, not a UI. See `docs/SERVE.md`.
+- **The first surface that is global to the machine.** The control channel is keyed by
+  home, so there is one daemon per space; a spaces picker means holding N. Listing only
+  probes (opening the browser never wakes every daemon you have registered) — selecting
+  a space is what attaches it.
+- **Your agents are visible.** Agent spaces appear in the picker, tagged, so you can
+  watch what they are doing. They are read-only there: a write through an agent's daemon
+  would be signed *as* that agent. Write through your own space and sign as yourself.
+- **Loopback auth, because the socket was the authentication.** `control.rs` never
+  needed auth — a Unix socket is gated by file permissions, a named pipe by its DACL, so
+  opening the channel *was* the credential. An HTTP port inherits none of that and adds a
+  caller that never existed: the pages you visit. So: loopback-only bind, a per-run
+  token, and a strict `Host`/`Origin` allowlist. The last is the load-bearing one — after
+  a DNS rebind the browser believes the attacker is us and hands over the cookie, so the
+  token stops being a secret; `Host` is the field they cannot launder.
+- **Destructive verbs keep the CLI's question.** `confirm_destructive` refuses under
+  `--json` because a pipe cannot be asked. A browser can, so the question comes back and
+  the UI asks it — using `cli::destructive_question`'s own words, so the modal and the
+  terminal cannot disagree about what is dangerous.
+- **The client has one seam.** One vocabulary (`Command`), one door (`contribute`).
+  Keys, the palette, and the `?` overlay are projections of one registry, never second
+  lists. The core registers its own commands through that same door, so an extension can
+  do anything the core can — and override anything the core gets wrong.
+- **What the TUI left behind.** Its architecture outlived it: `UI.md` §4 (the doorbell
+  stream, the correlation-free optimistic overlay) is still the contract, and `lait serve`
+  implements it. Its keyboard design — one action vocabulary with stable ids, bindings as
+  data with every listing a projection, a palette derived from the live `cmdspec` tree —
+  is the web client's spine. `ratatui`/`crossterm` stay for the inline `lait members`
+  picker, which was never part of the TUI; only `tui-textarea` left the tree.
+
 ## Unreleased — CLI ergonomics: ask before doing, and say what actually went wrong
 
 Additive within epoch 1 — no flag day. The new `hello` handshake and the

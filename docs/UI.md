@@ -1,10 +1,18 @@
-# UI — lait: CLI & TUI
+# UI — lait: CLI & clients
 
 > **Status:** implemented (v0.4.8); this is the design of record, kept in sync with
 > the shipped surfaces. The third design leg, companion to
 > [`ARCHITECTURE.md`](./ARCHITECTURE.md) (refs `A§`) and [`SCHEMA.md`](./SCHEMA.md)
-> (refs `S§`). Covers the two human surfaces of the tracker — the **CLI** and the
-> **TUI** — plus the agent surface (MCP) they share a contract with. The full
+> (refs `S§`). Covers the human surfaces of the tracker — the **CLI** and the
+> **web client** ([`SERVE.md`](./SERVE.md)) — plus the agent surface (MCP) they share
+> a contract with.
+>
+> **The TUI is gone** (see §4). It was this doc's second human surface for P0–P3; the
+> browser replaced it. Its *architecture* survives it and is still normative — §4 is the
+> contract every live client implements, and `lait serve` implements it — so the section
+> numbers §4.1/§4.2/§4.3 remain the stable references that `SERVE.md` and the code cite.
+> §5's view semantics (board columns, peek, inbox/activity) are Layer-B and shared; where
+> a subsection describes terminal chrome it is called out. The full
 > **P0-complete** surface (single node, git-backed) is built, and the P1/P3 surfaces
 > it slotted (§8 — live sync/presence, membership) have since landed; P4 polish is the
 > remaining work. Decisions are flagged **[DECISION]** with the shipped default in bold,
@@ -18,7 +26,7 @@ façade over the CRDT** (S§7, Layer B) — never three parallel implementations
 | Surface | What it is | Who uses it | Talks to the daemon via |
 |---|---|---|---|
 | **CLI** | one-shot verbs, scriptable, `--json` | humans in a shell, scripts, agents | control socket, request→response |
-| **TUI** | full-screen interactive board | humans at a terminal | control socket, request→response **+ a live event stream** |
+| **web** | keyboard-first board in a browser (`lait serve`, [`SERVE.md`](./SERVE.md)) | humans | **loopback HTTP + SSE** — the same control plane, re-bound to a socket a browser can speak |
 | **MCP** | tool-call surface (A§12) | agents | control socket (same requests, JSON-shaped) |
 
 **The rule (extends S§1):** all three are **thin clients of the daemon**; the daemon is
@@ -26,15 +34,21 @@ the *only* thing that owns a Loro doc. A surface never embeds the node, never to
 `.loro` files, never re-implements merge. It **sends a `Request`, gets a `Response`
 snapshot, and — for live surfaces — consumes the `IssueEvent` stream.** This is the whole
 reason Layer B is a hand-maintained projection (S§1): the three surfaces are its three
-consumers, and the TUI is not privileged over the CLI.
+consumers, and no surface is privileged over another.
 
-**Consequence for the TUI (the load-bearing decision, confirmed).** The TUI is a
-**daemon client over IPC**, *not* an in-process embedding of the node. It renders from
-`Response` snapshots and patches itself from the `IssueEvent` stream; edits are `Request`s.
-"Optimistic local ops + instant render" (A§9) is achieved by **client-side optimistic echo
-over a local IPC hop** (§4.3), not by the TUI holding its own Loro replica. One node
-process, one source of truth, one Layer-B contract to keep stable — the TUI inherits the
-same refactor-freedom the contract buys the CLI and MCP.
+**Consequence for the interactive surface (the load-bearing decision, confirmed).** It is a
+**daemon client**, *not* an in-process embedding of the node. It renders from `Response`
+snapshots and re-reads on the doorbell stream; edits are `Request`s. "Optimistic local ops +
+instant render" (A§9) is achieved by **client-side optimistic echo over a local hop** (§4.3),
+not by the client holding its own Loro replica. One node process, one source of truth, one
+Layer-B contract to keep stable — every client inherits the same refactor-freedom the
+contract buys the CLI and MCP.
+
+The browser changes the *transport* and nothing else: `lait serve` binds the identical
+`Request`/`Response` enum to loopback HTTP and the identical `Doorbell` stream to SSE. It is
+emphatically **not a peer** — no key, no ACL entry, never invited — which is why the network
+model needs no "viewer" role. Being global to the machine, it is the one surface that holds
+several daemons at once (SERVE.md).
 
 **Design tenets (Linear-grade devex, the plan's foundation — A§1):**
 1. **Keyboard-first, mouse-optional.** Every action has a key; nothing *requires* a mouse.
@@ -42,8 +56,8 @@ same refactor-freedom the contract buys the CLI and MCP.
    *defines* the activity-feed granularity, so verbs are drawn at commit boundaries.
 3. **Instant feel.** Reads render from the Catalog cache (no issue-doc loads, A§9); writes
    echo optimistically and self-heal on the authoritative event.
-4. **Same nouns everywhere.** A `Ref` means the same thing in the CLI, the TUI command
-   palette, and an MCP tool argument (§3).
+4. **Same nouns everywhere.** A `Ref` means the same thing in the CLI, the web client's
+   command palette, and an MCP tool argument (§3).
 
 > `src/control.rs` now carries the **tracker** Layer B specified here (the S§7 enum):
 > the issue verbs, the membership/ACL verbs, `Subscribe`, and `Diagnose`. The chat-era
@@ -227,7 +241,7 @@ return **zero or many** matches. The daemon answers:
   suggestion at all, because a wrong suggestion invites the wrong command.
 - **many** → `Candidates` listing them with the shortest disambiguating prefix
   (`iss_3f9a…`, `iss_3f9b…`); the caller re-issues with more characters. The CLI prints the
-  candidate list; the TUI shows a picker (§5.6).
+  candidate list; an interactive client shows a picker (§5.6).
 
 The **canonical** handle in all output is the short `DocId` prefix; `KEY-n` is shown as a
 friendly alias beside it, never as the sole identifier (S§5.4).
@@ -236,39 +250,47 @@ friendly alias beside it, never as the sole identifier (S§5.4).
 
 A ref can resolve to a doc that exists in `Catalog.docs` but whose **issue body hasn't
 arrived** (a peer synced the Catalog first, A§9). `show` on such a ref returns the
-provisional `DocMeta` projection flagged `provisional: true`; the TUI dims it (§4.4). When
+provisional `DocMeta` projection flagged `provisional: true`; clients dim it (§4.4). When
 the issue doc arrives, the row self-heals (S§3.1). This only occurs post-P1; at P0 every doc
 is local, but the flag is designed now so the surfaces don't need reshaping later.
 
-## 4. TUI architecture & reactivity
+## 4. Live client architecture & reactivity
 
-`lait tui` is a [ratatui](https://ratatui.rs) full-screen client. **[DECISION] ratatui**
-— it is the mature, portable (crossterm on all three OSes, matching the cross-platform bar
-in A§ decision log) Rust TUI substrate; no real alternative. It renders from Layer-B
-snapshots and stays live off the event stream.
+**[DECISION] The full-screen TUI is retired** (v0.5.0). `lait tui` was a
+[ratatui](https://ratatui.rs) client and the original reader of everything in this section;
+the **web client** (`lait serve`, [`SERVE.md`](./SERVE.md)) is the interactive surface now.
+The reasoning was not that the TUI was bad but that it was a surface the project did not want
+to maintain, and that a browser reaches people a terminal does not. Its best ideas were
+harvested rather than deleted — the action vocabulary, keymap-as-data, and the
+palette-derived-from-`cmdspec` all live on in the web client's seam (SERVE.md).
+
+**This section is not TUI-specific and remains normative.** It is the contract *any* live
+client implements, and `lait serve` implements it exactly: §4.1's connection model, §4.2's
+doorbell stream, and §4.3's correlation-free overlay are cited by `SERVE.md` and by the code.
+Read "the client" below as "the CLI's `watch`, or the browser".
 
 The central design fact: **the event stream is doorbells, not deltas.** An event never
 carries the new state; it *rings* — "scope S is dirty" — and the client re-reads the
-authoritative projection for S. The daemon owns every Loro doc and every merge; the TUI only
+authoritative projection for S. The daemon owns every Loro doc and every merge; a client only
 ever holds a *prediction* (its optimistic overlay) and a *cache of the daemon's cache*. This
 is what makes reconciliation correlation-free (§4.3): there is no op-id to match, no payload
 to trust, no partial patch to mis-apply — just "a doorbell rang → re-read → repaint."
 
 ### 4.1 Process & connection model
 
-On launch the TUI runs `ensure_daemon` (identical to the CLI), then opens **two** control
+On attach a live client runs `ensure_daemon` (identical to the CLI), then opens **two** control
 connections over the one socket:
 
 ```
         ┌─ command channel ──> Request  ──> Response       (issue ops, snapshot loads)
- TUI ───┤
+ web ───┤
         └─ subscribe channel <── Doorbell stream …          (live dirty-notices, §4.2)
 ```
 
 - **Command channel:** ordinary request→response (the existing `control::request` path),
   reused for every edit and every snapshot re-read.
 - **Subscribe channel:** one long-lived connection carrying the live doorbell stream. This is
-  the one Layer-B addition the TUI needs (S§7):
+  the one Layer-B addition a live client needs (S§7):
 
   > **`Subscribe { since: u64 }`** — turns the one-shot handler into a **streaming
   > mode**: the daemon reads the request, then instead of returning after one response, parks
@@ -283,7 +305,7 @@ connections over the one socket:
 *session*, not durable (S§2): a daemon restart (crash, or the routine idle-shutdown) resets
 it to 0, and the ring buffer holds only the last ~1000 doorbell *batches*, so a client can
 fall off the back. Rather than special-case each, the stream emits a **`Reset` doorbell**
-meaning *"your position is invalid — rebaseline from a fresh snapshot."* The TUI handles it
+meaning *"your position is invalid — rebaseline from a fresh snapshot."* A client handles it
 identically to first-connect: pull `Board`/`List` snapshots, adopt them wholesale, resume
 `Subscribe` from the snapshot's `last`. The daemon rings `Reset` (a) as the **first frame** of
 every `Subscribe`, and (b) whenever a client's `since` is older than the oldest retained batch
@@ -306,11 +328,11 @@ Doorbell { epoch, seq,
 
 Two authority planes ring through the one stream (§ the two placements of A§9/S§3):
 - **Issue-row plane** — `DocMeta.{title,status,priority,assigneeSummary,head}` moved for some
-  docs. The TUI re-reads the affected board slice; the row it reads *is* the Loro-truth-derived
+  docs. The client re-reads the affected board slice; the row it reads *is* the Loro-truth-derived
   cache (S§3.1), so it already reflects the LWW winner — nothing to compute.
 - **Catalog-structure plane** — board *ordering* (`boards[proj]`, e.g. an `IssueMove` reorder,
   which leaves `DocMeta` untouched), project/label config, workflow columns, or the ACL. The
-  TUI re-reads that Catalog slice.
+  client re-reads that Catalog slice.
 
 **Batching is two-level, each stage grouping at the boundary it uniquely knows:**
 - **Daemon (temporal/transactional).** The daemon coalesces changes within a window — a whole
@@ -320,13 +342,13 @@ Two authority planes ring through the one stream (§ the two placements of A§9/
   (1000 *batches*, not 1000 individual doc changes). The project keying is **free**: every
   dirty doc's `projectId` is already in hand during the S§3.1 row recompute
   (`get_changed_containers_in`), so partitioning costs the daemon nothing.
-- **Client (spatial/visibility).** The TUI intersects `dirty_by_project` with what is on
+- **Client (spatial/visibility).** The client intersects `dirty_by_project` with what is on
   screen and re-reads only the visible project's slice; whole off-screen projects are skipped
   with a single map lookup, without parsing their doc lists. **Sync-burst cost is ∝ screen
   size, not workspace size** — the whole point of the catalog-cache design (A§9).
 
 **The feed is pulled, not pushed.** A 300-doc remote import must not stream 300 transition
-rows. The doorbell only sets `activity_advanced`; the TUI materializes feed rows lazily via
+rows. The doorbell only sets `activity_advanced`; the client materializes feed rows lazily via
 the existing `Activity { since }` request when the feed view (§5.4) is open — "doorbell rings,
 view pulls," consistent all the way through. (A single local edit may carry its one transition
 inline for a snappy feed; at scale it is pull.)
@@ -345,7 +367,7 @@ The overlay is a **local prediction**, nothing more. An edit keystroke:
    immediately** — the user sees the change at keystroke latency.
 2. **Sends the `Request`** on the command channel.
 3. **Clears the overlay on *any* doorbell for that scope** — its own write's echo or a
-   concurrent remote edit — by re-reading the authoritative `DocMeta` row. The TUI never
+   concurrent remote edit — by re-reading the authoritative `DocMeta` row. The client never
    correlates a doorbell to *its* write; it always yields to the row (which is the LWW winner,
    S§3.1). If the `Request` returns **`Error`**, it rolls the overlay back.
 
@@ -370,7 +392,7 @@ client-model expression of A§9's "optimistic local ops."
 
 ### 4.4 Render loop & coalescing
 
-Event-driven, not a busy loop. The TUI `select!`s over **terminal input** and the **doorbell
+Event-driven, not a busy loop. The client `select!`ed over **terminal input** and the **doorbell
 stream**, and redraws only when the model or focus changes — idle costs nothing. The render
 frame is also the **client coalescing point** (§4.2): doorbells that arrive within a frame are
 unioned, so a burst of remote edits triggers **one** set of minimal, visibility-bounded
@@ -380,7 +402,7 @@ once as it rolls back.
 
 ### 4.5 Daemon lifecycle & presence honesty
 
-A `Subscribe` connection holds `active_conns >= 1` (`node.rs`), so an open TUI **pins the
+A `Subscribe` connection holds `active_conns >= 1` (`node.rs`), so an open browser tab **pins the
 daemon alive** and idle-shutdown only ever fires in pure-CLI use. **This is intended, not a
 leak:** an always-on node is what the P2P design wants more of — it densifies the gossip mesh
 and is the on-ramp to the seed role (A§10, "any client node can be promoted to a seed").
@@ -391,7 +413,7 @@ The one genuine leak inside that is **false availability** — advertising `● 
 
 | State | Meaning | Driven by |
 |---|---|---|
-| `online` | interactive, reply-ready | TUI/CLI/MCP **input** within the engagement window |
+| `online` | interactive, reply-ready | web/CLI/MCP **input** within the engagement window |
 | `away` | node up and syncing, human/agent not engaged | daemon alive, no recent input |
 | `offline` | node down | daemon stop / `Bye` / presence lapse |
 
@@ -448,7 +470,7 @@ its active tab.
   `boards[P]` (the movable list, A§9); the swap is optimistic, an error reloads.
 - `H`/`L` **move status** to the prev/next workflow column (optimistic overlay).
 - `S`/`D`/`O` — the work-state verbs `start`/`done`/`stop` on the focused issue (one commit
-  each; no git-branch step in the TUI).
+  each; no git-branch step in the client).
 - Quick actions: `a` assign, `b` label, `p` priority, `s` set status, `m` move project (all
   pickers, §5.5), `e` title, `C` comment, `y` yank ref, `x` multi-select.
 - **Multi-select & bulk**: `x` marks (`▣` on the card, a count badge in the header); any
@@ -461,18 +483,18 @@ its active tab.
 `/` opens a **live text filter** (title/ref/alias, keystroke-by-keystroke; `Enter` keeps it,
 `Esc` restores). The active filter shows as a header chip; column counts reflect it.
 
-`P` **pins** the current filter as a **saved tab** (named inline), persisted as JSON under
-the store-layer `tui.tabs` config key. `[`/`]` cycle `(all) → tab1 → tab2 → (all)`; clicking
-a chip toggles it. A tab carries a client text filter **plus** a daemon-side `Filter`
-(mine/status/label); the board applies the daemon filter by **doc-id intersection** with a
-`List` fetch — mine/label semantics stay server truth, never re-implemented client-side.
+**Saved tabs went with the client** (v0.5.0), along with their `tui.tabs` config key. The idea
+was sound and is worth rebuilding in the web client: a tab carried a client text filter
+**plus** a daemon-side `Filter` (mine/status/label), and applied the daemon filter by
+**doc-id intersection** with a `List` fetch — so mine/label semantics stayed server truth and
+were never re-implemented client-side. That intersection rule is the part to keep.
 
 ### 5.3 Issue peek
 
 Lazy-loaded via `IssueView` + `History`. Title, metadata, label chips (label colors), the
 `description` (full-buffer replace on edit — the client holds no `LoroText` cursor; the
 daemon applies it as a text update), comments, and the derived **history timeline** with ⚠
-collision notes (A§9). `e` title · `d` description · `C` comment — all in-TUI editors
+collision notes (A§9). `e` title · `d` description · `C` comment — all in-client editors
 (tui-textarea): real cursor movement, bracketed paste, multi-line for description/comment
 (`Ctrl+S` saves), single-line for titles (`Enter` saves). A quick-create parse error reopens
 the editor with the line intact and the clap error inline — a typo never eats the line.
@@ -530,52 +552,31 @@ that substitutes the chosen canonical ref and retries.
   pin via `: seed add <ticket|id>`.
 - **Log** (`: watch`) — the presence/system event ring, tailed live off `presence_advanced`.
 
-## 6. Keymap, mouse & theming
+## 6. Keybindings — the design that outlived the TUI
 
-Vim-familiar motion, Linear-familiar actions. **The keymap is data**: per-context binding
-tables are the single source that the bottom legend, the `?` help, and dispatch all project
-from (lazygit-style). The `?` overlay is **actionable** — `j`/`k` move, `Enter` runs the
-highlighted action in the underlying context.
+The TUI's keymap section lived here: per-context binding tables, a bottom legend and an
+actionable `?` overlay projected from them, mouse hit-regions, and `tui.theme`. The surface is
+gone; **three of its ideas were the reason to keep any of it, and all three are now the web
+client's spine** ([`SERVE.md`](./SERVE.md#the-clients-seam)):
 
-| Scope | Key | Action |
-|---|---|---|
-| Global | `?` | actionable help overlay |
-| Global | `:` / `Ctrl-K` | command palette (§5.5) |
-| Global | `/` | live filter (§5.2) |
-| Global | `q` / `Esc` | pop overlay → close peek → board → quit |
-| Global | `r` | force snapshot reload (self-heal) |
-| Global | `1`–`5` / `!` | board / inbox / activity / members / spaces / doctor |
-| Global | `Tab`/`Shift-Tab` | next / prev project |
-| Global | `[` / `]` | cycle saved tabs (§5.2) |
-| Motion | `j`/`k` `h`/`l` (+arrows) | move focus |
-| Motion | `g`/`G` | top / bottom |
-| Board | `J`/`K` | reorder within column (`IssueMove`) |
-| Board | `H`/`L` | move issue to prev/next status |
-| Board | `S`/`D`/`O` | start / done / stop (work-state verbs) |
-| Board | `P` | pin the current filter as a tab |
-| Issue op | `c` | quick-create (title, then `-p`/`-a`/`-P`/`-l` tokens — `new`'s grammar) |
-| Issue op | `Enter` | open peek / expand |
-| Issue op | `a`·`b`·`p`·`s`·`m` | assign · label · priority · status · move project |
-| Issue op | `x` / `X` | toggle / clear multi-select |
-| Peek | `e`·`d`·`C`·`y` | edit title · description · comment · yank ref |
-| Members | `y`·`n`·`R`·`d`·`i` | approve · dismiss · rename · remove · invite |
-| Spaces | `Enter`·`f`·`P` | switch · forget · prune |
+1. **One vocabulary.** Keys, clicks, the legend, and the palette never *do* anything — they
+   resolve to a stable, kebab-case action id and something else executes it. That id is also
+   the rebinding key, which is why it has to be stable.
+2. **Bindings are data; every listing is a projection.** The legend was a *filter* over the
+   same tables that dispatched, and `?` showed all of them. One edit, three surfaces. The web
+   client's palette and `?` overlay are projections of one registry for the same reason.
+3. **One grammar, two entry points.** The palette derived its completions from the live
+   `cmdspec` tree and dispatched back through it, so it could never drift from the CLI and
+   could run real arg-bearing lines rather than being a menu.
 
-**Rebinding.** Every action has a stable kebab-case id (shown in `?`); the config keys
-`tui.key.<action-id> = <chord>` (e.g. `tui.key.open-palette = ctrl+p`) rebind at startup —
-a bad override warns in the status line, never gates.
+Two rules came with them, both load-bearing and both kept verbatim: an override **replaces**
+an action's key set rather than aliasing it, and a bad override **warns, never gates** — a
+typo in config must not take down the client you would fix it in.
 
-**Mouse.** Clicks land on render-time hit regions (overlays win): project/saved tabs, column
-headers, rows (double-click peeks), the peek, legend chips, palette/picker rows. The wheel
-scrolls the panel under the cursor. All progressive enhancement — a console that rejects
-mouse capture still gets the full keyboard client.
-
-**Theming.** `tui.theme = dark | light | auto` (auto = the zero-dependency `COLORFGBG`
-heuristic). Every renderer takes styles from the one `Theme`; the DTO-carried color strings
-(workflow states, projects, labels) map through `parse_color` (named + `#rrggbb`) into
-column tints, tab accents, and label chips. Terminal lifecycle is panic-safe: a RAII guard
-plus a panic hook restore raw mode/alt screen/mouse capture exactly once, so a crash message
-is readable and the shell survives.
+What did *not* survive is terminal-specific and should not be mourned: `crossterm` key
+codes, mouse hit-regions (a browser has elements), `COLORFGBG` theme sniffing (a browser has
+`prefers-color-scheme`), and a parser that rejected `meta+` — correct on a terminal, exactly
+wrong where Cmd is the primary modifier.
 
 ## 7. Conflict & limitation surfacing
 
@@ -585,7 +586,7 @@ The UI must make the CRDT's honest limitations legible rather than hiding them:
   write lands, and a **non-blocking `⚠` activity note** appears in the feed and on the
   detail view's activity section ("status In Review → In Progress, concurrent with ab").
   The board just shows the merged value.
-- **No CAS (S§7.2)** — the TUI offers no "close only if open" affordance; an action always
+- **No CAS (S§7.2)** — no client offers a "close only if open" affordance; an action always
   applies and merges. If the world moved under you, the doorbell stream repaints the new truth.
 - **Convergent flicker (§4.3)** — a remote edit racing your pending optimistic write on the
   same field can flicker the value for one frame before converging. Accepted: it always
@@ -605,11 +606,11 @@ touching the issue grammar. Where each attaches:
 
 - **P1 — live sync & presence.** A status bar gains a **sync indicator** (peers online,
   catalog-head freshness, "syncing N docs") fed by the existing presence/gossip events
-  (A§8); `who`/`invite`/`connect` become the TUI's peers panel.
+  (A§8); `who`/`invite`/`connect` become the web client's peers panel.
   No new issue grammar — sync is ambient.
 - **P1/P2 — receipts & tiers ([`HARDENING.md`]).** `send`/`ack`/`receipts`/`focus` and the
   tier ladder (`ambient…interrupt`) attach to the **activity/notification** surface, not the
-  issue model: `watch --min-tier/--on-interrupt` is the CLI teeth; the TUI shows receipt
+  issue model: `watch --min-tier/--on-interrupt` is the CLI teeth; the web client shows receipt
   badges (`✓delivered ✓seen ✓acked`) and honors `mute_below`. Designed there, slotted here.
 - **P3 — membership UI (landed).** A **members view** over `Catalog.acl` (S§6): roles,
   add/remove, key rotation, driven by `MemberAdd/Remove`, `KeyRotate` (S§7). The ACL is
@@ -628,13 +629,16 @@ touching the issue grammar. Where each attaches:
   store — never a wire nick.
 - **P4 — MCP parity & polish.** The MCP tool set (A§12) is generated from / checked against
   the **same `Response` DTOs** the CLI `--json` emits (S§7.3), so agent and human surfaces
-  never drift. TUI polish (themes, resize, wide-table horizontal scroll) is P4.
+  never drift. Client polish (theming, responsive layout, wide-table scroll) rides with the
+  web client (SERVE.md), not here.
 
 ## 9. Decisions — settled (mirror of A§14 / S§10)
 
-- **§4 TUI substrate — ratatui** (default, agreed) vs any other Rust TUI lib. Settled.
+- **§4 TUI substrate — ratatui** (default, agreed) vs any other Rust TUI lib. Settled, then
+  **superseded (v0.5.0)**: the TUI is retired and the browser is the interactive surface
+  (§4, SERVE.md). ratatui remains only for the inline `lait members` picker.
 - **§4.1 live channel — streaming `Subscribe`** (default) vs re-polling `Wait`. Originally
-  settled as "both supported" (Subscribe for the TUI, Wait for scripting/`watch`); **revised**
+  settled as "both supported" (Subscribe for live clients, Wait for scripting/`watch`); **revised**
   once the doorbell grew a presence plane — `watch` now rides `Subscribe` and `Wait` is
   deleted. One wake path, one rebaseline story (`Reset`/`epoch`).
 - **§4.2 event shape — batched, project-keyed doorbells** (agreed) vs value-carrying deltas.
@@ -651,7 +655,7 @@ touching the issue grammar. Where each attaches:
   every transition — deferred; the doorbell already prevents the *stream* flood, so this is a
   feed-rendering choice only.
 - **§5.3 description editing — full-buffer replace at P0** (default; client holds no
-  `LoroText` cursor) vs an in-TUI collaborative-cursor editor (later; needs the client to
+  `LoroText` cursor) vs an in-client collaborative-cursor editor (later; needs the client to
   hold a live `LoroText` view, which reintroduces a client-side replica — deferred with the
   in-process question).
 - **§5.5 palette key — `:` and `Ctrl-K`** (default, both bound) — trivially flippable.

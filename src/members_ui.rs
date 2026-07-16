@@ -16,7 +16,7 @@
 //! the self-asserted nick (UI.md §8). Admin-only actions are hidden unless this
 //! node is an admin.
 //!
-//! Like the TUI (`src/tui`), this is a Layer-B client over the daemon control
+//! Like every other surface, this is a Layer-B client over the daemon control
 //! socket, not an embedded node: it snapshots the roster with `Members` +
 //! `MemberRequests` and mutates via `MemberApprove` / `MemberAlias` /
 //! `MemberRemove` / `Invite`, then re-reads. Rendering is a ratatui
@@ -46,8 +46,8 @@ use ratatui::{
 use crate::cli::ensure_daemon;
 use crate::control::{request, Request, Response};
 use crate::dto::{JoinRequestDto, MemberDto};
+use crate::list_picker::{row_line, window, Cell};
 use crate::proto::WorkspaceTicket;
-use crate::tui::widgets::list_picker::{row_line, window, Cell};
 
 /// One selectable row: a pending request (approvable) or an existing member.
 #[derive(Clone)]

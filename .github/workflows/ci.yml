@@ -18,6 +18,51 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The web client (`lait serve`'s UI). Its build output is COMMITTED under
+  # src/serve/assets because `include_dir!` embeds it at compile time and
+  # `cargo install lait` must not need npm (docs/SERVE.md). Committed build output
+  # goes stale the first time someone edits viewer/ and forgets to rebuild — and
+  # it would go stale *silently*, shipping a binary whose UI predates its API. So
+  # this job rebuilds and fails if the result differs from what's in git.
+  viewer:
+    name: viewer
+    runs-on: ubuntu-latest
+    steps:
+      # SHA-pinned like every other action here: a tag is mutable, and CI is
+      # exactly where you don't want a dependency that can change under you.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: viewer/package-lock.json
+
+      # `npm ci` (not `install`) so the lockfile is authoritative and CI cannot
+      # quietly resolve a different tree than a developer did.
+      - name: Install
+        run: npm ci
+        working-directory: viewer
+
+      - name: Typecheck
+        run: npm run check
+        working-directory: viewer
+
+      - name: Test
+        run: npm test
+        working-directory: viewer
+
+      - name: Build
+        run: npm run build
+        working-directory: viewer
+
+      - name: Assert the committed bundle is what viewer/ builds
+        run: |
+          if ! git diff --exit-code --stat -- src/serve/assets; then
+            echo "::error::src/serve/assets is stale — run 'npm run build' in viewer/ and commit the result."
+            exit 1
+          fi
+
   # Build, lint (fmt + clippy), test, smoke-run, and the TLS-backend
   # guard on every supported OS. This is the portability gate: everything must
   # be green on all three, not just unix. clippy runs per-OS so the cfg-gated

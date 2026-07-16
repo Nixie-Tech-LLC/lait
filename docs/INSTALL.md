@@ -124,7 +124,7 @@ Supported shells: `bash`, `zsh`, `fish`, `powershell`, `elvish`.
 cd your-project
 lait init                                  # found a space here (seeds a project)
 lait new "fix login race" -P high --start  # file it + claim it + branch
-lait tui
+lait serve --open                          # the board, in your browser
 ```
 
 Joining a teammate's space instead? `lait join <their-invite-link>` — it creates

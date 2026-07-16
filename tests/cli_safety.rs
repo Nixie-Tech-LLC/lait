@@ -194,7 +194,7 @@ fn a_dead_daemon_is_reported_dead_and_a_live_one_is_not() {
     let empty = tmp_home("dead");
     let log_path = empty.join("daemon.log");
     let log = std::fs::File::create(&log_path).expect("create log");
-    let mut child = lait::daemon_spawn::spawn(&exe, &empty, Some(log)).expect("spawn daemon");
+    let mut child = lait::daemon_spawn::spawn(&exe, &empty, Some(log), None).expect("spawn daemon");
     let deadline = Instant::now() + Duration::from_secs(15);
     let status = loop {
         match child.try_wait().expect("try_wait") {
@@ -233,7 +233,7 @@ fn a_dead_daemon_is_reported_dead_and_a_live_one_is_not() {
     std::env::set_var("LAIT_IDLE_SECS", "2");
     let home = tmp_home("live");
     init(&home);
-    let mut child = lait::daemon_spawn::spawn(&exe, &home, None).expect("spawn daemon");
+    let mut child = lait::daemon_spawn::spawn(&exe, &home, None, None).expect("spawn daemon");
     let alive = child.try_wait().expect("try_wait");
     assert!(
         alive.is_none(),
@@ -406,4 +406,49 @@ fn a_newer_daemon_is_never_replaced_even_with_yes() {
         !stderr.contains("stopped it"),
         "must never stop a daemon newer than this build; got: {stderr}",
     );
+}
+
+/// A leaf whose name collides with another's must not read the other's args.
+///
+/// `leaf.name` is only the **last** path segment, so `labels new` answers to
+/// `"new"` exactly as the top-level verb does. `app::dispatch` special-cases
+/// `new --start`, and asking clap for an arg the matched leaf never declared is a
+/// **panic**, not a `false` — so `lait labels new <name>` aborted with "Mismatch
+/// between definition and access of `start`" before it reached the daemon.
+/// Shipped, and invisible until someone created a label from a surface that
+/// wasn't a hand-typed CLI.
+///
+/// This needs a real store, which is the whole reason it lives here and not in
+/// the parse tests: `parse_to_request` is perfectly happy, and dispatch aborts on
+/// "no space in this directory" *before* reaching the fault — so the cheap version
+/// of this test passes against the bug.
+#[test]
+fn colliding_leaf_names_do_not_read_each_others_args() {
+    let home = tmp_home("leafname");
+    init(&home);
+
+    let out = lait(&home, &["labels", "new", "bug", "--color", "red"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        !stderr.contains("panicked"),
+        "`lait labels new` panicked:\n{stderr}",
+    );
+    assert!(out.status.success(), "`lait labels new` failed: {stderr}",);
+
+    // And it actually made the label, rather than merely not crashing.
+    let listed = lait(&home, &["--json", "labels", "ls"]);
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        stdout.contains("\"bug\""),
+        "the label was not created: {stdout}",
+    );
+
+    // NOT tested here: `new --start`. It chains into the work loop and **creates
+    // and checks out a git branch in the process's cwd** — and `lait()` doesn't
+    // pin one, so it runs in whatever directory the test harness sits in. Asserting
+    // it here once left this very repo checked out on a branch named after the test
+    // fixture. A `--start` test needs its own throwaway git repo as cwd; until it
+    // has one, it does not belong in a suite about not destroying things.
+    shutdown(&home);
 }

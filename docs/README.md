@@ -19,7 +19,9 @@ One binary, four surfaces, one persistent node per space:
   channel. Auto-spawned on first use; only `lait init`/`lait join` create stores.
 - `lait <cmd>` — the CLI: flat verbs on issues, plural nouns on registries;
   `--json` emits the stable, versioned DTO (S§7.3).
-- `lait tui` — a full-screen board client living off the doorbell stream (U§4).
+- `lait serve` — the same façade over loopback HTTP + SSE, so a browser can be a
+  client too. The only surface that is global to the machine rather than bound to
+  one store: it supervises a daemon per space ([`SERVE.md`](./SERVE.md)).
 - `lait mcp` — the same commands as MCP tools for agents, same DTOs.
 
 Issues carry a collision-free short `iss_` handle plus a friendly `KEY-n` alias;
@@ -54,13 +56,14 @@ UI §4. They are the design of record, kept in sync with the shipped code.
 |---|---|---|
 | [`ARCHITECTURE.md`](./ARCHITECTURE.md) | `A§` | The system: layered design, the git/iroh/Loro split, sync protocol, seed role, E2EE model, decision log. |
 | [`SCHEMA.md`](./SCHEMA.md) | `S§` | The data shapes across the three layers (CRDT storage / control protocol / wire) and **what authority each field carries**. |
-| [`UI.md`](./UI.md) | `U§` | The three drive surfaces — CLI, TUI, MCP — and the one imperative façade they share over the CRDT. |
+| [`UI.md`](./UI.md) | `U§` | The drive surfaces — CLI, web ([`SERVE.md`](./SERVE.md)), MCP — and the one imperative façade they share over the CRDT. |
 
 ## Focused designs
 
 | Doc | Status | Covers |
 |---|---|---|
 | [`GUIDED-JOIN.md`](./GUIDED-JOIN.md) | shipped (v0.4.7) | The first-invite verifier (`lait doctor`) and the directory-trap fix. |
+| [`SERVE.md`](./SERVE.md) | vertical slice | `lait serve`: the control plane over loopback HTTP/SSE. Why the browser is a client and not a peer, the rebinding guard, the per-space daemon supervisor, and the identity seam. |
 | [`HARDENING.md`](./HARDENING.md) | proposed (deferred) | Agent-messaging delivery/ack receipts and urgency tiers ("notify anyway"). Not yet built. |
 
 ## Operator docs
