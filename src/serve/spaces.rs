@@ -366,24 +366,33 @@ impl Supervisor {
     /// it is a real consequence of a click, not a read.
     pub async fn attach(&self, id: &str) -> Result<PathBuf> {
         let (home, identity) = self.resolve(id)?;
-        let mut attached = self.attached.lock().await;
-        if let Some(a) = attached.get(id) {
-            // A live attachment is reusable; a dead one is a trap. When the
-            // space's daemon stops, its pump ends — and if the entry outlives it,
-            // every later attach short-circuits onto a corpse and the doorbells
-            // for that space never come back. The failure is silent, which is the
-            // worst part: the browser's own stream to `serve` is still open, so
-            // the UI reports itself live while going quietly stale forever.
-            if a.alive.load(Ordering::Acquire) && !a.pump.is_finished() {
-                return Ok(a.home.clone());
+        // The fast path, and only the fast path, under the lock. Spawning a daemon
+        // can take seconds, and `attached` is global to every space — holding it
+        // across that await would make the first attach of one slow space stall
+        // RPCs to every other, which is precisely the scenario a supervisor exists
+        // to avoid.
+        {
+            let mut attached = self.attached.lock().await;
+            if let Some(a) = attached.get(id) {
+                // A live attachment is reusable; a dead one is a trap. When the
+                // space's daemon stops its pump ends — and if the entry outlives
+                // it, every later attach short-circuits onto a corpse and the
+                // doorbells for that space never come back. The failure is silent,
+                // which is the worst part: the browser's own stream to `serve` is
+                // still open, so the UI reports itself live while going quietly
+                // stale forever.
+                if a.alive.load(Ordering::Acquire) && !a.pump.is_finished() {
+                    return Ok(a.home.clone());
+                }
+                attached.remove(id);
+                // The daemon this pump was reading is gone, so `ensure_daemon`'s
+                // verified-memo is now a lie — and a stale entry there does not
+                // mean "already fine", it means "never respawn this". Clear it, or
+                // the re-attach below short-circuits and we connect to nothing.
+                crate::cli::forget_verified(&home);
             }
-            attached.remove(id);
-            // The daemon this pump was reading is gone, so `ensure_daemon`'s
-            // verified-memo is now a lie — and a stale entry there does not mean
-            // "already fine", it means "never respawn this". Clear it, or the
-            // re-attach below short-circuits and we connect to nothing.
-            crate::cli::forget_verified(&home);
         }
+
         // A self-contained home *is* its own identity dir, so pinning it to
         // `home` is the whole fix. `Own` keeps inheriting our env, which is
         // already correct for every store the global identity signs for.
@@ -391,45 +400,64 @@ impl Supervisor {
             SpaceIdentity::Agent { .. } => Some(home.as_path()),
             SpaceIdentity::Own => None,
         };
+        // Unlocked: idempotent, so two callers racing the same space simply both
+        // find it healthy.
         crate::cli::ensure_daemon_as(&home, pin).await?;
+
+        // Re-acquire to publish. Another caller may have attached this space while
+        // we were unlocked — `ensure_daemon_as` is idempotent, so they both found
+        // it healthy and we simply take theirs. Checked *before* spawning a pump,
+        // so the loser never creates one: a dropped `JoinHandle` detaches rather
+        // than aborts, and a stray pump would quietly double every doorbell.
+        let mut attached = self.attached.lock().await;
+        if let Some(a) = attached.get(id) {
+            if a.alive.load(Ordering::Acquire) && !a.pump.is_finished() {
+                return Ok(a.home.clone());
+            }
+            attached.remove(id);
+        }
 
         let tx = self.doorbells.clone();
         let space = id.to_string();
         let pump_home = home.clone();
         let alive = Arc::new(AtomicBool::new(true));
         let pump_alive = alive.clone();
+        // `tokio::spawn` doesn't await, so the lock is held only long enough to
+        // publish the entry.
         let pump = tokio::spawn(async move {
-            // `since: 0` asks for a full rebaseline, matching a fresh TUI attach.
-            let mut sub = match control::subscribe(&pump_home, 0).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(space = %space, error = %e, "subscribe failed");
-                    pump_alive.store(false, Ordering::Release);
-                    return;
-                }
-            };
-            loop {
-                match sub.next().await {
-                    Ok(Some(doorbell)) => {
-                        // Err only means "nobody listening" — the tab is closed.
-                        // Keep pumping: it may come back, and the daemon is up
-                        // regardless of whether anyone is watching.
-                        let _ = tx.send(SpaceDoorbell {
-                            space: space.clone(),
-                            doorbell,
-                        });
+            // `since: 0` asks for a full rebaseline, matching a fresh attach.
+            match control::subscribe(&pump_home, 0).await {
+                Ok(mut sub) => loop {
+                    match sub.next().await {
+                        Ok(Some(doorbell)) => {
+                            // Err only means "nobody listening" — the tab is
+                            // closed. Keep pumping: it may come back, and the
+                            // daemon is up regardless of whether anyone watches.
+                            let _ = tx.send(SpaceDoorbell {
+                                space: space.clone(),
+                                doorbell,
+                            });
+                        }
+                        // EOF: the daemon stopped. We do not reconnect here — the
+                        // restart policy lives in `ensure_daemon`, which owns the
+                        // heal path, and `attach` re-runs it once it notices this
+                        // pump died.
+                        Ok(None) => break,
+                        Err(e) => {
+                            tracing::warn!(space = %space, error = %e, "doorbell stream ended");
+                            break;
+                        }
                     }
-                    // EOF: the daemon stopped. We do not reconnect here — the
-                    // restart policy lives in `ensure_daemon`, which owns the heal
-                    // path, and `attach` re-runs it once it notices this pump died.
-                    Ok(None) => break,
-                    Err(e) => {
-                        tracing::warn!(space = %space, error = %e, "doorbell stream ended");
-                        break;
-                    }
-                }
+                },
+                Err(e) => tracing::warn!(space = %space, error = %e, "subscribe failed"),
             }
 
+            // **One** exit, deliberately. A stream that never opened and one that
+            // ended later leave the client in the same place — holding a view of a
+            // space nothing is backing — so they get the same farewell. This used
+            // to be two paths, and the never-opened one skipped the announcement
+            // below: it still healed, but only when something happened to ask,
+            // which is the exact asymmetry the announcement exists to remove.
             pump_alive.store(false, Ordering::Release);
 
             // Say so on the way out, or the repair deadlocks: `attach` only
