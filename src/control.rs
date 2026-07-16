@@ -86,7 +86,7 @@ pub fn control_name(home: &Path) -> Result<Name<'static>> {
 }
 
 /// A board position for `IssueMove` (UI.md §5.1 `--top/--bottom/--before/--after`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "at", rename_all = "snake_case")]
 pub enum BoardPos {
     Top,
@@ -96,7 +96,7 @@ pub enum BoardPos {
 }
 
 /// List/board filter (UI.md §2.1).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Filter {
     #[serde(default)]
     pub mine: bool,
@@ -110,7 +110,7 @@ pub struct Filter {
 }
 
 /// A request from a client to the daemon (SCHEMA §7).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     // ---- tracker (Layer-B façade over the issue model) ----

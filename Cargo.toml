@@ -138,6 +138,12 @@ include_dir = "0.7"
 
 # mcp server (stdio)
 rmcp = { version = "1.7", features = ["server", "macros", "transport-io"] }
+# Already in the tree via rmcp (which `mcp.rs` derives against). Declared directly
+# so `control::Request` can describe its own shape, which is what lets
+# `tests/viewer_parity.rs` check the hand-written TS mirror against it instead of
+# trusting it. Same "generate/check, don't hand-maintain twice" rule as
+# `mcp_parity.rs`.
+schemars = "1"
 # Native `lait update`: GitHub-release self-updater. `ureq` backend + `rustls`
 # keeps it pure-Rust (no reqwest/native-tls/OpenSSL C dep); gzip/zip extraction
 # only (no xz), matching the `.tar.gz` release archives.

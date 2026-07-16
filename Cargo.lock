@@ -2661,6 +2661,7 @@ dependencies = [
  "qrcode",
  "ratatui",
  "rmcp",
+ "schemars",
  "self_update",
  "serde",
  "serde-byte-array",
