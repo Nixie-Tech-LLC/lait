@@ -1,6 +1,19 @@
 # Changelog
 
-## Unreleased — the browser is the interactive surface; the TUI is gone
+## v0.5.0 — the browser is the interactive surface
+
+The 0.4.x line was a chat engine wearing an issue tracker's clothes. This one is
+the tracker: `lait serve` puts a keyboard-first board in a browser over the same
+control plane the CLI already spoke, the re-architecture pulls the last chat-era
+assumptions out at the root, and the daily loop — `lait` → `start` → work →
+`done` — finally reads like the thing you actually do.
+
+> **Two breaks, both needing action.** Stores, invite tickets, and the wire all
+> changed: **every node must re-init (founders) or re-join from a fresh invite
+> (everyone else)**; nothing is migrated. And **`lait tui` is gone** — `lait serve`
+> replaces it. Both are detailed below.
+
+### The browser is the interactive surface; the TUI is gone
 
 **Breaking: `lait tui` no longer exists.** `lait serve` replaces it — a keyboard-first
 board in a browser, over the same Layer-B control plane. Also removed: the `tui.theme`,
@@ -41,7 +54,7 @@ daemon, or the wire changed.
   is the web client's spine. `ratatui`/`crossterm` stay for the inline `lait members`
   picker, which was never part of the TUI; only `tui-textarea` left the tree.
 
-## Unreleased — CLI ergonomics: ask before doing, and say what actually went wrong
+### CLI ergonomics: ask before doing, and say what actually went wrong
 
 Additive within epoch 1 — no flag day. The new `hello` handshake and the
 `Candidates.near_miss_for` field both decode on clients that predate them.
@@ -100,7 +113,7 @@ Additive within epoch 1 — no flag day. The new `hello` handshake and the
   them. Unix was never affected — those fds are `CLOSE_ON_EXEC` — and Windows now
   matches it exactly: nextest reports the suite leak-free on all three OSes.
 
-## Unreleased — protocol version negotiation, schema gate & release hardening
+### Protocol version negotiation, schema gate & release hardening
 
 Composes with the workspace re-architecture break below — the same epoch-1 wire
 change (`lait/sync/1`, `lait/presence/1`, workspace-id gossip topic) — adding
@@ -128,40 +141,7 @@ in-band version negotiation on top of it.
   in place (macOS notarization + Windows Azure signing land next). See
   `docs/RELEASE-SIGNING.md`.
 
-## Unreleased — the rich TUI (full CLI parity)
-
-`lait tui` grows from proof-of-concept to a full client. Board-centric with a
-co-visible right-side issue peek; every CLI verb is reachable inside it.
-
-- **Board + peek.** Workflow columns with two-line cards, colors from the
-  workflow/project/label registries, an optimistic overlay (`▲`), and a peek
-  panel with description, comments, and the derived history timeline (⚠ marks
-  LWW collisions). `S`/`D`/`O` run start/done/stop; `H`/`L` move status;
-  `J`/`K` reorder (`IssueMove`, optimistic).
-- **One grammar, two entry points.** The `:` palette parses through the same
-  clap tree as the shell, with fuzzy verb completion; `start`/`config`/
-  `spaces`/`invite`/`watch` map to native TUI surfaces, process-level commands
-  say "CLI-only" honestly. Ambiguous refs open a disambiguation picker that
-  retries with the chosen candidate.
-- **In-TUI editors** (tui-textarea): quick-create parses inline `-p/-a/-P/-l`
-  tokens with `new`'s grammar; multi-line description/comment (`Ctrl+S`
-  saves); a parse error reopens the editor with the line intact.
-- **Pickers + multi-select.** Assign/label pickers pre-check current state and
-  submit the diff; `x` marks issues and every verb goes bulk (one request per
-  issue, `7 ok · 1 failed` tally).
-- **Screens.** Inbox (unread watermark, `C` clears), Activity, Members (the
-  inline picker's domain: key-first approve, rename, remove, invite w/ QR
-  overlay), Spaces (live, commit-last space switch), Config (edit any key;
-  `tui.*` changes apply live), Remotes, Log.
-- **Filter + saved tabs.** `/` live filter; `P` pins it as a named tab
-  (store-layer `tui.tabs`), `[`/`]` cycle; daemon-side tab filters apply by
-  doc-id intersection with `List` — mine/label semantics stay server truth.
-- **Mouse, themes, rebinding.** Clickable tabs/rows/legend, double-click
-  peeks, wheel scrolls the panel under the cursor. `tui.theme = dark|light|
-  auto`; `tui.key.<action-id>` rebinds any action (bad overrides warn, never
-  gate). Panic-safe terminal restore (RAII + hook).
-
-## Unreleased — the daily-loop DX pass (spaces, start/done/stop, inbox)
+### The daily-loop DX pass (spaces, start/done/stop, inbox)
 
 Shaped by a blind design exercise (Linear-style and Jira-style teams designing
 this CLI from the same capability spec): both independently reinvented our
@@ -193,7 +173,7 @@ explicit-create + registry architecture, and exposed the gaps this pass closes.
 - MCP gains `issue_start` / `issue_done` / `issue_stop` / `inbox` tools — an
   agent works an issue exactly like a human (claim → comment → done).
 
-## Unreleased — workspace & project re-architecture (BREAKING)
+### Workspace & project re-architecture (BREAKING)
 
 > **Clean break.** Stores, invite tickets, and the wire protocol all changed;
 > old and new nodes cannot see each other (new gossip topics + ALPN bumps
