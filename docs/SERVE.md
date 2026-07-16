@@ -254,6 +254,13 @@ because a text box you cannot leave is worse than a shortcut that does not fire.
 
 ## The client
 
+> **Building and hacking on it:** the client is a Vite/React app in
+> [`viewer/`](../viewer/README.md), committed pre-built into `src/serve/assets` and
+> embedded at compile time. `cd viewer && npm run dev` starts the engine, wires the
+> run token into the dev proxy, and gives you HMR in one command — the full loop and
+> the *why* (committed bundle, the proxy vs. the `Origin` guard) are in
+> [`viewer/README.md`](../viewer/README.md).
+
 Five surfaces, reachable by `g`-sequences and by the palette:
 
 | View | Key | What it is |

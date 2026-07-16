@@ -1004,7 +1004,11 @@ pub fn specs() -> Vec<Spec> {
         ),
         Spec::special(
             "serve",
-            "Open your spaces in a browser (local, loopback-only).",
+            // `--json` is a global flag, so it needs no entry here — but it needs
+            // *saying*, because the token is the reason anyone scripts this and a
+            // long-running command that prints a machine line first is unusual
+            // enough to be worth one clause.
+            "Open your spaces in a browser (local, loopback-only). --json prints {url, token, port}, then serves.",
             vec![
                 A::val("port", "Port to bind on 127.0.0.1 (default 7717)."),
                 A::flag("open", "Open the URL in your default browser."),
