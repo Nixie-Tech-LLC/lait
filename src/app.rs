@@ -377,7 +377,19 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
             }
             // `new --start` chains the create into the work loop: file it, then
             // claim it (two honest commits = two activity rows, S§7.1).
-            if leaf.name == "new" && m.get_flag("start") {
+            //
+            // Ask for `start` in a way that can answer "there is no such arg".
+            // `leaf.name` is only the *last* path segment, so `labels new` answers
+            // to "new" as much as the top-level verb does — and `get_flag` on a
+            // leaf that never declared the arg is a panic, not a `false`. That is
+            // exactly what `lait labels new <name>` did.
+            let wants_start = m
+                .try_get_one::<bool>("start")
+                .ok()
+                .flatten()
+                .copied()
+                .unwrap_or(false);
+            if leaf.name == "new" && wants_start {
                 crate::cli::run_new_start(&home, req, out).await?;
             } else if leaf.name == "members" && !out.json && std::io::stdout().is_terminal() {
                 // Bare `lait members` in an interactive terminal opens the modal
