@@ -366,16 +366,11 @@ fn colliding_leaf_names_do_not_read_each_others_args() {
         "the label was not created: {stdout}",
     );
 
-    // And the top-level `new --start` must still *read* its flag. `--start`
-    // chains into the work loop (assign + activate + branch), so it can fail for
-    // git reasons in a bare temp dir — what must not happen is clap refusing the
-    // flag or dispatch failing to see it, which is what the fix touched.
-    let started = lait(&home, &["new", "a title", "--start"]);
-    let started_err = String::from_utf8_lossy(&started.stderr);
-    assert!(
-        !started_err.contains("panicked") && !started_err.contains("unexpected argument"),
-        "`new --start` regressed: {started_err}",
-    );
-
+    // NOT tested here: `new --start`. It chains into the work loop and **creates
+    // and checks out a git branch in the process's cwd** — and `lait()` doesn't
+    // pin one, so it runs in whatever directory the test harness sits in. Asserting
+    // it here once left this very repo checked out on a branch named after the test
+    // fixture. A `--start` test needs its own throwaway git repo as cwd; until it
+    // has one, it does not belong in a suite about not destroying things.
     shutdown(&home);
 }
