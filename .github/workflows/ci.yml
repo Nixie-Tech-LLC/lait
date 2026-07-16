@@ -257,6 +257,42 @@ jobs:
           grep -q 'x86_64-pc-windows-msvc' plan.json \
             || { echo "::error::Windows target missing from dist plan"; exit 1; }
 
+  # The self-updater's in-archive binary path is a claim about cargo-dist's
+  # layout, and the unit tests can only check it against our MODEL of that
+  # layout. The model was wrong twice — v0.4.8 and v0.5.0 shipped a Windows path
+  # of `lait.exe.exe`, so `lait update` was dead on Windows for every user, and
+  # nothing caught it because the test just restated the code. This job closes
+  # the loop against reality: it downloads the archives users actually download
+  # and asserts the path self_update would extract is really in them.
+  #
+  # It validates the CURRENT tree's updater against the LATEST release — exactly
+  # the operation `lait update` performs — so a cargo-dist layout change breaks
+  # CI here rather than stranding users on a binary that cannot update itself.
+  updater-contract:
+    name: self-updater archive contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Fetch the latest release's archives
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-archives
+          gh release download --repo "$GITHUB_REPOSITORY" -D release-archives --clobber \
+            -p 'lait-x86_64-pc-windows-msvc.zip' \
+            -p 'lait-aarch64-apple-darwin.tar.gz' \
+            -p 'lait-x86_64-apple-darwin.tar.gz' \
+            -p 'lait-aarch64-unknown-linux-gnu.tar.gz' \
+            -p 'lait-x86_64-unknown-linux-gnu.tar.gz'
+          ls -l release-archives
+      - name: Assert the updater's path resolves inside them
+        shell: bash
+        env:
+          LAIT_RELEASE_ARCHIVES: release-archives
+        run: cargo test --lib -- --ignored --exact app::tests::update_bin_path_is_a_real_entry_in_the_published_archives
+
   # Packaging manifests (Scoop + winget) are hand-maintained templates that the
   # release CD (publish-scoop / publish-winget) stamps with each release's real
   # version + hash. CI can't check the version/hash (they don't exist until a

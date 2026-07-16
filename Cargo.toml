@@ -175,6 +175,19 @@ proptest = "1"
 # ordering and precedence are tested through the thing that implements them
 # rather than a copy of it. No port, no daemon.
 tower = { version = "0.5", features = ["util"] }
+# Ground truth for the self-updater's archive layout: the `#[ignore]`d
+# `update_bin_path_is_a_real_entry_in_the_published_archives` reads the REAL
+# published release archives (CI downloads them; see the `updater-contract` job),
+# so the path handed to self_update is checked against the bytes users actually
+# download rather than against our own model of cargo-dist's conventions — the
+# model is what was wrong in v0.4.8/v0.5.0. All three already build as part of
+# `self_update`, so they add no meaningful compile cost.
+flate2 = "1"
+tar = "0.4"
+# `deflate` only — the same codec `self_update`'s `compression-zip-deflate`
+# turns on, and all cargo-dist's zip uses. The default feature set drags in
+# aes/bzip2/zstd/lzma for codecs no release archive contains.
+zip = { version = "6", default-features = false, features = ["deflate"] }
 
 # The profile that 'dist' will build with
 [profile.dist]

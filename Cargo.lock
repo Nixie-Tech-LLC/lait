@@ -2646,6 +2646,7 @@ dependencies = [
  "data-encoding",
  "directories",
  "ed25519-dalek 2.2.0",
+ "flate2",
  "fs2",
  "getrandom 0.3.4",
  "include_dir",
@@ -2667,6 +2668,7 @@ dependencies = [
  "serde-byte-array",
  "serde_json",
  "sha2 0.10.9",
+ "tar",
  "tokio",
  "tokio-stream",
  "tower",
@@ -2674,6 +2676,7 @@ dependencies = [
  "tracing-subscriber",
  "windows-sys 0.61.2",
  "x25519-dalek",
+ "zip",
 ]
 
 [[package]]
