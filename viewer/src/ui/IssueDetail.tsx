@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import * as Dropdown from "@radix-ui/react-dropdown-menu";
-import { Check, ChevronDown, Trash2 } from "lucide-react";
+import { Trash2 } from "lucide-react";
 
 import { rpc } from "../api";
 import {
@@ -14,6 +13,8 @@ import type { Field } from "../core/overlay";
 import { catalogColor } from "./colors";
 import { short, when } from "./time";
 import { PriorityIcon, StatusIcon } from "./icons";
+import { Picker } from "./Picker";
+import { IconButton } from "./primitives";
 
 /**
  * The issue detail — co-visible beside the list, not an overlay.
@@ -109,14 +110,14 @@ export function IssueDetail({
           </span>
         )}
         {!readOnly && (
-          <button
+          <IconButton
+            label="Delete issue"
+            variant="danger"
+            className="ml-auto"
             onClick={() => onDelete(issue.reff)}
-            className="text-mute hover:text-danger ml-auto grid size-6 place-items-center rounded"
-            title="Delete issue"
-            aria-label="Delete issue"
           >
             <Trash2 className="size-3.5" />
-          </button>
+          </IconButton>
         )}
       </header>
 
@@ -148,19 +149,17 @@ export function IssueDetail({
           <Picker
             label="Status"
             disabled={readOnly}
-            trigger={
-              <>
-                {state && (
-                  <StatusIcon category={state.category} color={catalogColor(state.color)} />
-                )}
-                {state?.name ?? issue.status}
-              </>
-            }
-            items={states.map((s) => ({
+            value={{
+              id: issue.status,
+              label: state?.name ?? issue.status,
+              ...(state
+                ? { icon: <StatusIcon category={state.category} color={catalogColor(state.color)} /> }
+                : {}),
+            }}
+            options={states.map((s) => ({
               id: s.id,
               label: s.name,
               icon: <StatusIcon category={s.category} color={catalogColor(s.color)} />,
-              active: s.id === issue.status,
             }))}
             onPick={(id) =>
               onPredict(issue.doc_id, "status", id, () =>
@@ -172,19 +171,18 @@ export function IssueDetail({
           <Picker
             label="Priority"
             disabled={readOnly}
-            trigger={
-              <>
-                <PriorityIcon priority={issue.priority} />
-                <span className="capitalize">{issue.priority}</span>
-              </>
-            }
+            className="capitalize"
+            value={{
+              id: issue.priority,
+              label: issue.priority,
+              icon: <PriorityIcon priority={issue.priority} />,
+            }}
             // Highest first: the list you scan top-down should start where the
             // urgency does.
-            items={[...PRIORITY_ORDER].reverse().map((p) => ({
+            options={[...PRIORITY_ORDER].reverse().map((p) => ({
               id: p,
               label: p,
               icon: <PriorityIcon priority={p} />,
-              active: p === issue.priority,
             }))}
             onPick={(id) =>
               onPredict(issue.doc_id, "priority", id, () =>
@@ -334,59 +332,6 @@ function Description({
       className="border-line focus:border-line-strong resize-y rounded border bg-transparent p-2 outline-none"
       aria-label="Description"
     />
-  );
-}
-
-function Picker({
-  label,
-  trigger,
-  items,
-  onPick,
-  disabled,
-}: {
-  label: string;
-  trigger: React.ReactNode;
-  items: Array<{ id: string; label: string; icon: React.ReactNode; active: boolean }>;
-  onPick: (id: string) => void;
-  disabled: boolean;
-}) {
-  if (disabled) {
-    return (
-      <span className="border-line text-dim flex items-center gap-1.5 rounded border px-2 py-1 text-sm">
-        {trigger}
-      </span>
-    );
-  }
-  return (
-    <Dropdown.Root>
-      <Dropdown.Trigger
-        aria-label={label}
-        className="border-line hover:bg-hover data-[state=open]:bg-hover flex items-center gap-1.5 rounded border px-2 py-1 text-sm"
-      >
-        {trigger}
-        <ChevronDown className="text-mute size-3" />
-      </Dropdown.Trigger>
-      <Dropdown.Portal>
-        {/* Radix owns focus trapping, escape, outside-click, and collision
-            flipping — all of which are invisible until they're missing. */}
-        <Dropdown.Content
-          sideOffset={4}
-          className="border-line-strong bg-raised shadow-overlay z-50 min-w-40 rounded-lg border p-1"
-        >
-          {items.map((i) => (
-            <Dropdown.Item
-              key={i.id}
-              onSelect={() => onPick(i.id)}
-              className="data-[highlighted=true]:bg-hover flex cursor-default items-center gap-2 rounded px-2 py-1 text-sm outline-none"
-            >
-              {i.icon}
-              <span className="flex-1 capitalize">{i.label}</span>
-              {i.active && <Check className="size-3" />}
-            </Dropdown.Item>
-          ))}
-        </Dropdown.Content>
-      </Dropdown.Portal>
-    </Dropdown.Root>
   );
 }
 

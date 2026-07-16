@@ -5,6 +5,7 @@ import { Check, Copy, KeyRound, Link2, Pencil, ShieldCheck, UserPlus, X } from "
 import { ConfirmRequired, rpc } from "../api";
 import type { JoinRequestDto, MemberDto } from "../types";
 import { when } from "./time";
+import * as ask from "./dialogs";
 import { Button, IconButton } from "./primitives";
 
 /**
@@ -102,10 +103,17 @@ export function Members({
                     disabled={busy === r.key}
                     onClick={() =>
                       void act(r.key, async () => {
-                        const as = window.prompt(
-                          `Approve ${r.key.slice(0, 12)}…\n\nOptional local name for this key (private to you):`,
-                          r.nick,
-                        );
+                        const as = await ask.prompt({
+                          title: "Approve this key",
+                          // The key, not the nick: it is the thing you verified.
+                          body: `${r.key.slice(0, 24)}… — this seals them the space key.`,
+                          label: "Local name (private to you)",
+                          placeholder: "optional",
+                          defaultValue: r.nick,
+                          confirmText: "Approve",
+                          // Approving without naming them is a real choice.
+                          allowEmpty: true,
+                        });
                         // Cancel means cancel — an empty string is a deliberate
                         // "no petname", null is "I changed my mind".
                         if (as === null) return;
@@ -158,10 +166,13 @@ export function Members({
                       label="Set a local name"
                       onClick={() =>
                         void act(m.key, async () => {
-                          const name = window.prompt(
-                            "Local name for this key (private to you; empty clears):",
-                            m.alias,
-                          );
+                          const name = await ask.prompt({
+                            title: "Local name",
+                            body: "Private to you, never synced. Empty clears it.",
+                            label: "Name",
+                            defaultValue: m.alias,
+                            allowEmpty: true,
+                          });
                           if (name === null) return;
                           await rpc(spaceId, { cmd: "member_alias", who: m.key, name: name.trim() });
                         })
@@ -181,7 +192,13 @@ export function Members({
                               // The engine hands back its own question — removing
                               // rotates the space key, and it says so.
                               if (e instanceof ConfirmRequired) {
-                                if (window.confirm(e.question)) {
+                                if (
+                                  await ask.confirm({
+                                    title: e.question,
+                                    confirmText: "Remove",
+                                    danger: true,
+                                  })
+                                ) {
                                   await rpc(
                                     spaceId,
                                     { cmd: "member_remove", who: m.key },

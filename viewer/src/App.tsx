@@ -21,8 +21,11 @@ import { Inbox } from "./ui/Inbox";
 import { Members } from "./ui/Members";
 import { IssueDetail } from "./ui/IssueDetail";
 import { IssueList } from "./ui/IssueList";
+import { NewIssue } from "./ui/NewIssue";
 import { Palette } from "./ui/Palette";
 import { Shortcuts } from "./ui/Shortcuts";
+import * as ask from "./ui/dialogs";
+import { DialogHost } from "./ui/dialogs";
 import { IconButton, TooltipProvider } from "./ui/primitives";
 import { Sidebar } from "./ui/Sidebar";
 import {
@@ -58,6 +61,8 @@ export function App() {
   const [detail, setDetail] = useState(true);
   const [view, setView] = useState<View>("list");
   const [unread, setUnread] = useState(0);
+  /** The composer, and the column it was opened from (null = closed). */
+  const [composing, setComposing] = useState<{ status?: string } | null>(null);
   const [filter, setFilter] = useState<FilterState>(EMPTY_FILTER);
   const [filterOpen, setFilterOpen] = useState(false);
   const [focusToken, setFocusToken] = useState(0);
@@ -305,12 +310,7 @@ export function App() {
         const next = list[Math.max(0, Math.min(list.length - 1, (i < 0 ? 0 : i) + delta))];
         if (next) setSelection(next.reff);
       },
-      createIssue: () =>
-        void guard(async () => {
-          const title = window.prompt("Issue title");
-          if (!title || !current) return;
-          await rpc(current, { cmd: "issue_new", title });
-        }),
+      createIssue: () => setComposing({}),
       deleteIssue: (reff) =>
         void guard(async () => {
           if (!current) return;
@@ -320,7 +320,8 @@ export function App() {
             // The engine hands back the CLI's own question rather than us
             // inventing one, so modal and terminal cannot disagree on the stakes.
             if (e instanceof ConfirmRequired) {
-              if (window.confirm(e.question)) {
+              // The engine's own words, in our dialog.
+              if (await ask.confirm({ title: e.question, confirmText: "Delete", danger: true })) {
                 await rpc(current, { cmd: "issue_delete", reff }, { confirm: true });
               }
               return;
@@ -513,7 +514,7 @@ export function App() {
               selection={selection}
               optimistic={optimistic}
               onSelect={api.select}
-              onCreate={() => run("issue.create")}
+              onCreate={(status) => setComposing({ status })}
               readOnly={readOnly}
             />
           ) : shown && view === "list" ? (
@@ -523,7 +524,7 @@ export function App() {
               optimistic={optimistic}
               onSelect={api.select}
               onOpen={() => setDetail(true)}
-              onCreate={() => run("issue.create")}
+              onCreate={(status) => setComposing({ status })}
               readOnly={readOnly}
             />
           ) : (
@@ -555,6 +556,18 @@ export function App() {
         </>
       )}
 
+      {composing && current && board && (
+        <NewIssue
+          spaceId={current}
+          projectKey={board.project.key}
+          states={board.columns.map((c) => c.state)}
+          labels={labels}
+          defaultStatus={composing.status}
+          onClose={() => setComposing(null)}
+          onError={setError}
+        />
+      )}
+      <DialogHost />
       {modal === "palette" && <Palette ctx={ctx} onClose={() => setModal(null)} />}
       {modal === "shortcuts" && <Shortcuts ctx={ctx} onClose={() => setModal(null)} />}
 
