@@ -71,7 +71,10 @@ export interface Row {
   title: string;
   status: string;
   priority: Priority;
+  /** Viewer-relative one-liner (`you +2`) — the shape a terminal row prints. */
   assignee_summary: string;
+  /** The keys behind that summary, for clients that draw faces instead. */
+  assignees: string[];
   tombstone: boolean;
   provisional: boolean;
 }

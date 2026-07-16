@@ -1,7 +1,8 @@
 import { useEffect, useRef } from "react";
 import { Plus } from "lucide-react";
 
-import type { BoardColumn, BoardView, Row } from "../types";
+import type { BoardColumn, BoardView, MemberDto, Row } from "../types";
+import { AvatarStack, stackFor } from "./Avatar";
 import { catalogColor } from "./colors";
 import { PriorityIcon, StatusIcon } from "./icons";
 import { IconButton, Kbd } from "./primitives";
@@ -20,6 +21,7 @@ import { IconButton, Kbd } from "./primitives";
  */
 export function IssueList({
   board,
+  members,
   selection,
   optimistic,
   onSelect,
@@ -28,6 +30,8 @@ export function IssueList({
   readOnly,
 }: {
   board: BoardView;
+  /** The ACL, for resolving assignee keys to faces. */
+  members: MemberDto[];
   selection: string | null;
   /** Docs carrying an unconfirmed local prediction. */
   optimistic: ReadonlySet<string>;
@@ -48,6 +52,7 @@ export function IssueList({
           <Group
             key={col.state.id}
             col={col}
+            members={members}
             selection={selection}
             optimistic={optimistic}
             onSelect={onSelect}
@@ -70,6 +75,7 @@ const visible = (c: BoardColumn) => c.rows.filter((r) => !r.tombstone);
 
 function Group({
   col,
+  members,
   selection,
   optimistic,
   onSelect,
@@ -78,6 +84,7 @@ function Group({
   readOnly,
 }: {
   col: BoardColumn;
+  members: MemberDto[];
   selection: string | null;
   optimistic: ReadonlySet<string>;
   onSelect: (reff: string) => void;
@@ -111,6 +118,7 @@ function Group({
             key={row.reff}
             row={row}
             state={col}
+            members={members}
             selected={row.reff === selection}
             pending={optimistic.has(row.doc_id)}
             onSelect={onSelect}
@@ -125,6 +133,7 @@ function Group({
 function IssueRow({
   row,
   state,
+  members,
   selected,
   pending,
   onSelect,
@@ -132,6 +141,7 @@ function IssueRow({
 }: {
   row: Row;
   state: BoardColumn;
+  members: MemberDto[];
   selected: boolean;
   pending: boolean;
   onSelect: (reff: string) => void;
@@ -176,9 +186,9 @@ function IssueRow({
           aria-label="Pending"
         />
       )}
-      {row.assignee_summary && (
-        <span className="text-mute shrink-0 text-xs">{row.assignee_summary}</span>
-      )}
+      {/* Faces, not `assignee_summary` — that string is the terminal's projection
+          ("you +1"), and this row has a fixed 32px rhythm to keep. */}
+      <AvatarStack members={stackFor(row.assignees, members)} className="w-14 justify-end" />
     </li>
   );
 }

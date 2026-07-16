@@ -295,14 +295,14 @@ cannot catch.
 
 ## Next
 
-- **Replace the shell with the React app**, embedded in the binary so `lait serve`
-  stays one self-contained artifact and the SPA stays same-origin — which is what
-  makes the `Origin` allowlist enforceable in the first place.
-- **Optimistic updates.** Every write currently waits for the doorbell before it
-  shows. That is correct and never lies, but it is a round trip you can feel. The
-  TUI's overlay is the design to port: `(doc_id, field) -> value`, invalidated by any
-  doorbell for that doc — correlation-free, no request ids, no rollback log. Add the
-  TTL the terminal version could do without.
+- **The daemon's project chain does not fit a browser, and the client must not
+  pretend otherwise.** `Request::Board { project: null }` resolves via the *CLI*
+  chain — the git branch's key → `project.default` → the only project → a teaching
+  error. A tab has no branch and no cwd, so on a space with more than one project
+  that chain reaches the error every time. The client names a project explicitly once
+  it has the list (`project_list`), which works but cannot honour `project.default` —
+  that lives in `config`, which the RPC endpoint cannot reach (see below). A
+  supervisor-level settings endpoint would close this properly.
 - **Notifications** belong to the *daemon*, not the tab. `http://localhost` is a
   secure context so the Notification API works, but a tab only fires while it is
   open; the always-on component is the daemon. The browser should badge; the daemon

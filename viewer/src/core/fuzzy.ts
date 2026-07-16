@@ -51,6 +51,30 @@ export function fuzzyScore(needle: string, haystack: string): number | null {
   return score - Math.floor(h.length / 8);
 }
 
+/**
+ * cmdk's filter contract: return 0 to hide, higher sorts first.
+ *
+ * Shared by the palette and every picker so "matches" means one thing in this
+ * client. Bridges `fuzzyScore`, whose `null`-means-no-match and unbounded range are
+ * not what cmdk expects.
+ *
+ * Two traps, both survived by real bugs:
+ *
+ * - An empty search returns 1 (show everything, in source order) rather than
+ *   scoring — otherwise the list reorders itself before you have typed anything.
+ * - The result is shifted above zero. A legitimate match can score 0 or less via
+ *   the length penalty, and 0 means *hide* to cmdk, so a real hit would vanish.
+ */
+export function cmdkFilter(value: string, search: string, keywords?: string[]): number {
+  if (!search.trim()) return 1;
+  let best: number | null = null;
+  for (const hay of [value, ...(keywords ?? [])]) {
+    const s = fuzzyScore(search, hay);
+    if (s !== null && (best === null || s > best)) best = s;
+  }
+  return best === null ? 0 : Math.max(best + 100, 1);
+}
+
 /** Rank items by their best-scoring searchable text; drop non-matches. */
 export function rank<T>(items: readonly T[], needle: string, text: (t: T) => string[]): T[] {
   if (!needle.trim()) return [...items];

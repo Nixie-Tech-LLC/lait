@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { AlertTriangle } from "lucide-react";
 
 import { rpc } from "../api";
+import { describeChanges, describeEvent } from "../core/activity";
 import type { ActivityEvent } from "../types";
 import { when } from "./time";
 
@@ -16,6 +17,12 @@ import { when } from "./time";
  * One `Request` = one commit = one row (S§7.1), so a mutation that moved three
  * fields is *one* entry with three changes rather than three entries. The feed's
  * granularity is the command surface's, by design.
+ *
+ * **Who did it is `core/activity.ts`'s call, not this file's.** This used to render
+ * `{actor_nick} {text}` straight from the struct, which was wrong twice: most kinds
+ * carry no `text` at all (so the row was a bare name), and `actor` is stamped with
+ * the *local* identity on every event — including `synced`, the one that fires when
+ * a teammate's change arrives. The feed was crediting you with other people's edits.
  */
 export function Activity({
   spaceId,
@@ -62,15 +69,7 @@ export function Activity({
           <span className="text-mute w-20 shrink-0 truncate font-mono text-xs tabular-nums">
             {e.reff}
           </span>
-          <span className="min-w-0 flex-1">
-            <span className="font-medium">{e.actor_nick || "someone"}</span>{" "}
-            <span className="text-dim">{e.text}</span>
-            {e.changes.length > 0 && (
-              <span className="text-mute ml-2 text-xs">
-                {e.changes.map((c) => `${c.field}: ${c.from ?? "—"} → ${c.to ?? "—"}`).join(", ")}
-              </span>
-            )}
-          </span>
+          <Line event={e} />
           {/* A concurrent overwrite is worth flagging but never worth blocking on
               (A§9): last-writer-wins already resolved it; you just get told. */}
           {e.collision && (
@@ -83,5 +82,21 @@ export function Activity({
         </li>
       ))}
     </ul>
+  );
+}
+
+function Line({ event }: { event: ActivityEvent }) {
+  const { actor, phrase } = describeEvent(event);
+  const changes = describeChanges(event);
+  return (
+    <span className="min-w-0 flex-1">
+      {/* No name when we have no honest one — see core/activity.ts. */}
+      {actor && <span className="font-medium">{actor} </span>}
+      <span className="text-dim">{phrase}</span>
+      {/* `created` and `commented` are the two kinds that carry words of their
+          own; everything else is phrased above. */}
+      {event.text && <span className="text-mute ml-2 text-xs">{event.text}</span>}
+      {changes && <span className="text-mute ml-2 text-xs">{changes}</span>}
+    </span>
   );
 }

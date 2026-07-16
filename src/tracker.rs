@@ -1299,6 +1299,7 @@ impl Tracker {
             status: row.status.clone(),
             priority: row.priority,
             assignee_summary: self.assignee_summary(&row.assignees),
+            assignees: row.assignees.clone(),
             tombstone: row.tombstone,
             provisional: row.provisional,
         }

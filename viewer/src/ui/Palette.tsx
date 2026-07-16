@@ -1,7 +1,7 @@
 import { Command } from "cmdk";
 import { useMemo } from "react";
 
-import { fuzzyScore } from "../core/fuzzy";
+import { cmdkFilter } from "../core/fuzzy";
 import { formatBinding } from "../core/keys";
 import { registry, type Ctx } from "../core/registry";
 import { Kbd } from "./primitives";
@@ -48,7 +48,7 @@ export function Palette({ ctx, onClose }: { ctx: Ctx; onClose: () => void }) {
         loop
         onMouseDown={(e) => e.stopPropagation()}
         className="border-line-strong bg-raised shadow-overlay flex h-fit max-h-[60vh] w-[min(560px,92vw)] flex-col overflow-hidden rounded-lg border"
-        filter={score}
+        filter={cmdkFilter}
       >
         <Command.Input
           autoFocus
@@ -88,24 +88,4 @@ export function Palette({ ctx, onClose }: { ctx: Ctx; onClose: () => void }) {
       </Command>
     </div>
   );
-}
-
-/**
- * cmdk's filter contract: return 0 to hide, higher sorts first.
- *
- * Bridges our scorer, whose `null`-means-no-match and unbounded range are not what
- * cmdk expects. An empty search shows everything in registration order (score 1),
- * which is the registry's own `order`-derived shape rather than an alphabetical
- * one nobody asked for.
- */
-function score(value: string, search: string, keywords?: string[]): number {
-  if (!search.trim()) return 1;
-  let best: number | null = null;
-  for (const hay of [value, ...(keywords ?? [])]) {
-    const s = fuzzyScore(search, hay);
-    if (s !== null && (best === null || s > best)) best = s;
-  }
-  // Shift above zero: a legitimate match can score 0 or less (the length penalty),
-  // and 0 means "hide" to cmdk — so a real hit would silently vanish.
-  return best === null ? 0 : Math.max(best + 100, 1);
 }

@@ -72,6 +72,10 @@ fn response_dtos_round_trip() {
         status: "in_progress".into(),
         priority: Priority::High,
         assignee_summary: "you +1".into(),
+        assignees: vec![
+            lait::ids::UserId::from_key_string("a".repeat(64)),
+            lait::ids::UserId::from_key_string("b".repeat(64)),
+        ],
         tombstone: false,
         provisional: false,
     };

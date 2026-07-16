@@ -3,11 +3,19 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
 
 import { rpc } from "../api";
-import { PRIORITY_ORDER, type LabelDto, type Priority, type WorkflowState } from "../types";
+import {
+  PRIORITY_ORDER,
+  type LabelDto,
+  type MemberDto,
+  type Priority,
+  type WorkflowState,
+} from "../types";
+import { Avatar, AvatarStack } from "./Avatar";
 import { catalogColor } from "./colors";
 import { PriorityIcon, StatusIcon } from "./icons";
-import { MultiPicker, Picker } from "./Picker";
+import { Combobox } from "./Picker";
 import { Button, IconButton, Kbd } from "./primitives";
+import { short } from "./time";
 
 /**
  * The composer.
@@ -30,6 +38,7 @@ export function NewIssue({
   projectKey,
   states,
   labels,
+  members,
   defaultStatus,
   onClose,
   onError,
@@ -38,6 +47,7 @@ export function NewIssue({
   projectKey: string;
   states: WorkflowState[];
   labels: LabelDto[];
+  members: MemberDto[];
   /** The column you opened this from, if any. */
   defaultStatus?: string | undefined;
   onClose: () => void;
@@ -47,7 +57,10 @@ export function NewIssue({
   const [body, setBody] = useState("");
   const [priority, setPriority] = useState<Priority>("none");
   const [status, setStatus] = useState(defaultStatus ?? states[0]?.id ?? "backlog");
+  /** Label **names** — `issue_new` resolves names, not ids, and creates on first use. */
   const [picked, setPicked] = useState<string[]>([]);
+  /** Assignee **keys** — `index::resolve_user` takes `me` or a full 64-hex key. */
+  const [assignees, setAssignees] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [again, setAgain] = useState(false);
 
@@ -65,6 +78,7 @@ export function NewIssue({
         ...(body.trim() ? { body: body.trim() } : {}),
         ...(priority !== "none" ? { priority } : {}),
         ...(picked.length ? { labels: picked } : {}),
+        ...(assignees.length ? { assignees } : {}),
       });
       // `issue_new` can't set status, so honour a non-default column with a
       // follow-up rather than pretending the field exists.
@@ -146,7 +160,7 @@ export function NewIssue({
           </div>
 
           <div className="flex flex-wrap items-center gap-2 px-4 py-3">
-            <Picker
+            <Combobox
               label="Status"
               value={
                 state
@@ -164,7 +178,7 @@ export function NewIssue({
               }))}
               onPick={setStatus}
             />
-            <Picker
+            <Combobox
               label="Priority"
               value={{ id: priority, label: priority === "none" ? "Priority" : priority }}
               options={[...PRIORITY_ORDER].reverse().map((p) => ({
@@ -175,10 +189,57 @@ export function NewIssue({
               onPick={(id) => setPriority(id as Priority)}
               className="capitalize"
             />
-            <MultiPicker
+            <Combobox
+              multi
+              label="Assignees"
+              selected={assignees}
+              emptyText="No members yet"
+              face={
+                assignees.length === 0 ? (
+                  <span className="text-mute">Assignees</span>
+                ) : (
+                  <span className="flex items-center gap-1.5">
+                    <AvatarStack
+                      members={assignees.map((k) => {
+                        const m = members.find((x) => x.key === k);
+                        return { key: k, alias: m?.alias ?? "", me: m?.me ?? false };
+                      })}
+                    />
+                    <span>{assignees.length === 1 ? nameFor(assignees[0]!, members) : assignees.length}</span>
+                  </span>
+                )
+              }
+              options={members.map((m) => ({
+                id: m.key,
+                label: nameFor(m.key, members),
+                icon: <Avatar userKey={m.key} alias={m.alias} me={m.me} size="sm" />,
+                hint: m.key.slice(0, 6),
+                keywords: [m.key, m.alias],
+              }))}
+              onToggle={(key) =>
+                setAssignees((a) => (a.includes(key) ? a.filter((x) => x !== key) : [...a, key]))
+              }
+            />
+            <Combobox
+              multi
               label="Labels"
               selected={picked}
-              options={labels.map((l) => ({ id: l.id, label: l.name, swatch: catalogColor(l.color) }))}
+              emptyText="No labels yet"
+              face={
+                picked.length === 0 ? (
+                  <span className="text-mute">Labels</span>
+                ) : (
+                  <span>{picked.join(", ")}</span>
+                )
+              }
+              // `id` is the **name**: `issue_new` resolves label names and creates
+              // unknown ones on first use, so the name is the identity here.
+              options={labels.map((l) => ({
+                id: l.name,
+                label: l.name,
+                swatch: catalogColor(l.color),
+                keywords: [l.id],
+              }))}
               onToggle={(name) =>
                 setPicked((p) => (p.includes(name) ? p.filter((x) => x !== name) : [...p, name]))
               }
@@ -201,4 +262,11 @@ export function NewIssue({
       </Dialog.Portal>
     </Dialog.Root>
   );
+}
+
+/** `you` for yourself, the local petname if set, the key's head otherwise. */
+function nameFor(key: string, members: MemberDto[]): string {
+  const m = members.find((x) => x.key === key);
+  if (m?.me) return "you";
+  return m?.alias.trim() || short(key);
 }

@@ -63,7 +63,7 @@ UI §4. They are the design of record, kept in sync with the shipped code.
 | Doc | Status | Covers |
 |---|---|---|
 | [`GUIDED-JOIN.md`](./GUIDED-JOIN.md) | shipped (v0.4.7) | The first-invite verifier (`lait doctor`) and the directory-trap fix. |
-| [`SERVE.md`](./SERVE.md) | vertical slice | `lait serve`: the control plane over loopback HTTP/SSE. Why the browser is a client and not a peer, the rebinding guard, the per-space daemon supervisor, and the identity seam. |
+| [`SERVE.md`](./SERVE.md) | shipped (v0.5.x) | `lait serve`: the control plane over loopback HTTP/SSE. Why the browser is a client and not a peer, the rebinding guard, the per-space daemon supervisor, and the identity seam. |
 | [`HARDENING.md`](./HARDENING.md) | proposed (deferred) | Agent-messaging delivery/ack receipts and urgency tiers ("notify anyway"). Not yet built. |
 
 ## Operator docs

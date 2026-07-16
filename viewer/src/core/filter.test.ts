@@ -11,6 +11,7 @@ const row = (over: Partial<Row> & { reff: string }): Row => ({
   status: "backlog",
   priority: "none",
   assignee_summary: "",
+  assignees: [],
   tombstone: false,
   provisional: false,
   ...over,
@@ -63,11 +64,19 @@ describe("what the daemon must answer", () => {
     expect(needsServer({ ...EMPTY_FILTER, label: "bug" })).toBe(true);
   });
 
+  it("does not ask the server about status", () => {
+    // Status is an id-to-id comparison over data the daemon already handed us —
+    // there is no semantic to preserve, and `Filter.status` is single-valued so it
+    // could not express a multi-select anyway. See the note in filter.ts.
+    expect(needsServer({ ...EMPTY_FILTER, status: ["backlog", "done"] })).toBe(false);
+  });
+
   it("knows when anything is narrowing the view", () => {
     expect(isActive(EMPTY_FILTER)).toBe(false);
     expect(isActive({ ...EMPTY_FILTER, text: "  " })).toBe(false);
     expect(isActive({ ...EMPTY_FILTER, text: "x" })).toBe(true);
     expect(isActive({ ...EMPTY_FILTER, mine: true })).toBe(true);
+    expect(isActive({ ...EMPTY_FILTER, status: ["done"] })).toBe(true);
   });
 });
 
@@ -109,5 +118,47 @@ describe("applyFilter", () => {
 
   it("returns the board untouched when nothing is filtering", () => {
     expect(applyFilter(b, EMPTY_FILTER, null)).toBe(b);
+  });
+});
+
+describe("the status filter selects columns", () => {
+  const b = board([
+    row({ reff: "iss_1", status: "backlog", title: "Fix login" }),
+    row({ reff: "iss_2", status: "backlog", title: "Add logout" }),
+    row({ reff: "iss_3", status: "done", title: "Ship it" }),
+  ]);
+
+  it("drops the columns you didn't ask for", () => {
+    // The one filter allowed to change the board's structure: you named the
+    // statuses, so the others are not "empty" — they are not part of the question.
+    const out = applyFilter(b, { ...EMPTY_FILTER, status: ["done"] }, null);
+    expect(out.columns).toHaveLength(1);
+    expect(out.columns[0]!.state.id).toBe("done");
+    expect(countRows(out)).toBe(1);
+  });
+
+  it("keeps every column when no status is selected", () => {
+    expect(applyFilter(b, { ...EMPTY_FILTER, status: [] }, null).columns).toHaveLength(2);
+  });
+
+  it("is multi-select — the thing the daemon's Option<String> cannot express", () => {
+    const out = applyFilter(b, { ...EMPTY_FILTER, status: ["backlog", "done"] }, null);
+    expect(out.columns).toHaveLength(2);
+    expect(countRows(out)).toBe(3);
+  });
+
+  it("keeps a selected column that a text filter emptied", () => {
+    // The distinction the module note draws: `status` chose the column, `text`
+    // emptied it. The column stays, because the workflow did not change.
+    const out = applyFilter(b, { ...EMPTY_FILTER, status: ["done"], text: "zzz" }, null);
+    expect(out.columns).toHaveLength(1);
+    expect(countRows(out)).toBe(0);
+  });
+
+  it("composes with a server filter without re-deriving it", () => {
+    const allowed = new Set(["doc_iss_1"]);
+    const out = applyFilter(b, { ...EMPTY_FILTER, status: ["backlog"], mine: true }, allowed);
+    expect(countRows(out)).toBe(1);
+    expect(out.columns[0]!.rows[0]!.reff).toBe("iss_1");
   });
 });

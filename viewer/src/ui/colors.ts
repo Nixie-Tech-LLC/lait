@@ -33,3 +33,48 @@ export function catalogColor(name: string): string {
   if (/^#[0-9a-f]{3,8}$/i.test(key)) return key;
   return NAMED[key] ?? "var(--color-mute)";
 }
+
+/**
+ * Member avatars: a **designed** set, indexed by key — never a computed hue.
+ *
+ * The obvious move is `hsl(hash % 360, …)`, and it is the wrong one for the same
+ * reason `color: blue` is wrong above: a hue we did not choose is a hue we cannot
+ * promise contrast for, and at 20px with white text on top, "mostly fine" means
+ * "illegible for two members in ten". These eight are picked to hold white text in
+ * both themes and to stay distinguishable from each other — including for the most
+ * common forms of colour blindness, which a rainbow of computed hues is not.
+ *
+ * Deliberately *not* light-dark(): an avatar is a solid chip carrying white text,
+ * so it wants the same ink in both themes. The surrounding ring adapts; the fill
+ * does not need to.
+ */
+const AVATAR: readonly string[] = [
+  "#4f46e5", // indigo
+  "#0891b2", // cyan
+  "#059669", // emerald
+  "#b45309", // amber
+  "#c026d3", // fuchsia
+  "#dc2626", // red
+  "#7c3aed", // violet
+  "#0d9488", // teal
+];
+
+/**
+ * A stable colour for a member key.
+ *
+ * FNV-1a over the whole key rather than `parseInt(key.slice(0, 2), 16)`: a prefix
+ * is exactly what member keys are *displayed* by (and approved by), so two members
+ * a human is being asked to tell apart are the two most likely to share a prefix —
+ * and would have drawn the same colour. Hashing the full key puts the collision
+ * somewhere it does not correlate with what the eye is comparing.
+ */
+export function avatarColor(userKey: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < userKey.length; i++) {
+    h ^= userKey.charCodeAt(i);
+    // `Math.imul` keeps this a 32-bit multiply; `h * 16777619` loses the low bits
+    // to float precision and collapses the distribution.
+    h = Math.imul(h, 0x01000193);
+  }
+  return AVATAR[Math.abs(h) % AVATAR.length] ?? AVATAR[0]!;
+}

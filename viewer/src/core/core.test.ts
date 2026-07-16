@@ -10,7 +10,7 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { fuzzyScore, rank } from "./fuzzy";
+import { cmdkFilter, fuzzyScore, rank } from "./fuzzy";
 import { formatBinding, matchChord, parseBinding } from "./keys";
 import { Registry, type Command, type Ctx } from "./registry";
 import { resolve, shouldHandle } from "./resolve";
@@ -248,46 +248,45 @@ describe("the core has no privileged path", () => {
   });
 });
 
-describe("the palette's cmdk filter bridge", () => {
-  // `score` adapts our scorer to cmdk's contract, and the two disagree in a way
-  // that fails silently: ours returns null-for-no-match over an unbounded range,
-  // cmdk reads 0 as "hide". A legitimate match CAN score <= 0 (the length
+describe("the cmdk filter bridge", () => {
+  // `cmdkFilter` adapts our scorer to cmdk's contract, and the two disagree in a
+  // way that fails silently: ours returns null-for-no-match over an unbounded
+  // range, cmdk reads 0 as "hide". A legitimate match CAN score <= 0 (the length
   // penalty), so without the shift a real hit vanishes from the palette.
+  //
+  // This used to test a hand-copied mirror of the function, because it lived in a
+  // React file and the test would not import one. It lives in `core/fuzzy` now —
+  // shared by the palette and every picker — so the real thing is under test and
+  // the copy that could drift from it is gone.
   it("never returns 0 for a real match, however long the title", () => {
     const long = "Configure the extremely verbose thing with a very long name indeed";
     expect(fuzzyScore("c", long)).toBeLessThanOrEqual(0); // the trap
-    expect(paletteScore(long, "c")).toBeGreaterThan(0); // the fix
+    expect(cmdkFilter(long, "c")).toBeGreaterThan(0); // the fix
   });
 
   it("returns 0 only for an actual non-match", () => {
-    expect(paletteScore("New issue", "zzz")).toBe(0);
+    expect(cmdkFilter("New issue", "zzz")).toBe(0);
   });
 
   it("shows everything for an empty query", () => {
-    expect(paletteScore("anything", "")).toBeGreaterThan(0);
-    expect(paletteScore("anything", "   ")).toBeGreaterThan(0);
+    expect(cmdkFilter("anything", "")).toBeGreaterThan(0);
+    expect(cmdkFilter("anything", "   ")).toBeGreaterThan(0);
   });
 
   it("ranks a better match higher, so cmdk sorts the way we do", () => {
-    expect(paletteScore("New issue", "ni")).toBeGreaterThan(paletteScore("Toggle sidebar", "ni"));
+    expect(cmdkFilter("New issue", "ni")).toBeGreaterThan(cmdkFilter("Toggle sidebar", "ni"));
   });
 
   it("matches on the command id via keywords", () => {
-    expect(paletteScore("New issue", "issue.cr", ["issue.create"])).toBeGreaterThan(0);
+    expect(cmdkFilter("New issue", "issue.cr", ["issue.create"])).toBeGreaterThan(0);
+  });
+
+  // A picker keys its items by id and searches the label through `keywords` (see
+  // Picker.tsx), which only works because the bridge scores keywords equally.
+  it("finds a picker option by its label when the value is an opaque id", () => {
+    expect(cmdkFilter("iss_01JTHLH8QT", "fix login", ["fix login race"])).toBeGreaterThan(0);
   });
 });
-
-/** Mirror of `ui/Palette.tsx`'s `score` — kept here so the contract is pinned
- *  without dragging React into a unit test. */
-function paletteScore(value: string, search: string, keywords?: string[]): number {
-  if (!search.trim()) return 1;
-  let best: number | null = null;
-  for (const hay of [value, ...(keywords ?? [])]) {
-    const s = fuzzyScore(search, hay);
-    if (s !== null && (best === null || s > best)) best = s;
-  }
-  return best === null ? 0 : Math.max(best + 100, 1);
-}
 
 describe("fuzzy ranking", () => {
   it("prefers prefixes and word boundaries over scattered hits", () => {

@@ -180,7 +180,17 @@ pub struct Row {
     pub title: String,
     pub status: String,
     pub priority: Priority,
+    /// Viewer-relative one-liner (`you +2`) — what a terminal row prints.
     pub assignee_summary: String,
+    /// The assignee keys behind that summary.
+    ///
+    /// Both, not one. `assignee_summary` is *rendered* — it resolves "you" against
+    /// the local `UserId` and collapses the tail into `+2`, which is exactly right
+    /// for a CLI row and useless to a client that wants to draw faces. The keys are
+    /// already in `RowMeta` (cached viewer-neutrally, precisely so the summary can
+    /// be computed per-viewer), so this projects them rather than making every
+    /// graphical client open N issue docs to learn what the catalog already knows.
+    pub assignees: Vec<UserId>,
     pub tombstone: bool,
     pub provisional: bool,
 }

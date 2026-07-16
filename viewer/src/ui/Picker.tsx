@@ -1,150 +1,218 @@
-import * as Dropdown from "@radix-ui/react-dropdown-menu";
+import { useState } from "react";
+import * as Popover from "@radix-ui/react-popover";
+import { cva, type VariantProps } from "class-variance-authority";
+import { Command } from "cmdk";
 import { Check, ChevronDown } from "lucide-react";
 
+import { cmdkFilter } from "../core/fuzzy";
 import { cn } from "./primitives";
 
 /**
- * A pill that opens a menu — the tracker's workhorse control.
+ * A pill that opens a searchable menu — the tracker's workhorse control.
  *
- * Shared rather than re-declared per surface: the detail pane and the composer are
- * setting the *same* fields, and a status pill that behaves differently depending
- * on which panel you opened it from is the kind of drift nobody notices until it's
- * everywhere.
+ * **One control, not one per field.** Status, priority, assignees, labels, and
+ * project are all "pick from a set", and the moment they stop being the same
+ * component they start disagreeing: about where the check mark goes, whether the
+ * menu closes on pick, whether search exists. That drift is invisible in review and
+ * obvious in use, so there is exactly one of these.
  *
- * Radix owns focus trapping, escape, outside-click, typeahead, and collision
- * flipping — all invisible until they're missing.
+ * **The search field is always there**, including over four statuses where it looks
+ * like overkill. Two reasons, and the second is the real one:
+ *
+ * 1. It makes every picker keyboard-complete — `s` `d` `o` `n` `↵` sets Done without
+ *    the hand leaving the keys, which is the whole point of this client.
+ * 2. `cmdk` drives its list from the input's focus. Hiding the input below some
+ *    threshold means Radix focuses the popover content instead, and the keydown
+ *    never reaches `Command`'s handler — arrow keys silently stop working on
+ *    exactly the small menus that looked too simple to break.
+ *
+ * Radix's Popover owns focus trapping, escape, outside-click, and collision
+ * flipping; `cmdk` owns roving focus, `aria-activedescendant`, and scroll-into-view.
+ * The *ranking* stays ours (`cmdkFilter`), so the palette and every picker agree on
+ * what "matches" means.
+ *
+ * `open`/`onOpenChange` are exposed so a keybinding can open a picker — `a` has to
+ * reach the assignee menu without a mouse, and a component with private open state
+ * could not be driven from the registry.
  */
+
+/**
+ * Two shapes, one behaviour.
+ *
+ * `pill` is a standalone control — the composer's row of choices, where each needs
+ * its own edge to read as separate. `bare` is for a property list, where the `dt`
+ * already names the field and five bordered pills stacked vertically would draw
+ * five boxes around information that is already in a box. Chrome recedes; the
+ * affordance arrives on hover.
+ */
+const trigger = cva("flex items-center gap-1.5 text-sm", {
+  variants: {
+    variant: {
+      pill: "border-line hover:bg-hover data-[state=open]:bg-hover rounded-full border px-2 py-1",
+      bare: "hover:bg-hover data-[state=open]:bg-hover -mx-1 min-w-0 rounded px-1 py-0.5 text-left",
+    },
+  },
+  defaultVariants: { variant: "pill" },
+});
 
 export interface Option {
   id: string;
   label: string;
   icon?: React.ReactNode;
   swatch?: string;
+  /** Secondary text, muted and right-aligned — a key prefix under a petname. */
+  hint?: string;
+  /** Matched by search but not shown. A member's full key, a label's id. */
+  keywords?: string[];
 }
 
-export function Picker({
-  label,
-  value,
-  options,
-  onPick,
-  disabled,
-  placeholder,
-  className,
-}: {
+type Mode =
+  | { multi?: false; value: Option | null; onPick: (id: string) => void }
+  | { multi: true; selected: readonly string[]; onToggle: (id: string) => void };
+
+type Props = {
+  /** Accessible name, and the trigger's text when nothing is chosen. */
   label: string;
-  /** The selected option, or null for "nothing chosen yet". */
-  value: Option | null;
   options: Option[];
-  onPick: (id: string) => void;
+  /** Trigger content. Defaults to the single-select face. */
+  face?: React.ReactNode;
   disabled?: boolean;
   placeholder?: string;
   className?: string;
-}) {
-  const face = (
+  /** Controlled, so a keybinding can open this. Uncontrolled if omitted. */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  emptyText?: string;
+} & Mode &
+  VariantProps<typeof trigger>;
+
+export function Combobox(props: Props) {
+  const {
+    label,
+    options,
+    face,
+    disabled,
+    placeholder,
+    className,
+    open,
+    onOpenChange,
+    emptyText,
+    variant,
+  } = props;
+
+  // Open state is internal *and* overridable. A keybinding needs to force it open;
+  // a single-select pick needs to close it. Both have to work, so the component owns
+  // a copy and mirrors any controlled value over the top.
+  const [internal, setInternal] = useState(false);
+  const isOpen = open ?? internal;
+  const setOpen = (o: boolean) => {
+    setInternal(o);
+    onOpenChange?.(o);
+  };
+
+  const single = props.multi !== true ? props.value : null;
+  const content = face ?? (
     <>
-      {value?.icon}
-      {value?.swatch && (
-        <span className="size-2 shrink-0 rounded-full" style={{ background: value.swatch }} />
+      {single?.icon}
+      {single?.swatch && (
+        <span className="size-2 shrink-0 rounded-full" style={{ background: single.swatch }} />
       )}
-      <span className={cn(!value && "text-mute")}>{value?.label ?? placeholder ?? label}</span>
+      <span className={cn(!single && "text-mute")}>{single?.label ?? placeholder ?? label}</span>
     </>
   );
 
+  // A read-only space still shows its values — it just cannot open a menu over
+  // them. Rendering nothing would hide the data; rendering a dead button would
+  // promise something the engine refuses.
   if (disabled) {
     return (
-      <span className={cn("border-line text-dim flex items-center gap-1.5 rounded-full border px-2 py-1 text-sm", className)}>
-        {face}
+      <span
+        className={cn(
+          "flex items-center gap-1.5 text-sm",
+          variant === "bare"
+            ? "text-dim px-1 py-0.5"
+            : "border-line text-dim rounded-full border px-2 py-1",
+          className,
+        )}
+      >
+        {content}
       </span>
     );
   }
 
-  return (
-    <Dropdown.Root>
-      <Dropdown.Trigger
-        aria-label={label}
-        className={cn(
-          "border-line hover:bg-hover data-[state=open]:bg-hover flex items-center gap-1.5 rounded-full border px-2 py-1 text-sm",
-          className,
-        )}
-      >
-        {face}
-        <ChevronDown className="text-mute size-3" />
-      </Dropdown.Trigger>
-      <Dropdown.Portal>
-        <Dropdown.Content
-          sideOffset={4}
-          className="border-line-strong bg-raised shadow-overlay z-50 min-w-44 rounded-lg border p-1"
-        >
-          {options.map((o) => (
-            <Dropdown.Item
-              key={o.id}
-              onSelect={() => onPick(o.id)}
-              className="data-[highlighted=true]:bg-hover flex cursor-default items-center gap-2 rounded px-2 py-1 text-sm outline-none"
-            >
-              {o.icon}
-              {o.swatch && (
-                <span className="size-2 shrink-0 rounded-full" style={{ background: o.swatch }} />
-              )}
-              <span className="flex-1">{o.label}</span>
-              {value?.id === o.id && <Check className="size-3" />}
-            </Dropdown.Item>
-          ))}
-        </Dropdown.Content>
-      </Dropdown.Portal>
-    </Dropdown.Root>
-  );
-}
+  const isSelected = (id: string) =>
+    props.multi === true ? props.selected.includes(id) : props.value?.id === id;
 
-/** The same pill, multi-select. Stays open between picks — choosing three labels
- *  should cost one trip to the menu, not three. */
-export function MultiPicker({
-  label,
-  selected,
-  options,
-  onToggle,
-  disabled,
-}: {
-  label: string;
-  selected: string[];
-  options: Option[];
-  onToggle: (id: string) => void;
-  disabled?: boolean;
-}) {
-  if (disabled || options.length === 0) return null;
   return (
-    <Dropdown.Root>
-      <Dropdown.Trigger
-        aria-label={label}
-        className="border-line hover:bg-hover data-[state=open]:bg-hover flex items-center gap-1.5 rounded-full border px-2 py-1 text-sm"
-      >
-        <span className={cn(selected.length === 0 && "text-mute")}>
-          {selected.length === 0 ? label : selected.join(", ")}
-        </span>
-        <ChevronDown className="text-mute size-3" />
-      </Dropdown.Trigger>
-      <Dropdown.Portal>
-        <Dropdown.Content
+    <Popover.Root open={isOpen} onOpenChange={setOpen}>
+      <Popover.Trigger aria-label={label} className={cn(trigger({ variant }), className)}>
+        {content}
+        {/* A bare trigger keeps its chevron hidden until hover: in a property list
+            the value is the content and five permanent chevrons are five arrows
+            pointing at nothing. It still appears on keyboard focus. */}
+        <ChevronDown
+          className={cn(
+            "text-mute size-3 shrink-0",
+            variant === "bare" &&
+              "opacity-0 transition-opacity group-hover/prop:opacity-100 group-focus-within/prop:opacity-100",
+          )}
+        />
+      </Popover.Trigger>
+      <Popover.Portal>
+        <Popover.Content
           sideOffset={4}
-          className="border-line-strong bg-raised shadow-overlay z-50 min-w-44 rounded-lg border p-1"
+          align="start"
+          className="border-line-strong bg-raised shadow-overlay z-50 w-60 overflow-hidden rounded-lg border p-0"
         >
-          {options.map((o) => (
-            <Dropdown.CheckboxItem
-              key={o.id}
-              checked={selected.includes(o.label)}
-              onCheckedChange={() => onToggle(o.label)}
-              // Without this the menu closes on every pick.
-              onSelect={(e) => e.preventDefault()}
-              className="data-[highlighted=true]:bg-hover flex cursor-default items-center gap-2 rounded px-2 py-1 text-sm outline-none"
-            >
-              {o.swatch && (
-                <span className="size-2 shrink-0 rounded-full" style={{ background: o.swatch }} />
-              )}
-              <span className="flex-1">{o.label}</span>
-              {selected.includes(o.label) && <Check className="size-3" />}
-            </Dropdown.CheckboxItem>
-          ))}
-        </Dropdown.Content>
-      </Dropdown.Portal>
-    </Dropdown.Root>
+          <Command filter={cmdkFilter} loop>
+            <Command.Input
+              autoFocus
+              placeholder={`${label}…`}
+              className="border-line placeholder:text-mute w-full border-b bg-transparent px-3 py-2 text-sm outline-none"
+            />
+            <Command.List className="max-h-64 overflow-y-auto p-1">
+              <Command.Empty className="text-mute px-2 py-3 text-center text-sm">
+                {emptyText ?? "No matches"}
+              </Command.Empty>
+              {options.map((o) => (
+                <Command.Item
+                  key={o.id}
+                  // Identity is the **id**, not the label: cmdk keys items by
+                  // `value`, so two members sharing a petname — or two labels named
+                  // the same in different cases — would collapse into one row that
+                  // highlights twice. Search still reaches the label through
+                  // `keywords`, which `cmdkFilter` scores identically.
+                  value={o.id}
+                  keywords={[o.label, ...(o.keywords ?? [])]}
+                  onSelect={() => {
+                    if (props.multi === true) {
+                      // Multi stays open: choosing three labels should cost one trip
+                      // to the menu, not three.
+                      props.onToggle(o.id);
+                    } else {
+                      props.onPick(o.id);
+                      setOpen(false);
+                    }
+                  }}
+                  className="data-[selected=true]:bg-hover flex cursor-default items-center gap-2 rounded px-2 py-1 text-sm outline-none"
+                >
+                  {o.icon}
+                  {o.swatch && (
+                    <span className="size-2 shrink-0 rounded-full" style={{ background: o.swatch }} />
+                  )}
+                  <span className="min-w-0 flex-1 truncate">{o.label}</span>
+                  {o.hint && <span className="text-mute shrink-0 font-mono text-2xs">{o.hint}</span>}
+                  {/* Reserve the check's width always, or every row shifts sideways
+                      the moment one becomes selected. */}
+                  <span className="size-3 shrink-0">
+                    {isSelected(o.id) && <Check className="size-3" />}
+                  </span>
+                </Command.Item>
+              ))}
+            </Command.List>
+          </Command>
+        </Popover.Content>
+      </Popover.Portal>
+    </Popover.Root>
   );
 }
