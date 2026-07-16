@@ -1,5 +1,63 @@
 # Changelog
 
+## v0.5.2 — the board works, history is durable, and issues have a shape
+
+v0.5.0 put a board in the browser but left it read-rich and write-poor: you could
+look at it, not work it. This release closes that, and lands two engine features on
+top — a per-issue history that survives restarts and attributes every change, and an
+issue graph (sub-issues, links, blockers) that could not exist before.
+
+> **One flag day, but no re-init.** Sync protocol v1 is retired: a v0.5.2 node
+> **refuses to sync with a v0.5.1-or-older node**, with a clear "the peer must
+> upgrade lait" message rather than a silent divergence. This is deliberate — the new
+> content-authority ops (below) would split E2EE if an old node silently dropped what
+> it couldn't decode. So **every node in a workspace must `lait update` to v0.5.2**;
+> do it and they sync again. Unlike v0.5.0, **nothing is re-initialized** — your
+> stores, invites, and history all carry forward, and this is designed to be the
+> *last* flag day of its kind.
+>
+> ```
+> lait update      # on every node in the workspace
+> ```
+
+### The web client runs the daily loop
+
+The browser could render the board; now it can drive it. Assign and unassign, add and
+remove labels, `start` / `done` / `stop`, drag a card across columns (or move it by
+keyboard), switch and create projects, filter by status — all with the same keymap the
+terminal taught (`a` `b` `p` `s` `m`, `S`/`D`/`O`, `J`/`K`). Rows and cards show
+assignee avatars instead of a "you +1" string. Every one of these verbs already
+existed in the engine; the browser simply couldn't reach them.
+
+### A history you can trust, and a shape for issues
+
+- **Durable, attributed history.** Each issue's timeline is now read from its change
+  log on disk, so it **survives daemon restarts** and names **who** made each change —
+  a teammate's edit included, because the author travels with the op. (It replaces a
+  per-session ring that forgot everything on restart and could only ever say "a peer
+  changed this.")
+- **The issue graph.** Issues now have **sub-issues** (a parent/child tree),
+  **links** (`blocks` / `relates` / `duplicates`), and a computed set of **open
+  blockers**. Sub-issues use a tree-move CRDT, so two people reparenting concurrently
+  can never produce a cycle. The web surfaces all of it as a navigable Relations
+  panel; creating edges from the browser lands next.
+
+### Content authority and agents (CRAIT)
+
+Membership and catalog structure are now carried by a **signed-DAG envelope** whose
+authority is content-addressed and verifiable. Human members can **sponsor agent
+keypairs**, and there is a **membership audit log** whose author is cryptographically
+verified — the one feed in lait that isn't advisory — surfaced in the web Members
+view, an unauthorized op shown rather than hidden.
+
+### Contributor tooling
+
+`npm run dev` is now one command: it starts the engine, reads its token, and wires the
+dev proxy — no second terminal, no copy-paste. `lait serve --json` prints
+`{url, token, port}` for scripting, and `cargo build` now picks up a rebuilt web
+bundle on its own (the `touch src/serve/shell.rs` ritual is gone). A new
+`viewer/README.md` documents the whole loop.
+
 ## v0.5.1 — `lait update` actually updates
 
 `lait update` has never worked on Windows. It always failed with `specified file
