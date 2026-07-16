@@ -78,7 +78,20 @@ struct App {
 }
 
 /// Run the local server until interrupted.
-pub async fn run(port: u16, open: bool) -> Result<()> {
+///
+/// `json` swaps the human sentence for a one-line object carrying the same facts:
+///
+/// ```json
+/// {"url":"http://127.0.0.1:7717/?token=…","token":"…","port":7717}
+/// ```
+///
+/// It exists because tooling needs the token and the only alternative was scraping
+/// it out of a sentence with a regex — which makes prose written for a human into an
+/// API, so improving the wording becomes a breaking change. `viewer/scripts/dev.mjs`
+/// is the first caller; an editor plugin that wants to embed the client is the next.
+/// The line is emitted **before** the server starts accepting, so a parent process
+/// can read one line and know it is safe to connect.
+pub async fn run(port: u16, open: bool, json: bool) -> Result<()> {
     // Identity scoping, resolved once at startup — see `spaces::scope` for why
     // `$LAIT_HOME` is the axis that matters.
     let identity = crate::config::identity_dir()?;
@@ -103,8 +116,19 @@ pub async fn run(port: u16, open: bool) -> Result<()> {
     });
 
     let url = format!("http://127.0.0.1:{}/?token={}", bound.port(), token);
-    println!("lait serve — your spaces at:\n  {url}");
-    println!("(loopback only; this link carries a one-time token for this run)");
+    if json {
+        // One line, then keep serving — the same shape `watch` has: a long-running
+        // command whose first output is the fact you were waiting for. Rust's
+        // stdout is a `LineWriter`, so the newline flushes it to a piped parent
+        // without an explicit flush.
+        println!(
+            "{}",
+            serde_json::json!({ "url": url, "token": token, "port": bound.port() })
+        );
+    } else {
+        println!("lait serve — your spaces at:\n  {url}");
+        println!("(loopback only; this link carries a one-time token for this run)");
+    }
     if open {
         open_browser(&url);
     }

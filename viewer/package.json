@@ -5,7 +5,8 @@
   "type": "module",
   "description": "lait's web client — a keyboard-first board over the local control plane. Builds into src/serve/assets, which lait serve embeds.",
   "scripts": {
-    "dev": "vite",
+    "dev": "node scripts/dev.mjs",
+    "dev:vite": "vite",
     "build": "tsc -b && vite build",
     "check": "tsc -b --noEmit",
     "preview": "vite preview",

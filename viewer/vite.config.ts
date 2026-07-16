@@ -40,8 +40,13 @@ export default defineConfig({
       // developer convenience is how the guard stops meaning anything. So the
       // *proxy* adapts instead, and production stays same-origin with no dev flag
       // in the binary at all.
+      //
+      // `npm run dev` (scripts/dev.mjs) starts the engine and sets both env vars
+      // below from its `--json` line, so the port here is whatever it actually
+      // bound — not a guess. The literal is the engine's own default, for anyone
+      // running `npm run dev:vite` against a server they started themselves.
       "/api": {
-        target: "http://127.0.0.1:7717",
+        target: `http://127.0.0.1:${process.env.LAIT_PORT || "7717"}`,
         // Rewrites Host to the target, so the loopback-authority check passes.
         changeOrigin: true,
         configure: (proxy) => {
@@ -52,8 +57,8 @@ export default defineConfig({
             // thing that pair defends against.
             proxyReq.removeHeader("origin");
             // The cookie belongs to :5178's jar, which the engine never set. Carry
-            // the run's token explicitly instead: `LAIT_TOKEN=... npm run dev`,
-            // read from the URL `lait serve` prints.
+            // the run's token explicitly instead — `npm run dev` sets `LAIT_TOKEN`
+            // from the engine's `--json` line, so nobody has to copy it by hand.
             const token = process.env.LAIT_TOKEN;
             if (token) proxyReq.setHeader("authorization", `Bearer ${token}`);
           });

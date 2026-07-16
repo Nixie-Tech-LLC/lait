@@ -300,7 +300,7 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
                 .transpose()
                 .context("--port must be a number 0-65535")?
                 .unwrap_or(crate::serve::DEFAULT_PORT);
-            return crate::serve::run(port, m.get_flag("open")).await;
+            return crate::serve::run(port, m.get_flag("open"), out.json).await;
         }
         // The workspace registry + config: pure local state, no store/daemon.
         Dispatch::Special(Special::Workspaces) => {
