@@ -11,6 +11,7 @@ const row = (over: Partial<Row> & { reff: string }): Row => ({
   status: "backlog",
   priority: "none",
   assignee_summary: "",
+  assignees: [],
   tombstone: false,
   provisional: false,
   ...over,

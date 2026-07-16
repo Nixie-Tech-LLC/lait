@@ -128,5 +128,102 @@ export const coreCommands = contribute({
       when: (c) => !c.overlay && canWrite(c) && hasSelection(c),
       run: (c) => c.selection && c.app.deleteIssue(c.selection),
     },
+
+    // ---- quick-action pickers ----------------------------------------------
+    // UI.md §5.1's grammar, verbatim: `a` assign, `b` label, `p` priority, `s` set
+    // status, `m` move project. `b` rather than the more obvious `l` because the
+    // TUI reserved `l` for column motion and these keys are what people's fingers
+    // already know — inheriting a grammar means inheriting the awkward parts too,
+    // or it isn't inherited.
+    ...(
+      [
+        ["assignee", "a", "Assign…"],
+        ["label", "b", "Label…"],
+        ["priority", "p", "Set priority…"],
+        ["status", "s", "Set status…"],
+        ["project", "m", "Move to project…"],
+      ] as const
+    ).map(([field, key, title]) => ({
+      id: `issue.${field}`,
+      title,
+      group: "Issues",
+      keys: [key],
+      when: (c: Ctx) => !c.overlay && canWrite(c) && hasSelection(c),
+      run: (c: Ctx) => c.app.openField(field),
+    })),
+
+    // ---- the work-state verbs ----------------------------------------------
+    // Not status changes with a nicer name: each bundles assignment in the *same*
+    // commit (`start` takes it, `stop` puts it down — tracker.rs:834-849), which is
+    // exactly why they are their own verbs and not `issue_edit --status`.
+    ...(
+      [
+        ["start", "S", "Start issue"],
+        ["done", "D", "Finish issue"],
+        ["stop", "O", "Stop issue"],
+      ] as const
+    ).map(([action, key, title]) => ({
+      id: `issue.${action}`,
+      title,
+      group: "Issues",
+      keys: [key],
+      when: (c: Ctx) => !c.overlay && canWrite(c) && hasSelection(c),
+      run: (c: Ctx) => c.app.work(action),
+    })),
+
+    // ---- position ----------------------------------------------------------
+    {
+      id: "issue.move.up",
+      title: "Move issue up",
+      group: "Issues",
+      keys: ["K"],
+      when: (c) => !c.overlay && canWrite(c) && hasSelection(c),
+      run: (c) => c.app.reorder(-1),
+    },
+    {
+      id: "issue.move.down",
+      title: "Move issue down",
+      group: "Issues",
+      keys: ["J"],
+      when: (c) => !c.overlay && canWrite(c) && hasSelection(c),
+      run: (c) => c.app.reorder(1),
+    },
+    {
+      id: "issue.status.prev",
+      title: "Move issue to previous status",
+      group: "Issues",
+      keys: ["H"],
+      when: (c) => !c.overlay && canWrite(c) && hasSelection(c),
+      run: (c) => c.app.shiftStatus(-1),
+    },
+    {
+      id: "issue.status.next",
+      title: "Move issue to next status",
+      group: "Issues",
+      keys: ["L"],
+      when: (c) => !c.overlay && canWrite(c) && hasSelection(c),
+      run: (c) => c.app.shiftStatus(1),
+    },
+
+    {
+      id: "issue.yank",
+      title: "Copy issue ref",
+      group: "Issues",
+      keys: ["y"],
+      // A read-only space can still be quoted from: yanking is not a write.
+      when: (c) => !c.overlay && hasSelection(c),
+      run: (c) => c.app.yankRef(),
+    },
+
+    // ---- registries --------------------------------------------------------
+    {
+      id: "project.new",
+      title: "New project",
+      group: "Issues",
+      // No bare key. Creating a project mints a permanent `KEY` that every issue
+      // in it is named after; it is not a keystroke-frequency action.
+      when: (c) => !c.overlay && canWrite(c),
+      run: (c) => c.app.createProject(),
+    },
   ],
 });

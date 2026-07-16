@@ -1,18 +1,27 @@
 import { useEffect, useRef } from "react";
-import * as Dropdown from "@radix-ui/react-dropdown-menu";
-import { Check, ListFilter, X } from "lucide-react";
+import { ListFilter, X } from "lucide-react";
 
-import { isActive, type FilterState } from "../core/filter";
-import type { LabelDto } from "../types";
+import { EMPTY_FILTER, isActive, type FilterState } from "../core/filter";
+import type { LabelDto, WorkflowState } from "../types";
 import { catalogColor } from "./colors";
-import { IconButton } from "./primitives";
+import { StatusIcon } from "./icons";
+import { Combobox } from "./Picker";
+import { Button, IconButton } from "./primitives";
 
 /**
  * The filter bar.
  *
- * Text is live and client-side (keystroke-by-keystroke, no round trip); `mine` and
- * `label` are the daemon's and are marked as such by being in a menu rather than in
- * the box you type into. That split is not cosmetic — see `core/filter.ts`.
+ * **One control per dimension**, not one menu holding several. `mine`, `status`, and
+ * `label` answer different questions, and a single "Any ▾" menu that mixed them
+ * could only ever show one of them in its trigger — so a board narrowed by both a
+ * label and `mine` looked, from the outside, like it was narrowed by one. Linear
+ * splits filters into a chip each for the same reason: the bar has to *say* what is
+ * hiding your issues, or you stop trusting it.
+ *
+ * The kinds are still marked by where they live: text is the box you type into and
+ * is client-side; everything else is a control. Which of those cost a round trip and
+ * which do not is `core/filter.ts`'s call, not this file's — see the note there on
+ * why `status` is the one that looks server-shaped and isn't.
  *
  * Escape restores what the filter was on open rather than just clearing it, which
  * is the TUI's rule: a filter you can't back out of is one you stop using.
@@ -20,12 +29,14 @@ import { IconButton } from "./primitives";
 export function FilterBar({
   filter,
   labels,
+  states,
   focusToken,
   onChange,
   onClose,
 }: {
   filter: FilterState;
   labels: LabelDto[];
+  states: WorkflowState[];
   /** Bumped by the `/` command; refocuses without the bar owning the binding. */
   focusToken: number;
   onChange: (f: FilterState) => void;
@@ -40,6 +51,8 @@ export function FilterBar({
     input.current?.select();
     // Only when `/` fires — not on every keystroke, or it would re-select as you type.
   }, [focusToken]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const label = labels.find((l) => l.name === filter.label);
 
   return (
     <div className="border-line flex h-9 shrink-0 items-center gap-2 border-b px-3">
@@ -65,52 +78,76 @@ export function FilterBar({
         aria-label="Filter issues"
       />
 
-      <Dropdown.Root>
-        <Dropdown.Trigger
-          className={`hover:bg-hover flex shrink-0 items-center gap-1 rounded px-2 py-0.5 text-sm ${
-            filter.mine || filter.label ? "text-accent" : "text-mute"
-          }`}
-        >
-          {filter.mine ? "Mine" : filter.label ? `Label: ${filter.label}` : "Any"}
-        </Dropdown.Trigger>
-        <Dropdown.Portal>
-          <Dropdown.Content
-            sideOffset={4}
-            align="end"
-            className="border-line-strong bg-raised shadow-overlay z-50 min-w-44 rounded-lg border p-1"
-          >
-            <Dropdown.Item
-              onSelect={() => onChange({ ...filter, mine: !filter.mine })}
-              className="data-[highlighted=true]:bg-hover flex cursor-default items-center gap-2 rounded px-2 py-1 text-sm outline-none"
-            >
-              <span className="flex-1">Assigned to me</span>
-              {filter.mine && <Check className="size-3" />}
-            </Dropdown.Item>
-            {labels.length > 0 && <Dropdown.Separator className="bg-line my-1 h-px" />}
-            {labels.map((l) => (
-              <Dropdown.Item
-                key={l.id}
-                onSelect={() => onChange({ ...filter, label: filter.label === l.name ? null : l.name })}
-                className="data-[highlighted=true]:bg-hover flex cursor-default items-center gap-2 rounded px-2 py-1 text-sm outline-none"
-              >
-                <span
-                  className="size-2 shrink-0 rounded-full"
-                  style={{ background: catalogColor(l.color) }}
-                />
-                <span className="flex-1">{l.name}</span>
-                {filter.label === l.name && <Check className="size-3" />}
-              </Dropdown.Item>
-            ))}
-          </Dropdown.Content>
-        </Dropdown.Portal>
-      </Dropdown.Root>
+      {/* A boolean is a toggle, not a menu with two entries in it. */}
+      <Button
+        variant={filter.mine ? "active" : "ghost"}
+        aria-pressed={filter.mine}
+        onClick={() => onChange({ ...filter, mine: !filter.mine })}
+        className="shrink-0"
+      >
+        Mine
+      </Button>
+
+      <Combobox
+        multi
+        label="Status"
+        selected={filter.status}
+        className="shrink-0"
+        face={
+          <span className={filter.status.length ? "text-accent" : "text-mute"}>
+            {filter.status.length === 0
+              ? "Status"
+              : filter.status.length === 1
+                ? (states.find((s) => s.id === filter.status[0])?.name ?? "Status")
+                : `${filter.status.length} statuses`}
+          </span>
+        }
+        options={states.map((s) => ({
+          id: s.id,
+          label: s.name,
+          icon: <StatusIcon category={s.category} color={catalogColor(s.color)} />,
+        }))}
+        onToggle={(id) =>
+          onChange({
+            ...filter,
+            status: filter.status.includes(id)
+              ? filter.status.filter((x) => x !== id)
+              : [...filter.status, id],
+          })
+        }
+      />
+
+      {labels.length > 0 && (
+        <Combobox
+          label="Label"
+          className="shrink-0"
+          // Single-valued because `Filter.label` is: the daemon resolves one name to
+          // one `LabelId`. Offering multi-select here would be promising an
+          // intersection the `Request` cannot carry.
+          value={
+            label ? { id: label.name, label: label.name, swatch: catalogColor(label.color) } : null
+          }
+          face={
+            <span className={filter.label ? "text-accent" : "text-mute"}>
+              {filter.label ?? "Label"}
+            </span>
+          }
+          options={labels.map((l) => ({
+            id: l.name,
+            label: l.name,
+            swatch: catalogColor(l.color),
+          }))}
+          onPick={(name) =>
+            onChange({ ...filter, label: filter.label === name ? null : name })
+          }
+        />
+      )}
 
       {isActive(filter) && (
-        <IconButton label="Clear filter" onClick={() => onChange({ text: "", mine: false, label: null })}>
+        <IconButton label="Clear filter" onClick={() => onChange(EMPTY_FILTER)}>
           <X className="size-3.5" />
         </IconButton>
       )}
-
     </div>
   );
 }

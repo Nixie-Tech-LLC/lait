@@ -13,8 +13,16 @@ import {
 import { ConfirmRequired, LaitError, rpc, spaces as fetchSpaces } from "./api";
 import { useDoorbell } from "./doorbell";
 import { coalesce } from "./core/coalesce";
-import { contribute, registry, type AppApi, type Ctx, type View } from "./core/registry";
+import {
+  contribute,
+  registry,
+  type AppApi,
+  type Ctx,
+  type IssueField,
+  type View,
+} from "./core/registry";
 import { useKeys } from "./core/useKeys";
+import { neighbourState, workTarget } from "./core/workflow";
 import { Activity } from "./ui/Activity";
 import { Board } from "./ui/Board";
 import { FilterBar } from "./ui/FilterBar";
@@ -23,10 +31,13 @@ import { Members } from "./ui/Members";
 import { IssueDetail } from "./ui/IssueDetail";
 import { IssueList } from "./ui/IssueList";
 import { NewIssue } from "./ui/NewIssue";
+import { NewProject } from "./ui/NewProject";
 import { Palette } from "./ui/Palette";
 import { Shortcuts } from "./ui/Shortcuts";
+import { catalogColor } from "./ui/colors";
 import * as ask from "./ui/dialogs";
 import { DialogHost } from "./ui/dialogs";
+import { Combobox } from "./ui/Picker";
 import { IconButton, TooltipProvider } from "./ui/primitives";
 import { Sidebar } from "./ui/Sidebar";
 import {
@@ -37,7 +48,17 @@ import {
   type FilterState,
 } from "./core/filter";
 import { applyOverlay, Overlay, PREDICTION_TTL_MS, type Field } from "./core/overlay";
-import { isReadOnly, type BoardView, type LabelDto, type Row, type SpaceRow } from "./types";
+import {
+  isReadOnly,
+  type BoardPos,
+  type BoardView,
+  type LabelDto,
+  type MemberDto,
+  type ProjectDto,
+  type Row,
+  type SpaceRow,
+  type WorkflowState,
+} from "./types";
 import "./commands";
 
 type Modal = "palette" | "shortcuts" | null;
@@ -64,10 +85,18 @@ export function App() {
   const [unread, setUnread] = useState(0);
   /** The composer, and the column it was opened from (null = closed). */
   const [composing, setComposing] = useState<{ status?: string } | null>(null);
+  const [composingProject, setComposingProject] = useState(false);
   const [filter, setFilter] = useState<FilterState>(EMPTY_FILTER);
   const [filterOpen, setFilterOpen] = useState(false);
   const [focusToken, setFocusToken] = useState(0);
   const [labels, setLabels] = useState<LabelDto[]>([]);
+  const [members, setMembers] = useState<MemberDto[]>([]);
+  const [projects, setProjects] = useState<ProjectDto[]>([]);
+  /** Which project's board is on screen. `null` = let the daemon's chain pick
+   *  (branch key → `project.default` → the only project), same as a bare `lait board`. */
+  const [project, setProject] = useState<string | null>(null);
+  /** The picker a keybinding has asked for. Also an overlay: it owns the keymap. */
+  const [field, setField] = useState<IssueField | null>(null);
   /** Doc-ids the daemon says qualify. `null` = the daemon wasn't asked, which is
    *  not the same as "nothing qualifies" — see core/filter.ts. */
   const [allowed, setAllowed] = useState<ReadonlySet<string> | null>(null);
@@ -139,7 +168,7 @@ export function App() {
    * Backs off rather than hammering, and gives up after a few tries so a genuinely
    * dead space says so instead of spinning forever.
    */
-  const loadBoardRaw = useCallback(async (id: string | null): Promise<void> => {
+  const loadBoardRaw = useCallback(async (id: string | null, proj: string | null): Promise<void> => {
     // Only the newest load may commit. Two doorbells in quick succession issue
     // two loads, and the one that resolves *last* is not the one issued last —
     // so an older board could silently overwrite a newer one, and nothing would
@@ -152,7 +181,7 @@ export function App() {
     if (!id) return setBoard(null);
     for (let attempt = 0; ; attempt++) {
       try {
-        const r = await rpc(id, { cmd: "board", project: null });
+        const r = await rpc(id, { cmd: "board", project: proj });
         if (stale()) return;
         setBoard(r.kind === "board" ? r : null);
         setError(null);
@@ -187,33 +216,91 @@ export function App() {
    */
   const loadBoard = useMemo(() => {
     const run = coalesce(loadBoardRaw);
-    return (id: string | null): Promise<void> => {
+    return (id: string | null, proj: string | null): Promise<void> => {
       boardSeq.current++;
-      return run(id);
+      return run(id, proj);
     };
   }, [loadBoardRaw]);
   const loadSpaces = useMemo(() => coalesce(loadSpacesRaw), [loadSpacesRaw]);
+
+  // The project is read through a ref by the doorbell handler and the sweep, which
+  // must not re-subscribe every time it changes.
+  const projectRef = useRef(project);
+  projectRef.current = project;
 
   useEffect(() => {
     void loadSpaces();
   }, [loadSpaces]);
   useEffect(() => {
-    void loadBoard(current);
-  }, [current, loadBoard]);
+    void loadBoard(current, project);
+  }, [current, project, loadBoard]);
 
-  // Labels for the filter menu — the daemon's registry, not names we invented.
+  // A project selected in one space does not exist in the next one.
   useEffect(() => {
-    if (!current) return setLabels([]);
-    // Same race as `loadBoard`: switch space mid-flight and the old space's
-    // labels would land in the new space's filter menu.
+    setProject(null);
+  }, [current]);
+
+  /**
+   * Name a project once we know there is a choice.
+   *
+   * `Request::Board { project: null }` asks the daemon to resolve one, and its
+   * chain is a **CLI** chain: the git branch's key → `project.default` → the only
+   * project → a teaching error. A browser tab has no cwd and no branch, so on a
+   * space with more than one project that chain reaches the error every time — and
+   * the client sent `null` unconditionally, which is why a second project made the
+   * board render "more than one project (ACME, DSN) — pass -p <KEY>" instead of
+   * issues. The switcher in the header is only half the fix; this is the other.
+   *
+   * Left `null` for a single-project space on purpose: the chain resolves it fine,
+   * and `project.default` keeps working for the one case a browser can honour it.
+   * (Reading `project.default` outright is not possible from here — `config` is a
+   * `Special` CLI handler, not a `Request`, so no HTTP endpoint reaches it.)
+   */
+  useEffect(() => {
+    if (project !== null || projects.length < 2) return;
+    setProject(projects[0]!.key);
+  }, [projects, project]);
+
+  /**
+   * The three registries every picker reads from — the daemon's, never ours.
+   *
+   * Fetched together because they share a lifetime (this space, this revision) and
+   * a failure mode: none of them is worth an error banner. A picker with fewer
+   * options is a smaller menu; a red bar across the board is a broken app. The
+   * board is the thing whose failure is worth shouting about, and it already does.
+   *
+   * Same race as `loadBoard`: switch space mid-flight and the old space's members
+   * would land in the new space's assignee picker — hence `alive`.
+   */
+  useEffect(() => {
+    if (!current) {
+      setLabels([]);
+      setMembers([]);
+      setProjects([]);
+      return;
+    }
     let alive = true;
     void (async () => {
-      try {
-        const r = await rpc(current, { cmd: "label_list" });
-        if (alive && r.kind === "labels") setLabels(r.labels);
-      } catch {
-        // A missing label registry is not worth an error banner over — the menu
-        // just offers fewer options.
+      const [l, m, p, s] = await Promise.all([
+        rpc(current, { cmd: "label_list" }).catch(() => null),
+        rpc(current, { cmd: "members" }).catch(() => null),
+        rpc(current, { cmd: "project_list" }).catch(() => null),
+        rpc(current, { cmd: "status" }).catch(() => null),
+      ]);
+      if (!alive) return;
+      if (l?.kind === "labels") setLabels(l.labels);
+      if (p?.kind === "projects") setProjects(p.projects);
+      if (m?.kind === "members") {
+        // `members` carries no alias for **you**: a petname is something you assign
+        // to other people, so `tracker.rs::members` reports `alias: ""` for `me`.
+        // Your own name lives in `user.nick`, which only `status` reports — and
+        // without it yours is the one avatar in the workspace with no letter on it,
+        // which is a strange way to meet yourself. Patched here rather than in the
+        // avatar, so every surface agrees on what you are called.
+        const nick = s?.kind === "status" ? s.nick.trim() : "";
+        setMembers(
+          nick ? m.members.map((x) => (x.me && !x.alias ? { ...x, alias: nick } : x)) : m.members,
+        );
       }
     })();
     return () => {
@@ -261,7 +348,7 @@ export function App() {
           overlay.current.clear();
           setPredicted((n) => n + 1);
           void loadSpaces();
-          void loadBoard(current);
+          void loadBoard(current, projectRef.current);
           setRevision((r) => r + 1);
           return;
         }
@@ -283,7 +370,7 @@ export function App() {
         // drop the predictions: clearing before the fresh rows land would flash
         // the old server value for a frame, which is the one thing the optimism
         // exists to prevent.
-        void loadBoard(current).then(() => {
+        void loadBoard(current, projectRef.current).then(() => {
           const docs = Object.values(d.dirty_by_project).flat();
           let cleared = false;
           for (const doc of docs) cleared = overlay.current.clearDoc(doc) || cleared;
@@ -303,12 +390,30 @@ export function App() {
     ),
   );
 
+  /** The workflow, in board order — which is the order the work verbs resolve by. */
+  const states: WorkflowState[] = useMemo(
+    () => board?.columns.map((c) => c.state) ?? [],
+    [board],
+  );
+
   const currentRef = useRef(current);
   currentRef.current = current;
   const rowsRef = useRef(rows);
   rowsRef.current = rows;
   const selRef = useRef(selection);
   selRef.current = selection;
+  const statesRef = useRef(states);
+  statesRef.current = states;
+  // The *filtered* board: reordering has to land relative to a neighbour you can
+  // actually see, or `J` jumps the card past rows a filter is hiding.
+  const shownRef = useRef(shown);
+  shownRef.current = shown;
+
+  /** The selected row, or null. Read through refs so commands stay stable. */
+  const selectedRow = useCallback(
+    (): Row | null => rowsRef.current.find((r) => r.reff === selRef.current) ?? null,
+    [],
+  );
 
   /**
    * Predict, then send.
@@ -365,12 +470,103 @@ export function App() {
       toast: (m) => setToast(m),
       refresh: () => {
         void loadSpaces();
-        void loadBoard(current);
+        void loadBoard(current, projectRef.current);
         setToast("Refreshed");
       },
       select: (reff) => setSelection(reff),
       predict: (doc, field, value, send) => void predict(doc, field, value, send),
       pickSpace: (id) => setCurrent(id),
+      pickProject: (key) => setProject(key),
+
+      // A picker needs its subject visible: opening the assignee menu over a pane
+      // you closed is a menu with no context.
+      openField: (f) => {
+        setDetail(true);
+        setField(f);
+      },
+
+      /**
+       * A work verb: one `Request`, one commit.
+       *
+       * Only `status` is predicted. The verbs also bundle assignment in the same
+       * commit (`start` takes the issue, `stop` puts it down), but `Row` carries
+       * `assignee_summary` — a string the *daemon* derives ("you", "alice +1") —
+       * and re-deriving it here to predict it would be a second implementation of a
+       * server rule for the sake of one frame. The doorbell brings the real one.
+       */
+      work: (action) => {
+        const row = selectedRow();
+        if (!row || !current) return;
+        const cmd = `issue_${action}` as const;
+        const target = workTarget(statesRef.current, action);
+        if (!target) {
+          // No state in that category — the daemon refuses with a better sentence
+          // than we could write. Send it and show its words.
+          void guard(() => rpc(current, { cmd, reff: row.reff }));
+          return;
+        }
+        void predict(row.doc_id, "status", target.id, () =>
+          rpc(current, { cmd, reff: row.reff }),
+        );
+      },
+
+      /** `H`/`L` — the neighbouring workflow column. Clamps at both ends. */
+      shiftStatus: (delta) => {
+        const row = selectedRow();
+        if (!row || !current) return;
+        const next = neighbourState(statesRef.current, row.status, delta);
+        if (!next) return;
+        void predict(row.doc_id, "status", next.id, () =>
+          rpc(current, { cmd: "issue_edit", reff: row.reff, status: next.id }),
+        );
+      },
+
+      /**
+       * `J`/`K` — reorder within the column.
+       *
+       * Position is `Catalog.boards[P]`'s to decide (A§9) and is not a field `Row`
+       * carries, so there is nothing to predict: the doorbell repaints. Against a
+       * daemon on a Unix socket that is a few milliseconds.
+       *
+       * Refused in a Done column, and that is not a nicety. Entering a done-category
+       * status **removes the doc from `boards[P]`** (`tracker.rs:858-869`); done
+       * columns are rendered by the append rule instead, sorted `created_at desc`.
+       * So a reorder there mutates a list the column isn't drawn from — the request
+       * succeeds, the daemon rings, and the card lands exactly where it was. Doing
+       * nothing is the honest outcome.
+       */
+      reorder: (delta) => {
+        const row = selectedRow();
+        const shownBoard = shownRef.current;
+        if (!row || !current || !shownBoard) return;
+        const col = shownBoard.columns.find((c) => c.state.id === row.status);
+        if (!col || col.state.category === "done") return;
+
+        const visible = col.rows.filter((r) => !r.tombstone);
+        const i = visible.findIndex((r) => r.reff === row.reff);
+        const target = visible[i + delta];
+        if (i < 0 || !target) return;
+
+        void guard(() =>
+          rpc(current, {
+            cmd: "issue_move",
+            reff: row.reff,
+            pos: delta < 0 ? { at: "before", reff: target.reff } : { at: "after", reff: target.reff },
+          }),
+        );
+      },
+
+      yankRef: () => {
+        const row = selectedRow();
+        if (!row) return;
+        // The friendly handle if it has one — that is what a human pastes into a
+        // branch name or a commit message.
+        const ref = row.key_alias ?? row.reff;
+        void navigator.clipboard
+          .writeText(ref)
+          .then(() => setToast(`Copied ${ref}`))
+          .catch(() => setError("Clipboard blocked by the browser"));
+      },
       moveSelection: (delta) => {
         const list = rowsRef.current;
         if (!list.length) return;
@@ -379,6 +575,7 @@ export function App() {
         if (next) setSelection(next.reff);
       },
       createIssue: () => setComposing({}),
+      createProject: () => setComposingProject(true),
       deleteIssue: (reff) =>
         void guard(async () => {
           if (!current) return;
@@ -398,12 +595,68 @@ export function App() {
           }
         }),
     }),
-    [current, guard, loadBoard, loadSpaces, predict],
+    [current, guard, loadBoard, loadSpaces, predict, selectedRow],
   );
 
   const ctx: Ctx = useMemo(
-    () => ({ view, spaceId: current, readOnly, selection, overlay: modal !== null, app: api }),
-    [view, current, readOnly, selection, modal, api],
+    () => ({
+      view,
+      spaceId: current,
+      readOnly,
+      selection,
+      // An open picker owns the keymap exactly as the palette does: `j` in the
+      // assignee menu is cmdk's, not the board's.
+      overlay: modal !== null || field !== null,
+      app: api,
+    }),
+    [view, current, readOnly, selection, modal, field, api],
+  );
+
+  /**
+   * A card was dropped: set its status, then place it.
+   *
+   * **Two requests, and there is no way to make it one.** `issue_edit` carries
+   * `status` but no position; `issue_move` carries `project` and `pos` but no
+   * status. So a cross-column drag is two commits and two activity rows — the same
+   * wrinkle the composer already documents for "file into a non-default column".
+   * That is an honest record of what happened (moved, then placed) rather than a
+   * fiction, and the alternative is a `Request` variant that does not exist.
+   *
+   * The **order is load-bearing**. Status first, position second:
+   *
+   * - Moving *into* a done status removes the doc from `boards[P]`; moving *out of*
+   *   one re-inserts it at the top (`tracker.rs:858-869`). Doing the placement first
+   *   would have that re-insert stomp the position we just asked for.
+   * - Dropping into a done column sends **no** `issue_move` at all (`pos` is null):
+   *   done columns are rendered by the append rule and ignore the movable list, so
+   *   the write would be invisible at best and a lie about ordering at worst.
+   *
+   * Only status is predicted — `applyOverlay` re-buckets the row into the new
+   * column immediately, which is the part that has to feel instant. Position is not
+   * a field `Row` carries, so it settles on the doorbell a few milliseconds later.
+   */
+  const dropCard = useCallback(
+    (reff: string, status: string, pos: BoardPos | null) => {
+      const id = currentRef.current;
+      if (!id) return;
+      const row = rowsRef.current.find((r) => r.reff === reff);
+      if (!row) return;
+
+      const changingStatus = row.status !== status;
+      if (!changingStatus && !pos) return; // dropped where it already was
+
+      const send = async () => {
+        if (changingStatus) await rpc(id, { cmd: "issue_edit", reff, status });
+        if (pos) await rpc(id, { cmd: "issue_move", reff, pos });
+      };
+
+      if (changingStatus) {
+        void predict(row.doc_id, "status", status, send);
+      } else {
+        void guard(send);
+      }
+    },
+    [guard, predict],
   );
 
   const pending = useKeys(ctx);
@@ -430,7 +683,7 @@ export function App() {
     const t = window.setInterval(() => {
       if (!overlay.current.sweep()) return;
       setPredicted((n) => n + 1);
-      void loadBoard(currentRef.current);
+      void loadBoard(currentRef.current, projectRef.current);
       // The detail pane reads off `revision`, not the board.
       setRevision((r) => r + 1);
     }, PREDICTION_TTL_MS / 2);
@@ -478,8 +731,45 @@ export function App() {
             <PanelLeft className="size-4" />
           </IconButton>
 
+          {/*
+            The project is a *switch*, not a label.
+
+            It read as a title before, which quietly made the client single-project:
+            `board` was sent with `project: null` forever, so a space with three
+            projects only ever showed whichever one the daemon's default chain
+            picked, and the other two were unreachable from the browser. The name was
+            never decoration — it was the one control the header was missing.
+          */}
           <h1 className="ml-1 flex min-w-0 items-baseline gap-1.5">
-            <span className="truncate font-semibold">{board?.project.name ?? "lait"}</span>
+            {projects.length > 1 ? (
+              <Combobox
+                variant="bare"
+                label="Project"
+                className="font-semibold"
+                value={
+                  board
+                    ? {
+                        id: board.project.key,
+                        label: board.project.name,
+                        swatch: catalogColor(board.project.color),
+                      }
+                    : null
+                }
+                options={projects.map((p) => ({
+                  id: p.key,
+                  label: p.name,
+                  swatch: catalogColor(p.color),
+                  hint: p.key,
+                }))}
+                // Straight to the api, not through a command: a command's `run`
+                // takes only a `Ctx`, so "pick *this* project" has no way to travel
+                // through the registry. Same reason `Sidebar` calls `pickSpace`
+                // directly — selection carries an argument, actions don't.
+                onPick={api.pickProject}
+              />
+            ) : (
+              <span className="truncate font-semibold">{board?.project.name ?? "lait"}</span>
+            )}
             <span className="text-mute shrink-0">/</span>
             <span className="text-dim shrink-0 capitalize">{view}</span>
           </h1>
@@ -559,6 +849,7 @@ export function App() {
           <FilterBar
             filter={filter}
             labels={labels}
+            states={states}
             focusToken={focusToken}
             onChange={setFilter}
             onClose={() => setFilterOpen(false)}
@@ -591,15 +882,18 @@ export function App() {
           ) : shown && view === "board" ? (
             <Board
               board={shown}
+              members={members}
               selection={selection}
               optimistic={optimistic}
               onSelect={api.select}
               onCreate={(status) => setComposing({ status })}
+              onDrop={dropCard}
               readOnly={readOnly}
             />
           ) : shown && view === "list" ? (
             <IssueList
               board={shown}
+              members={members}
               selection={selection}
               optimistic={optimistic}
               onSelect={api.select}
@@ -625,8 +919,13 @@ export function App() {
               key={selection}
               spaceId={current}
               reff={selection}
-              states={board.columns.map((c) => c.state)}
+              states={states}
+              members={members}
+              labels={labels}
+              projects={projects}
               readOnly={readOnly}
+              openField={field}
+              onOpenField={setField}
               revision={revision}
               onError={setError}
               onDelete={api.deleteIssue}
@@ -640,10 +939,22 @@ export function App() {
         <NewIssue
           spaceId={current}
           projectKey={board.project.key}
-          states={board.columns.map((c) => c.state)}
+          states={states}
           labels={labels}
+          members={members}
           defaultStatus={composing.status}
           onClose={() => setComposing(null)}
+          onError={setError}
+        />
+      )}
+      {composingProject && current && (
+        <NewProject
+          spaceId={current}
+          taken={projects.map((p) => p.key.toUpperCase())}
+          onClose={() => setComposingProject(false)}
+          // Land in what you just made. Creating a project and staying on the old
+          // board is the app ignoring the thing you came to do.
+          onCreated={(key) => setProject(key)}
           onError={setError}
         />
       )}

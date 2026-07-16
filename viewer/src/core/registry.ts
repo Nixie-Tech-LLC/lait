@@ -30,6 +30,20 @@ import type { Field } from "./overlay";
  *  and the browser's back button belongs to the browser. */
 export type View = "list" | "board" | "inbox" | "activity" | "members";
 
+/**
+ * A field a picker can be opened on.
+ *
+ * These are the *editable* fields of an issue that resolve to a set — the ones
+ * UI.md §5.1 gives quick-action keys (`a` assign, `b` label, `p` priority, `s` set
+ * status, `m` move project). Title and description are text, not a set, so they are
+ * not here: they are edited in place.
+ */
+export type IssueField = "assignee" | "label" | "status" | "priority" | "project";
+
+/** The work-state verbs. One `Request` each, and each bundles more than a status —
+ *  see `tracker.rs::work_state`. */
+export type WorkAction = "start" | "done" | "stop";
+
 /** Everything a command can touch. The app supplies it; extensions receive it. */
 export interface Ctx {
   /** The root surface on screen. */
@@ -64,6 +78,22 @@ export interface AppApi {
   deleteIssue(reff: string): void;
   pickSpace(id: string): void;
   moveSelection(delta: number): void;
+
+  /** Open the picker for `field` on the selected issue. Reveals the detail pane if
+   *  it is closed — a picker for an issue you cannot see is a menu with no subject. */
+  openField(field: IssueField): void;
+  /** Run a work-state verb on the selected issue (`issue_start`/`_done`/`_stop`). */
+  work(action: WorkAction): void;
+  /** Reorder the selected issue within its board column. `-1` up, `1` down. */
+  reorder(delta: number): void;
+  /** Shift the selected issue to the previous/next workflow column (UI.md §5.1 `H`/`L`). */
+  shiftStatus(delta: number): void;
+  /** Copy the selected issue's ref to the clipboard (UI.md §5.1 `y`). */
+  yankRef(): void;
+  /** The project whose board is on screen; `null` = the daemon's default chain. */
+  pickProject(key: string | null): void;
+  /** Open the new-project composer. */
+  createProject(): void;
 }
 
 export interface Command {
