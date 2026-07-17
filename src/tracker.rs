@@ -3122,7 +3122,7 @@ impl Tracker {
         (
             Response::Ok {
                 message: Some(format!(
-                    "started {k}-of-{n} recovery elevation — co-founders run `space elevate-advance` until the group key is installed"
+                    "started {k}-of-{n} recovery elevation — the DKG completes automatically as the co-founders' nodes sync; the group key installs once every share is in"
                 )),
             },
             Some(DirtySet::catalog(CatalogScope::Acl)),
@@ -3133,6 +3133,11 @@ impl Tracker {
     /// on what has synced. Idempotent: posts each round once, and installs the
     /// group key (via a space `Rotate`) once, by the recovery-key holder. Called
     /// by `space_elevate_cmd`, an explicit advance, and on import.
+    ///
+    /// The ceremony board is grow-only and re-scanned each import; completed and
+    /// abandoned sessions are never pruned, so a member could pad it to inflate
+    /// per-import work (bounded per call by the `guard` below). Session GC/expiry
+    /// is future work — see the `C_CEREMONY` container in `engine::membership`.
     pub fn dkg_advance(&mut self) -> Result<bool> {
         let mut any = false;
         // A ceremony has a bounded number of steps; the guard is a backstop
@@ -3235,7 +3240,16 @@ impl Tracker {
     /// my commitment, then my signature share once the signer set has committed,
     /// then (any holder) aggregate the group signature and install the signed
     /// space op. The signer set is fixed as the `threshold` lowest-index holders,
-    /// so every participant assembles the identical `SigningPackage`.
+    /// so every participant assembles the identical `SigningPackage` — which keeps
+    /// the ceremony convergent without a coordinator, at the cost that recovery
+    /// needs *those* K holders (not any K-of-N) online and consenting. For the
+    /// common K=N case that is every holder anyway; loosening it to any committed
+    /// K-of-N needs a coordinator op to freeze the set (future work), since a set
+    /// derived from "who has committed" can shift under a late lower-index holder
+    /// and invalidate shares already bound to an earlier `SigningPackage`.
+    ///
+    /// Contribution is gated on local `intent` (see below): a passive replica
+    /// never co-signs a request it did not itself authorize.
     fn sign_advance_session(
         &mut self,
         sign_session: &[u8; 16],
