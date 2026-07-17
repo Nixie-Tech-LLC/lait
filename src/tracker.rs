@@ -2772,11 +2772,7 @@ impl Tracker {
         let home = self.store.home_path();
         let mut out = Vec::new();
         let mut i = 0;
-        loop {
-            let Ok(hex) = std::fs::read_to_string(home.join(format!("space-recovery-{i}.key")))
-            else {
-                break;
-            };
+        while let Ok(hex) = std::fs::read_to_string(home.join(format!("space-recovery-{i}.key"))) {
             if let Ok(v) = data_encoding::HEXLOWER_PERMISSIVE.decode(hex.trim().as_bytes()) {
                 if let Ok(seed) = <[u8; 32]>::try_from(v.as_slice()) {
                     out.push(seed);
