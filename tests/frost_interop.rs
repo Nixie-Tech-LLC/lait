@@ -92,7 +92,12 @@ fn a_trusted_dealer_group_signature_verifies_as_ed25519() {
             .expect("keygen");
     let key_packages: BTreeMap<_, _> = shares
         .into_iter()
-        .map(|(id, ss)| (id, frost::keys::KeyPackage::try_from(ss).expect("key package")))
+        .map(|(id, ss)| {
+            (
+                id,
+                frost::keys::KeyPackage::try_from(ss).expect("key package"),
+            )
+        })
         .collect();
 
     let message = b"lait/space/1/event: Recover{new_root, gen}";
@@ -130,8 +135,10 @@ fn a_dkg_group_signature_verifies_as_ed25519() {
             .collect()
     };
     let mut r2_secrets = BTreeMap::new();
-    let mut r2_inbox: BTreeMap<Identifier, BTreeMap<Identifier, frost::keys::dkg::round2::Package>> =
-        ids.iter().map(|id| (*id, BTreeMap::new())).collect();
+    let mut r2_inbox: BTreeMap<
+        Identifier,
+        BTreeMap<Identifier, frost::keys::dkg::round2::Package>,
+    > = ids.iter().map(|id| (*id, BTreeMap::new())).collect();
     for id in &ids {
         let (secret2, outgoing) =
             frost::keys::dkg::part2(r1_secrets.remove(id).unwrap(), &others_r1(id))

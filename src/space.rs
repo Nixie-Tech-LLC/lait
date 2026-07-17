@@ -1,13 +1,13 @@
 //! `lait/space/1` — the **self-certifying workspace** and its **root lifecycle**.
 //!
 //! Membership made *identity* self-certifying (`ActorId = H(inception)`); this
-//! does the same for the **workspace** one layer up, and then gives its trust
-//! root a **break-glass recovery** path (W5).
+//! does the same for the **workspace** one layer up, and gives its trust root a
+//! **break-glass recovery** path (W5).
 //!
 //! # Self-certifying id
 //!
 //! ```text
-//! workspace_id = ws_<crockford128( blake3("lait/space/1" ‖ device ‖ salt ‖ recovery_root) )>
+//! workspace_id = ws_<crockford128( blake3("lait/space/1" ‖ device ‖ salt ‖ recovery_commit) )>
 //! ```
 //!
 //! The founding device key + a random salt + the recovery commitment are hashed
@@ -15,26 +15,30 @@
 //! a workspace id, so the id cannot depend on it). The signed inception is then
 //! the "Found" artifact: `ws_id` commits to the device, the inception commits to
 //! `ws_id`, and `founder_actor = H(inception)`. A joiner given
-//! `{ws_id, salt, recovery_root, founder_inception}` verifies the chain offline.
+//! `{ws_id, salt, recovery_commit, founder_inception}` verifies the chain offline.
 //!
-//! # Root lifecycle (W5)
+//! # Root lifecycle (W5) — a single (rotating) recovery authority
 //!
 //! `genesis.founding_actors` is only the *bootstrap* root: it seeds `acl::replay`.
-//! Ordinary governance (add/remove admins) already rides the ACL. What the ACL
-//! cannot do is re-root when the live admin set is **lost or compromised** — that
-//! is the break-glass [`Recover`](SpaceOp::Recover), authorized not by any current
-//! admin but by proving a **threshold K-of-N** of the pre-committed recovery keys.
+//! Ordinary governance (add/remove admins) rides the ACL. What the ACL cannot do
+//! is re-root when the live admin set is **lost or compromised** — that is the
+//! break-glass [`Recover`](SpaceOp::Recover).
 //!
-//! `recovery_root = H("…/recovery" ‖ K ‖ sorted[H(recovery_pubkey_i)])` is fixed in
-//! the id at birth, so it is unforgeable. It is rotatable **only** by a `Recover`
-//! (never by a current admin), so a compromised root cannot lock out recovery. A
-//! `Recover` **replaces** the acl seed with `new_root` (a clean-slate re-root; the
-//! recovered admin re-adds the legit team and re-keys, fencing the old root), and
-//! its `gen` is strictly monotone so an old recovery cannot be replayed.
+//! Recovery authority is **one public key** — the same shape whether it is a plain
+//! solo key or a **FROST threshold group key** produced by K-of-N holders (a group
+//! signature verifies as a plain Ed25519 signature, so the plane never sees the
+//! threshold; it lives entirely in the off-plane signing ceremony). The workspace
+//! commits to `recovery_commit = blake3(recovery_pubkey)` in its id at birth
+//! (mirroring actor recovery's pre-rotation commitment): a `Recover`/`Rotate` is
+//! authorized when its author hashes to the current commitment.
+//!
+//! [`Rotate`](SpaceOp::Rotate) installs a *new* recovery key — signed by the
+//! *current* one — so authority can be **elevated** (found solo, then rotate to a
+//! DKG group key as co-founders come online) without ever touching `ws_id`. `gen`
+//! is strictly monotone, so an old op cannot be replayed.
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
 
 use crate::actor::{self, SignedEvent};
 use crate::ids::{ActorId, UserId, WorkspaceId};
@@ -43,80 +47,34 @@ use crate::store::Genesis;
 
 /// Domain separator for the workspace-id derivation.
 const SPACE_DOMAIN: &[u8] = b"lait/space/1";
-/// Domain separator for the recovery-set commitment.
-const RECOVERY_DOMAIN: &[u8] = b"lait/space/1/recovery";
 /// Signing domain for the space-event plane (recovery).
 pub const SPACE_EVENT_DOMAIN: &[u8] = b"lait/space/1/event";
 
 /// A signed space-plane event — the shared hash-DAG envelope under this domain.
+/// For a threshold group, the `author` is the FROST group public key and `sig` is
+/// the aggregated group signature; the envelope is otherwise unchanged.
 pub type SignedSpaceEvent = SignedNode;
 
-/// The set of break-glass recovery keys and the threshold needed to recover.
-/// `key_hashes` are `blake3(recovery_pubkey)` (never the keys themselves). The
-/// workspace commits to `root()` at birth; a `Recover` reveals this preimage so a
-/// replica can check it against the committed root.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RecoverySet {
-    pub threshold: u32,
-    pub key_hashes: Vec<[u8; 32]>,
-}
-
-impl RecoverySet {
-    /// The commitment folded into the workspace id — canonical over a sorted key
-    /// set, so the same set always yields the same root regardless of order.
-    pub fn root(&self) -> [u8; 32] {
-        let mut sorted = self.key_hashes.clone();
-        sorted.sort_unstable();
-        let mut h = blake3::Hasher::new();
-        h.update(RECOVERY_DOMAIN);
-        h.update(&self.threshold.to_le_bytes());
-        for kh in &sorted {
-            h.update(kh);
-        }
-        *h.finalize().as_bytes()
-    }
-    /// Whether the set is well-formed: `1 ≤ threshold ≤ N`, no duplicate keys.
-    fn well_formed(&self) -> bool {
-        let distinct: BTreeSet<[u8; 32]> = self.key_hashes.iter().copied().collect();
-        distinct.len() == self.key_hashes.len()
-            && self.threshold >= 1
-            && (self.threshold as usize) <= self.key_hashes.len()
-    }
-}
-
-/// The `blake3` commitment to a single recovery public key.
-pub fn recovery_key_hash(recovery_pub: &UserId) -> Option<[u8; 32]> {
+/// The commitment to a recovery public key: `blake3(pubkey bytes)`. This is what
+/// the workspace id binds at birth and what a `Rotate` installs for the next key.
+pub fn recovery_commit(recovery_pub: &UserId) -> Option<[u8; 32]> {
     let raw = hex32(recovery_pub.as_str())?;
     Some(*blake3::hash(&raw).as_bytes())
 }
 
-/// The recovery public key (device id) a seed produces.
+/// The recovery public key a seed produces (for a plain solo recovery key).
 pub fn recovery_pub_of(seed: &[u8; 32]) -> UserId {
     let sk = ed25519_dalek::SigningKey::from_bytes(seed);
     UserId::from_key_string(data_encoding::HEXLOWER.encode(sk.verifying_key().as_bytes()))
 }
 
-/// Mint a fresh `k`-of-`n` recovery set: the public [`RecoverySet`] (commit it in
-/// the id) and the `n` secret seeds (store each offline with a distinct holder).
-pub fn mint_recovery_set(n: usize, k: u32) -> (RecoverySet, Vec<[u8; 32]>) {
-    let secrets: Vec<[u8; 32]> = (0..n)
-        .map(|_| {
-            let mut s = [0u8; 32];
-            getrandom::fill(&mut s).expect("getrandom");
-            s
-        })
-        .collect();
-    let key_hashes = secrets
-        .iter()
-        .map(|s| recovery_key_hash(&recovery_pub_of(s)).expect("valid recovery pubkey"))
-        .collect();
-    (
-        RecoverySet {
-            threshold: k,
-            key_hashes,
-        },
-        secrets,
-    )
+/// Mint a fresh solo (1-of-1) recovery keypair: returns `(pubkey, secret seed)`.
+/// The secret is stored offline; a threshold group key is instead produced by a
+/// FROST DKG among the holders and installed via [`SpaceOp::Rotate`].
+pub fn mint_recovery_key() -> (UserId, [u8; 32]) {
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed).expect("getrandom");
+    (recovery_pub_of(&seed), seed)
 }
 
 fn hex32(s: &str) -> Option<[u8; 32]> {
@@ -129,37 +87,38 @@ fn hex32(s: &str) -> Option<[u8; 32]> {
     v.as_slice().try_into().ok()
 }
 
-/// A workspace-plane op. Only [`Recover`](SpaceOp::Recover) exists in v1: planned
-/// root governance rides the ACL; the space plane is the break-glass path.
+/// A workspace-plane op. Both are signed by the **current recovery key** (a solo
+/// key or a FROST group key); planned admin governance rides the ACL.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpaceOp {
-    /// Re-root the workspace under threshold authority. Each of `set.threshold`
-    /// distinct recovery keys signs an **identical** `Recover` payload; replay
-    /// counts distinct committed signers and applies once the threshold is met.
+    /// Break-glass re-root: replace the bootstrap root that seeds `acl::replay`.
     Recover {
-        /// The new bootstrap root that will seed `acl::replay` (non-empty).
+        /// The new root (non-empty); the recovered admin re-adds the team + re-keys.
         new_root: Vec<ActorId>,
-        /// Preimage of the recovery commitment being satisfied (must hash to the
-        /// current `recovery_root`).
-        set: RecoverySet,
-        /// The recovery commitment installed for the *next* recovery. May rotate
-        /// the break-glass keys, but v1's driver keeps it equal to the current
-        /// commitment (rotating the set in a distributed K-of-N needs custody
-        /// coordination — a deliberate follow-up); `gen` alone fences replay.
-        next_recovery_root: [u8; 32],
-        /// Strictly `current_gen + 1` — monotone, so an old recovery can't replay.
+        /// Strictly `current_gen + 1` — monotone, so an old op can't replay.
         gen: u32,
     },
+    /// Rotate the recovery authority to a new key (e.g. elevate a solo key to a
+    /// DKG group key). Signed by the current key; the new key's commitment becomes
+    /// the authority for the next op.
+    Rotate { new_recovery_key: UserId, gen: u32 },
 }
 
 impl SpaceOp {
+    fn gen(&self) -> u32 {
+        match self {
+            SpaceOp::Recover { gen, .. } | SpaceOp::Rotate { gen, .. } => *gen,
+        }
+    }
     fn encode(&self) -> Vec<u8> {
         postcard::to_stdvec(self).expect("encode space op")
     }
 }
 
-/// Sign a [`SpaceOp`] with a recovery key's seed (its author is the recovery
-/// public key). Each threshold signer calls this over the identical op.
+/// Sign a [`SpaceOp`] with the recovery key's seed (its author is the recovery
+/// public key). A threshold group instead produces the signature via a FROST
+/// signing ceremony and assembles the same [`SignedSpaceEvent`] with the group
+/// key as `author`.
 pub fn sign_op(
     recovery_seed: &[u8; 32],
     op: &SpaceOp,
@@ -180,11 +139,11 @@ pub fn sign_op(
 pub struct RootState {
     /// The effective bootstrap root — what seeds `acl::replay`.
     pub root: Vec<ActorId>,
-    /// The current recovery commitment (rotated by each applied `Recover`).
-    pub recovery_root: [u8; 32],
-    /// Generation of the last applied recovery (0 at birth).
+    /// The commitment to the current recovery key (rotated by each `Rotate`).
+    pub recovery_commit: [u8; 32],
+    /// Generation of the last applied op (0 at birth).
     pub gen: u32,
-    /// Whether any recovery has been applied.
+    /// Whether any break-glass `Recover` has been applied.
     pub recovered: bool,
 }
 
@@ -193,13 +152,13 @@ pub struct RootState {
 pub fn derive_workspace_id(
     founding_device: &UserId,
     salt: &[u8; 16],
-    recovery_root: &[u8; 32],
+    recovery_commit: &[u8; 32],
 ) -> WorkspaceId {
     let mut h = blake3::Hasher::new();
     h.update(SPACE_DOMAIN);
     h.update(founding_device.as_str().as_bytes());
     h.update(salt);
-    h.update(recovery_root);
+    h.update(recovery_commit);
     let digest = h.finalize();
     let mut d16 = [0u8; 16];
     d16.copy_from_slice(&digest.as_bytes()[..16]);
@@ -208,15 +167,15 @@ pub fn derive_workspace_id(
 
 /// Verify a workspace's founding commitment and return the **verified** founding
 /// actor to root genesis on. Checks, all offline:
-/// 1. `ws_id` commits to the inception's signing device + `salt` + `recovery_root`;
+/// 1. `ws_id` commits to the inception's signing device + `salt` + `recovery_commit`;
 /// 2. the inception is a valid, `ws_id`-scoped founding key-event.
 pub fn verify_founding(
     ws_id: &WorkspaceId,
     salt: &[u8; 16],
-    recovery_root: &[u8; 32],
+    recovery_commit: &[u8; 32],
     founder_inception: &SignedEvent,
 ) -> Result<ActorId> {
-    if derive_workspace_id(&founder_inception.author, salt, recovery_root) != *ws_id {
+    if derive_workspace_id(&founder_inception.author, salt, recovery_commit) != *ws_id {
         bail!("workspace id does not commit to this founder — ticket is forged or corrupt");
     }
     let founder_actor = ActorId::from_incept_hash(&founder_inception.hash());
@@ -228,79 +187,59 @@ pub fn verify_founding(
 }
 
 /// Replay the space plane over genesis to the current root. Seeds from
-/// `genesis.founding_actors` / `genesis.recovery_root`, then applies each
-/// threshold-satisfied `Recover` in generation order. Deterministic and
-/// convergent: same events → same `RootState` on every replica.
+/// `genesis.founding_actors` / `genesis.recovery_root`, then applies each op —
+/// authored by the current recovery key — in generation order. Deterministic and
+/// convergent: same events → same `RootState` on every replica, order-independent.
 pub fn replay(genesis: &Genesis, ws_id: &WorkspaceId, events: &[SignedSpaceEvent]) -> RootState {
     let mut state = RootState {
         root: genesis.founding_actors.clone(),
-        recovery_root: genesis.recovery_root,
+        recovery_commit: genesis.recovery_root,
         gen: 0,
         recovered: false,
     };
 
-    // Gather valid Recover events: signature checks, the signer is a committed key
-    // of the set it presents, and the set is well-formed. Group identical payloads
-    // and tally the distinct committed signers behind each.
-    let mut tally: BTreeMap<Vec<u8>, (SpaceOp, BTreeSet<[u8; 32]>)> = BTreeMap::new();
-    for ev in events {
-        if !ev.verify_sig(SPACE_EVENT_DOMAIN, ws_id.as_str()) {
-            continue;
-        }
-        let Ok(op) = postcard::from_bytes::<SpaceOp>(&ev.op) else {
-            continue;
-        };
-        let SpaceOp::Recover { set, new_root, .. } = &op;
-        if !set.well_formed() || new_root.is_empty() {
-            continue;
-        }
-        let Some(signer) = recovery_key_hash(&ev.author) else {
-            continue;
-        };
-        if !set.key_hashes.contains(&signer) {
-            continue; // signer is not a committed recovery key of the set it claims
-        }
-        tally
-            .entry(ev.op.clone())
-            .or_insert_with(|| (op.clone(), BTreeSet::new()))
-            .1
-            .insert(signer);
-    }
-
-    // Apply recoveries in generation order. Each must satisfy the CURRENT
-    // recovery commitment, meet its threshold, and be the next generation. Ties
-    // at a generation are broken by payload bytes (deterministic).
-    let mut candidates: Vec<(SpaceOp, BTreeSet<[u8; 32]>, Vec<u8>)> = tally
-        .into_iter()
-        .map(|(bytes, (op, signers))| (op, signers, bytes))
+    // Decode + signature-verify every op up front; carry the op bytes for a
+    // deterministic tie-break among same-generation ops.
+    let mut ops: Vec<(u32, Vec<u8>, SpaceOp, UserId)> = events
+        .iter()
+        .filter_map(|ev| {
+            if !ev.verify_sig(SPACE_EVENT_DOMAIN, ws_id.as_str()) {
+                return None;
+            }
+            let op = postcard::from_bytes::<SpaceOp>(&ev.op).ok()?;
+            Some((op.gen(), ev.op.clone(), op, ev.author.clone()))
+        })
         .collect();
-    candidates.sort_by(|a, b| {
-        let (SpaceOp::Recover { gen: ga, .. }, SpaceOp::Recover { gen: gb, .. }) = (&a.0, &b.0);
-        ga.cmp(gb).then_with(|| a.2.cmp(&b.2))
-    });
+    ops.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
+    // Apply the next-generation op whose author is the current recovery authority.
     loop {
         let mut applied = false;
-        for (op, signers, _) in &candidates {
-            let SpaceOp::Recover {
-                new_root,
-                set,
-                next_recovery_root,
-                gen,
-            } = op;
+        for (gen, _, op, author) in &ops {
             if *gen != state.gen + 1 {
                 continue;
             }
-            if set.root() != state.recovery_root {
-                continue;
+            if recovery_commit(author) != Some(state.recovery_commit) {
+                continue; // not signed by the current recovery key
             }
-            if (signers.len() as u32) < set.threshold {
-                continue;
+            match op {
+                SpaceOp::Recover { new_root, .. } => {
+                    if new_root.is_empty() {
+                        continue;
+                    }
+                    state.root = new_root.clone();
+                    state.recovered = true;
+                }
+                SpaceOp::Rotate {
+                    new_recovery_key, ..
+                } => {
+                    let Some(c) = recovery_commit(new_recovery_key) else {
+                        continue;
+                    };
+                    state.recovery_commit = c;
+                }
             }
-            state.root = new_root.clone();
-            state.recovery_root = *next_recovery_root;
             state.gen = *gen;
-            state.recovered = true;
             applied = true;
             break;
         }
@@ -315,39 +254,27 @@ pub fn replay(genesis: &Genesis, ws_id: &WorkspaceId, events: &[SignedSpaceEvent
 mod tests {
     use super::*;
     use crate::actor::incept_single;
-    use ed25519_dalek::SigningKey;
 
     fn device_of(seed: &[u8; 32]) -> UserId {
-        let sk = SigningKey::from_bytes(seed);
-        UserId::from_key_string(data_encoding::HEXLOWER.encode(sk.verifying_key().as_bytes()))
-    }
-
-    fn set_of(seeds: &[[u8; 32]], threshold: u32) -> RecoverySet {
-        RecoverySet {
-            threshold,
-            key_hashes: seeds
-                .iter()
-                .map(|s| recovery_key_hash(&device_of(s)).unwrap())
-                .collect(),
-        }
+        recovery_pub_of(seed)
     }
 
     fn founding(
         seed: [u8; 32],
         salt: [u8; 16],
-        recovery_root: [u8; 32],
+        recovery_commit: [u8; 32],
     ) -> (WorkspaceId, SignedEvent, ActorId) {
-        let ws = derive_workspace_id(&device_of(&seed), &salt, &recovery_root);
+        let ws = derive_workspace_id(&device_of(&seed), &salt, &recovery_commit);
         let (incept, actor) = incept_single(&seed, &ws, [1u8; 16], [2u8; 16], None);
         (ws, incept, actor)
     }
 
-    fn genesis_with(ws: &WorkspaceId, founder: &ActorId, salt: [u8; 16], rr: [u8; 32]) -> Genesis {
+    fn genesis_with(ws: &WorkspaceId, founder: &ActorId, salt: [u8; 16], rc: [u8; 32]) -> Genesis {
         Genesis {
             workspace_id: ws.clone(),
             founding_actors: vec![founder.clone()],
             salt,
-            recovery_root: rr,
+            recovery_root: rc,
         }
     }
 
@@ -357,97 +284,98 @@ mod tests {
 
     #[test]
     fn a_valid_founding_verifies_to_its_actor() {
-        let rr = set_of(&[[20u8; 32]], 1).root();
-        let (ws, incept, actor) = founding([7u8; 32], [9u8; 16], rr);
+        let rc = recovery_commit(&recovery_pub_of(&[20u8; 32])).unwrap();
+        let (ws, incept, actor) = founding([7u8; 32], [9u8; 16], rc);
         assert_eq!(
-            verify_founding(&ws, &[9u8; 16], &rr, &incept).unwrap(),
+            verify_founding(&ws, &[9u8; 16], &rc, &incept).unwrap(),
             actor
         );
         assert!(WorkspaceId::parse(ws.as_str()).is_some());
     }
 
     #[test]
-    fn a_tampered_recovery_root_is_rejected() {
-        let rr = set_of(&[[20u8; 32]], 1).root();
-        let (ws, incept, _) = founding([7u8; 32], [9u8; 16], rr);
-        // A different recovery root no longer reproduces the id.
+    fn a_tampered_recovery_commit_is_rejected() {
+        let rc = recovery_commit(&recovery_pub_of(&[20u8; 32])).unwrap();
+        let (ws, incept, _) = founding([7u8; 32], [9u8; 16], rc);
         assert!(verify_founding(&ws, &[9u8; 16], &[0xEE; 32], &incept).is_err());
     }
 
     #[test]
-    fn threshold_recovery_re_roots_only_when_enough_keys_sign() {
-        // 2-of-3 recovery. Two committed keys sign an identical Recover → applies.
-        let rseeds = [[21u8; 32], [22u8; 32], [23u8; 32]];
-        let set = set_of(&rseeds, 2);
-        let rr = set.root();
-        let (ws, _incept, founder) = founding([7u8; 32], [9u8; 16], rr);
-        let genesis = genesis_with(&ws, &founder, [9u8; 16], rr);
+    fn only_the_committed_recovery_key_can_re_root() {
+        // Birth commits to recovery key R. A Recover signed by R re-roots; one
+        // signed by an unrelated key is inert.
+        let r_seed = [21u8; 32];
+        let rc = recovery_commit(&recovery_pub_of(&r_seed)).unwrap();
+        let (ws, _i, founder) = founding([7u8; 32], [9u8; 16], rc);
+        let genesis = genesis_with(&ws, &founder, [9u8; 16], rc);
         let new_root = vec![a_new_actor([50u8; 32], &ws)];
-        let next_rr = set_of(&[[31u8; 32]], 1).root();
         let op = SpaceOp::Recover {
             new_root: new_root.clone(),
-            set: set.clone(),
-            next_recovery_root: next_rr,
             gen: 1,
         };
 
-        // One signature — below threshold: no re-root.
-        let one = vec![sign_op(&rseeds[0], &op, vec![], &ws)];
-        let st = replay(&genesis, &ws, &one);
-        assert_eq!(st.root, vec![founder.clone()], "1 of 2 does not recover");
-        assert!(!st.recovered);
+        // Wrong key: not authorized.
+        let evil = vec![sign_op(&[99u8; 32], &op, vec![], &ws)];
+        assert!(!replay(&genesis, &ws, &evil).recovered);
 
-        // Two distinct committed signatures — threshold met: re-roots and rotates.
-        let two = vec![
-            sign_op(&rseeds[0], &op, vec![], &ws),
-            sign_op(&rseeds[1], &op, vec![], &ws),
-        ];
-        let st = replay(&genesis, &ws, &two);
-        assert_eq!(st.root, new_root, "2 of 3 re-roots the workspace");
+        // The committed key: re-roots.
+        let good = vec![sign_op(&r_seed, &op, vec![], &ws)];
+        let st = replay(&genesis, &ws, &good);
         assert!(st.recovered);
-        assert_eq!(st.recovery_root, next_rr, "the recovery set is rotated");
+        assert_eq!(st.root, new_root);
         assert_eq!(st.gen, 1);
     }
 
     #[test]
-    fn a_non_committed_signer_does_not_count_toward_threshold() {
-        let rseeds = [[21u8; 32], [22u8; 32]];
-        let set = set_of(&rseeds, 2);
-        let rr = set.root();
-        let (ws, _i, founder) = founding([7u8; 32], [9u8; 16], rr);
-        let genesis = genesis_with(&ws, &founder, [9u8; 16], rr);
-        let op = SpaceOp::Recover {
-            new_root: vec![a_new_actor([50u8; 32], &ws)],
-            set: set.clone(),
-            next_recovery_root: [0u8; 32],
+    fn rotate_elevates_the_recovery_key_then_only_the_new_one_recovers() {
+        // Solo key R1 elevates authority to R2 (a stand-in for a DKG group key);
+        // thereafter only R2 can recover, and R1 is spent.
+        let r1 = [21u8; 32];
+        let r2 = [22u8; 32];
+        let rc1 = recovery_commit(&recovery_pub_of(&r1)).unwrap();
+        let (ws, _i, founder) = founding([7u8; 32], [9u8; 16], rc1);
+        let genesis = genesis_with(&ws, &founder, [9u8; 16], rc1);
+
+        let rotate = SpaceOp::Rotate {
+            new_recovery_key: recovery_pub_of(&r2),
             gen: 1,
         };
-        // One committed signer + one OUTSIDER (not in the set) — still below 2.
-        let evs = vec![
-            sign_op(&rseeds[0], &op, vec![], &ws),
-            sign_op(&[99u8; 32], &op, vec![], &ws),
+        let recover = SpaceOp::Recover {
+            new_root: vec![a_new_actor([50u8; 32], &ws)],
+            gen: 2,
+        };
+
+        // R1 rotates to R2; R2 then recovers.
+        let events = vec![
+            sign_op(&r1, &rotate, vec![], &ws),
+            sign_op(&r2, &recover, vec![], &ws),
         ];
-        let st = replay(&genesis, &ws, &evs);
-        assert!(!st.recovered, "an outsider's signature is not counted");
-        assert_eq!(st.root, vec![founder]);
+        let st = replay(&genesis, &ws, &events);
+        assert!(
+            st.recovered && st.gen == 2,
+            "R2 recovers after the rotation"
+        );
+
+        // R1 attempting the gen-2 recover after rotation is inert (no longer the key).
+        let r1_recover = sign_op(&r1, &recover, vec![], &ws);
+        let events2 = vec![sign_op(&r1, &rotate, vec![], &ws), r1_recover];
+        assert!(
+            !replay(&genesis, &ws, &events2).recovered,
+            "the spent key cannot recover"
+        );
     }
 
     #[test]
-    fn a_stale_generation_recovery_cannot_replay() {
-        let rseeds = [[21u8; 32]];
-        let set = set_of(&rseeds, 1);
-        let rr = set.root();
-        let (ws, _i, founder) = founding([7u8; 32], [9u8; 16], rr);
-        let genesis = genesis_with(&ws, &founder, [9u8; 16], rr);
-        // A gen-2 recovery with no gen-1 before it: not next-in-sequence, skipped.
+    fn a_stale_generation_op_cannot_replay() {
+        let r = [21u8; 32];
+        let rc = recovery_commit(&recovery_pub_of(&r)).unwrap();
+        let (ws, _i, founder) = founding([7u8; 32], [9u8; 16], rc);
+        let genesis = genesis_with(&ws, &founder, [9u8; 16], rc);
+        // A gen-2 op with no gen-1 before it is not next-in-sequence.
         let op = SpaceOp::Recover {
             new_root: vec![a_new_actor([50u8; 32], &ws)],
-            set,
-            next_recovery_root: [0u8; 32],
             gen: 2,
         };
-        let st = replay(&genesis, &ws, &[sign_op(&rseeds[0], &op, vec![], &ws)]);
-        assert!(!st.recovered, "a non-monotone generation is ignored");
-        assert_eq!(st.root, vec![founder]);
+        assert!(!replay(&genesis, &ws, &[sign_op(&r, &op, vec![], &ws)]).recovered);
     }
 }
