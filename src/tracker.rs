@@ -216,7 +216,13 @@ pub fn found_workspace(
         UserId::from_key_string(data_encoding::HEXLOWER.encode(sk.verifying_key().as_bytes()))
     };
     let salt = rand16();
-    let ws = crate::space::derive_workspace_id(&founding_device, &salt);
+    // Mint the workspace's break-glass recovery set (v1: 1-of-1) and fold its
+    // commitment into the id, so root recovery is authorized offline against a
+    // value bound at birth — never a compromised current admin (lait/space/1 W5).
+    let (recovery_set, recovery_secrets) = crate::space::mint_recovery_set(1, 1);
+    let recovery_root = recovery_set.root();
+    let ws = crate::space::derive_workspace_id(&founding_device, &salt, &recovery_root);
+    persist_space_recovery(store, &recovery_set, &recovery_secrets)?;
     let cat = CatalogDoc::create(&ws, name, Some(store.peer_id()), me)?;
     // Seed the first project so a fresh workspace is usable on the very next
     // command. Plain catalog data — a joiner never hits this path.
@@ -242,6 +248,7 @@ pub fn found_workspace(
         workspace_id: ws.clone(),
         founding_actors: vec![actor_id.clone()],
         salt,
+        recovery_root,
     };
     store.write_genesis(&genesis)?;
     store.save_catalog(&cat)?;
@@ -332,6 +339,46 @@ fn persist_recovery_key(store: &Store, seed: &[u8; 32]) -> Result<()> {
     Ok(())
 }
 
+/// Persist the workspace **break-glass recovery** material beside the store: each
+/// secret seed to `space-recovery-{i}.key` (owner-only; move each offline with a
+/// distinct holder for K-of-N) and the public [`RecoverySet`] to
+/// `space-recovery-set.json` (needed to author a `Recover`). Root credentials, so
+/// secrets are created owner-only from the start and errors propagate.
+fn persist_space_recovery(
+    store: &Store,
+    set: &crate::space::RecoverySet,
+    secrets: &[[u8; 32]],
+) -> Result<()> {
+    use std::io::Write;
+    let home = store.home_path();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700))
+            .context("restrict store home permissions for space-recovery keys")?;
+    }
+    for (i, seed) in secrets.iter().enumerate() {
+        let path = home.join(format!("space-recovery-{i}.key"));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&path).context("create space-recovery key")?;
+        f.write_all(data_encoding::HEXLOWER.encode(seed).as_bytes())
+            .context("write space-recovery key")?;
+        f.sync_all().context("fsync space-recovery key")?;
+    }
+    // The set (public key hashes + threshold) is not secret; a holder needs it to
+    // build a Recover preimage.
+    let set_json = serde_json::to_string(set).context("encode recovery set")?;
+    std::fs::write(home.join("space-recovery-set.json"), set_json)
+        .context("write space-recovery-set.json")?;
+    Ok(())
+}
+
 /// Bootstrap a store from a join ticket — the `lait join` path (A§6/A§10).
 /// Writes the ticket's genesis (the host is the founding admin whose signed ACL
 /// the joiner validates against) and **empty** catalog/membership docs, so
@@ -342,6 +389,7 @@ pub fn join_workspace_store(
     store: &Store,
     workspace: &str,
     salt: &[u8; 16],
+    recovery_root: &[u8; 32],
     founder_inception: &actor::SignedEvent,
 ) -> Result<WorkspaceId> {
     if store.is_initialized() {
@@ -349,15 +397,18 @@ pub fn join_workspace_store(
     }
     let ws_id = WorkspaceId::parse(workspace)
         .ok_or_else(|| anyhow!("invalid workspace id in ticket: {workspace}"))?;
-    // Verify the trust root offline: the id must commit to the founder, and the
-    // founding inception must validly incept for THIS workspace. A tampered
-    // anchor fails here rather than silently forking the joiner (lait/space/1).
-    let founder_actor = crate::space::verify_founding(&ws_id, salt, founder_inception)
-        .context("verify workspace founding — ask for a fresh invite")?;
+    // Verify the trust root offline: the id must commit to the founder AND the
+    // recovery set, and the founding inception must validly incept for THIS
+    // workspace. A tampered anchor fails here rather than silently forking the
+    // joiner (lait/space/1).
+    let founder_actor =
+        crate::space::verify_founding(&ws_id, salt, recovery_root, founder_inception)
+            .context("verify workspace founding — ask for a fresh invite")?;
     let genesis = Genesis {
         workspace_id: ws_id.clone(),
         founding_actors: vec![founder_actor],
         salt: *salt,
+        recovery_root: *recovery_root,
     };
     store.write_genesis(&genesis)?;
     store.save_catalog(&CatalogDoc::empty(Some(store.peer_id())))?;
@@ -701,6 +752,7 @@ impl Tracker {
             Request::DeviceRevoke { device } => Ok(self.device_revoke_cmd(device)),
             Request::DeviceList => Ok((self.device_list_response(), None)),
             Request::Recover => Ok(self.recover()),
+            Request::SpaceRecover => Ok(self.space_recover_cmd()),
             Request::Members => Ok((self.members_response(), None)),
             Request::MemberLog => Ok((self.member_log_response(), None)),
             other => Err(anyhow!("not a tracker request: {other:?}")),
@@ -2204,11 +2256,28 @@ impl Tracker {
 
     // ---- membership / ACL operations (P3, S§6, A§11) ----
 
-    /// The materialized ACL state (deterministic replay from genesis over the
-    /// actor plane + the signed ACL ops, S§6 / lait/actor/1).
+    /// The genesis as seen *after* any break-glass recovery: `founding_actors` is
+    /// the space plane's effective root (`lait/space/1`), not the immutable birth
+    /// seed. With no recovery this is the birth genesis unchanged.
+    fn effective_genesis(&self) -> Genesis {
+        let root = crate::space::replay(
+            &self.genesis,
+            &self.workspace_id,
+            &self.membership.space_events(),
+        );
+        Genesis {
+            founding_actors: root.root,
+            ..self.genesis.clone()
+        }
+    }
+
+    /// The materialized ACL state (deterministic replay from the *effective* root
+    /// over the actor plane + the signed ACL ops, S§6 / lait/actor/1). Seeding
+    /// from the recovery-aware root is the one integration point of the space
+    /// plane: after a threshold `Recover`, replay roots on the recovered admins.
     pub fn acl_state(&self) -> AclState {
         acl::replay(
-            &self.genesis,
+            &self.effective_genesis(),
             &self.membership.actor_events(),
             &self.membership.ops(),
         )
@@ -2264,14 +2333,14 @@ impl Tracker {
     /// `(salt, founder_inception)` a joiner checks the workspace id against. Any
     /// correctly-joined node holds both — the salt in genesis, the founder's
     /// inception in the membership actor log.
-    pub fn founding_proof(&self) -> Option<([u8; 16], actor::SignedEvent)> {
+    pub fn founding_proof(&self) -> Option<([u8; 16], [u8; 32], actor::SignedEvent)> {
         let founder = self.genesis.founding_actors.first()?;
         let incept = self
             .membership
             .actor_events()
             .into_iter()
             .find(|ev| ActorId::from_incept_hash(&ev.hash()) == *founder)?;
-        Some((self.genesis.salt, incept))
+        Some((self.genesis.salt, self.genesis.recovery_root, incept))
     }
     pub fn is_member_actor(&self, actor: &ActorId) -> bool {
         self.acl_state().is_member(actor)
@@ -2696,6 +2765,143 @@ impl Tracker {
             .decode(s.as_bytes())
             .ok()?;
         raw.as_slice().try_into().ok()
+    }
+
+    /// Load the workspace break-glass recovery seeds held beside the store.
+    fn read_space_recovery_keys(&self) -> Vec<[u8; 32]> {
+        let home = self.store.home_path();
+        let mut out = Vec::new();
+        let mut i = 0;
+        loop {
+            let Ok(hex) = std::fs::read_to_string(home.join(format!("space-recovery-{i}.key")))
+            else {
+                break;
+            };
+            if let Ok(v) = data_encoding::HEXLOWER_PERMISSIVE.decode(hex.trim().as_bytes()) {
+                if let Ok(seed) = <[u8; 32]>::try_from(v.as_slice()) {
+                    out.push(seed);
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// The public recovery set (threshold + key hashes) beside the store.
+    fn read_space_recovery_set(&self) -> Option<crate::space::RecoverySet> {
+        let json =
+            std::fs::read_to_string(self.store.home_path().join("space-recovery-set.json")).ok()?;
+        serde_json::from_str(&json).ok()
+    }
+
+    /// Retire the used recovery files and write the freshly-minted set.
+    fn rotate_recovery_files(
+        &self,
+        set: &crate::space::RecoverySet,
+        secrets: &[[u8; 32]],
+    ) -> Result<()> {
+        let home = self.store.home_path();
+        let mut i = 0;
+        while home.join(format!("space-recovery-{i}.key")).exists() {
+            let _ = std::fs::remove_file(home.join(format!("space-recovery-{i}.key")));
+            i += 1;
+        }
+        let _ = std::fs::remove_file(home.join("space-recovery-set.json"));
+        persist_space_recovery(&self.store, set, secrets)
+    }
+
+    /// Break-glass **workspace recovery** (lait/space/1 W5). Re-roots the space to
+    /// THIS device's actor using the offline recovery keys held beside the store,
+    /// authored as threshold `Recover` events. Below threshold, it records the
+    /// signatures it can and waits for the rest (they accumulate via sync). At
+    /// threshold the effective root flips, the recovery set rotates (used keys
+    /// retired), and a fresh epoch is minted to fence the old root.
+    pub fn space_recover_cmd(&mut self) -> (Response, Option<DirtySet>) {
+        let keys = self.read_space_recovery_keys();
+        if keys.is_empty() {
+            return (
+                Response::err(
+                    "no space-recovery-*.key beside the store — restore your offline workspace recovery keys first",
+                ),
+                None,
+            );
+        }
+        let Some(set) = self.read_space_recovery_set() else {
+            return (
+                Response::err("no space-recovery-set.json beside the store"),
+                None,
+            );
+        };
+        // This device's actor becomes the new root (self-incept if needed).
+        let me_actor = match self.self_inception() {
+            Ok(ev) => ActorId::from_incept_hash(&ev.hash()),
+            Err(e) => return (Response::err(format!("{e:#}")), None),
+        };
+        // Rotate the break-glass set so the keys we are about to spend are retired.
+        let (next_set, next_secrets) =
+            crate::space::mint_recovery_set(set.key_hashes.len(), set.threshold);
+        let cur = crate::space::replay(
+            &self.genesis,
+            &self.workspace_id,
+            &self.membership.space_events(),
+        );
+        let op = crate::space::SpaceOp::Recover {
+            new_root: vec![me_actor.clone()],
+            set: set.clone(),
+            next_recovery_root: next_set.root(),
+            gen: cur.gen + 1,
+        };
+        // Sign the identical payload with every locally-held committed key.
+        let committed: std::collections::BTreeSet<[u8; 32]> =
+            set.key_hashes.iter().copied().collect();
+        let res = (|| -> Result<()> {
+            for seed in &keys {
+                let held = crate::space::recovery_key_hash(&crate::space::recovery_pub_of(seed));
+                if held.is_some_and(|h| committed.contains(&h)) {
+                    let ev = crate::space::sign_op(seed, &op, vec![], &self.workspace_id);
+                    self.membership.add_space_event(&ev)?;
+                }
+            }
+            self.persist_membership("space_recover")
+        })();
+        if let Err(e) = res {
+            return (Response::err(format!("{e:#}")), None);
+        }
+        let after = crate::space::replay(
+            &self.genesis,
+            &self.workspace_id,
+            &self.membership.space_events(),
+        );
+        if !after.recovered || after.root != vec![me_actor.clone()] {
+            return (
+                Response::Ok {
+                    message: Some(format!(
+                        "recorded recovery signatures — waiting for a threshold of {} to be reached",
+                        set.threshold
+                    )),
+                },
+                Some(DirtySet::catalog(CatalogScope::Acl)),
+            );
+        }
+        // Threshold met: retire the spent keys, then re-key to fence the old root.
+        if let Err(e) = self.rotate_recovery_files(&next_set, &next_secrets) {
+            return (Response::err(format!("{e:#}")), None);
+        }
+        let rekey = self
+            .rotate_key()
+            .and_then(|()| self.persist_membership("recover_rekey"));
+        if let Err(e) = rekey {
+            return (Response::err(format!("{e:#}")), None);
+        }
+        (
+            Response::Ok {
+                message: Some(format!(
+                    "recovered the workspace — root reset to {} and re-keyed",
+                    me_actor.short()
+                )),
+            },
+            Some(DirtySet::catalog(CatalogScope::Acl)),
+        )
     }
 
     /// Resolve a `<who>` ref to a known actor: an `act_` id directly, or a
@@ -3655,7 +3861,7 @@ mod tests {
         user: UserId,
         seed: [u8; 32],
         ws: &str,
-        proof: &([u8; 16], actor::SignedEvent),
+        proof: &([u8; 16], [u8; 32], actor::SignedEvent),
     ) -> TestNode {
         let home = std::env::temp_dir().join(format!(
             "gc-trk-{}-{}",
@@ -3664,7 +3870,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&home).unwrap();
         let store = Store::open(&home).unwrap();
-        join_workspace_store(&store, ws, &proof.0, &proof.1).unwrap();
+        join_workspace_store(&store, ws, &proof.0, &proof.1, &proof.2).unwrap();
         let clock = FakeClock::new(1_000_000 + seed[0] as u64 * 100_000);
         let tracker = Tracker::open(store, user, "tester".into(), seed, Box::new(clock)).unwrap();
         TestNode { tracker, home }
@@ -4724,7 +4930,7 @@ mod tests {
         // forged ticket that presents the inviter's own inception as the founder
         // for A's workspace is rejected at join: the self-certifying id does not
         // commit to B's device (lait/space/1), so verify_founding fails.
-        let (a_salt, _a_incept) = a.tracker.founding_proof().unwrap();
+        let (a_salt, a_rr, _a_incept) = a.tracker.founding_proof().unwrap();
         let forged_home = std::env::temp_dir().join(format!(
             "gc-trk-{}-{}",
             std::process::id(),
@@ -4732,12 +4938,64 @@ mod tests {
         ));
         std::fs::create_dir_all(&forged_home).unwrap();
         let forged_store = Store::open(&forged_home).unwrap();
-        let err = join_workspace_store(&forged_store, &a_ws, &a_salt, &b_incept);
+        let err = join_workspace_store(&forged_store, &a_ws, &a_salt, &a_rr, &b_incept);
         assert!(
             err.is_err(),
             "a ticket rooting on the inviter's inception is rejected, not forked"
         );
         let _ = std::fs::remove_dir_all(&forged_home);
+    }
+
+    #[test]
+    fn break_glass_recovery_re_roots_the_workspace() {
+        // W5: the live admin (A) is lost/compromised. A holder restores the
+        // offline workspace recovery key on a FRESH device C and recovers —
+        // re-rooting the workspace to C, evicting A, convergently for all peers.
+        let mut a = new_node(); // founder A; 1-of-1 space recovery key beside its store
+        with_project(&mut a.tracker);
+        new_issue(&mut a.tracker, "old");
+        let a_actor = a.tracker.my_actor().unwrap();
+        let a_ws = a.tracker.workspace_str();
+
+        // Fresh device C bootstraps on A's workspace (verifies the founding), then
+        // syncs the state from a survivor (here A) — the realistic break-glass
+        // flow: pull the workspace, then re-root.
+        let c_seed = [71u8; 32];
+        let c_user = user_from_seed(c_seed);
+        let mut c = new_joiner_node_as(c_user, c_seed, &a_ws, &a.tracker.founding_proof().unwrap());
+        sync_all(&mut a.tracker, &mut c.tracker);
+
+        // The offline recovery material is restored beside C's store.
+        std::fs::copy(
+            a.home.join("space-recovery-0.key"),
+            c.home.join("space-recovery-0.key"),
+        )
+        .unwrap();
+        std::fs::copy(
+            a.home.join("space-recovery-set.json"),
+            c.home.join("space-recovery-set.json"),
+        )
+        .unwrap();
+
+        // C recovers: threshold 1-of-1 met, so the root flips to C.
+        let (resp, _) = c.tracker.space_recover_cmd();
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        let c_actor = c.tracker.my_actor().unwrap();
+        assert!(
+            c.tracker.acl_state().is_admin(&c_actor),
+            "the recovered device is the new root admin"
+        );
+        assert!(
+            !c.tracker.acl_state().is_admin(&a_actor),
+            "the old root no longer holds authority"
+        );
+
+        // Convergent: A syncs C's recovery and agrees it is no longer the root.
+        sync_all(&mut c.tracker, &mut a.tracker);
+        assert!(
+            a.tracker.acl_state().is_admin(&c_actor) && !a.tracker.acl_state().is_admin(&a_actor),
+            "every replica converges on the recovered root"
+        );
     }
 
     #[test]

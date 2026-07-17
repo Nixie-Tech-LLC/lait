@@ -137,6 +137,7 @@ fn join_home(home: &Path, ticket: &str) {
         &store,
         &t.workspace,
         &t.salt,
+        &t.recovery_root,
         t.founder_inception
             .as_ref()
             .expect("ticket carries a founding proof"),

@@ -242,6 +242,11 @@ pub struct WorkspaceTicket {
     /// founder rather than trusting a bare anchor string.
     #[serde(default)]
     pub salt: [u8; 16],
+    /// The break-glass recovery commitment folded into `workspace`. The joiner
+    /// checks the id commits to it too, so the recovery authority is pinned at
+    /// verification, not trusted from a mutable field.
+    #[serde(default)]
+    pub recovery_root: [u8; 32],
     /// The founder's signed inception. Together with `salt` it makes the trust
     /// root **verifiable offline**: the joiner checks `workspace` commits to this
     /// inception's device, that the inception validly incepts for `workspace`,
@@ -381,6 +386,7 @@ mod tests {
             host: host_key(),
             host_nick: "alice".into(),
             salt: [0u8; 16],
+            recovery_root: [0u8; 32],
             founder_inception: None,
             invite: None,
         }

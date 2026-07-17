@@ -1383,7 +1383,8 @@ impl Node {
             | Request::DeviceAdd { .. }
             | Request::DeviceRevoke { .. }
             | Request::DeviceList
-            | Request::Recover => {
+            | Request::Recover
+            | Request::SpaceRecover => {
                 let (resp, changed) = self.dispatch_tracker(req);
                 if changed {
                     // our catalog head moved — announce so peers pull (A§8).
@@ -1674,21 +1675,22 @@ impl Node {
                 // commits to it, so a non-founder's invite still roots the joiner
                 // on the TRUE founder and a tampered anchor is rejected — every
                 // correctly-joined node holds the same proof (lait/space/1).
-                let (salt, founder_inception) = match self.tracker.lock().unwrap().founding_proof()
-                {
-                    Some(p) => p,
-                    None => {
-                        return Ok(Response::err(
-                            "this workspace has no founding proof — cannot mint an invite",
-                        ))
-                    }
-                };
+                let (salt, recovery_root, founder_inception) =
+                    match self.tracker.lock().unwrap().founding_proof() {
+                        Some(p) => p,
+                        None => {
+                            return Ok(Response::err(
+                                "this workspace has no founding proof — cannot mint an invite",
+                            ))
+                        }
+                    };
                 let ticket = WorkspaceTicket {
                     workspace,
                     name,
                     host: self.shared.my_id,
                     host_nick: self.shared.nick(),
                     salt,
+                    recovery_root,
                     founder_inception: Some(founder_inception),
                     invite,
                 };

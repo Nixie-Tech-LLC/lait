@@ -312,6 +312,7 @@ mod tests {
                 workspace_id: w,
                 founding_actors: vec![actors[&founder].0.clone()],
                 salt: [0u8; 16],
+                recovery_root: [0u8; 32],
             },
             events,
             actors,

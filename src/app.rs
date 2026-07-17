@@ -681,6 +681,7 @@ async fn run_join_cli(m: &ArgMatches, out: Out) -> Result<()> {
             &store,
             &ticket.workspace,
             &ticket.salt,
+            &ticket.recovery_root,
             founder_inception,
         )?;
     }

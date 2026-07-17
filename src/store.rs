@@ -49,6 +49,11 @@ pub struct Genesis {
     /// so a replica can confirm the id commits to its founder.
     #[serde(default)]
     pub salt: [u8; 16],
+    /// The break-glass recovery commitment folded into `workspace_id`
+    /// (`H(threshold ‖ sorted[H(recovery_pubkey_i)])`). Seeds the space plane's
+    /// recovery authority; rotatable only by a threshold `Recover`.
+    #[serde(default)]
+    pub recovery_root: [u8; 32],
 }
 
 /// Whether `home` holds an initialized store — a pure probe (no dirs created,
@@ -425,6 +430,7 @@ mod tests {
             workspace_id: WorkspaceId::mint(&SystemUlidSource),
             founding_actors: vec![crate::ids::ActorId::from_incept_hash(&"a".repeat(64))],
             salt: [0u8; 16],
+            recovery_root: [0u8; 32],
         };
         store.write_genesis(&g).unwrap();
         assert_eq!(store.genesis().unwrap(), Some(g));

@@ -300,6 +300,11 @@ pub enum Request {
     },
     /// List the device keys currently bound to our actor.
     DeviceList,
+    /// Break-glass **workspace** recovery (lait/space/1 W5): re-root the workspace
+    /// to this device using the offline workspace recovery keys, as threshold
+    /// `Recover` events. Distinct from [`Recover`](Self::Recover), which resets a
+    /// single actor's devices.
+    SpaceRecover,
     /// Recover our actor with the offline recovery key: reset the device set to
     /// this device (identity is restored; content-key access is re-sealed lazily
     /// by an admin/peer).

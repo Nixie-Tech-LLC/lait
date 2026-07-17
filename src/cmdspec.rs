@@ -1147,6 +1147,14 @@ pub fn specs() -> Vec<Spec> {
             |_| Ok(Request::Recover),
         ),
         Spec::req(
+            "recover-workspace",
+            "Break-glass: re-root the WHOLE workspace to this device using the \
+             offline workspace recovery keys (threshold K-of-N), when the admins \
+             are lost or compromised. Sync from a surviving peer first.",
+            vec![],
+            |_| Ok(Request::SpaceRecover),
+        ),
+        Spec::req(
             "activity",
             "Workspace-wide recent transitions.",
             vec![A::val("since", "Only events after this seq.").default("0")],

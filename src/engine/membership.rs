@@ -27,12 +27,13 @@ const ROOT: &str = "membership";
 const K_WORKSPACE: &str = "workspaceId";
 const C_ACL: &str = "acl";
 const C_ACTORS: &str = "actors"; // the lait/actor/1 key-event log (flat, grow-only)
-                                 // Per-device sealed key envelopes, keyed by content-addressed epoch id. The
-                                 // epoch's *authorization* (gen, recipient set, key commitment) is NOT here — it
-                                 // rides a signed `AclAction::MintEpoch` on the ACL DAG (C_ACL), so a replica
-                                 // adopts a key only when a valid writer-signed mint authorizes its epoch. These
-                                 // envelopes are unsigned ciphertext, but each is bound to its mint by
-                                 // `blake3(key) == mint.key_commit`, so a forged envelope is inert.
+const C_SPACE: &str = "space"; // the lait/space/1 event log (break-glass recovery, grow-only)
+                               // Per-device sealed key envelopes, keyed by content-addressed epoch id. The
+                               // epoch's *authorization* (gen, recipient set, key commitment) is NOT here — it
+                               // rides a signed `AclAction::MintEpoch` on the ACL DAG (C_ACL), so a replica
+                               // adopts a key only when a valid writer-signed mint authorizes its epoch. These
+                               // envelopes are unsigned ciphertext, but each is bound to its mint by
+                               // `blake3(key) == mint.key_commit`, so a forged envelope is inert.
 const C_KEYS: &str = "keys"; // epoch_id(hex) -> Map<device UserId, sealed bytes>
 
 fn epoch_hex(id: &[u8; 16]) -> String {
@@ -52,6 +53,7 @@ impl MembershipDoc {
         root.insert(K_WORKSPACE, workspace_id.as_str())?;
         root.insert_container(C_ACL, LoroList::new())?;
         root.insert_container(C_ACTORS, LoroList::new())?;
+        root.insert_container(C_SPACE, LoroList::new())?;
         root.insert_container(C_KEYS, LoroMap::new())?;
         op::commit_with(&doc, &OpCtx::authority("init", founder));
         Ok(Self { doc })
@@ -213,6 +215,49 @@ impl MembershipDoc {
         for i in 0..list.len() {
             if let Some(ValueOrContainer::Value(loro::LoroValue::Binary(b))) = list.get(i) {
                 if let Ok(ev) = postcard::from_bytes::<crate::actor::SignedEvent>(&b) {
+                    out.push(ev);
+                }
+            }
+        }
+        out
+    }
+
+    // ---- space events (the lait/space/1 recovery plane, grow-only) ----
+
+    fn space_list(&self) -> Option<LoroList> {
+        match self.root().get(C_SPACE) {
+            Some(ValueOrContainer::Container(Container::List(l))) => Some(l),
+            _ => None,
+        }
+    }
+
+    /// Append a signed space-plane event (idempotent by hash). These re-seed the
+    /// acl root under threshold recovery authority (`lait/space/1`). The container
+    /// is founded in [`create`](Self::create) and arrives by sync, so a recovering
+    /// node appends to the shared container rather than minting a conflicting one
+    /// (missing ⇒ the store hasn't synced yet).
+    pub fn add_space_event(&self, ev: &crate::space::SignedSpaceEvent) -> Result<()> {
+        let hash = ev.hash();
+        if self.space_events().iter().any(|e| e.hash() == hash) {
+            return Ok(());
+        }
+        let bytes = postcard::to_stdvec(ev).map_err(|e| anyhow!("encode space event: {e}"))?;
+        let list = self
+            .space_list()
+            .ok_or_else(|| anyhow!("space container missing — sync the workspace first"))?;
+        list.insert(list.len(), bytes.as_slice())?;
+        Ok(())
+    }
+
+    /// All space-plane events currently held.
+    pub fn space_events(&self) -> Vec<crate::space::SignedSpaceEvent> {
+        let Some(list) = self.space_list() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for i in 0..list.len() {
+            if let Some(ValueOrContainer::Value(loro::LoroValue::Binary(b))) = list.get(i) {
+                if let Ok(ev) = postcard::from_bytes::<crate::space::SignedSpaceEvent>(&b) {
                     out.push(ev);
                 }
             }

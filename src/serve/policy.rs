@@ -74,6 +74,7 @@ pub fn is_read(req: &Request) -> bool {
         | Request::DeviceAdd { .. }
         | Request::DeviceRevoke { .. }
         | Request::Recover
+        | Request::SpaceRecover
         // …joining and inviting, which act *as* an identity on the wire…
         | Request::Invite { .. }
         | Request::Join { .. }
