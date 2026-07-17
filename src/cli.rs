@@ -1341,7 +1341,8 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
                     .as_deref()
                     .map(|s| format!("  via {}", s.chars().take(8).collect::<String>()))
                     .unwrap_or_default();
-                println!("{:<7} {}{}{}{}", m.role, m.key.short(), name, sponsor, you);
+                let short: String = m.key.chars().take(12).collect();
+                println!("{:<7} {}{}{}{}", m.role, short, name, sponsor, you);
             }
             0
         }

@@ -16,9 +16,10 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 
-use crate::acl::{self, AclOp, AclState, Role, SignedOp};
+use crate::acl::{self, AclAction, AclOp, AclState, Grant, SignedOp};
+use crate::actor::{self, ActorPlane};
 use crate::authz;
 use crate::catalog::{CatalogDoc, RowMeta};
 use crate::control::{BoardPos, CatalogScope, Filter, Request, Response};
@@ -29,7 +30,7 @@ use crate::dto::{
 };
 use crate::engine::history;
 use crate::engine::op::OpCtx;
-use crate::ids::{DocId, LabelId, ProjectId, UlidSource, UserId, WorkspaceId};
+use crate::ids::{ActorId, DocId, LabelId, ProjectId, UlidSource, UserId, WorkspaceId};
 use crate::index::{self, AliasTable, RefResolution};
 use crate::issue::{IssueDoc, NewIssue};
 use crate::membership::MembershipDoc;
@@ -196,6 +197,7 @@ pub fn derive_project_key(name: &str) -> String {
 pub fn found_workspace(
     store: &Store,
     me: &UserId,
+    device_seed: &[u8; 32],
     name: &str,
     clock: &dyn UlidSource,
 ) -> Result<(WorkspaceId, ProjectDto)> {
@@ -215,24 +217,84 @@ pub fn found_workspace(
     let project_key = derive_project_key(project_name);
     cat.add_project(&project_id, project_name, &project_key, "blue")?;
     cat.apply(&OpCtx::structure("project_new", me));
+
+    // Provision the founder's recovery key (pre-rotation commitment) and incept
+    // the founding actor — the genesis anchors trust in the *actor*, so the
+    // founder can rotate devices without re-founding (lait/actor/1).
+    let (recovery_commit, recovery_seed) = mint_recovery();
+    persist_recovery_key(store, &recovery_seed)?;
+    let (incept_ev, actor_id) =
+        actor::incept_single(device_seed, &ws, rand16(), rand16(), Some(recovery_commit));
+
     let genesis = Genesis {
         workspace_id: ws.clone(),
-        founding_admins: vec![me.clone()],
+        founding_actors: vec![actor_id],
     };
     store.write_genesis(&genesis)?;
     store.save_catalog(&cat)?;
     let membership = MembershipDoc::create(&ws, Some(store.peer_id()), me)?;
+    membership.add_actor_event(&incept_ev)?;
     let key = crypto::random_key();
     if let Some(sealed) = crypto::seal_to(me, &key) {
         membership.put_sealed(0, me, &sealed)?;
     }
-    membership.apply(&OpCtx::authority("seal", me));
+    membership.apply(&OpCtx::authority("found", me));
     store.save_membership(&membership)?;
     store.commit("init workspace");
     let project = cat
         .project(&project_id)
         .ok_or_else(|| anyhow!("seeded project vanished"))?;
     Ok((ws, project))
+}
+
+/// 16 random bytes (an actor inception / consent nonce). Non-deterministic by
+/// design — an inception id must be unpredictable, so this never routes through
+/// the injected [`UlidSource`] clock.
+fn rand16() -> [u8; 16] {
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b).expect("getrandom");
+    b
+}
+
+/// Mint a recovery keypair: returns (commitment, secret seed). The secret is
+/// written to `recovery.key` and should be moved offline; the commitment is
+/// public (it rides the inception).
+fn mint_recovery() -> ([u8; 32], [u8; 32]) {
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed).expect("getrandom");
+    let pk = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+    let recovery_pub = UserId::from_key_string(data_encoding::HEXLOWER.encode(pk.as_bytes()));
+    let commit = actor::recovery_commitment(&recovery_pub).expect("valid recovery pubkey");
+    (commit, seed)
+}
+
+/// Persist the recovery secret beside the store. This is a root credential (the
+/// pre-rotation escrow — losing it forfeits recovery, never workspace access),
+/// so it is created **owner-only from the start** (never world-readable, even
+/// for an instant) and any permission error is propagated, never swallowed.
+fn persist_recovery_key(store: &Store, seed: &[u8; 32]) -> Result<()> {
+    use std::io::Write;
+    let home = store.home_path();
+    // Tighten the parent dir to owner-only on unix before writing the secret.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700))
+            .context("restrict store home permissions for recovery.key")?;
+    }
+    let path = home.join("recovery.key");
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&path).context("create recovery.key")?;
+    f.write_all(data_encoding::HEXLOWER.encode(seed).as_bytes())
+        .context("write recovery.key")?;
+    f.sync_all().context("fsync recovery.key")?;
+    Ok(())
 }
 
 /// Bootstrap a store from a join ticket — the `lait join` path (A§6/A§10).
@@ -247,10 +309,12 @@ pub fn join_workspace_store(store: &Store, workspace: &str, founder: &str) -> Re
     }
     let ws_id = WorkspaceId::parse(workspace)
         .ok_or_else(|| anyhow!("invalid workspace id in ticket: {workspace}"))?;
-    let founding_admins = UserId::parse(founder).map(|u| vec![u]).unwrap_or_default();
+    let founding_actors = crate::ids::ActorId::parse(founder)
+        .map(|a| vec![a])
+        .unwrap_or_default();
     let genesis = Genesis {
         workspace_id: ws_id.clone(),
-        founding_admins,
+        founding_actors,
     };
     store.write_genesis(&genesis)?;
     store.save_catalog(&CatalogDoc::empty(Some(store.peer_id())))?;
@@ -1145,14 +1209,18 @@ impl Tracker {
             .row(&doc_id)
             .map(|r| r.project_id)
             .ok_or_else(|| anyhow!("no such row"))?;
-        if !self.acl_state().is_human_member(&self.me) {
-            return Ok((
-                Response::err("agents may not delete issues (no content authority)"),
-                None,
-            ));
-        }
-        // Sign the tombstone op, embedding the membership frontier we observed
-        // (the at-position anchor), and append it to the encrypted authz DAG.
+        let me_actor = match self.my_actor() {
+            Some(a) if self.acl_state().is_human_member(&a) => a,
+            _ => {
+                return Ok((
+                    Response::err("agents may not delete issues (no content authority)"),
+                    None,
+                ))
+            }
+        };
+        // Sign the tombstone op, embedding both the membership frontier and the
+        // actor-log frontier we observed (the at-position anchors), and append it
+        // to the encrypted authz DAG.
         let op = authz::AuthzOp {
             action: authz::AuthzAction::Tombstone {
                 doc: doc_id.clone(),
@@ -1160,6 +1228,8 @@ impl Tracker {
             },
             ts: self.now_secs(),
             asof: self.membership.heads(),
+            by: me_actor.clone(),
+            actor_asof: self.membership.actor_heads(&me_actor),
         };
         let signed = authz::sign_authz(
             &self.seed,
@@ -1201,6 +1271,7 @@ impl Tracker {
     fn authz_state(&self) -> authz::AuthzState {
         authz::replay(
             &self.genesis,
+            &self.membership.actor_events(),
             &self.membership.ops(),
             &self.catalog.authz_ops(),
         )
@@ -1975,56 +2046,240 @@ impl Tracker {
 
     // ---- membership / ACL operations (P3, S§6, A§11) ----
 
-    /// The materialized ACL state (deterministic replay from genesis, S§6).
+    /// The materialized ACL state (deterministic replay from genesis over the
+    /// actor plane + the signed ACL ops, S§6 / lait/actor/1).
     pub fn acl_state(&self) -> AclState {
-        acl::replay(&self.genesis, &self.membership.ops())
+        acl::replay(
+            &self.genesis,
+            &self.membership.actor_events(),
+            &self.membership.ops(),
+        )
     }
-    pub fn is_member(&self, user: &UserId) -> bool {
-        self.acl_state().is_member(user)
+    /// The actor plane materialized from the membership doc's key-events.
+    pub fn actor_plane(&self) -> ActorPlane {
+        actor::replay(&self.workspace_id, &self.membership.actor_events())
     }
-    /// Members (key, role, is_me) for the members view (UI.md §8).
-    pub fn members(&self) -> Vec<(UserId, Role, bool)> {
+
+    /// Ensure this device has an actor identity in this space, returning its
+    /// inception event (for a joiner to carry in its `JoinRequest` so an admin
+    /// can admit its *actor*). Idempotent: if we already have an actor, the
+    /// existing inception is returned; otherwise we provision a recovery key and
+    /// self-incept, persisting the event to our membership doc.
+    pub fn self_inception(&mut self) -> Result<actor::SignedEvent> {
+        if let Some(me) = self.my_actor() {
+            let target = me.incept_hash().to_string();
+            if let Some(ev) = self
+                .membership
+                .actor_events()
+                .into_iter()
+                .find(|e| e.hash() == target)
+            {
+                return Ok(ev);
+            }
+        }
+        let (recovery_commit, recovery_seed) = mint_recovery();
+        persist_recovery_key(&self.store, &recovery_seed)?;
+        let (ev, _id) = actor::incept_single(
+            &self.seed,
+            &self.workspace_id,
+            rand16(),
+            rand16(),
+            Some(recovery_commit),
+        );
+        self.membership.add_actor_event(&ev)?;
+        self.persist_membership("self_incept")?;
+        Ok(ev)
+    }
+    /// This device's own actor, if its inception has been established/synced.
+    pub fn my_actor(&self) -> Option<ActorId> {
+        self.actor_plane().actor_of_device(&self.me).cloned()
+    }
+    pub fn is_member_actor(&self, actor: &ActorId) -> bool {
+        self.acl_state().is_member(actor)
+    }
+    /// Whether this device's actor is a member / admin of the workspace.
+    pub fn am_i_member(&self) -> bool {
+        self.my_actor().is_some_and(|a| self.acl_state().is_member(&a))
+    }
+    pub fn am_i_admin(&self) -> bool {
+        self.my_actor().is_some_and(|a| self.acl_state().is_admin(&a))
+    }
+    /// Every device key belonging to a current member actor — the resolvable
+    /// identities for the local user directory.
+    pub fn member_device_keys(&self) -> Vec<UserId> {
+        let plane = self.actor_plane();
         self.acl_state()
             .members()
             .into_iter()
-            .map(|(k, r)| {
-                let me = k == self.me;
-                (k, r, me)
+            .flat_map(|(a, _)| plane.devices_of(&a))
+            .collect()
+    }
+    /// Whether a device key currently speaks for a member actor.
+    pub fn is_member_device(&self, dev: &UserId) -> bool {
+        self.actor_plane()
+            .actor_of_device(dev)
+            .is_some_and(|a| self.acl_state().is_member(a))
+    }
+    /// Members (actor, grants, is_me) for the members view (UI.md §8). "is_me"
+    /// is true when this device speaks for the actor.
+    pub fn members(&self) -> Vec<(ActorId, Vec<Grant>, bool)> {
+        let mine = self.my_actor();
+        self.acl_state()
+            .members()
+            .into_iter()
+            .map(|(a, g)| {
+                let me = mine.as_ref() == Some(&a);
+                (a, g, me)
             })
             .collect()
     }
 
-    /// Add a member (signed AddMember op) and seal every key-epoch we hold to
-    /// them so they can read the workspace (S§6, A§11). Admin-only.
-    pub fn member_add(&mut self, user: &UserId, role: Role) -> (Response, Option<DirtySet>) {
-        if !self.acl_state().is_admin(&self.me) {
-            return (Response::err("only an admin can add members"), None);
-        }
-        let op = acl::sign_op(
+    /// Author a membership op as our own actor, embedding our current actor-log
+    /// frontier so a replica resolves our device→actor binding at position.
+    fn author_acl(&self, action: AclAction) -> Result<SignedOp> {
+        let by = self
+            .my_actor()
+            .ok_or_else(|| anyhow!("this device has no actor identity in this space yet"))?;
+        let actor_asof = self.membership.actor_heads(&by);
+        Ok(acl::sign_op(
             &self.seed,
-            &AclOp::AddMember {
-                key: user.clone(),
-                role,
+            &AclOp {
+                action,
+                by,
+                actor_asof,
             },
             self.membership.heads(),
             &self.workspace_id,
-        );
-        if let Err(e) = self.member_apply(op, "member_add", |t| {
-            let epochs: Vec<(u32, WorkspaceKey)> =
-                t.keyring.iter().map(|(e, k)| (*e, *k)).collect();
-            for (epoch, key) in epochs {
-                if let Some(sealed) = crypto::seal_to(user, &key) {
-                    t.membership.put_sealed(epoch, user, &sealed)?;
+        ))
+    }
+
+    /// Seal every key-epoch we hold to **every device** of `actor` — the
+    /// self-healing sealing fan-out (SEAL-1/SEAL-2): reaching one live device is
+    /// enough for that actor to propagate the key to its siblings, but we seal
+    /// all devices we can see for immediacy. The actor's inception must already
+    /// be present (callers import it first).
+    fn seal_epochs_to_actor(t: &mut Self, actor: &ActorId) -> Result<()> {
+        let devices = t.actor_plane().devices_of(actor);
+        let epochs: Vec<(u32, WorkspaceKey)> = t.keyring.iter().map(|(e, k)| (*e, *k)).collect();
+        for (epoch, key) in epochs {
+            for d in &devices {
+                if let Some(sealed) = crypto::seal_to(d, &key) {
+                    t.membership.put_sealed(epoch, d, &sealed)?;
                 }
             }
-            Ok(())
+        }
+        Ok(())
+    }
+
+    /// Add (or re-grant) a member by actor and seal them the workspace key
+    /// (S§6, A§11). Admin-only. The target actor's inception must already be
+    /// known locally (the enrollment path imports it first via `redeem_invite`).
+    pub fn member_add(&mut self, actor: &ActorId, grants: Vec<Grant>) -> (Response, Option<DirtySet>) {
+        let acl = self.acl_state();
+        match self.my_actor() {
+            Some(me) if acl.is_admin(&me) => {}
+            _ => return (Response::err("only an admin can add members"), None),
+        }
+        if !self.actor_plane().exists(actor) {
+            return (
+                Response::err(format!(
+                    "unknown actor {} — invite them so their identity arrives first",
+                    actor.short()
+                )),
+                None,
+            );
+        }
+        let op = match self.author_acl(AclAction::AddMember {
+            actor: actor.clone(),
+            grants,
+        }) {
+            Ok(op) => op,
+            Err(e) => return (Response::err(format!("{e:#}")), None),
+        };
+        let target = actor.clone();
+        if let Err(e) = self.member_apply(op, "member_add", |t| {
+            Self::seal_epochs_to_actor(t, &target)
         }) {
             return (Response::err(format!("{e:#}")), None);
         }
-        self.push_activity(None, &user.short(), "member_added", vec![], &user.short());
+        self.push_activity(None, &actor.short(), "member_added", vec![], &actor.short());
         (
             Response::Ok {
-                message: Some(format!("added member {}", user.short())),
+                message: Some(format!("added member {}", actor.short())),
+            },
+            Some(DirtySet::catalog(CatalogScope::Acl)),
+        )
+    }
+
+    /// Import a joiner's actor **inception** (from a `JoinRequest`) so a manual
+    /// `member add <device>` can resolve their actor before admission. Validates
+    /// the inception (a forged one is ignored) and is idempotent. Does NOT grant
+    /// membership — it only makes the pending joiner's identity locally known.
+    /// Returns whether the actor is now known.
+    pub fn import_inception(&mut self, incept: &actor::SignedEvent) -> Result<bool> {
+        let actor = ActorId::from_incept_hash(&incept.hash());
+        if self.actor_plane().exists(&actor) {
+            return Ok(true);
+        }
+        let mut candidate = self.membership.actor_events();
+        candidate.push(incept.clone());
+        if !actor::replay(&self.workspace_id, &candidate).exists(&actor) {
+            return Ok(false); // invalid inception — never enters the container
+        }
+        self.membership.add_actor_event(incept)?;
+        self.persist_membership("incept_import")?;
+        Ok(true)
+    }
+
+    /// Admit a member by **importing their inception** and sealing them in —
+    /// the manual-approve counterpart to [`redeem_invite`] (which additionally
+    /// checks an invite grant). Admin-only. The inception is validated (a forged
+    /// one is refused) before it enters the actors container.
+    ///
+    /// [`redeem_invite`]: Self::redeem_invite
+    pub fn admit_member(
+        &mut self,
+        incept: &actor::SignedEvent,
+        grants: Vec<Grant>,
+    ) -> (Response, Option<DirtySet>) {
+        let acl = self.acl_state();
+        match self.my_actor() {
+            Some(me) if acl.is_admin(&me) => {}
+            _ => return (Response::err("only an admin can add members"), None),
+        }
+        let actor = ActorId::from_incept_hash(&incept.hash());
+        let mut candidate = self.membership.actor_events();
+        candidate.push(incept.clone());
+        if !actor::replay(&self.workspace_id, &candidate).exists(&actor) {
+            return (Response::err("invalid actor inception"), None);
+        }
+        if acl.is_member(&actor) {
+            return (
+                Response::Ok {
+                    message: Some(format!("{} is already a member", actor.short())),
+                },
+                None,
+            );
+        }
+        let op = match self.author_acl(AclAction::AddMember {
+            actor: actor.clone(),
+            grants,
+        }) {
+            Ok(op) => op,
+            Err(e) => return (Response::err(format!("{e:#}")), None),
+        };
+        let incept = incept.clone();
+        let target = actor.clone();
+        if let Err(e) = self.member_apply(op, "member_admit", |t| {
+            t.membership.add_actor_event(&incept)?;
+            Self::seal_epochs_to_actor(t, &target)
+        }) {
+            return (Response::err(format!("{e:#}")), None);
+        }
+        self.push_activity(None, &actor.short(), "member_added", vec![], &actor.short());
+        (
+            Response::Ok {
+                message: Some(format!("added member {}", actor.short())),
             },
             Some(DirtySet::catalog(CatalogScope::Acl)),
         )
@@ -2043,58 +2298,71 @@ impl Tracker {
     /// [`member_add`]: Self::member_add
     pub fn redeem_invite(
         &mut self,
-        issuer: &UserId,
-        joiner: &UserId,
+        issuer_device: &UserId,
+        joiner_incept: &actor::SignedEvent,
         nonce: &[u8; 16],
         single_use: bool,
     ) -> (Response, Option<DirtySet>) {
+        // The joiner's self-certifying actor id is its inception's hash. Validate
+        // the inception cleanly incepts for THIS workspace before admitting it —
+        // a forged inception must never enter the actors container.
+        let joiner_actor = ActorId::from_incept_hash(&joiner_incept.hash());
+        let mut candidate = self.membership.actor_events();
+        candidate.push(joiner_incept.clone());
+        if !actor::replay(&self.workspace_id, &candidate).exists(&joiner_actor) {
+            return (
+                Response::err("join request carried an invalid actor inception"),
+                None,
+            );
+        }
+
+        let plane = self.actor_plane();
         let acl = self.acl_state();
-        // Authority: only a grant signed by a current admin admits anyone.
-        if !acl.is_admin(issuer) {
+        // Authority: the grant's signing device must currently speak for an admin.
+        let issuer_ok = plane
+            .actor_of_device(issuer_device)
+            .is_some_and(|a| acl.is_admin(a));
+        if !issuer_ok {
             return (
                 Response::err("invite issuer is not a workspace admin"),
                 None,
             );
         }
-        // We can only seal the key if we ourselves are an admin holding it; if not,
-        // stay silent and let the request sit for a human admin (graceful fallback).
-        if !acl.is_admin(&self.me) {
-            return (Response::err("this node is not an admin"), None);
+        // We can only seal if we ourselves are an admin holding the key.
+        match self.my_actor() {
+            Some(me) if acl.is_admin(&me) => {}
+            _ => return (Response::err("this node is not an admin"), None),
         }
         // Single-use replay guard.
         if single_use && self.membership.is_redeemed(nonce) {
             return (Response::err("invite already redeemed"), None);
         }
-        // Idempotent: already a member ⇒ nothing to seal, no ACL churn. (A repeat
-        // of an *already-spent* single-use nonce was rejected by the guard above.)
-        if acl.is_member(joiner) {
+        // Idempotent: already a member ⇒ nothing to seal, no ACL churn.
+        if acl.is_member(&joiner_actor) {
             return (
                 Response::Ok {
-                    message: Some(format!("{} is already a member", joiner.short())),
+                    message: Some(format!("{} is already a member", joiner_actor.short())),
                 },
                 None,
             );
         }
-        let op = acl::sign_op(
-            &self.seed,
-            &AclOp::AddMember {
-                key: joiner.clone(),
-                role: Role::Member,
-            },
-            self.membership.heads(),
-            &self.workspace_id,
-        );
+        let op = match self.author_acl(AclAction::AddMember {
+            actor: joiner_actor.clone(),
+            grants: vec![Grant::Write],
+        }) {
+            Ok(op) => op,
+            Err(e) => return (Response::err(format!("{e:#}")), None),
+        };
         let nonce = *nonce;
+        let incept = joiner_incept.clone();
+        let redeemer = joiner_incept.author.clone();
+        let target = joiner_actor.clone();
         if let Err(e) = self.member_apply(op, "invite_redeem", |t| {
-            let epochs: Vec<(u32, WorkspaceKey)> =
-                t.keyring.iter().map(|(e, k)| (*e, *k)).collect();
-            for (epoch, key) in epochs {
-                if let Some(sealed) = crypto::seal_to(joiner, &key) {
-                    t.membership.put_sealed(epoch, joiner, &sealed)?;
-                }
-            }
+            // Import the joiner's identity, then seal every epoch to its devices.
+            t.membership.add_actor_event(&incept)?;
+            Self::seal_epochs_to_actor(t, &target)?;
             if single_use {
-                t.membership.mark_redeemed(&nonce, joiner)?;
+                t.membership.mark_redeemed(&nonce, &redeemer)?;
             }
             Ok(())
         }) {
@@ -2102,14 +2370,14 @@ impl Tracker {
         }
         self.push_activity(
             None,
-            &joiner.short(),
+            &joiner_actor.short(),
             "member_added",
             vec![],
-            &joiner.short(),
+            &joiner_actor.short(),
         );
         (
             Response::Ok {
-                message: Some(format!("auto-approved {} via invite", joiner.short())),
+                message: Some(format!("auto-approved {} via invite", joiner_actor.short())),
             },
             Some(DirtySet::catalog(CatalogScope::Acl)),
         )
@@ -2117,29 +2385,32 @@ impl Tracker {
 
     /// Remove a member (signed RemoveMember op) and **rotate the workspace key**
     /// (lazy revocation, A§3 non-goal 2): a new epoch sealed only to the remaining
-    /// members, so the removed member cannot read *future* content. Admin-only.
-    pub fn member_remove(&mut self, user: &UserId) -> (Response, Option<DirtySet>) {
-        if !self.acl_state().is_admin(&self.me) {
-            return (Response::err("only an admin can remove members"), None);
-        }
-        if user == &self.me {
+    /// members' devices, so the removed actor cannot read *future* content.
+    /// Admin-only.
+    pub fn member_remove(&mut self, actor: &ActorId) -> (Response, Option<DirtySet>) {
+        let acl = self.acl_state();
+        let me = match self.my_actor() {
+            Some(me) if acl.is_admin(&me) => me,
+            _ => return (Response::err("only an admin can remove members"), None),
+        };
+        if actor == &me {
             return (Response::err("refusing to remove yourself"), None);
         }
-        let op = acl::sign_op(
-            &self.seed,
-            &AclOp::RemoveMember { key: user.clone() },
-            self.membership.heads(),
-            &self.workspace_id,
-        );
+        let op = match self.author_acl(AclAction::RemoveMember {
+            actor: actor.clone(),
+        }) {
+            Ok(op) => op,
+            Err(e) => return (Response::err(format!("{e:#}")), None),
+        };
         if let Err(e) = self.member_apply(op, "member_remove", |t| t.rotate_key()) {
             return (Response::err(format!("{e:#}")), None);
         }
-        self.push_activity(None, &user.short(), "member_removed", vec![], &user.short());
+        self.push_activity(None, &actor.short(), "member_removed", vec![], &actor.short());
         (
             Response::Ok {
                 message: Some(format!(
                     "removed member {} and rotated the key",
-                    user.short()
+                    actor.short()
                 )),
             },
             Some(DirtySet::catalog(CatalogScope::Acl)),
@@ -2148,7 +2419,10 @@ impl Tracker {
 
     /// Rotate the workspace key without a membership change (key hygiene).
     pub fn key_rotate_cmd(&mut self) -> (Response, Option<DirtySet>) {
-        if !self.acl_state().is_admin(&self.me) {
+        let is_admin = self
+            .my_actor()
+            .is_some_and(|me| self.acl_state().is_admin(&me));
+        if !is_admin {
             return (Response::err("only an admin can rotate the key"), None);
         }
         match self.rotate_key() {
@@ -2167,37 +2441,54 @@ impl Tracker {
         }
     }
 
+    /// Resolve a `<who>` ref to a known actor: an `act_` id directly, or a
+    /// device key / `@me` mapped through the actor plane to its owning actor.
+    fn resolve_actor(&self, who: &str) -> Option<ActorId> {
+        if let Some(a) = ActorId::parse(who) {
+            return Some(a);
+        }
+        let dev = index::resolve_user(who, &self.me)?;
+        self.actor_plane().actor_of_device(&dev).cloned()
+    }
+
     fn member_add_cmd(&mut self, who: String, admin: bool) -> (Response, Option<DirtySet>) {
-        let Some(user) = index::resolve_user(&who, &self.me) else {
+        let Some(actor) = self.resolve_actor(&who) else {
             return (
-                Response::not_found(format!("no user matches '{who}'")),
+                Response::not_found(format!(
+                    "no known actor matches '{who}' — invite them first so their identity arrives"
+                )),
                 None,
             );
         };
-        let role = if admin { Role::Admin } else { Role::Member };
-        self.member_add(&user, role)
+        let grants = if admin {
+            vec![Grant::Admin, Grant::Write]
+        } else {
+            vec![Grant::Write]
+        };
+        self.member_add(&actor, grants)
     }
     fn member_remove_cmd(&mut self, who: String) -> (Response, Option<DirtySet>) {
-        let Some(user) = index::resolve_user(&who, &self.me) else {
+        let Some(actor) = self.resolve_actor(&who) else {
             return (
-                Response::not_found(format!("no user matches '{who}'")),
+                Response::not_found(format!("no known actor matches '{who}'")),
                 None,
             );
         };
-        self.member_remove(&user)
+        self.member_remove(&actor)
     }
     fn members_response(&self) -> Response {
         let acl = self.acl_state();
+        let mine = self.my_actor();
         let members = acl
             .members()
             .into_iter()
-            .map(|(key, _role)| {
-                let standing = acl.standing(&key).unwrap_or("member");
+            .map(|(actor, _grants)| {
+                let standing = acl.standing(&actor).unwrap_or("member");
                 crate::dto::MemberDto {
-                    me: key == self.me,
-                    // The sponsoring member's key, for agents (empty otherwise).
-                    sponsor: acl.sponsor_of(&key).map(|s| s.as_str().to_string()),
-                    key,
+                    me: mine.as_ref() == Some(&actor),
+                    // The sponsoring actor, for agents (empty otherwise).
+                    sponsor: acl.sponsor_of(&actor).map(|s| s.as_str().to_string()),
+                    key: actor.as_str().to_string(),
                     role: standing.into(),
                     // Local petnames live outside the tracker (never synced); the
                     // node layer overlays them onto this projection after the fact.
@@ -2208,33 +2499,49 @@ impl Tracker {
         Response::Members { members }
     }
 
-    fn agent_add_cmd(&mut self, key: String) -> (Response, Option<DirtySet>) {
-        let Some(agent) = UserId::parse(&key) else {
-            return (
-                Response::err(format!(
-                    "an agent key must be a 64-hex ed25519 public key, got '{key}'"
-                )),
-                None,
-            );
+    fn agent_add_cmd(&mut self, incept: String) -> (Response, Option<DirtySet>) {
+        let bytes = match data_encoding::HEXLOWER_PERMISSIVE.decode(incept.as_bytes()) {
+            Ok(b) => b,
+            Err(_) => {
+                return (
+                    Response::err("agent inception must be hex-encoded (from `lait agent new`)"),
+                    None,
+                )
+            }
         };
-        self.agent_add(&agent)
+        let ev: actor::SignedEvent = match postcard::from_bytes(&bytes) {
+            Ok(ev) => ev,
+            Err(_) => return (Response::err("could not decode agent inception"), None),
+        };
+        self.agent_add(&ev)
     }
 
     /// The membership audit log — the signed ACL DAG replayed into a rendered,
     /// causally-ordered list of who did what, with each op's verdict (contract
     /// §3.4). Cryptographic provenance, distinct from the advisory activity feed.
     fn member_log_response(&self) -> Response {
-        let (_state, audit) = acl::replay_with_audit(&self.genesis, &self.membership.ops());
+        let (_state, audit) = acl::replay_with_audit(
+            &self.genesis,
+            &self.membership.actor_events(),
+            &self.membership.ops(),
+        );
         let entries = audit
             .into_iter()
             .map(|e| crate::dto::MemberLogEntry {
                 op: e.hash,
+                // The signing device key (verified — the signature covers the op).
                 actor: e.author.as_str().to_string(),
                 kind: e.kind.into(),
+                // The subject is now an actor.
                 subject: e.subject.map(|s| s.as_str().to_string()),
-                role: e.role.map(|r| match r {
-                    Role::Admin => "admin".into(),
-                    Role::Member => "member".into(),
+                role: e.grants.map(|g| {
+                    if g.contains(&Grant::Admin) {
+                        "admin".into()
+                    } else if g.contains(&Grant::Write) {
+                        "member".into()
+                    } else {
+                        "viewer".into()
+                    }
                 }),
                 authorized: e.authorized,
             })
@@ -2242,52 +2549,65 @@ impl Tracker {
         Response::MemberLog { entries }
     }
 
-    /// Sponsor an agent keypair (contract §3.4). Any human member may sponsor;
-    /// the agent is sealed the workspace key (so it can read/write content) but
-    /// holds no membership or content authority, and its standing dies with the
-    /// sponsor. Admin-agnostic — this is delegation, not elevation.
-    pub fn agent_add(&mut self, agent: &UserId) -> (Response, Option<DirtySet>) {
+    /// Sponsor an agent (contract §3.4). An agent is a **degenerate actor** (a
+    /// single-device identity, no recovery) that self-incepted in its own home;
+    /// the sponsor imports that inception and signs `AddAgent`. Any human member
+    /// may sponsor; the agent is sealed the workspace key (so it can read/write
+    /// content) but holds no membership or content authority, and its standing
+    /// dies with the sponsor. Delegation, not elevation.
+    pub fn agent_add(&mut self, agent_incept: &actor::SignedEvent) -> (Response, Option<DirtySet>) {
         let acl = self.acl_state();
-        if !acl.is_human_member(&self.me) {
-            return (
-                Response::err("only a human member can sponsor an agent"),
-                None,
-            );
+        let sponsor = match self.my_actor() {
+            Some(me) if acl.is_human_member(&me) => me,
+            _ => {
+                return (
+                    Response::err("only a human member can sponsor an agent"),
+                    None,
+                )
+            }
+        };
+        let agent_actor = ActorId::from_incept_hash(&agent_incept.hash());
+        let mut candidate = self.membership.actor_events();
+        candidate.push(agent_incept.clone());
+        if !actor::replay(&self.workspace_id, &candidate).exists(&agent_actor) {
+            return (Response::err("invalid agent inception"), None);
         }
-        if acl.is_member(agent) {
+        if acl.is_member(&agent_actor) {
             return (
                 Response::err(format!(
                     "{} is already a workspace principal",
-                    agent.short()
+                    agent_actor.short()
                 )),
                 None,
             );
         }
-        let op = acl::sign_op(
-            &self.seed,
-            &AclOp::AddAgent { key: agent.clone() },
-            self.membership.heads(),
-            &self.workspace_id,
-        );
-        // Seal every epoch we hold to the agent, exactly like a member add — an
-        // agent must decrypt the workspace to be useful.
-        let agent = agent.clone();
+        // The op is authored as the sponsor's actor (its by/asof), so the
+        // AddAgent's sponsor = sponsor actor by construction.
+        let _ = sponsor;
+        let op = match self.author_acl(AclAction::AddAgent {
+            actor: agent_actor.clone(),
+        }) {
+            Ok(op) => op,
+            Err(e) => return (Response::err(format!("{e:#}")), None),
+        };
+        let incept = agent_incept.clone();
+        let target = agent_actor.clone();
         if let Err(e) = self.member_apply(op, "agent_add", |t| {
-            let epochs: Vec<(u32, WorkspaceKey)> =
-                t.keyring.iter().map(|(e, k)| (*e, *k)).collect();
-            for (epoch, key) in epochs {
-                if let Some(sealed) = crypto::seal_to(&agent, &key) {
-                    t.membership.put_sealed(epoch, &agent, &sealed)?;
-                }
-            }
-            Ok(())
+            t.membership.add_actor_event(&incept)?;
+            Self::seal_epochs_to_actor(t, &target)
         }) {
             return (Response::err(format!("{e:#}")), None);
         }
-        self.push_activity(None, &agent.short(), "agent_added", vec![], &agent.short());
+        self.push_activity(
+            None,
+            &agent_actor.short(),
+            "agent_added",
+            vec![],
+            &agent_actor.short(),
+        );
         (
             Response::Ok {
-                message: Some(format!("sponsored agent {}", agent.short())),
+                message: Some(format!("sponsored agent {}", agent_actor.short())),
             },
             Some(DirtySet::catalog(CatalogScope::Acl)),
         )
@@ -2319,9 +2639,16 @@ impl Tracker {
         let new_epoch = self.current_epoch() + 1;
         let new_key = crypto::random_key();
         self.membership.set_epoch(new_epoch)?;
-        for (member, _role) in self.acl_state().members() {
-            if let Some(sealed) = crypto::seal_to(&member, &new_key) {
-                self.membership.put_sealed(new_epoch, &member, &sealed)?;
+        // Seal the new epoch to every device of every *current* member actor
+        // (computed AFTER any just-applied remove). A removed actor's devices
+        // are never in this set — the lazy-revocation fence. Reaching one live
+        // device per actor is sufficient (SEAL-1); the actor self-heals the rest.
+        let plane = self.actor_plane();
+        for (actor, _grants) in self.acl_state().members() {
+            for d in plane.devices_of(&actor) {
+                if let Some(sealed) = crypto::seal_to(&d, &new_key) {
+                    self.membership.put_sealed(new_epoch, &d, &sealed)?;
+                }
             }
         }
         self.keyring.insert(new_epoch, new_key);
@@ -2646,6 +2973,22 @@ mod tests {
         UserId::from_key_string(data_encoding::HEXLOWER.encode(pk.as_bytes()))
     }
 
+    /// A single-device actor inception for `seed` in `t`'s workspace (a joiner's
+    /// identity, as it would ride in a JoinRequest).
+    fn incept_for(seed: [u8; 32], t: &Tracker) -> actor::SignedEvent {
+        let (ev, _) = actor::incept_single(
+            &seed,
+            &t.workspace_id,
+            [seed[0]; 16],
+            [seed[0] ^ 0x33; 16],
+            None,
+        );
+        ev
+    }
+    fn actor_of(ev: &actor::SignedEvent) -> ActorId {
+        ActorId::from_incept_hash(&ev.hash())
+    }
+
     fn new_node_as(user: UserId, seed: [u8; 32]) -> TestNode {
         let home = std::env::temp_dir().join(format!(
             "gc-trk-{}-{}",
@@ -2659,7 +3002,7 @@ mod tests {
         let clock = FakeClock::new(1_000_000 + seed[0] as u64 * 100_000);
         // Explicit founding (no lazy mint): seeds the "Testbed" workspace with
         // its default TEST project, so trackers open like real founder stores.
-        found_workspace(&store, &user, "Testbed", &clock).unwrap();
+        found_workspace(&store, &user, &seed, "Testbed", &clock).unwrap();
         let tracker = Tracker::open(store, user, "tester".into(), seed, Box::new(clock)).unwrap();
         TestNode { tracker, home }
     }
@@ -3081,7 +3424,8 @@ mod tests {
         let b_user = user_from_seed(b_seed);
         let a_ws = a.tracker.workspace_str();
         // B's store is bootstrapped from the ticket (the `lait join` path).
-        let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, me().as_str());
+        let a_actor = a.tracker.my_actor().unwrap().to_string();
+        let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, &a_actor);
         assert_eq!(
             b.tracker.workspace_str(),
             a_ws,
@@ -3094,13 +3438,16 @@ mod tests {
             titles(&mut b.tracker).is_empty(),
             "non-member decrypts nothing"
         );
-        assert!(!b.tracker.is_member(&b_user));
+        assert!(!b.tracker.am_i_member());
 
         // A adds B → B syncs membership, unseals the key, decrypts everything.
-        let (resp, _) = a.tracker.member_add(&b_user, Role::Member);
+        // B's inception rides to A (here: passed directly, as a JoinRequest would).
+        let b_incept = b.tracker.self_inception().unwrap();
+        let b_actor = actor_of(&b_incept);
+        let (resp, _) = a.tracker.admit_member(&b_incept, vec![Grant::Write]);
         assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
         sync_all(&mut a.tracker, &mut b.tracker);
-        assert!(b.tracker.is_member(&b_user), "B is now a member");
+        assert!(b.tracker.am_i_member(), "B is now a member");
         assert_eq!(
             titles(&mut b.tracker),
             vec!["secret issue".to_string()],
@@ -3108,7 +3455,7 @@ mod tests {
         );
 
         // A removes B + rotates; new content is encrypted under an epoch B lacks.
-        let (resp, _) = a.tracker.member_remove(&b_user);
+        let (resp, _) = a.tracker.member_remove(&b_actor);
         assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
         new_issue(&mut a.tracker, "post-removal");
         sync_all(&mut a.tracker, &mut b.tracker);
@@ -3123,46 +3470,50 @@ mod tests {
         let mut a = new_node(); // founder + admin (me())
         with_project(&mut a.tracker);
         new_issue(&mut a.tracker, "gated issue");
-        let joiner = user_from_seed([8u8; 32]);
+        let j_incept = incept_for([8u8; 32], &a.tracker);
+        let j_actor = actor_of(&j_incept);
         let nonce = [1u8; 16];
 
-        let (resp, dirty) = a.tracker.redeem_invite(&me(), &joiner, &nonce, true);
+        let (resp, dirty) = a.tracker.redeem_invite(&me(), &j_incept, &nonce, true);
         assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
         assert!(
             dirty.is_some(),
             "a successful admit dirties the catalog/ACL"
         );
-        assert!(a.tracker.is_member(&joiner), "joiner is now a member");
+        assert!(a.tracker.is_member_actor(&j_actor), "joiner is now a member");
         assert!(
             a.tracker.membership.is_redeemed(&nonce),
             "single-use nonce is burned in the same commit"
         );
 
         // Replay: the same nonce must not seat a second, different joiner.
-        let other = user_from_seed([9u8; 32]);
+        let other = incept_for([9u8; 32], &a.tracker);
         let (resp2, dirty2) = a.tracker.redeem_invite(&me(), &other, &nonce, true);
         assert!(
             matches!(resp2, Response::Error { .. }),
             "spent nonce is rejected: {resp2:?}"
         );
         assert!(dirty2.is_none(), "a rejected replay changes nothing");
-        assert!(!a.tracker.is_member(&other), "replay seats no one");
+        assert!(
+            !a.tracker.is_member_actor(&actor_of(&other)),
+            "replay seats no one"
+        );
     }
 
     #[test]
     fn redeem_invite_rejects_a_non_admin_issuer() {
         let mut a = new_node(); // only me() is an admin
         let issuer = user_from_seed([5u8; 32]); // never added to the ACL
-        let joiner = user_from_seed([8u8; 32]);
+        let j_incept = incept_for([8u8; 32], &a.tracker);
 
-        let (resp, dirty) = a.tracker.redeem_invite(&issuer, &joiner, &[2u8; 16], true);
+        let (resp, dirty) = a.tracker.redeem_invite(&issuer, &j_incept, &[2u8; 16], true);
         assert!(
             matches!(resp, Response::Error { .. }),
             "a pass signed by a non-admin is not honored: {resp:?}"
         );
         assert!(dirty.is_none());
         assert!(
-            !a.tracker.is_member(&joiner),
+            !a.tracker.is_member_actor(&actor_of(&j_incept)),
             "no membership granted on a bad issuer"
         );
     }
@@ -3170,11 +3521,12 @@ mod tests {
     #[test]
     fn redeem_invite_is_idempotent_for_an_existing_member() {
         let mut a = new_node();
-        let joiner = user_from_seed([8u8; 32]);
-        let (_r, _d) = a.tracker.member_add(&joiner, Role::Member);
-        assert!(a.tracker.is_member(&joiner));
+        let j_incept = incept_for([8u8; 32], &a.tracker);
+        let j_actor = actor_of(&j_incept);
+        let (_r, _d) = a.tracker.admit_member(&j_incept, vec![Grant::Write]);
+        assert!(a.tracker.is_member_actor(&j_actor));
 
-        let (resp, dirty) = a.tracker.redeem_invite(&me(), &joiner, &[3u8; 16], true);
+        let (resp, dirty) = a.tracker.redeem_invite(&me(), &j_incept, &[3u8; 16], true);
         assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
         assert!(dirty.is_none(), "already a member ⇒ no ACL churn");
     }
@@ -3183,13 +3535,16 @@ mod tests {
     fn redeem_invite_reusable_pass_admits_many_without_burning() {
         let mut a = new_node();
         let nonce = [4u8; 16];
-        let j1 = user_from_seed([8u8; 32]);
-        let j2 = user_from_seed([9u8; 32]);
+        let j1 = incept_for([8u8; 32], &a.tracker);
+        let j2 = incept_for([9u8; 32], &a.tracker);
 
         let (r1, _) = a.tracker.redeem_invite(&me(), &j1, &nonce, false);
         let (r2, _) = a.tracker.redeem_invite(&me(), &j2, &nonce, false);
         assert!(matches!(r1, Response::Ok { .. }) && matches!(r2, Response::Ok { .. }));
-        assert!(a.tracker.is_member(&j1) && a.tracker.is_member(&j2));
+        assert!(
+            a.tracker.is_member_actor(&actor_of(&j1))
+                && a.tracker.is_member_actor(&actor_of(&j2))
+        );
         assert!(
             !a.tracker.membership.is_redeemed(&nonce),
             "a reusable pass is never burned"
@@ -3286,7 +3641,7 @@ mod tests {
     fn founding_twice_errors() {
         let n = new_node();
         let store = Store::open(&n.home).unwrap();
-        let err = found_workspace(&store, &me(), "Again", &FakeClock::new(1)).unwrap_err();
+        let err = found_workspace(&store, &me(), &[1u8; 32], "Again", &FakeClock::new(1)).unwrap_err();
         assert!(
             format!("{err:#}").contains("already initialized"),
             "{err:#}"
@@ -3503,8 +3858,10 @@ mod tests {
         let b_seed = [8u8; 32];
         let b_user = user_from_seed(b_seed);
         let a_ws = a.tracker.workspace_str();
-        let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, me().as_str());
-        let (resp, _) = a.tracker.member_add(&b_user, Role::Member);
+        let a_actor = a.tracker.my_actor().unwrap().to_string();
+        let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, &a_actor);
+        let b_incept = b.tracker.self_inception().unwrap();
+        let (resp, _) = a.tracker.admit_member(&b_incept, vec![Grant::Write]);
         assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
 
         // A files an issue assigned to B, then syncs: the doc is NEW to B, so
@@ -3625,8 +3982,10 @@ mod tests {
         let b_seed = [9u8; 32];
         let b_user = user_from_seed(b_seed);
         let a_ws = a.tracker.workspace_str();
-        let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, me().as_str());
-        let (resp, _) = a.tracker.member_add(&b_user, Role::Member);
+        let a_actor = a.tracker.my_actor().unwrap().to_string();
+        let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, &a_actor);
+        let b_incept = b.tracker.self_inception().unwrap();
+        let (resp, _) = a.tracker.admit_member(&b_incept, vec![Grant::Write]);
         assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
         let reff = new_issue(&mut a.tracker, "contested");
         sync_all(&mut a.tracker, &mut b.tracker);
@@ -3810,28 +4169,32 @@ mod tests {
         let b_seed = [21u8; 32];
         let b_user = user_from_seed(b_seed);
         let a_ws = a.tracker.workspace_str();
-        let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, me().as_str());
-        let (resp, _) = a.tracker.member_add(&b_user, Role::Member);
+        let a_actor = a.tracker.my_actor().unwrap().to_string();
+        let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, &a_actor);
+        let b_incept = b.tracker.self_inception().unwrap();
+        let (resp, _) = a.tracker.admit_member(&b_incept, vec![Grant::Write]);
         assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
         // B must sync to learn it is a member before it can act as one.
         sync_all(&mut a.tracker, &mut b.tracker);
+        let b_actor = actor_of(&b_incept);
         assert!(
-            b.tracker.acl_state().is_human_member(&b_user),
+            b.tracker.acl_state().is_human_member(&b_actor),
             "B sees itself"
         );
 
-        // B sponsors an agent (agent's key is a fresh ed25519 pubkey).
-        let agent = user_from_seed([99u8; 32]);
-        let (resp, _) = b.tracker.agent_add(&agent);
+        // B sponsors an agent (the agent self-incepted its degenerate actor).
+        let agent_incept = incept_for([99u8; 32], &b.tracker);
+        let agent_actor = actor_of(&agent_incept);
+        let (resp, _) = b.tracker.agent_add(&agent_incept);
         assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
-        assert!(b.tracker.acl_state().is_agent(&agent));
+        assert!(b.tracker.acl_state().is_agent(&agent_actor));
         assert_eq!(
-            b.tracker.acl_state().sponsor_of(&agent),
-            Some(&b_user),
+            b.tracker.acl_state().sponsor_of(&agent_actor),
+            Some(&b_actor),
             "the agent's sponsor is B"
         );
         assert!(
-            !b.tracker.acl_state().is_human_member(&agent),
+            !b.tracker.acl_state().is_human_member(&agent_actor),
             "an agent is not a human member"
         );
 

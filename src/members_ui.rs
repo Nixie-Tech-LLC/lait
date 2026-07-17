@@ -182,7 +182,7 @@ impl App {
     fn selected_label(&self) -> String {
         match self.items.get(self.sel) {
             Some(Item::Member(m)) if !m.alias.is_empty() => m.alias.clone(),
-            Some(Item::Member(m)) => m.key.short(),
+            Some(Item::Member(m)) => m.key.chars().take(12).collect::<String>(),
             Some(Item::Request(r)) => r.key.chars().take(12).collect(),
             None => String::new(),
         }
@@ -520,7 +520,7 @@ fn item_text(app: &App, i: usize) -> String {
                 format!("   {}", m.alias)
             };
             let you = if m.me { "   (you)" } else { "" };
-            format!("{:<6} {}{}{}", m.role, m.key.short(), name, you)
+            format!("{:<6} {}{}{}", m.role, m.key.chars().take(12).collect::<String>(), name, you)
         }
     }
 }
@@ -730,14 +730,14 @@ mod tests {
         }];
         app.members = vec![
             MemberDto {
-                key: crate::ids::UserId::from_key_string("9f2a".repeat(16)),
+                key: format!("act_{}", "9f2a".repeat(16)),
                 role: "admin".to_string(),
                 me: true,
                 sponsor: None,
                 alias: String::new(),
             },
             MemberDto {
-                key: crate::ids::UserId::from_key_string("3b7c".repeat(16)),
+                key: format!("act_{}", "3b7c".repeat(16)),
                 role: "member".to_string(),
                 me: false,
                 sponsor: None,

@@ -77,8 +77,13 @@ pub struct AuthzOp {
     /// Advisory unix seconds (non-goal 6: self-asserted, for rendering).
     pub ts: u64,
     /// The membership-plane heads the author observed at signing — the
-    /// at-position anchor (module docs).
+    /// at-position anchor for the *actor's* standing (module docs).
     pub asof: Vec<String>,
+    /// The actor the signing device claims to speak for.
+    pub by: crate::ids::ActorId,
+    /// The heads of `by`'s actor key-event log the author observed — the
+    /// at-position anchor for the *device→actor* binding (lait/actor/1).
+    pub actor_asof: Vec<String>,
 }
 
 impl AuthzOp {
@@ -131,6 +136,7 @@ impl AuthzState {
 /// with the same sets derives the same state.
 pub fn replay(
     genesis: &Genesis,
+    actor_events: &[crate::actor::SignedEvent],
     membership_ops: &[SignedOp],
     authz_ops: &[SignedNode],
 ) -> AuthzState {
@@ -179,7 +185,7 @@ pub fn replay(
             .filter(|op| include.contains(&op.hash()))
             .cloned()
             .collect();
-        let st = acl::replay(genesis, &subset);
+        let st = acl::replay(genesis, actor_events, &subset);
         at_cache.insert(key, st.clone());
         st
     };
@@ -192,14 +198,22 @@ pub fn replay(
     let mut restores: BTreeMap<DocId, Vec<String>> = BTreeMap::new();
     for h in &order {
         let Some(op) = &decoded[h] else { continue };
-        if op.asof.len() > MAX_ASOF {
+        if op.asof.len() > MAX_ASOF || op.actor_asof.len() > crate::actor::MAX_ACTOR_ASOF {
             continue; // malformed padded frontier — ignored, never authorized
         }
+        // The signing device must speak for the claimed actor at the declared
+        // actor-log frontier (device→actor binding at position)...
         let author = &nodes[h].author;
-        let st = membership_at(&op.asof);
-        // Human members only: agents hold no content authority (§3.4), and a
+        let bound = crate::actor::replay_at(&genesis.workspace_id, actor_events, &op.actor_asof)
+            .is_device_of(&op.by, author);
+        if !bound {
+            continue;
+        }
+        // ...and that actor must be a human member at the op's membership
+        // position: agents hold no content authority (§3.4), and a
         // non-member-at-position never did.
-        if !st.is_human_member(author) {
+        let st = membership_at(&op.asof);
+        if !st.is_human_member(&op.by) {
             continue;
         }
         match &op.action {
@@ -243,55 +257,123 @@ pub fn replay(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acl::{sign_op, AclOp, Role};
-    use crate::ids::SystemUlidSource;
-    use crate::ids::UserId;
-    use ed25519_dalek::SigningKey;
+    use crate::acl::{sign_op, AclAction, AclOp, Grant};
+    use crate::actor::{self, SignedEvent};
+    use crate::ids::{ActorId, SystemUlidSource, WorkspaceId};
+    use std::collections::BTreeMap;
 
     fn seed(n: u8) -> [u8; 32] {
         [n; 32]
     }
-    fn user(n: u8) -> UserId {
-        let pk = SigningKey::from_bytes(&seed(n)).verifying_key();
-        UserId::from_key_string(data_encoding::HEXLOWER.encode(pk.as_bytes()))
-    }
-    fn genesis(admins: &[u8]) -> Genesis {
-        Genesis {
-            workspace_id: crate::ids::WorkspaceId::mint(&SystemUlidSource),
-            founding_admins: admins.iter().map(|n| user(*n)).collect(),
-        }
-    }
     fn doc() -> DocId {
         DocId::mint(&SystemUlidSource)
     }
-    fn tomb(doc: &DocId, on: bool, asof: Vec<String>) -> AuthzOp {
-        AuthzOp {
-            action: AuthzAction::Tombstone {
-                doc: doc.clone(),
-                on,
+    fn incept(n: u8, w: &WorkspaceId) -> (SignedEvent, ActorId) {
+        actor::incept_single(&seed(n), w, [n; 16], [n ^ 0x55; 16], None)
+    }
+
+    /// A fixture: a genesis founded by actor(founder), plus inceptions for each
+    /// listed seed available on the actor plane. Each seed n → its actor + the
+    /// actor's inception head (its single-device `actor_asof` frontier).
+    struct Fx {
+        g: Genesis,
+        events: Vec<SignedEvent>,
+        actors: BTreeMap<u8, (ActorId, String)>,
+    }
+    fn fx(founder: u8, others: &[u8]) -> Fx {
+        let w = WorkspaceId::mint(&SystemUlidSource);
+        let mut events = Vec::new();
+        let mut actors = BTreeMap::new();
+        for n in std::iter::once(founder).chain(others.iter().copied()) {
+            let (ev, id) = incept(n, &w);
+            actors.insert(n, (id, ev.hash()));
+            events.push(ev);
+        }
+        Fx {
+            g: Genesis {
+                workspace_id: w,
+                founding_actors: vec![actors[&founder].0.clone()],
             },
-            ts: 100,
-            asof,
+            events,
+            actors,
+        }
+    }
+    impl Fx {
+        fn ws(&self) -> &WorkspaceId {
+            &self.g.workspace_id
+        }
+        fn actor(&self, n: u8) -> ActorId {
+            self.actors[&n].0.clone()
+        }
+        fn acl(&self, author: u8, by: u8, action: AclAction, parents: Vec<String>) -> SignedOp {
+            let (by_actor, head) = self.actors[&by].clone();
+            sign_op(
+                &seed(author),
+                &AclOp {
+                    action,
+                    by: by_actor,
+                    actor_asof: vec![head],
+                },
+                parents,
+                self.ws(),
+            )
+        }
+        fn add_member(&self, subject: u8, grants: Vec<Grant>, parents: Vec<String>) -> SignedOp {
+            self.acl(
+                1,
+                1,
+                AclAction::AddMember {
+                    actor: self.actor(subject),
+                    grants,
+                },
+                parents,
+            )
+        }
+        /// A tombstone op authored by device `author` claiming actor `by`, whose
+        /// device→actor binding resolves at `by`'s inception frontier.
+        fn tomb(
+            &self,
+            author: u8,
+            by: u8,
+            doc: &DocId,
+            on: bool,
+            asof: Vec<String>,
+            parents: Vec<String>,
+        ) -> SignedNode {
+            let (by_actor, head) = self.actors[&by].clone();
+            sign_authz(
+                &seed(author),
+                &AuthzOp {
+                    action: AuthzAction::Tombstone {
+                        doc: doc.clone(),
+                        on,
+                    },
+                    ts: 100,
+                    asof,
+                    by: by_actor,
+                    actor_asof: vec![head],
+                },
+                parents,
+                self.ws(),
+            )
+        }
+        fn replay(&self, membership: &[SignedOp], authz: &[SignedNode]) -> AuthzState {
+            replay(&self.g, &self.events, membership, authz)
         }
     }
 
     #[test]
     fn member_delete_is_honored_stranger_and_agent_are_not() {
-        let g = genesis(&[1]);
-        let add_b = sign_op(
-            &seed(1),
-            &AclOp::AddMember {
-                key: user(2),
-                role: Role::Member,
+        // founder=1, member=2, agent=10, stranger=9.
+        let f = fx(1, &[2, 10, 9]);
+        let add_b = f.add_member(2, vec![Grant::Write], vec![]);
+        let add_agent = f.acl(
+            2,
+            2,
+            AclAction::AddAgent {
+                actor: f.actor(10),
             },
-            vec![],
-            &g.workspace_id,
-        );
-        let add_agent = sign_op(
-            &seed(2),
-            &AclOp::AddAgent { key: user(10) },
             vec![add_b.hash()],
-            &g.workspace_id,
         );
         let heads = vec![add_agent.hash()];
         let membership = vec![add_b, add_agent];
@@ -299,20 +381,10 @@ mod tests {
         let d1 = doc();
         let d2 = doc();
         let d3 = doc();
-        let by_member = sign_authz(
-            &seed(2),
-            &tomb(&d1, true, heads.clone()),
-            vec![],
-            &g.workspace_id,
-        );
-        let by_stranger = sign_authz(
-            &seed(9),
-            &tomb(&d2, true, heads.clone()),
-            vec![],
-            &g.workspace_id,
-        );
-        let by_agent = sign_authz(&seed(10), &tomb(&d3, true, heads), vec![], &g.workspace_id);
-        let st = replay(&g, &membership, &[by_member, by_stranger, by_agent]);
+        let by_member = f.tomb(2, 2, &d1, true, heads.clone(), vec![]);
+        let by_stranger = f.tomb(9, 9, &d2, true, heads.clone(), vec![]);
+        let by_agent = f.tomb(10, 10, &d3, true, heads, vec![]);
+        let st = f.replay(&membership, &[by_member, by_stranger, by_agent]);
         assert!(st.is_tombstoned(&d1), "a member's delete stands");
         assert!(!st.is_tombstoned(&d2), "a stranger's delete is void");
         assert!(
@@ -324,32 +396,19 @@ mod tests {
 
     #[test]
     fn offboarding_does_not_resurrect_past_deletes() {
-        // B deletes while a member (asof pins the frontier); B is REMOVED
-        // afterwards. At-position: the delete still stands.
-        let g = genesis(&[1]);
-        let add_b = sign_op(
-            &seed(1),
-            &AclOp::AddMember {
-                key: user(2),
-                role: Role::Member,
+        let f = fx(1, &[2]);
+        let add_b = f.add_member(2, vec![Grant::Write], vec![]);
+        let rm_b = f.acl(
+            1,
+            1,
+            AclAction::RemoveMember {
+                actor: f.actor(2),
             },
-            vec![],
-            &g.workspace_id,
-        );
-        let rm_b = sign_op(
-            &seed(1),
-            &AclOp::RemoveMember { key: user(2) },
             vec![add_b.hash()],
-            &g.workspace_id,
         );
         let d = doc();
-        let del = sign_authz(
-            &seed(2),
-            &tomb(&d, true, vec![add_b.hash()]), // frontier where B was a member
-            vec![],
-            &g.workspace_id,
-        );
-        let st = replay(&g, &[add_b, rm_b], &[del]);
+        let del = f.tomb(2, 2, &d, true, vec![add_b.hash()], vec![]);
+        let st = f.replay(&[add_b, rm_b], &[del]);
         assert!(
             st.is_tombstoned(&d),
             "a delete authorized at its causal position survives the author's later removal"
@@ -358,36 +417,21 @@ mod tests {
 
     #[test]
     fn an_asof_where_the_author_was_never_valid_is_void() {
-        // A stranger claims the genesis frontier — they were never a member at
-        // any frontier, so the claim buys nothing. (A REMOVED member claiming
-        // an old frontier is fenced by the E2EE epoch, not by replay — module
-        // docs — so the replay-level test is the never-member case.)
-        let g = genesis(&[1]);
+        let f = fx(1, &[9]);
         let d = doc();
-        let del = sign_authz(&seed(9), &tomb(&d, true, vec![]), vec![], &g.workspace_id);
-        let st = replay(&g, &[], &[del]);
+        let del = f.tomb(9, 9, &d, true, vec![], vec![]);
+        let st = f.replay(&[], &[del]);
         assert!(!st.is_tombstoned(&d));
     }
 
     #[test]
     fn restore_wins_over_concurrent_delete() {
-        let g = genesis(&[1]);
+        let f = fx(1, &[]);
         let d = doc();
-        let del1 = sign_authz(&seed(1), &tomb(&d, true, vec![]), vec![], &g.workspace_id);
-        // Two children of del1: a restore and a re-delete — concurrent.
-        let restore = sign_authz(
-            &seed(1),
-            &tomb(&d, false, vec![]),
-            vec![del1.hash()],
-            &g.workspace_id,
-        );
-        let redelete = sign_authz(
-            &seed(1),
-            &tomb(&d, true, vec![]),
-            vec![del1.hash()],
-            &g.workspace_id,
-        );
-        let st = replay(&g, &[], &[del1, restore, redelete]);
+        let del1 = f.tomb(1, 1, &d, true, vec![], vec![]);
+        let restore = f.tomb(1, 1, &d, false, vec![], vec![del1.hash()]);
+        let redelete = f.tomb(1, 1, &d, true, vec![], vec![del1.hash()]);
+        let st = f.replay(&[], &[del1, restore, redelete]);
         assert!(
             !st.is_tombstoned(&d),
             "concurrent delete/restore resolves to visible (restore-wins)"
@@ -396,22 +440,12 @@ mod tests {
 
     #[test]
     fn sequential_redelete_after_restore_stands() {
-        let g = genesis(&[1]);
+        let f = fx(1, &[]);
         let d = doc();
-        let del1 = sign_authz(&seed(1), &tomb(&d, true, vec![]), vec![], &g.workspace_id);
-        let restore = sign_authz(
-            &seed(1),
-            &tomb(&d, false, vec![]),
-            vec![del1.hash()],
-            &g.workspace_id,
-        );
-        let del2 = sign_authz(
-            &seed(1),
-            &tomb(&d, true, vec![]),
-            vec![restore.hash()],
-            &g.workspace_id,
-        );
-        let st = replay(&g, &[], &[del1, restore, del2]);
+        let del1 = f.tomb(1, 1, &d, true, vec![], vec![]);
+        let restore = f.tomb(1, 1, &d, false, vec![], vec![del1.hash()]);
+        let del2 = f.tomb(1, 1, &d, true, vec![], vec![restore.hash()]);
+        let st = f.replay(&[], &[del1, restore, del2]);
         assert!(
             st.is_tombstoned(&d),
             "a causally-later delete succeeds the restore"
@@ -420,35 +454,57 @@ mod tests {
 
     #[test]
     fn replay_is_order_independent() {
-        let g = genesis(&[1]);
+        let f = fx(1, &[]);
         let d = doc();
-        let del = sign_authz(&seed(1), &tomb(&d, true, vec![]), vec![], &g.workspace_id);
-        let restore = sign_authz(
-            &seed(1),
-            &tomb(&d, false, vec![]),
-            vec![del.hash()],
-            &g.workspace_id,
-        );
-        let a = replay(&g, &[], &[del.clone(), restore.clone()]);
-        let b = replay(&g, &[], &[restore, del]);
+        let del = f.tomb(1, 1, &d, true, vec![], vec![]);
+        let restore = f.tomb(1, 1, &d, false, vec![], vec![del.hash()]);
+        let a = f.replay(&[], &[del.clone(), restore.clone()]);
+        let b = f.replay(&[], &[restore, del]);
         assert_eq!(a, b);
         assert!(!a.is_tombstoned(&d));
     }
 
     #[test]
-    fn cross_plane_signature_reuse_is_rejected() {
-        // A membership-plane signature must not verify in the authz plane even
-        // with identical bytes — the domain separates them.
-        let g = genesis(&[1]);
-        let acl_node = sign_op(
-            &seed(1),
-            &AclOp::RemoveMember { key: user(2) },
+    fn device_not_speaking_for_claimed_actor_is_void() {
+        // Device 9 authors a tombstone CLAIMING the founder's actor: the
+        // device→actor binding fails, so the op is void even though the claimed
+        // actor is a member.
+        let f = fx(1, &[9]);
+        let d = doc();
+        let (founder_actor, founder_head) = f.actors[&1].clone();
+        let forged = sign_authz(
+            &seed(9),
+            &AuthzOp {
+                action: AuthzAction::Tombstone {
+                    doc: d.clone(),
+                    on: true,
+                },
+                ts: 100,
+                asof: vec![],
+                by: founder_actor,
+                actor_asof: vec![founder_head],
+            },
             vec![],
-            &g.workspace_id,
+            f.ws(),
         );
-        assert!(acl_node.verify_sig(crate::acl::ACL_DOMAIN, g.workspace_id.as_str()));
+        let st = f.replay(&[], &[forged]);
+        assert!(!st.is_tombstoned(&d), "a device that is not the actor's is void");
+    }
+
+    #[test]
+    fn cross_plane_signature_reuse_is_rejected() {
+        let f = fx(1, &[2]);
+        let acl_node = f.acl(
+            1,
+            1,
+            AclAction::RemoveMember {
+                actor: f.actor(2),
+            },
+            vec![],
+        );
+        assert!(acl_node.verify_sig(crate::acl::ACL_DOMAIN, f.ws().as_str()));
         assert!(
-            !acl_node.verify_sig(AUTHZ_DOMAIN, g.workspace_id.as_str()),
+            !acl_node.verify_sig(AUTHZ_DOMAIN, f.ws().as_str()),
             "planes are mutually unusable"
         );
     }

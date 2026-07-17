@@ -27,7 +27,8 @@ const ROOT: &str = "membership";
 const K_WORKSPACE: &str = "workspaceId";
 const K_EPOCH: &str = "currentEpoch";
 const C_ACL: &str = "acl";
-const C_KEYS: &str = "keys"; // epoch(str) -> Map<UserId, sealed bytes>
+const C_ACTORS: &str = "actors"; // the lait/actor/1 key-event log (flat, grow-only)
+const C_KEYS: &str = "keys"; // epoch(str) -> Map<device UserId, sealed bytes>
 const C_REDEEMED: &str = "redeemed"; // invite nonce(hex) -> redeemer UserId
 
 /// A wrapper around the workspace's membership `LoroDoc`.
@@ -43,6 +44,7 @@ impl MembershipDoc {
         root.insert(K_WORKSPACE, workspace_id.as_str())?;
         root.insert(K_EPOCH, 0i64)?;
         root.insert_container(C_ACL, LoroList::new())?;
+        root.insert_container(C_ACTORS, LoroList::new())?;
         root.insert_container(C_KEYS, LoroMap::new())?;
         root.insert_container(C_REDEEMED, LoroMap::new())?;
         op::commit_with(&doc, &OpCtx::authority("init", founder));
@@ -114,6 +116,18 @@ impl MembershipDoc {
             _ => None,
         }
     }
+    /// The actor key-event container, created on demand (like `redeemed`) so a
+    /// doc founded before the actor plane still records events after upgrade.
+    fn actors_list(&self, create: bool) -> Option<LoroList> {
+        match self.root().get(C_ACTORS) {
+            Some(ValueOrContainer::Container(Container::List(l))) => Some(l),
+            _ if create => self
+                .root()
+                .insert_container(C_ACTORS, LoroList::new())
+                .ok(),
+            _ => None,
+        }
+    }
 
     pub fn workspace_id(&self) -> Option<WorkspaceId> {
         lx::get_str(&self.root(), K_WORKSPACE).and_then(|s| WorkspaceId::parse(&s))
@@ -170,6 +184,71 @@ impl MembershipDoc {
         }
         ops.iter()
             .map(|o| o.hash())
+            .filter(|h| !is_parent.contains(h))
+            .collect()
+    }
+
+    // ---- actor key-events (the lait/actor/1 plane, grow-only like the ACL) ----
+
+    /// Append a signed actor key-event (idempotent by event hash). Callers
+    /// that author an ACL op referencing new actor events MUST add those
+    /// events in the same commit as the op, so a replica never imports an op
+    /// whose `actor_asof` frontier it cannot resolve.
+    pub fn add_actor_event(&self, ev: &crate::actor::SignedEvent) -> Result<()> {
+        let hash = ev.hash();
+        if self.actor_events().iter().any(|e| e.hash() == hash) {
+            return Ok(());
+        }
+        let bytes = postcard::to_stdvec(ev).map_err(|e| anyhow!("encode actor event: {e}"))?;
+        let list = self
+            .actors_list(true)
+            .ok_or_else(|| anyhow!("actors container missing"))?;
+        list.insert(list.len(), bytes.as_slice())?;
+        Ok(())
+    }
+
+    /// All actor key-events currently held (every actor's log, flat — replay
+    /// partitions by declared actor).
+    pub fn actor_events(&self) -> Vec<crate::actor::SignedEvent> {
+        let Some(list) = self.actors_list(false) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for i in 0..list.len() {
+            if let Some(ValueOrContainer::Value(loro::LoroValue::Binary(b))) = list.get(i) {
+                if let Ok(ev) = postcard::from_bytes::<crate::actor::SignedEvent>(&b) {
+                    out.push(ev);
+                }
+            }
+        }
+        out
+    }
+
+    /// The heads of ONE actor's log — the parents for its next event and the
+    /// `actor_asof` frontier an authored op embeds. Computed over the events
+    /// declaring that actor (the inception hash equals the actor id's hash).
+    pub fn actor_heads(&self, actor: &crate::ids::ActorId) -> Vec<String> {
+        let events = self.actor_events();
+        let mine: Vec<&crate::actor::SignedEvent> = events
+            .iter()
+            .filter(|e| {
+                if e.hash() == actor.incept_hash() {
+                    return true;
+                }
+                postcard::from_bytes::<crate::actor::ActorOp>(&e.op)
+                    .ok()
+                    .and_then(|op| op.actor().cloned())
+                    .is_some_and(|a| &a == actor)
+            })
+            .collect();
+        let mut is_parent = std::collections::HashSet::new();
+        for e in &mine {
+            for p in &e.parents {
+                is_parent.insert(p.clone());
+            }
+        }
+        mine.iter()
+            .map(|e| e.hash())
             .filter(|h| !is_parent.contains(h))
             .collect()
     }
@@ -251,8 +330,8 @@ impl MembershipDoc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acl::{sign_op, AclOp, Role};
-    use crate::ids::SystemUlidSource;
+    use crate::acl::{sign_op, AclAction, AclOp, Grant};
+    use crate::ids::{ActorId, SystemUlidSource};
 
     fn ws() -> WorkspaceId {
         WorkspaceId::mint(&SystemUlidSource)
@@ -261,6 +340,24 @@ mod tests {
         use ed25519_dalek::SigningKey;
         let pk = SigningKey::from_bytes(&[n; 32]).verifying_key();
         UserId::from_key_string(data_encoding::HEXLOWER.encode(pk.as_bytes()))
+    }
+    fn actor(n: u8) -> ActorId {
+        ActorId::from_incept_hash(&format!("{:064x}", n))
+    }
+    fn add_op(subject: u8, grants: Vec<Grant>, parents: Vec<String>, w: &WorkspaceId) -> SignedOp {
+        sign_op(
+            &[1; 32],
+            &AclOp {
+                action: AclAction::AddMember {
+                    actor: actor(subject),
+                    grants,
+                },
+                by: actor(1),
+                actor_asof: vec![],
+            },
+            parents,
+            w,
+        )
     }
     fn ctx(kind: &str) -> OpCtx {
         OpCtx::authority(kind, &user(1))
@@ -273,15 +370,7 @@ mod tests {
     fn ops_grow_only_and_heads_track_frontier() {
         let w = ws();
         let m = fresh(&w);
-        let op1 = sign_op(
-            &[1; 32],
-            &AclOp::AddMember {
-                key: user(2),
-                role: Role::Member,
-            },
-            vec![],
-            &w,
-        );
+        let op1 = add_op(2, vec![Grant::Write], vec![], &w);
         m.add_op(&op1).unwrap();
         m.add_op(&op1).unwrap(); // idempotent
         m.apply(&ctx("member_add"));
@@ -289,7 +378,11 @@ mod tests {
         assert_eq!(m.heads(), vec![op1.hash()]);
         let op2 = sign_op(
             &[1; 32],
-            &AclOp::RemoveMember { key: user(2) },
+            &AclOp {
+                action: AclAction::RemoveMember { actor: actor(2) },
+                by: actor(1),
+                actor_asof: vec![],
+            },
             vec![op1.hash()],
             &w,
         );
@@ -343,15 +436,7 @@ mod tests {
     fn snapshot_roundtrip_preserves_membership() {
         let w = ws();
         let m = fresh(&w);
-        let op = sign_op(
-            &[1; 32],
-            &AclOp::AddMember {
-                key: user(2),
-                role: Role::Admin,
-            },
-            vec![],
-            &w,
-        );
+        let op = add_op(2, vec![Grant::Admin], vec![], &w);
         m.add_op(&op).unwrap();
         m.put_sealed(0, &user(2), b"k").unwrap();
         m.set_epoch(1).unwrap();

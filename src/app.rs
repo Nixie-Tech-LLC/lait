@@ -530,7 +530,8 @@ async fn run_init(m: &ArgMatches, out: Out) -> Result<()> {
     let key = load_or_create_identity(&config::identity_dir()?)?;
     let me = UserId::from_key_string(key.public().to_string());
     let store = Store::open(&home)?;
-    let (ws, project) = crate::tracker::found_workspace(&store, &me, &name, &SystemUlidSource)?;
+    let (ws, project) =
+        crate::tracker::found_workspace(&store, &me, &key.to_bytes(), &name, &SystemUlidSource)?;
     // Register the founder — this is what makes `lait workspaces` complete.
     if let Err(e) = workspaces::upsert(workspaces::WorkspaceEntry {
         workspace: ws.to_string(),
@@ -634,7 +635,7 @@ async fn run_join_cli(m: &ArgMatches, out: Out) -> Result<()> {
         }
     } else {
         let store = Store::open(&target)?;
-        crate::tracker::join_workspace_store(&store, &ticket.workspace, &ticket.host.to_string())?;
+        crate::tracker::join_workspace_store(&store, &ticket.workspace, &ticket.founder_actor)?;
     }
 
     // Set the display name before the daemon is auto-spawned so a cold joiner

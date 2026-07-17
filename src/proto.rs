@@ -128,6 +128,11 @@ pub enum Payload {
         nick: String,
         #[serde(default)]
         invite: Option<SignedInvite>,
+        /// The joiner's self-certifying actor inception (lait/actor/1), so an
+        /// admin can admit its *actor* before doc-sync delivers it. Absent only
+        /// from a pre-actor peer (which a v2 daemon will not admit).
+        #[serde(default)]
+        incept: Option<crate::actor::SignedEvent>,
     },
     /// Periodic liveness heartbeat for presence tracking. `state` carries the
     /// three-state input-driven presence (online/away, UI.md §4.5).
@@ -224,6 +229,11 @@ pub struct WorkspaceTicket {
     pub host: EndpointId,
     /// Nick of the host who minted this ticket (for one-step `connect`).
     pub host_nick: String,
+    /// The founding **actor** id (`act_…`) the joiner roots its genesis on —
+    /// trust anchors in the founder's self-certifying identity, not a device key
+    /// (lait/actor/1). The founder's inception syncs in the membership doc.
+    #[serde(default)]
+    pub founder_actor: String,
     /// An optional pre-authorization capability (Pattern A). Present ⇒ a joiner is
     /// auto-admitted on `join` (the seal happens without a manual `members
     /// approve`). Absent ⇒ the classic request→approve flow. The joiner echoes it
@@ -355,6 +365,7 @@ mod tests {
             name: "demo".into(),
             host: host_key(),
             host_nick: "alice".into(),
+            founder_actor: format!("act_{}", "0".repeat(64)),
             invite: None,
         }
     }
@@ -399,8 +410,12 @@ mod tests {
     #[test]
     fn ticket_is_a_short_one_liner() {
         let s = sample().to_string();
+        // Since the lait/actor/1 cutover the ticket also carries the founding
+        // *actor* id (a self-certifying identity, ~68 chars) so a joiner roots
+        // its genesis on the founder's identity rather than a device key. That
+        // is a real size cost, but the ticket stays a single copy-paste line.
         assert!(
-            s.len() < 120,
+            s.len() < 260,
             "ticket should be a short one-liner, got {} chars",
             s.len()
         );

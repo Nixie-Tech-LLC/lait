@@ -194,6 +194,63 @@ impl fmt::Display for UserId {
     }
 }
 
+/// An actor id — the **self-certifying** identity of a member (`lait/actor/1`):
+/// `act_` + the blake3 content-address of the actor's `Incept` event, 64
+/// lowercase hex chars. An actor is a *set of device keys under one
+/// self-managed key-event log*; a `UserId` (device key) signs, an `ActorId`
+/// *is someone*. Not an ed25519 key — it never verifies a signature — and
+/// content-independent of any device key, so devices rotate under a stable
+/// identity. Minted per-workspace (the `Incept` payload binds the workspace id
+/// + a nonce), so the same human is unlinkable across spaces by default.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ActorId(String);
+
+impl ActorId {
+    /// The textual prefix these ids carry (including the underscore).
+    pub const PREFIX: &'static str = "act_";
+
+    /// Parse `act_` + 64 lowercase hex chars.
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        let rest = s.strip_prefix(Self::PREFIX)?;
+        if rest.len() == 64 && rest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            Some(Self(format!(
+                "{}{}",
+                Self::PREFIX,
+                rest.to_ascii_lowercase()
+            )))
+        } else {
+            None
+        }
+    }
+
+    /// Wrap the content-address of an `Incept` event (a 64-hex blake3 string,
+    /// as produced by `SignedNode::hash`). The caller vouches the hash shape.
+    pub fn from_incept_hash(hash: &str) -> Self {
+        Self(format!("{}{}", Self::PREFIX, hash))
+    }
+
+    /// The bare incept-event hash (no textual prefix).
+    pub fn incept_hash(&self) -> &str {
+        &self.0[Self::PREFIX.len()..]
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// A short, display-friendly handle: `act_` + first 8 hash chars.
+    pub fn short(&self) -> String {
+        self.0.chars().take(Self::PREFIX.len() + 8).collect()
+    }
+}
+
+impl fmt::Display for ActorId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

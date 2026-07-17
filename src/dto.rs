@@ -334,17 +334,20 @@ pub struct InboxEntry {
 /// signed ACL graph — the only cryptographically-verified identity in the system.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberDto {
-    pub key: UserId,
-    /// "admin" | "member" | "agent" (contract §3.4).
+    /// The member's **actor id** (`act_…`) since the lait/actor/1 cutover — a
+    /// self-certifying identity over a set of device keys, not a raw key. Kept
+    /// as `key` for wire/field stability across the CLI/TUI/viewer projections.
+    pub key: String,
+    /// "admin" | "member" | "viewer" | "agent" (contract §3.4).
     pub role: String,
-    /// Whether this is us.
+    /// Whether this is us (this device speaks for the actor).
     pub me: bool,
-    /// For an agent, the sponsoring member's key; `None` for humans. The agent's
+    /// For an agent, the sponsoring actor; `None` for humans. The agent's
     /// standing dies with this sponsor.
     #[serde(default)]
     pub sponsor: Option<String>,
-    /// Local petname you've assigned to this key (empty if none). A private,
-    /// never-synced label — the trusted half of the local-petname identity model.
+    /// Local petname you've assigned (empty if none). A private, never-synced
+    /// label — the trusted half of the local-petname identity model.
     #[serde(default)]
     pub alias: String,
 }

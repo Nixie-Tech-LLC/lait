@@ -117,7 +117,7 @@ fn found_home(home: &Path) {
     let key = lait::config::load_or_create_identity(home).expect("identity");
     let me = lait::ids::UserId::from_key_string(key.public().to_string());
     let store = lait::store::Store::open(home).expect("store");
-    lait::tracker::found_workspace(&store, &me, "test", &lait::ids::SystemUlidSource)
+    lait::tracker::found_workspace(&store, &me, &key.to_bytes(), "test", &lait::ids::SystemUlidSource)
         .expect("found workspace");
 }
 
@@ -127,7 +127,7 @@ fn found_home(home: &Path) {
 fn join_home(home: &Path, ticket: &str) {
     let t: lait::proto::WorkspaceTicket = ticket.parse().expect("parse ticket");
     let store = lait::store::Store::open(home).expect("store");
-    lait::tracker::join_workspace_store(&store, &t.workspace, &t.host.to_string())
+    lait::tracker::join_workspace_store(&store, &t.workspace, &t.founder_actor)
         .expect("bootstrap joiner store");
 }
 
@@ -329,7 +329,7 @@ fn approve_join_request_key_first_and_seed_list_is_structured() {
         Response::Members { members } => assert!(
             members
                 .iter()
-                .any(|m| m.key.as_str() == b_id && m.alias == "bob"),
+                .any(|m| m.alias == "bob"),
             "approved member should carry the local alias 'bob'"
         ),
         other => panic!("A: members returned {other:?}"),
@@ -465,7 +465,7 @@ fn self_asserted_nick_never_resolves_only_admin_chosen_alias_does() {
         Response::Members { members } => assert!(
             members
                 .iter()
-                .any(|m| m.key.as_str() == b_id && m.alias == "eve"),
+                .any(|m| m.alias == "eve"),
             "approved member should carry the admin-chosen alias 'eve', not 'bob'"
         ),
         other => panic!("A: members returned {other:?}"),

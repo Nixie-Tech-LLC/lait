@@ -28,15 +28,22 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::CatalogDoc;
-use crate::ids::{DocId, UserId, WorkspaceId};
+use crate::ids::{DocId, WorkspaceId};
 use crate::issue::IssueDoc;
 
 /// The workspace genesis — the root of trust (A§6, S§6). Distributed in the
 /// invite ticket; persisted here as public data.
+///
+/// Since the `lait/actor/1` cutover the founding principals are **actors**
+/// (self-certifying identities), not raw device keys: a founder's device signs
+/// membership ops, but the genesis anchors trust in its *actor* so the founder
+/// can rotate devices without re-founding. The founder's inception event ships
+/// in the ticket and syncs in the membership doc; a replica validates it by
+/// rehashing to the genesis [`ActorId`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Genesis {
     pub workspace_id: WorkspaceId,
-    pub founding_admins: Vec<UserId>,
+    pub founding_actors: Vec<crate::ids::ActorId>,
 }
 
 /// Whether `home` holds an initialized store — a pure probe (no dirs created,
@@ -411,7 +418,7 @@ mod tests {
         assert!(store.genesis().unwrap().is_none());
         let g = Genesis {
             workspace_id: WorkspaceId::mint(&SystemUlidSource),
-            founding_admins: vec![UserId::from_key_string("a".repeat(64))],
+            founding_actors: vec![crate::ids::ActorId::from_incept_hash(&"a".repeat(64))],
         };
         store.write_genesis(&g).unwrap();
         assert_eq!(store.genesis().unwrap(), Some(g));
@@ -423,7 +430,7 @@ mod tests {
         let home = tmp_home();
         let store = Store::open(&home).unwrap();
         let ws = WorkspaceId::mint(&SystemUlidSource);
-        let me = UserId::from_key_string("a".repeat(64));
+        let me = crate::ids::UserId::from_key_string("a".repeat(64));
         let cat = CatalogDoc::create(&ws, "test", None, &me).unwrap();
         let p = ProjectId::mint(&SystemUlidSource);
         cat.add_project(&p, "Eng", "ENG", "blue").unwrap();
@@ -460,7 +467,7 @@ mod tests {
         let home = tmp_home();
         let store = Store::open(&home).unwrap();
         let ws = WorkspaceId::mint(&SystemUlidSource);
-        let cat = CatalogDoc::create(&ws, "test", None, &UserId::from_key_string("a".repeat(64)))
+        let cat = CatalogDoc::create(&ws, "test", None, &crate::ids::UserId::from_key_string("a".repeat(64)))
             .unwrap();
         store.save_catalog(&cat).unwrap();
         assert!(!store.repo.join("catalog.tmp").exists());

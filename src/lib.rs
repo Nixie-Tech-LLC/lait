@@ -22,6 +22,7 @@
 //!     the minimum framing to route them over iroh.
 
 pub mod acl;
+pub mod actor;
 pub mod app;
 pub mod authz;
 pub mod cli;

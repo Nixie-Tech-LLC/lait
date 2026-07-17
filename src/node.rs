@@ -628,7 +628,11 @@ impl Node {
                 self.touch(from, Some(nick));
                 self.mark_offline(from, true);
             }
-            Payload::JoinRequest { nick, invite } => {
+            Payload::JoinRequest {
+                nick,
+                invite,
+                incept,
+            } => {
                 let display = self.touch(from, Some(nick.clone()));
                 self.shared.events.lock().unwrap().push(
                     EventKind::Join,
@@ -637,12 +641,18 @@ impl Node {
                     format!("{display} joined the room"),
                 );
                 self.ring_presence_doorbell();
+                // Make the joiner's actor identity locally known so a manual
+                // `member add` can resolve it (validated + idempotent; a forged
+                // inception is ignored).
+                if let Some(incept) = &incept {
+                    let _ = self.tracker.lock().unwrap().import_inception(incept);
+                }
                 // Pattern A: if the joiner presented a valid pre-authorization and
                 // we're an admin who can seal, admit them now — no manual approve.
                 // On any failure we simply leave the request pending (the event
                 // above already surfaces it to `members requests`).
                 if let Some(invite) = invite {
-                    self.clone().try_auto_approve(from, invite);
+                    self.clone().try_auto_approve(from, invite, incept);
                 }
                 // a joiner wants our state — and may have state we lack; pull.
                 self.clone().trigger_pull(from);
@@ -787,11 +797,14 @@ impl Node {
             );
         }
         self.join_topic(ticket.topic(), vec![ticket.host]).await?;
+        // Mint (or recover) our actor inception so an admin can admit our actor.
+        let incept = self.tracker.lock().unwrap().self_inception().ok();
         self.broadcast(Payload::JoinRequest {
             nick: self.shared.nick(),
             // Echo the ticket's pre-authorization (if any) so an admin receiver can
             // auto-seal us the key without a manual approve (Pattern A).
             invite: ticket.invite.clone(),
+            incept,
         })
         .await
         .ok();
@@ -810,7 +823,7 @@ impl Node {
         } else {
             ticket.host_nick.clone()
         };
-        let already_member = self.tracker.lock().unwrap().is_member(&self.my_userid());
+        let already_member = self.tracker.lock().unwrap().am_i_member();
         if already_member {
             "joined \u{2014} you're on the board and syncing.".to_string()
         } else if ticket.invite.is_some() {
@@ -1056,7 +1069,12 @@ impl Node {
     /// classic pending-request flow, so a bad/expired/foreign invite never blocks
     /// a manual approve. On success we ring the doorbell and re-announce so the
     /// freshly-sealed joiner pulls and decrypts.
-    fn try_auto_approve(self: Arc<Self>, joiner_id: EndpointId, invite: SignedInvite) {
+    fn try_auto_approve(
+        self: Arc<Self>,
+        _joiner_id: EndpointId,
+        invite: SignedInvite,
+        incept: Option<crate::actor::SignedEvent>,
+    ) {
         let (issuer_pk, grant) = match invite.verify() {
             Ok(v) => v,
             Err(_) => return,
@@ -1065,7 +1083,8 @@ impl Node {
         if grant.is_expired(now) {
             return;
         }
-        let joiner = UserId::from_key_string(joiner_id.to_string());
+        // A pre-actor peer carries no inception — a v2 daemon cannot admit it.
+        let Some(incept) = incept else { return };
         let issuer = UserId::from_key_string(issuer_pk.to_string());
         let (changed, dirty) = {
             let mut t = self.tracker.lock().unwrap();
@@ -1073,7 +1092,7 @@ impl Node {
             if grant.workspace != t.workspace_str() {
                 return;
             }
-            let (_resp, dirty) = t.redeem_invite(&issuer, &joiner, &grant.nonce, grant.single_use);
+            let (_resp, dirty) = t.redeem_invite(&issuer, &incept, &grant.nonce, grant.single_use);
             (dirty.is_some(), dirty)
         };
         if let Some(dirty) = dirty {
@@ -1113,7 +1132,7 @@ impl Node {
             }
         }
         {
-            for (key, _role, _me) in self.tracker.lock().unwrap().members() {
+            for key in self.tracker.lock().unwrap().member_device_keys() {
                 keys.insert(key);
             }
         }
@@ -1134,13 +1153,15 @@ impl Node {
     /// yet ACL members. Newest-first, deduped by key. Ephemeral — bounded by the
     /// event ring, never persisted (UI.md §8).
     fn pending_join_requests(&self) -> Vec<JoinRequestDto> {
+        // A joiner's announced id is a *device* key; it is "already a member" if
+        // that device speaks for a member actor.
         let members: HashSet<String> = self
             .tracker
             .lock()
             .unwrap()
-            .members()
+            .member_device_keys()
             .into_iter()
-            .map(|(k, _r, _me)| k.as_str().to_string())
+            .map(|k| k.as_str().to_string())
             .collect();
         let (events, _) = self.shared.events.lock().unwrap().since(0);
         let mut seen: HashSet<String> = HashSet::new();
@@ -1334,9 +1355,22 @@ impl Node {
                 Ok(match resp {
                     Response::Members { mut members } => {
                         let aliases = load_aliases(&self.home);
+                        // A member's `key` is now an actor id; a local petname may
+                        // have been set on the actor id OR on any of its device
+                        // keys (e.g. the device seen in the join request). Resolve
+                        // through the actor's device set.
+                        let plane = self.tracker.lock().unwrap().actor_plane();
                         for m in &mut members {
-                            if let Some(a) = aliases.iter().find(|a| a.key == m.key.as_str()) {
+                            if let Some(a) = aliases.iter().find(|a| a.key == m.key) {
                                 m.alias = a.name.clone();
+                            } else if let Some(actor) = crate::ids::ActorId::parse(&m.key) {
+                                let devs = plane.devices_of(&actor);
+                                if let Some(a) = aliases
+                                    .iter()
+                                    .find(|a| devs.iter().any(|d| d.as_str() == a.key))
+                                {
+                                    m.alias = a.name.clone();
+                                }
                             }
                         }
                         Response::Members { members }
@@ -1433,13 +1467,11 @@ impl Node {
                     .values()
                     .filter(|p| p.presence.is_online())
                     .count();
-                let me = self.my_userid();
                 let (workspace, name, issues, projects, membership) = {
                     let t = self.tracker.lock().unwrap();
-                    let acl = t.acl_state();
-                    let membership = if acl.is_admin(&me) {
+                    let membership = if t.am_i_admin() {
                         "admin"
-                    } else if acl.is_member(&me) {
+                    } else if t.am_i_member() {
                         "member"
                     } else {
                         "pending"
@@ -1476,13 +1508,11 @@ impl Node {
                     .values()
                     .filter(|p| p.presence.is_online())
                     .count();
-                let me = self.my_userid();
                 let (workspace, name, issues, projects, membership) = {
                     let t = self.tracker.lock().unwrap();
-                    let acl = t.acl_state();
-                    let membership = if acl.is_admin(&me) {
+                    let membership = if t.am_i_admin() {
                         "admin"
-                    } else if acl.is_member(&me) {
+                    } else if t.am_i_member() {
                         "member"
                     } else {
                         "pending"
@@ -1530,11 +1560,19 @@ impl Node {
                         InviteGrant::mint(workspace.clone(), now_secs(), ttl_secs, !reusable);
                     SignedInvite::sign(&self.secret_key, &grant).ok()
                 };
+                let founder_actor = self
+                    .tracker
+                    .lock()
+                    .unwrap()
+                    .my_actor()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default();
                 let ticket = WorkspaceTicket {
                     workspace,
                     name,
                     host: self.shared.my_id,
                     host_nick: self.shared.nick(),
+                    founder_actor,
                     invite,
                 };
                 Ok(Response::Text {
