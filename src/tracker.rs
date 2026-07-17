@@ -2894,10 +2894,12 @@ impl Tracker {
         )
     }
 
-    /// Revoke a device from our actor and rotate the workspace key so the revoked
-    /// device is fenced from future content (self-protection — any member may do
-    /// this for their own actor; it re-seals the fresh epoch only to the
-    /// remaining devices).
+    /// Revoke a device from our actor. De-listing is self-authored (any member
+    /// may do it for their own actor). **Fencing** the device from future content
+    /// needs a key rotation, which only an admin may mint: an admin rotates
+    /// immediately (re-sealing the fresh epoch to the remaining devices only); a
+    /// non-admin de-lists and is told the rotation is pending an admin, rather
+    /// than being handed a rotation that would be inert.
     fn device_revoke_cmd(&mut self, device: String) -> (Response, Option<DirtySet>) {
         let Some(actor) = self.my_actor() else {
             return (Response::err("this device has no actor identity"), None);
@@ -2924,23 +2926,34 @@ impl Tracker {
             self.membership.actor_heads(&actor),
             &self.workspace_id,
         );
+        // De-listing the device is self-authored and always applies. Fully
+        // fencing it, though, requires a **key rotation**, which only an admin
+        // may mint. Rotate when we can; otherwise apply the revocation and report
+        // honestly that content re-keying is pending an admin — never claim a
+        // rotation that would be inert (the device would keep reading under the
+        // still-active epoch).
+        let can_rotate = self.am_i_admin();
         let res = (|| -> Result<()> {
             self.membership.add_actor_event(&ev)?;
-            // Lazy revocation of a device == a key rotation: the fresh epoch is
-            // sealed only to the remaining devices (the revoked one is now absent
-            // from devices_of), so it loses future content access.
-            self.rotate_key()?;
+            if can_rotate {
+                self.rotate_key()?;
+            }
             self.persist_membership("device_revoke")
         })();
         if let Err(e) = res {
             return (Response::err(format!("{e:#}")), None);
         }
+        let message = if can_rotate {
+            format!("revoked device {} and rotated the key", device.short())
+        } else {
+            format!(
+                "revoked device {} from your identity — ask an admin to rotate the workspace key to fence its access to existing content",
+                device.short()
+            )
+        };
         (
             Response::Ok {
-                message: Some(format!(
-                    "revoked device {} and rotated the key",
-                    device.short()
-                )),
+                message: Some(message),
             },
             Some(DirtySet::catalog(CatalogScope::Acl)),
         )
@@ -3073,7 +3086,13 @@ impl Tracker {
     ///
     /// [`heal_stale_epoch`]: Self::heal_stale_epoch
     fn rotate_key(&mut self) -> Result<()> {
-        let gen = self.active_epoch().map(|e| e.gen + 1).unwrap_or(0);
+        let gen = match self.active_epoch() {
+            Some(e) => e
+                .gen
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("key-epoch generation exhausted"))?,
+            None => 0,
+        };
         let id = rand16();
         let new_key = crypto::random_key();
         let key_commit = *blake3::hash(&new_key).as_bytes();
@@ -3150,14 +3169,30 @@ impl Tracker {
         let Some(active) = self.active_epoch() else {
             return Ok(());
         };
+        // Only an admin can mint, so only an admin can heal.
+        if !self.am_i_admin() {
+            return Ok(());
+        }
         let members: std::collections::BTreeSet<ActorId> = self
             .acl_state()
             .members()
             .into_iter()
             .map(|(a, _)| a)
             .collect();
-        let stale = active.members.iter().any(|m| !members.contains(m));
-        if stale && self.am_i_admin() {
+        // Re-key the active tip if it is compromised or unusable:
+        // - its *minter* is no longer a member — a departed member controlled
+        //   its recipient list and knows its key, so it must not linger as the
+        //   tip (the revocation fence the self-declared `members` list can't give);
+        // - a *declared recipient* is no longer a member (a concurrent removal
+        //   left a stale tip); or
+        // - we hold admin standing yet cannot open it — a peer minted an epoch
+        //   we have no key for, so content is frozen under it (liveness). A fresh
+        //   mint sealed to the true member set supersedes it and every replica
+        //   converges.
+        let minter_gone = !members.contains(&active.minted_by);
+        let recipient_gone = active.members.iter().any(|m| !members.contains(m));
+        let unopenable = !self.keyring.contains_key(&active.id);
+        if minter_gone || recipient_gone || unopenable {
             self.rotate_key()?;
             self.persist_membership("epoch_heal")?;
         }
@@ -4375,6 +4410,127 @@ mod tests {
         assert!(
             crate::crypto::aead_decrypt(&attacker_key, ct).is_none(),
             "the attacker's key must not decrypt the victim's content"
+        );
+    }
+
+    #[test]
+    fn heal_supersedes_the_epoch_of_a_removed_minter() {
+        // Backstop for the revocation bypass (a minter controls its epoch's
+        // recipient list and key): if the active epoch was minted by an actor who
+        // is later removed, an admin's heal re-keys it, so the departed member's
+        // key never lingers as the live tip.
+        let mut a = new_node(); // founder/admin A
+        with_project(&mut a.tracker);
+        new_issue(&mut a.tracker, "secret");
+        let a_actor = a.tracker.my_actor().unwrap();
+        let a_ws = a.tracker.workspace_str();
+
+        // B joins, is admitted as an ADMIN, and syncs.
+        let b_seed = [21u8; 32];
+        let b_user = user_from_seed(b_seed);
+        let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, &a_actor.to_string());
+        let b_incept = b.tracker.self_inception().unwrap();
+        let b_actor = actor_of(&b_incept);
+        let (resp, _) = a
+            .tracker
+            .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        sync_all(&mut a.tracker, &mut b.tracker);
+
+        // B (admin) rotates the key: the active epoch is now minted by B.
+        let (resp, _) = b.tracker.key_rotate_cmd();
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        sync_all(&mut b.tracker, &mut a.tracker);
+        assert_eq!(
+            a.tracker.active_epoch().unwrap().minted_by,
+            b_actor,
+            "the active epoch was minted by B"
+        );
+
+        // A removes B WITHOUT the auto-rotation (author the op directly), leaving
+        // B's epoch as the active tip — the concurrent-race residual heal guards.
+        let rm = a
+            .tracker
+            .author_acl(AclAction::RemoveMember {
+                actor: b_actor.clone(),
+            })
+            .unwrap();
+        a.tracker.membership.add_op(&rm).unwrap();
+        a.tracker
+            .persist_membership("test_remove_no_rotate")
+            .unwrap();
+        assert!(!a.tracker.acl_state().is_member(&b_actor), "B is removed");
+        assert_eq!(
+            a.tracker.active_epoch().unwrap().minted_by,
+            b_actor,
+            "B's epoch is still the tip before heal"
+        );
+
+        // Heal: A sees the tip was minted by a non-member and re-keys.
+        a.tracker.heal_stale_epoch().unwrap();
+        let healed = a.tracker.active_epoch().unwrap();
+        assert_eq!(healed.minted_by, a_actor, "A re-keyed the tip away from B");
+        assert!(
+            !a.tracker
+                .membership
+                .sealed_devices(&healed.id)
+                .contains(&b_user),
+            "the healed epoch is not sealed to the removed member's device"
+        );
+    }
+
+    #[test]
+    fn a_non_admin_device_revoke_is_honest_about_pending_rotation() {
+        // A non-admin can de-list its own device but cannot mint the key rotation
+        // that fences it, so the command says the rotation is pending an admin
+        // rather than claiming a rotation that would be inert.
+        let mut a = new_node(); // founder/admin
+        let a_ws = a.tracker.workspace_str();
+        let a_actor = a.tracker.my_actor().unwrap();
+
+        // B joins as a plain WRITER (no admin).
+        let b_seed = [41u8; 32];
+        let b_user = user_from_seed(b_seed);
+        let mut b = new_joiner_node_as(b_user, b_seed, &a_ws, &a_actor.to_string());
+        let b_incept = b.tracker.self_inception().unwrap();
+        let b_actor = actor_of(&b_incept);
+        a.tracker.admit_member(&b_incept, vec![Grant::Write]); // writer, not admin
+        sync_all(&mut a.tracker, &mut b.tracker);
+
+        // B adds a second device so it has one to revoke.
+        let b2_seed = [42u8; 32];
+        let b2_user = user_from_seed(b2_seed);
+        let binding = actor::consent_sign(
+            &b2_seed,
+            &a_ws,
+            [43u8; 16],
+            &actor::ConsentCtx::Member { actor: &b_actor },
+        );
+        let hex = data_encoding::HEXLOWER.encode(&postcard::to_stdvec(&binding).unwrap());
+        let (resp, _) = b.tracker.device_add_cmd(hex);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+
+        let gen_before = b.tracker.active_epoch().map(|e| e.gen);
+        // B (non-admin) revokes its second device.
+        let (resp, _) = b.tracker.device_revoke_cmd(b2_user.as_str().to_string());
+        match resp {
+            Response::Ok { message: Some(m) } => {
+                assert!(
+                    m.contains("admin"),
+                    "expected a pending-rotation notice: {m}"
+                )
+            }
+            other => panic!("expected Ok with a pending-rotation notice, got {other:?}"),
+        }
+        // The device is de-listed, but a non-admin's mint is inert: no rotation.
+        assert!(
+            !b.tracker.actor_plane().is_device_of(&b_actor, &b2_user),
+            "the second device is de-listed"
+        );
+        assert_eq!(
+            b.tracker.active_epoch().map(|e| e.gen),
+            gen_before,
+            "a non-admin cannot rotate the key"
         );
     }
 

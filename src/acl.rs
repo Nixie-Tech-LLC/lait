@@ -77,14 +77,17 @@ pub enum AclAction {
         actor: ActorId,
     },
     /// Mint a workspace key-epoch (A§11). **Signed, and authorized only when its
-    /// author holds content-write standing** (`can_write`), so the key-lifecycle
-    /// rides the same trust boundary as membership: a replica adopts an epoch only
-    /// when a valid mint op authorizes it, never because it merely appeared in the
-    /// synced doc. `key_commit = blake3(workspace_key)` binds the (unsigned,
-    /// per-device) sealed envelopes — a device accepts an unsealed key only if its
-    /// hash matches, so a forged envelope is inert. Grow-only and orthogonal to
-    /// the member set (no subject actor); concurrent mints coexist by `id` and the
-    /// deterministic `max(gen, id)` tip picks one.
+    /// author holds admin standing** — re-keying decides who reads future content
+    /// (a membership-authority action), so the key lifecycle rides the exact trust
+    /// boundary as add/remove-member: a departed member cannot mint itself
+    /// continued read access, and a replica adopts an epoch only when a valid mint
+    /// authorizes it, never because it merely appeared in the synced doc. `gen` is
+    /// bounded at replay to `max(ancestor mint gen) + 1` (no generation jump can
+    /// pin the tip or overflow). `key_commit = blake3(workspace_key)` binds the
+    /// (unsigned, per-device) sealed envelopes — a device accepts an unsealed key
+    /// only if its hash matches, so a forged envelope is inert. Grow-only and
+    /// orthogonal to the member set (no subject actor); concurrent mints coexist
+    /// by `id` and the deterministic `max(gen, id)` tip picks one.
     MintEpoch {
         id: [u8; 16],
         gen: u32,
@@ -116,6 +119,11 @@ pub struct EpochAuth {
     pub gen: u32,
     pub key_commit: [u8; 32],
     pub members: Vec<ActorId>,
+    /// The actor that authored this mint (the op's `by`). Healing re-keys when
+    /// the active epoch's minter is no longer a current member — a departed
+    /// member's epoch (whose recipient list it controlled) never lingers as the
+    /// tip, so its key cannot outlive its membership.
+    pub minted_by: ActorId,
 }
 
 /// A membership op: the action, the actor its author claims to be, and the
@@ -327,10 +335,13 @@ pub fn replay_with_audit(
     // ---- pass 1 (topo): authorize ops, tracking standing as it evolves ----
     let mut admins: BTreeSet<ActorId> = genesis.founding_actors.iter().cloned().collect();
     let mut humans: BTreeSet<ActorId> = admins.clone();
-    // Write-standing actors (Admin or Write grant) — who may mint a key-epoch.
-    // Founding actors are seeded [Admin, Write], so they start here too.
-    let mut writers: BTreeSet<ActorId> = admins.clone();
     let mut agents_now: BTreeMap<ActorId, ActorId> = BTreeMap::new();
+    // Generation of each authorized key-epoch mint (op hash → gen), for the
+    // monotonicity bound: a mint may claim at most `max(ancestor mint gen) + 1`,
+    // so no author can jump the generation (e.g. to `u32::MAX`) and pin the
+    // active tip forever. Concurrent mints off the same tip legitimately share a
+    // generation — the bound is over ancestors only.
+    let mut epoch_gens: HashMap<String, u32> = HashMap::new();
 
     let mut authorized: Vec<String> = Vec::new();
     let mut audit: Vec<AuditEntry> = Vec::new();
@@ -390,12 +401,30 @@ pub fn replay_with_audit(
                         && !humans.contains(actor)
                         && !agents_now.contains_key(actor)
                 }
-                // Minting a key-epoch requires **content-write standing** (A§11):
-                // re-keying content is a content-authority action, so a viewer,
-                // agent, or non-member cannot mint. This is the fence that stops
-                // an injected epoch from ever going live — an attacker is not a
-                // writer, so its mint never authorizes on any replica.
-                AclAction::MintEpoch { .. } => writers.contains(by),
+                // Minting a key-epoch requires **admin standing** (A§11):
+                // re-keying decides who reads future content, a membership-
+                // authority action — so a viewer, plain writer, agent, or
+                // non-member cannot mint. This is the fence that stops an
+                // injected epoch from going live, and it keeps the key lifecycle
+                // exclusive to the same principals that add/remove members, so a
+                // departed member cannot mint itself continued read access.
+                //
+                // The generation is additionally bounded to `max(ancestor mint
+                // gen) + 1` — an admin cannot jump the generation to pin the
+                // active tip (overflow / permanent non-supersession); concurrent mints off
+                // the same tip still share a generation and coexist by id.
+                AclAction::MintEpoch { gen, .. } => {
+                    admins.contains(by) && {
+                        let ceiling = epoch_gens
+                            .iter()
+                            .filter(|(mh, _)| ancestors.get(h).is_some_and(|anc| anc.contains(*mh)))
+                            .map(|(_, g)| *g)
+                            .max()
+                            .map(|g| g.saturating_add(1))
+                            .unwrap_or(0);
+                        *gen <= ceiling
+                    }
+                }
             };
         entry.authorized = ok;
         audit.push(entry);
@@ -412,11 +441,6 @@ pub fn replay_with_audit(
                 } else {
                     admins.remove(actor);
                 }
-                if grants.contains(&Grant::Admin) || grants.contains(&Grant::Write) {
-                    writers.insert(actor.clone());
-                } else {
-                    writers.remove(actor);
-                }
             }
             AclAction::AddAgent { actor } => {
                 agents_now.insert(actor.clone(), op.by.clone());
@@ -424,14 +448,16 @@ pub fn replay_with_audit(
             AclAction::RemoveMember { actor } => {
                 humans.remove(actor);
                 admins.remove(actor);
-                writers.remove(actor);
                 agents_now.remove(actor);
                 // in-pass sponsor cascade so an orphaned agent cannot author
                 // (nothing to author anyway) nor be counted as standing.
                 agents_now.retain(|_, sponsor| sponsor != actor);
             }
-            // Epoch mints don't touch the member set; recorded in pass 2.
-            AclAction::MintEpoch { .. } => {}
+            // Record the generation for the ancestor bound above; the epoch is
+            // materialized in pass 2. Member set is untouched.
+            AclAction::MintEpoch { gen, .. } => {
+                epoch_gens.insert(h.clone(), *gen);
+            }
         }
     }
 
@@ -473,6 +499,7 @@ pub fn replay_with_audit(
                     gen: *gen,
                     key_commit: *key_commit,
                     members: recipients.clone(),
+                    minted_by: op.by.clone(),
                 });
             }
         }
@@ -1204,5 +1231,111 @@ mod tests {
         );
         // Each race still seated its own winner.
         assert!(st.is_member(f.a(2)) && st.is_member(f.a(3)));
+    }
+
+    #[test]
+    fn only_an_admin_may_mint_a_key_epoch() {
+        // A plain Write member (content authority, NOT membership authority)
+        // cannot mint a key-epoch: re-keying is a membership-authority action, so
+        // a non-admin's mint never authorizes and never enters the epoch set. This
+        // is the fence that stops a departed/rogue writer from re-keying the
+        // workspace to a key it controls.
+        let f = fx(1, &[2]);
+        let add_writer = f.op(
+            1,
+            1,
+            AclAction::AddMember {
+                actor: f.a(2).clone(),
+                grants: vec![Grant::Write], // writer, not admin
+            },
+            vec![],
+        );
+        let writer_mint = f.op(
+            2,
+            2,
+            AclAction::MintEpoch {
+                id: [0xA1; 16],
+                gen: 0,
+                key_commit: [0u8; 32],
+                members: vec![f.a(2).clone()],
+            },
+            vec![add_writer.hash()],
+        );
+        let st = f.replay(&[add_writer.clone(), writer_mint]);
+        assert!(
+            st.epoch(&[0xA1; 16]).is_none(),
+            "a non-admin writer's mint is never authorized"
+        );
+
+        // Control: the founder (admin) mints, and the epoch is authorized.
+        let admin_mint = f.op(
+            1,
+            1,
+            AclAction::MintEpoch {
+                id: [0xB2; 16],
+                gen: 0,
+                key_commit: [0u8; 32],
+                members: vec![f.a(1).clone()],
+            },
+            vec![add_writer.hash()],
+        );
+        let st = f.replay(&[add_writer, admin_mint]);
+        assert!(
+            st.epoch(&[0xB2; 16]).is_some(),
+            "an admin's mint is authorized"
+        );
+    }
+
+    #[test]
+    fn a_mint_cannot_jump_the_generation() {
+        // The generation is bounded to `max(ancestor mint gen) + 1`, so no author
+        // can leap to a huge gen to pin the active tip (or overflow the next
+        // rotation). A gen-0 founding mint, then a child claiming gen 9999, is
+        // rejected; a child claiming the legitimate gen 1 is accepted.
+        let f = fx(1, &[]);
+        let mint0 = f.op(
+            1,
+            1,
+            AclAction::MintEpoch {
+                id: [0x01; 16],
+                gen: 0,
+                key_commit: [0u8; 32],
+                members: vec![f.a(1).clone()],
+            },
+            vec![],
+        );
+        let jump = f.op(
+            1,
+            1,
+            AclAction::MintEpoch {
+                id: [0x02; 16],
+                gen: 9999, // ceiling is 0 + 1 = 1
+                key_commit: [0u8; 32],
+                members: vec![f.a(1).clone()],
+            },
+            vec![mint0.hash()],
+        );
+        let st = f.replay(&[mint0.clone(), jump]);
+        assert!(
+            st.epoch(&[0x02; 16]).is_none(),
+            "a mint that jumps the generation is rejected"
+        );
+
+        let step = f.op(
+            1,
+            1,
+            AclAction::MintEpoch {
+                id: [0x03; 16],
+                gen: 1, // exactly ceiling
+                key_commit: [0u8; 32],
+                members: vec![f.a(1).clone()],
+            },
+            vec![mint0.hash()],
+        );
+        let st = f.replay(&[mint0, step]);
+        assert!(
+            st.epoch(&[0x03; 16]).is_some_and(|e| e.gen == 1),
+            "a mint that increments the generation by one is accepted"
+        );
     }
 }
