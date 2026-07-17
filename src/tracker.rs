@@ -2244,6 +2244,9 @@ impl Tracker {
         // old (de-authorized) admin's — mint a fresh one so the recovered root has
         // a readable, fenced content key.
         self.bootstrap_root_epoch_if_needed()?;
+        // Advance any FROST recovery-elevation ceremony this device is part of as
+        // the peers' round packages arrive.
+        self.dkg_advance()?;
         Ok(())
     }
 
@@ -2845,6 +2848,289 @@ impl Tracker {
             self.persist_membership("recover_bootstrap_epoch")?;
         }
         Ok(())
+    }
+
+    // ---- FROST recovery elevation (solo key → K-of-N DKG group key) ----
+
+    fn dkg_path(&self, session: &[u8; 16], label: &str) -> std::path::PathBuf {
+        self.store.home_path().join("dkg").join(format!(
+            "{}-{label}",
+            data_encoding::HEXLOWER.encode(session)
+        ))
+    }
+    fn dkg_has(&self, session: &[u8; 16], label: &str) -> bool {
+        self.dkg_path(session, label).exists()
+    }
+    fn dkg_read(&self, session: &[u8; 16], label: &str) -> Option<Vec<u8>> {
+        std::fs::read(self.dkg_path(session, label)).ok()
+    }
+    fn dkg_write(&self, session: &[u8; 16], label: &str, bytes: &[u8]) -> Result<()> {
+        use std::io::Write;
+        let dir = self.store.home_path().join("dkg");
+        std::fs::create_dir_all(&dir).context("create dkg dir")?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(self.dkg_path(session, label))
+            .context("open dkg file")?;
+        f.write_all(bytes).context("write dkg file")?;
+        f.sync_all().context("fsync dkg file")?;
+        Ok(())
+    }
+
+    /// Begin elevating the recovery authority to a `k`-of-N FROST group key over
+    /// `cofounders` (their device keys) + this device. Only the holder of the
+    /// current recovery key may elevate (they install the result). Posts the DKG
+    /// proposal and this node's first round, then the ceremony advances on sync.
+    pub fn space_elevate_cmd(
+        &mut self,
+        cofounders: Vec<String>,
+        k: u16,
+    ) -> (Response, Option<DirtySet>) {
+        // Must hold the current recovery key to install the resulting Rotate.
+        let cur = crate::space::replay(
+            &self.genesis,
+            &self.workspace_id,
+            &self.membership.space_events(),
+        );
+        let holds_current = self
+            .read_space_recovery_key()
+            .and_then(|s| crate::space::recovery_commit(&crate::space::recovery_pub_of(&s)))
+            == Some(cur.recovery_commit);
+        if !holds_current {
+            return (
+                Response::err(
+                    "only the holder of the current recovery key can elevate it (run this where space-recovery.key lives)",
+                ),
+                None,
+            );
+        }
+        // Assemble the sorted participant set (co-founders + me).
+        let mut participants: std::collections::BTreeSet<String> = cofounders.into_iter().collect();
+        participants.insert(self.me.as_str().to_string());
+        let participants: Vec<String> = participants.into_iter().collect();
+        let n = participants.len() as u16;
+        if !(1..=n).contains(&k) || n < 2 {
+            return (
+                Response::err("elevation needs ≥2 participants and threshold in 1..=N"),
+                None,
+            );
+        }
+        let session = rand16();
+        let propose = crate::dkg::CeremonyOp::Propose {
+            session,
+            n,
+            k,
+            participants,
+        };
+        let ev = crate::dkg::sign_ceremony(&self.seed, &propose, &self.workspace_id);
+        if let Err(e) = self
+            .membership
+            .add_ceremony_event(&ev)
+            .and_then(|()| self.persist_membership("dkg_propose"))
+        {
+            return (Response::err(format!("{e:#}")), None);
+        }
+        let _ = self.dkg_advance();
+        (
+            Response::Ok {
+                message: Some(format!(
+                    "started {k}-of-{n} recovery elevation — co-founders run `space elevate-advance` until the group key is installed"
+                )),
+            },
+            Some(DirtySet::catalog(CatalogScope::Acl)),
+        )
+    }
+
+    /// Drive every FROST ceremony this device participates in to a fixpoint, based
+    /// on what has synced. Idempotent: posts each round once, and installs the
+    /// group key (via a space `Rotate`) once, by the recovery-key holder. Called
+    /// by `space_elevate_cmd`, an explicit advance, and on import.
+    pub fn dkg_advance(&mut self) -> Result<bool> {
+        let mut any = false;
+        // A ceremony has a bounded number of steps; the guard is a backstop
+        // against any unforeseen non-convergence, never reached in normal flow.
+        let mut guard = 0;
+        while self.dkg_advance_once()? {
+            any = true;
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+        }
+        Ok(any)
+    }
+
+    fn dkg_advance_once(&mut self) -> Result<bool> {
+        let events = self.membership.ceremony_events();
+        // Sessions I'm proposed into.
+        let sessions: Vec<[u8; 16]> = events
+            .iter()
+            .filter_map(|ev| postcard::from_bytes::<crate::dkg::CeremonyOp>(&ev.op).ok())
+            .filter_map(|op| match op {
+                crate::dkg::CeremonyOp::Propose {
+                    session,
+                    participants,
+                    ..
+                } if participants.contains(&self.me.as_str().to_string()) => Some(session),
+                _ => None,
+            })
+            .collect();
+        let mut progressed = false;
+        for session in sessions {
+            progressed |= self.dkg_advance_session(&session, &events)?;
+        }
+        Ok(progressed)
+    }
+
+    fn dkg_advance_session(
+        &mut self,
+        session: &[u8; 16],
+        events: &[crate::space::SignedSpaceEvent],
+    ) -> Result<bool> {
+        let parsed = crate::dkg::parse_ceremony(events, &self.workspace_id, session);
+        // Config from the Propose.
+        let Some((n, k, participants)) = parsed.iter().find_map(|(_, op)| match op {
+            crate::dkg::CeremonyOp::Propose {
+                n, k, participants, ..
+            } => Some((*n, *k, participants.clone())),
+            _ => None,
+        }) else {
+            return Ok(false);
+        };
+        let index_of = |dev: &str| {
+            participants
+                .iter()
+                .position(|p| p == dev)
+                .map(|i| i as u16 + 1)
+        };
+        let Some(my_index) = index_of(self.me.as_str()) else {
+            return Ok(false);
+        };
+
+        // Round-1 packages posted so far, keyed by participant index.
+        let mut round1: crate::dkg::Packages = std::collections::BTreeMap::new();
+        for (author, op) in &parsed {
+            if let crate::dkg::CeremonyOp::Round1 { package, .. } = op {
+                if let Some(i) = index_of(author.as_str()) {
+                    round1.entry(i).or_insert_with(|| package.clone());
+                }
+            }
+        }
+        let i_posted_round1 = round1.contains_key(&my_index);
+
+        // Step 1 — post my round-1.
+        if !i_posted_round1 {
+            let (s1, pkg) = crate::dkg::dkg_round1(my_index, n, k)?;
+            self.dkg_write(session, "r1", &s1)?;
+            self.post_ceremony(crate::dkg::CeremonyOp::Round1 {
+                session: *session,
+                package: pkg,
+            })?;
+            return Ok(true);
+        }
+
+        // Step 2 — once all N round-1s are in, post my (sealed) round-2 shares.
+        let i_posted_round2 = parsed
+            .iter()
+            .any(|(a, op)| a == &self.me && matches!(op, crate::dkg::CeremonyOp::Round2 { .. }));
+        if round1.len() == n as usize && !i_posted_round2 && self.dkg_has(session, "r1") {
+            let others: crate::dkg::Packages = round1
+                .iter()
+                .filter(|(i, _)| **i != my_index)
+                .map(|(i, v)| (*i, v.clone()))
+                .collect();
+            let (s2, outgoing) =
+                crate::dkg::dkg_round2(&self.dkg_read(session, "r1").unwrap(), &others)?;
+            self.dkg_write(session, "r2", &s2)?;
+            for (recipient_index, pkg) in outgoing {
+                let recipient = &participants[recipient_index as usize - 1];
+                let recipient_uid = UserId::from_key_string(recipient.clone());
+                let Some(sealed) = crypto::seal_to(&recipient_uid, &pkg) else {
+                    continue;
+                };
+                self.post_ceremony(crate::dkg::CeremonyOp::Round2 {
+                    session: *session,
+                    to: recipient.clone(),
+                    sealed,
+                })?;
+            }
+            return Ok(true);
+        }
+
+        // Step 3 — once all round-2 shares sent TO me are in, finalize my key share.
+        let mut round2_to_me: crate::dkg::Packages = std::collections::BTreeMap::new();
+        for (author, op) in &parsed {
+            if let crate::dkg::CeremonyOp::Round2 { to, sealed, .. } = op {
+                if to == self.me.as_str() {
+                    if let (Some(sender_i), Some(pkg)) = (
+                        index_of(author.as_str()),
+                        crypto::open_sealed(&self.seed, &self.me, sealed),
+                    ) {
+                        round2_to_me.entry(sender_i).or_insert(pkg);
+                    }
+                }
+            }
+        }
+        if round2_to_me.len() == n as usize - 1
+            && self.dkg_has(session, "r2")
+            && !self.dkg_has(session, "share")
+        {
+            let others: crate::dkg::Packages = round1
+                .iter()
+                .filter(|(i, _)| **i != my_index)
+                .map(|(i, v)| (*i, v.clone()))
+                .collect();
+            let (share, pkp, group_key) = crate::dkg::dkg_round3(
+                &self.dkg_read(session, "r2").unwrap(),
+                &others,
+                &round2_to_me,
+            )?;
+            self.dkg_write(session, "share", &share)?;
+            self.dkg_write(session, "pkp", &pkp)?;
+            self.dkg_write(session, "group", group_key.as_str().as_bytes())?;
+            return Ok(true);
+        }
+
+        // Step 4 — the recovery-key holder installs the group key with a Rotate.
+        if self.dkg_has(session, "group") {
+            let group_key = String::from_utf8(self.dkg_read(session, "group").unwrap())
+                .ok()
+                .map(UserId::from_key_string);
+            let cur = crate::space::replay(
+                &self.genesis,
+                &self.workspace_id,
+                &self.membership.space_events(),
+            );
+            let already = group_key.as_ref().and_then(crate::space::recovery_commit)
+                == Some(cur.recovery_commit);
+            if let (Some(group_key), Some(secret)) = (group_key, self.read_space_recovery_key()) {
+                let hold = crate::space::recovery_commit(&crate::space::recovery_pub_of(&secret))
+                    == Some(cur.recovery_commit);
+                if hold && !already {
+                    let op = crate::space::SpaceOp::Rotate {
+                        new_recovery_key: group_key,
+                        gen: cur.gen + 1,
+                    };
+                    let ev = crate::space::sign_op(&secret, &op, vec![], &self.workspace_id);
+                    self.membership.add_space_event(&ev)?;
+                    self.persist_membership("dkg_install")?;
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn post_ceremony(&mut self, op: crate::dkg::CeremonyOp) -> Result<()> {
+        let ev = crate::dkg::sign_ceremony(&self.seed, &op, &self.workspace_id);
+        self.membership.add_ceremony_event(&ev)?;
+        self.persist_membership("dkg_round")
     }
 
     /// Resolve a `<who>` ref to a known actor: an `act_` id directly, or a
@@ -4933,6 +5219,75 @@ mod tests {
         assert!(
             a.tracker.acl_state().is_admin(&c_actor) && !a.tracker.acl_state().is_admin(&a_actor),
             "every replica converges on the recovered root"
+        );
+    }
+
+    #[test]
+    fn elevate_solo_recovery_to_a_2_of_2_dkg_group_key() {
+        // W5 elevation (the "airplane" story): A founds solo with a bootstrap
+        // recovery key, later adds co-founder B and elevates the recovery authority
+        // to a 2-of-2 FROST group key via a DKG that rides the synced bulletin
+        // board — no dealer, no secret ever leaves its holder.
+        let mut a = new_node(); // founder A, holds solo space-recovery.key
+        with_project(&mut a.tracker);
+        let a_ws = a.tracker.workspace_str();
+        let commit0 = crate::space::replay(
+            &a.tracker.genesis,
+            &a.tracker.workspace_id,
+            &a.tracker.membership.space_events(),
+        )
+        .recovery_commit;
+
+        // Co-founder B joins and is admitted; both sync.
+        let b_seed = [81u8; 32];
+        let b_user = user_from_seed(b_seed);
+        let mut b = new_joiner_node_as(
+            b_user.clone(),
+            b_seed,
+            &a_ws,
+            &a.tracker.founding_proof().unwrap(),
+        );
+        let b_incept = b.tracker.self_inception().unwrap();
+        a.tracker
+            .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
+        sync_all(&mut a.tracker, &mut b.tracker);
+
+        // A elevates to a 2-of-2 over {A, B}.
+        let (resp, _) = a
+            .tracker
+            .space_elevate_cmd(vec![b_user.as_str().to_string()], 2);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+
+        // Drive the DKG to a fixpoint via sync round-trips (each import advances).
+        for _ in 0..6 {
+            sync_all(&mut a.tracker, &mut b.tracker);
+            sync_all(&mut b.tracker, &mut a.tracker);
+        }
+
+        // The recovery authority is now the DKG group key, not A's solo key.
+        let after = crate::space::replay(
+            &a.tracker.genesis,
+            &a.tracker.workspace_id,
+            &a.tracker.membership.space_events(),
+        );
+        assert!(!after.recovered); // no re-root happened, only a Rotate
+        assert_ne!(
+            after.recovery_commit, commit0,
+            "the recovery authority rotated to the group key"
+        );
+        // Both replicas converge on the same new authority.
+        let b_after = crate::space::replay(
+            &b.tracker.genesis,
+            &b.tracker.workspace_id,
+            &b.tracker.membership.space_events(),
+        );
+        assert_eq!(after.recovery_commit, b_after.recovery_commit);
+
+        // A's solo key is no longer the authority — solo recovery is refused.
+        let (resp, _) = a.tracker.space_recover_cmd();
+        assert!(
+            matches!(resp, Response::Error { .. }),
+            "the retired solo key cannot recover the elevated space: {resp:?}"
         );
     }
 

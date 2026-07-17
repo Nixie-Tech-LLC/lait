@@ -28,12 +28,13 @@ const K_WORKSPACE: &str = "workspaceId";
 const C_ACL: &str = "acl";
 const C_ACTORS: &str = "actors"; // the lait/actor/1 key-event log (flat, grow-only)
 const C_SPACE: &str = "space"; // the lait/space/1 event log (break-glass recovery, grow-only)
-                               // Per-device sealed key envelopes, keyed by content-addressed epoch id. The
-                               // epoch's *authorization* (gen, recipient set, key commitment) is NOT here — it
-                               // rides a signed `AclAction::MintEpoch` on the ACL DAG (C_ACL), so a replica
-                               // adopts a key only when a valid writer-signed mint authorizes its epoch. These
-                               // envelopes are unsigned ciphertext, but each is bound to its mint by
-                               // `blake3(key) == mint.key_commit`, so a forged envelope is inert.
+const C_CEREMONY: &str = "ceremony"; // FROST DKG/signing round packages (grow-only bulletin board)
+                                     // Per-device sealed key envelopes, keyed by content-addressed epoch id. The
+                                     // epoch's *authorization* (gen, recipient set, key commitment) is NOT here — it
+                                     // rides a signed `AclAction::MintEpoch` on the ACL DAG (C_ACL), so a replica
+                                     // adopts a key only when a valid writer-signed mint authorizes its epoch. These
+                                     // envelopes are unsigned ciphertext, but each is bound to its mint by
+                                     // `blake3(key) == mint.key_commit`, so a forged envelope is inert.
 const C_KEYS: &str = "keys"; // epoch_id(hex) -> Map<device UserId, sealed bytes>
 
 fn epoch_hex(id: &[u8; 16]) -> String {
@@ -54,6 +55,7 @@ impl MembershipDoc {
         root.insert_container(C_ACL, LoroList::new())?;
         root.insert_container(C_ACTORS, LoroList::new())?;
         root.insert_container(C_SPACE, LoroList::new())?;
+        root.insert_container(C_CEREMONY, LoroList::new())?;
         root.insert_container(C_KEYS, LoroMap::new())?;
         op::commit_with(&doc, &OpCtx::authority("init", founder));
         Ok(Self { doc })
@@ -247,6 +249,47 @@ impl MembershipDoc {
             .ok_or_else(|| anyhow!("space container missing — sync the workspace first"))?;
         list.insert(list.len(), bytes.as_slice())?;
         Ok(())
+    }
+
+    // ---- FROST ceremony bulletin board (grow-only, ephemeral coordination) ----
+
+    fn ceremony_list(&self) -> Option<LoroList> {
+        match self.root().get(C_CEREMONY) {
+            Some(ValueOrContainer::Container(Container::List(l))) => Some(l),
+            _ => None,
+        }
+    }
+
+    /// Append a signed ceremony contribution (idempotent by hash). Round packages
+    /// for a FROST DKG/signing session; the container arrives by sync so a
+    /// participant appends rather than minting a conflicting one.
+    pub fn add_ceremony_event(&self, ev: &crate::space::SignedSpaceEvent) -> Result<()> {
+        let hash = ev.hash();
+        if self.ceremony_events().iter().any(|e| e.hash() == hash) {
+            return Ok(());
+        }
+        let bytes = postcard::to_stdvec(ev).map_err(|e| anyhow!("encode ceremony event: {e}"))?;
+        let list = self
+            .ceremony_list()
+            .ok_or_else(|| anyhow!("ceremony container missing — sync the workspace first"))?;
+        list.insert(list.len(), bytes.as_slice())?;
+        Ok(())
+    }
+
+    /// All ceremony contributions currently held.
+    pub fn ceremony_events(&self) -> Vec<crate::space::SignedSpaceEvent> {
+        let Some(list) = self.ceremony_list() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for i in 0..list.len() {
+            if let Some(ValueOrContainer::Value(loro::LoroValue::Binary(b))) = list.get(i) {
+                if let Ok(ev) = postcard::from_bytes::<crate::space::SignedSpaceEvent>(&b) {
+                    out.push(ev);
+                }
+            }
+        }
+        out
     }
 
     /// All space-plane events currently held.

@@ -17,8 +17,76 @@ use std::collections::BTreeMap;
 
 use anyhow::{anyhow, Result};
 use frost_ed25519 as frost;
+use serde::{Deserialize, Serialize};
 
-use crate::ids::UserId;
+use crate::ids::{UserId, WorkspaceId};
+use crate::sigdag::{self, SignedNode};
+
+/// Signing domain for FROST ceremony contributions (bulletin-board packages).
+pub const CEREMONY_DOMAIN: &[u8] = b"lait/space/1/ceremony";
+
+/// One participant's contribution to a FROST ceremony, posted to the shared
+/// bulletin board and signed by the contributing **device** (the sigdag author).
+/// A session is a DKG (produce a recovery group key) followed by one `Rotate`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CeremonyOp {
+    /// Open a DKG session: the ordered participant devices + threshold. Authored
+    /// by the initiator, who must hold the current recovery key to install the
+    /// result. `participants` are device `UserId` strings, sorted (index = pos+1).
+    Propose {
+        session: [u8; 16],
+        n: u16,
+        k: u16,
+        participants: Vec<String>,
+    },
+    /// A broadcast DKG round-1 package.
+    Round1 { session: [u8; 16], package: Vec<u8> },
+    /// A DKG round-2 secret share, sealed to recipient device `to`.
+    Round2 {
+        session: [u8; 16],
+        to: String,
+        sealed: Vec<u8>,
+    },
+}
+
+impl CeremonyOp {
+    pub fn session(&self) -> [u8; 16] {
+        match self {
+            CeremonyOp::Propose { session, .. }
+            | CeremonyOp::Round1 { session, .. }
+            | CeremonyOp::Round2 { session, .. } => *session,
+        }
+    }
+}
+
+/// Sign a [`CeremonyOp`] with the contributing device's seed.
+pub fn sign_ceremony(seed: &[u8; 32], op: &CeremonyOp, ws: &WorkspaceId) -> SignedNode {
+    sigdag::sign_node(
+        CEREMONY_DOMAIN,
+        seed,
+        postcard::to_stdvec(op).expect("encode ceremony op"),
+        vec![],
+        ws.as_str(),
+    )
+}
+
+/// Signature-verified `(author_device, op)` pairs for one session.
+pub fn parse_ceremony(
+    events: &[SignedNode],
+    ws: &WorkspaceId,
+    session: &[u8; 16],
+) -> Vec<(UserId, CeremonyOp)> {
+    events
+        .iter()
+        .filter_map(|ev| {
+            if !ev.verify_sig(CEREMONY_DOMAIN, ws.as_str()) {
+                return None;
+            }
+            let op = postcard::from_bytes::<CeremonyOp>(&ev.op).ok()?;
+            (op.session() == *session).then(|| (ev.author.clone(), op))
+        })
+        .collect()
+}
 
 /// Serialized packages keyed by 1-based participant index — how a round's
 /// contributions travel on the transport.
@@ -214,9 +282,12 @@ pub fn aggregate(
 mod tests {
     use super::*;
 
+    /// Per-participant `(key_share, public_key_package)`, keyed by index.
+    type Holders = BTreeMap<u16, (Vec<u8>, Vec<u8>)>;
+
     /// Run a full dealer-free `k`-of-`n` DKG through the byte API and return each
     /// participant's `(key_share, public_key_package)` plus the group key.
-    fn run_dkg(n: u16, k: u16) -> (BTreeMap<u16, (Vec<u8>, Vec<u8>)>, UserId) {
+    fn run_dkg(n: u16, k: u16) -> (Holders, UserId) {
         let ids: Vec<u16> = (1..=n).collect();
         // round 1
         let mut secret1 = BTreeMap::new();
