@@ -743,7 +743,9 @@ impl Tracker {
             Request::Recover => Ok(self.recover()),
             Request::SpaceRecover => Ok(self.space_recover_cmd()),
             Request::SpaceElevate { cofounders, k } => Ok(self.space_elevate_cmd(cofounders, k)),
-            Request::SpaceRecoverApprove { session } => Ok(self.space_recover_approve_cmd(session)),
+            Request::SpaceRecoverApprove { session, expect } => {
+                Ok(self.space_recover_approve_cmd(session, expect))
+            }
             Request::Members => Ok((self.members_response(), None)),
             Request::MemberLog => Ok((self.member_log_response(), None)),
             other => Err(anyhow!("not a tracker request: {other:?}")),
@@ -2936,6 +2938,7 @@ impl Tracker {
     pub fn space_recover_approve_cmd(
         &mut self,
         session_hex: String,
+        expect: Vec<String>,
     ) -> (Response, Option<DirtySet>) {
         let Some(session) = data_encoding::HEXLOWER_PERMISSIVE
             .decode(session_hex.trim().as_bytes())
@@ -2953,6 +2956,31 @@ impl Tracker {
                 None,
             );
         }
+        // The holder MUST state which actor(s) they expect this recovery to re-root
+        // to, so consent binds to the roots — not to an opaque session id whose
+        // request could re-root anywhere. Resolve them up front.
+        if expect.is_empty() {
+            return (
+                Response::err(
+                    "name the actor(s) you expect this recovery to re-root to (`--to <actor>`); refusing to co-sign a session blind",
+                ),
+                None,
+            );
+        }
+        let mut expected: Vec<ActorId> = Vec::with_capacity(expect.len());
+        for who in &expect {
+            let Some(a) = self.resolve_actor(who) else {
+                return (
+                    Response::not_found(format!(
+                        "no known actor matches '{who}' — sync the recovering device's identity first"
+                    )),
+                    None,
+                );
+            };
+            expected.push(a);
+        }
+        expected.sort();
+        expected.dedup();
         // The exact op the request asks the group to sign.
         let Some(op_bytes) = self
             .membership
@@ -2971,7 +2999,8 @@ impl Tracker {
                 None,
             );
         };
-        // It must be a Recover for the next generation — refuse to co-sign anything else.
+        // It must be a Recover for the next generation re-rooting to EXACTLY the
+        // actor set the holder named — refuse to co-sign anything else.
         let cur = crate::space::replay(
             &self.genesis,
             &self.workspace_id,
@@ -2992,6 +3021,22 @@ impl Tracker {
                 );
             }
         };
+        let mut got = target.clone();
+        got.sort();
+        got.dedup();
+        if got != expected {
+            let roots = target
+                .iter()
+                .map(|a| a.short())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return (
+                Response::err(format!(
+                    "that request re-roots to {roots}, not the actor(s) you named — refusing to co-sign"
+                )),
+                None,
+            );
+        }
         if let Err(e) = self.dkg_write(&session, "intent", &op_bytes) {
             return (Response::err(format!("{e:#}")), None);
         }
@@ -5791,8 +5836,19 @@ mod tests {
             "passive sync must not auto-co-sign a recovery no other holder consented to"
         );
 
+        // A must name the expected target: approving with the WRONG target is
+        // refused before any share is contributed (consent binds to the roots).
+        let (bad, _) = a
+            .tracker
+            .space_recover_approve_cmd(session_hex.clone(), vec![a_actor.as_str().to_string()]);
+        assert!(
+            matches!(bad, Response::Error { .. }),
+            "approving a mismatched target must be refused: {bad:?}"
+        );
         // A explicitly co-signs, having verified out-of-band that it re-roots to B.
-        let (resp, _) = a.tracker.space_recover_approve_cmd(session_hex);
+        let (resp, _) = a
+            .tracker
+            .space_recover_approve_cmd(session_hex, vec![b_actor.as_str().to_string()]);
         assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
 
         // Now the threshold consents; the group signature aggregates and installs.

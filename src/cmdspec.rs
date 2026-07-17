@@ -1158,15 +1158,23 @@ pub fn specs() -> Vec<Spec> {
         Spec::req(
             "recover-approve",
             "Co-sign a pending break-glass recovery as a holder of the group \
-             recovery key. Verify out-of-band that the session re-roots to the \
-             agreed party first — this contributes your threshold share to it.",
-            vec![A::pos(
-                "session",
-                "The recovery session id (from the initiator's `recover-workspace`).",
-            )],
+             recovery key. You must name who you expect it to re-root to (`--to`); \
+             a request that re-roots elsewhere is refused before your share is used.",
+            vec![
+                A::pos(
+                    "session",
+                    "The recovery session id (from the initiator's `recover-workspace`).",
+                ),
+                A::multi(
+                    "to",
+                    "The actor id you expect the workspace to re-root to (repeatable).",
+                )
+                .required(),
+            ],
             |m| {
                 Ok(Request::SpaceRecoverApprove {
                     session: req_str(m, "session"),
+                    expect: multi(m, "to"),
                 })
             },
         ),

@@ -317,6 +317,10 @@ pub enum Request {
     /// checked out-of-band that `session` re-roots to the agreed party.
     SpaceRecoverApprove {
         session: String,
+        /// The actor(s) the holder expects this recovery to re-root to — consent
+        /// binds to the roots, so an injected request that re-roots elsewhere is
+        /// refused before any share is contributed.
+        expect: Vec<String>,
     },
     /// Recover our actor with the offline recovery key: reset the device set to
     /// this device (identity is restored; content-key access is re-sealed lazily
