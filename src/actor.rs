@@ -275,7 +275,12 @@ pub fn consent_verify(workspace: &str, binding: &DeviceBinding, ctx: &ConsentCtx
 }
 
 fn hex_key(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
+    // Reject any non-hex byte BEFORE slicing: a `UserId` is a bare validated-
+    // nowhere String, so `s` is attacker-controlled UTF-8. Without this guard a
+    // 64-*byte* string containing a multibyte char slices inside a char boundary
+    // and panics — and because replay is a pure function every replica runs over
+    // the synced event set, one poison event would crash the whole workspace.
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let mut out = [0u8; 32];
@@ -880,6 +885,42 @@ mod tests {
             0,
             "a consent bound to the {{1,2}} core must not verify in a {{3,2}} inception"
         );
+    }
+
+    #[test]
+    fn malformed_device_key_does_not_panic() {
+        // Regression: a 64-*byte* non-ASCII device string (3-byte '€' + 61 ASCII)
+        // must not slice inside a char boundary and panic — a poison event would
+        // otherwise crash every replica's replay permanently.
+        let w = ws();
+        let poison = DeviceBinding {
+            device: UserId::from_key_string(format!("\u{20AC}{}", "a".repeat(61))),
+            nonce: [1u8; 16],
+            consent: vec![0u8; 64],
+        };
+        assert_eq!(poison.device.as_str().len(), 64);
+        let nonce = [3u8; 16];
+        let keys = vec![device(1), poison.device.clone()];
+        let mine = consent_sign(
+            &seed(1),
+            w.as_str(),
+            [2u8; 16],
+            &ConsentCtx::Incept {
+                incept_nonce: &nonce,
+                devices: &keys,
+                recovery_commit: &None,
+            },
+        );
+        let op = ActorOp::Incept {
+            workspace: w.as_str().to_string(),
+            nonce,
+            devices: vec![mine, poison],
+            recovery_commit: None,
+        };
+        let ev = sign_event(&seed(1), &op, vec![], &w);
+        // Must not panic; the poison binding fails hex parse → consent → void.
+        let plane = replay(&w, &[ev]);
+        assert_eq!(plane.actors().count(), 0);
     }
 
     #[test]

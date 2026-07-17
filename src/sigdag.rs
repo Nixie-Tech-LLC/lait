@@ -179,7 +179,10 @@ pub fn topo_order(nodes: &std::collections::HashMap<String, &SignedNode>) -> Vec
 }
 
 fn hex32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
+    // Reject non-hex bytes before slicing: `author` is an unvalidated String on
+    // an attacker-supplied node, and a 64-byte non-ASCII value would panic on a
+    // char-boundary slice — crashing `verify_sig` on every replica that syncs it.
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let mut out = [0u8; 32];

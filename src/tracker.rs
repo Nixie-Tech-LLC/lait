@@ -309,9 +309,13 @@ pub fn join_workspace_store(store: &Store, workspace: &str, founder: &str) -> Re
     }
     let ws_id = WorkspaceId::parse(workspace)
         .ok_or_else(|| anyhow!("invalid workspace id in ticket: {workspace}"))?;
-    let founding_actors = crate::ids::ActorId::parse(founder)
-        .map(|a| vec![a])
-        .unwrap_or_default();
+    // Fail loud on a missing/garbled founder anchor rather than minting a genesis
+    // with no admin (which would silently brick the join — no actor could ever
+    // authorize a membership op).
+    let founder_actor = crate::ids::ActorId::parse(founder).ok_or_else(|| {
+        anyhow!("ticket has no valid founder actor — it may be truncated or from an older lait; ask for a fresh one")
+    })?;
+    let founding_actors = vec![founder_actor];
     let genesis = Genesis {
         workspace_id: ws_id.clone(),
         founding_actors,
@@ -2499,21 +2503,19 @@ impl Tracker {
         Response::Members { members }
     }
 
-    fn agent_add_cmd(&mut self, incept: String) -> (Response, Option<DirtySet>) {
-        let bytes = match data_encoding::HEXLOWER_PERMISSIVE.decode(incept.as_bytes()) {
-            Ok(b) => b,
-            Err(_) => {
-                return (
-                    Response::err("agent inception must be hex-encoded (from `lait agent new`)"),
-                    None,
-                )
-            }
+    fn agent_add_cmd(&mut self, who: String) -> (Response, Option<DirtySet>) {
+        // `who` is the agent's device key (or actor id). The agent self-incepts
+        // when it joins, so by sponsor time its actor is known (synced, or
+        // imported from the join request by the node layer).
+        let Some(actor) = self.resolve_actor(&who) else {
+            return (
+                Response::not_found(format!(
+                    "no known actor for '{who}' — start the agent so it joins the workspace, then sponsor it"
+                )),
+                None,
+            );
         };
-        let ev: actor::SignedEvent = match postcard::from_bytes(&bytes) {
-            Ok(ev) => ev,
-            Err(_) => return (Response::err("could not decode agent inception"), None),
-        };
-        self.agent_add(&ev)
+        self.agent_add_by_actor(&actor)
     }
 
     /// The membership audit log — the signed ACL DAG replayed into a rendered,
@@ -2549,30 +2551,50 @@ impl Tracker {
         Response::MemberLog { entries }
     }
 
-    /// Sponsor an agent (contract §3.4). An agent is a **degenerate actor** (a
-    /// single-device identity, no recovery) that self-incepted in its own home;
-    /// the sponsor imports that inception and signs `AddAgent`. Any human member
-    /// may sponsor; the agent is sealed the workspace key (so it can read/write
-    /// content) but holds no membership or content authority, and its standing
-    /// dies with the sponsor. Delegation, not elevation.
+    /// Sponsor an agent by importing its inception, then delegating to
+    /// [`agent_add_by_actor`]. An agent is a **degenerate actor** (single-device,
+    /// no recovery) that self-incepted in its own home.
+    ///
+    /// [`agent_add_by_actor`]: Self::agent_add_by_actor
     pub fn agent_add(&mut self, agent_incept: &actor::SignedEvent) -> (Response, Option<DirtySet>) {
-        let acl = self.acl_state();
-        let sponsor = match self.my_actor() {
-            Some(me) if acl.is_human_member(&me) => me,
-            _ => {
-                return (
-                    Response::err("only a human member can sponsor an agent"),
-                    None,
-                )
-            }
-        };
         let agent_actor = ActorId::from_incept_hash(&agent_incept.hash());
         let mut candidate = self.membership.actor_events();
         candidate.push(agent_incept.clone());
         if !actor::replay(&self.workspace_id, &candidate).exists(&agent_actor) {
             return (Response::err("invalid agent inception"), None);
         }
-        if acl.is_member(&agent_actor) {
+        if let Err(e) = self.import_inception(agent_incept) {
+            return (Response::err(format!("{e:#}")), None);
+        }
+        self.agent_add_by_actor(&agent_actor)
+    }
+
+    /// Sponsor an already-known agent actor (contract §3.4): sign `AddAgent` and
+    /// seal it the workspace key. Any human member may sponsor; the agent holds
+    /// no membership or content authority, and its standing dies with the
+    /// sponsor. The agent's inception must already be present (it self-incepts
+    /// on join). Delegation, not elevation.
+    pub fn agent_add_by_actor(&mut self, agent_actor: &ActorId) -> (Response, Option<DirtySet>) {
+        let acl = self.acl_state();
+        match self.my_actor() {
+            Some(me) if acl.is_human_member(&me) => {}
+            _ => {
+                return (
+                    Response::err("only a human member can sponsor an agent"),
+                    None,
+                )
+            }
+        }
+        if !self.actor_plane().exists(agent_actor) {
+            return (
+                Response::err(format!(
+                    "unknown agent {} — start it so its identity joins first",
+                    agent_actor.short()
+                )),
+                None,
+            );
+        }
+        if acl.is_member(agent_actor) {
             return (
                 Response::err(format!(
                     "{} is already a workspace principal",
@@ -2583,17 +2605,14 @@ impl Tracker {
         }
         // The op is authored as the sponsor's actor (its by/asof), so the
         // AddAgent's sponsor = sponsor actor by construction.
-        let _ = sponsor;
         let op = match self.author_acl(AclAction::AddAgent {
             actor: agent_actor.clone(),
         }) {
             Ok(op) => op,
             Err(e) => return (Response::err(format!("{e:#}")), None),
         };
-        let incept = agent_incept.clone();
         let target = agent_actor.clone();
         if let Err(e) = self.member_apply(op, "agent_add", |t| {
-            t.membership.add_actor_event(&incept)?;
             Self::seal_epochs_to_actor(t, &target)
         }) {
             return (Response::err(format!("{e:#}")), None);

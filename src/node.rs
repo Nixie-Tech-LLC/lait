@@ -452,6 +452,11 @@ pub struct Node {
     doorbell_notify: Arc<Notify>,
     /// Peers we currently have an in-flight sync pull to (dedupes announce storms).
     syncing: Arc<Mutex<HashSet<EndpointId>>>,
+    /// Ephemeral join-request actor inceptions, keyed by the requesting device.
+    /// Bounded and NEVER persisted here — an inception only enters the synced
+    /// membership doc when an admin actually admits (redeem/approve), so an
+    /// unauthenticated peer cannot grow the shared container (amplification DoS).
+    pending_incepts: Arc<Mutex<HashMap<UserId, crate::actor::SignedEvent>>>,
     /// This node's home dir — used to persist the bootstrap peer set (DUR-1).
     home: PathBuf,
 }
@@ -641,11 +646,17 @@ impl Node {
                     format!("{display} joined the room"),
                 );
                 self.ring_presence_doorbell();
-                // Make the joiner's actor identity locally known so a manual
-                // `member add` can resolve it (validated + idempotent; a forged
-                // inception is ignored).
+                // Stash the joiner's inception EPHEMERALLY (bounded, never synced)
+                // so a manual `member add` can admit it later. It only enters the
+                // shared membership doc when an admin admits — so an
+                // unauthenticated peer cannot grow the container.
                 if let Some(incept) = &incept {
-                    let _ = self.tracker.lock().unwrap().import_inception(incept);
+                    const MAX_PENDING_INCEPTS: usize = 256;
+                    let dev = UserId::from_key_string(from.to_string());
+                    let mut pend = self.pending_incepts.lock().unwrap();
+                    if pend.contains_key(&dev) || pend.len() < MAX_PENDING_INCEPTS {
+                        pend.insert(dev, incept.clone());
+                    }
                 }
                 // Pattern A: if the joiner presented a valid pre-authorization and
                 // we're an admin who can seal, admit them now — no manual approve.
@@ -1314,7 +1325,6 @@ impl Node {
             | Request::LabelList
             | Request::Activity { .. }
             | Request::MemberRemove { .. }
-            | Request::AgentAdd { .. }
             | Request::MemberLog
             | Request::KeyRotate => {
                 let (resp, changed) = self.dispatch_tracker(req);
@@ -1334,6 +1344,15 @@ impl Node {
                 admin,
                 as_name,
             } => {
+                // If this device's inception was stashed from a join request,
+                // make it known now — admin-gated persistence, only on this
+                // explicit approve action (not on the raw request).
+                if let Some(dev) = UserId::parse(&who) {
+                    let pending = self.pending_incepts.lock().unwrap().get(&dev).cloned();
+                    if let Some(incept) = pending {
+                        let _ = self.tracker.lock().unwrap().import_inception(&incept);
+                    }
+                }
                 let (resp, changed) = self.dispatch_tracker(Request::MemberAdd {
                     who: who.clone(),
                     admin,
@@ -1343,6 +1362,23 @@ impl Node {
                     if let Some(name) = as_name.as_deref() {
                         upsert_alias(&self.home, &who, name.trim());
                     }
+                    let me = self.clone();
+                    tokio::spawn(async move { me.broadcast_announce().await.ok() });
+                }
+                Ok(resp)
+            }
+
+            // Sponsor an agent: import its stashed inception (from the agent's
+            // join) so the tracker can resolve its actor, then dispatch.
+            Request::AgentAdd { key } => {
+                if let Some(dev) = UserId::parse(&key) {
+                    let pending = self.pending_incepts.lock().unwrap().get(&dev).cloned();
+                    if let Some(incept) = pending {
+                        let _ = self.tracker.lock().unwrap().import_inception(&incept);
+                    }
+                }
+                let (resp, changed) = self.dispatch_tracker(Request::AgentAdd { key });
+                if changed {
                     let me = self.clone();
                     tokio::spawn(async move { me.broadcast_announce().await.ok() });
                 }
@@ -1429,6 +1465,12 @@ impl Node {
                 match resolve_user_dir(who.trim(), &self.my_userid(), &dir) {
                     UserResolution::One(u) => {
                         let key = u.as_str().to_string();
+                        // Import the joiner's stashed inception (from its join
+                        // request) so the tracker can resolve its actor — admin-
+                        // gated persistence, only on this explicit approve.
+                        if let Some(incept) = self.pending_incepts.lock().unwrap().get(&u).cloned() {
+                            let _ = self.tracker.lock().unwrap().import_inception(&incept);
+                        }
                         let (resp, changed) = self.dispatch_tracker(Request::MemberAdd {
                             who: key.clone(),
                             admin: false,
@@ -1560,13 +1602,16 @@ impl Node {
                         InviteGrant::mint(workspace.clone(), now_secs(), ttl_secs, !reusable);
                     SignedInvite::sign(&self.secret_key, &grant).ok()
                 };
-                let founder_actor = self
-                    .tracker
-                    .lock()
-                    .unwrap()
-                    .my_actor()
-                    .map(|a| a.to_string())
-                    .unwrap_or_default();
+                // Refuse to mint a ticket with no founder anchor — a joiner
+                // rooted on an empty founder actor can never resolve membership.
+                let founder_actor = match self.tracker.lock().unwrap().my_actor() {
+                    Some(a) => a.to_string(),
+                    None => {
+                        return Ok(Response::err(
+                            "this node has no actor identity yet — cannot mint an invite",
+                        ))
+                    }
+                };
                 let ticket = WorkspaceTicket {
                     workspace,
                     name,
@@ -2026,6 +2071,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         doorbell: Arc::new(Mutex::new(DoorbellRing::new(now_secs()))),
         doorbell_notify: Arc::new(Notify::new()),
         syncing: Arc::new(Mutex::new(HashSet::new())),
+        pending_incepts: Arc::new(Mutex::new(HashMap::new())),
         home: home.clone(),
     });
 
