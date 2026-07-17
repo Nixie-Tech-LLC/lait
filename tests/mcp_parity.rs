@@ -73,8 +73,8 @@ fn response_dtos_round_trip() {
         priority: Priority::High,
         assignee_summary: "you +1".into(),
         assignees: vec![
-            lait::ids::UserId::from_key_string("a".repeat(64)),
-            lait::ids::UserId::from_key_string("b".repeat(64)),
+            lait::ids::ActorId::from_incept_hash(&"a".repeat(64)),
+            lait::ids::ActorId::from_incept_hash(&"b".repeat(64)),
         ],
         tombstone: false,
         provisional: false,
@@ -119,7 +119,7 @@ fn response_dtos_round_trip() {
             labels: vec![],
             label_names: vec!["bug".into()],
             comments: vec![],
-            created_by: lait::ids::UserId::from_key_string("a".repeat(64)),
+            created_by: lait::ids::ActorId::from_incept_hash(&"a".repeat(64)),
             created_at: 1000,
             provisional: false,
         })),
@@ -176,7 +176,7 @@ fn issue_response_status_field_survives_the_kind_tag() {
         labels: vec![],
         label_names: vec![],
         comments: vec![],
-        created_by: lait::ids::UserId::from_key_string("a".repeat(64)),
+        created_by: lait::ids::ActorId::from_incept_hash(&"a".repeat(64)),
         created_at: 0,
         provisional: false,
     }));

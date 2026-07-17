@@ -100,6 +100,13 @@ pub struct AclOp {
     pub by: ActorId,
     /// Heads of `by`'s key-event log at signing (≤ [`actor::MAX_ACTOR_ASOF`]).
     pub actor_asof: Vec<String>,
+    /// For an `AddMember` admitting via a single-use invite, the nonce it spent.
+    /// Binding it into the signed op makes single-use convergent: [`replay`]
+    /// admits exactly one actor per nonce (deterministic tie-break), so two
+    /// admins concurrently redeeming the same invite for different actors can't
+    /// both stick. `None` for every other op.
+    #[serde(default)]
+    pub nonce: Option<[u8; 16]>,
 }
 
 impl AclOp {
@@ -452,6 +459,36 @@ pub fn replay_with_audit(
         members.remove(&k);
     }
 
+    // ---- single-use invite convergence: a nonce admits exactly one actor.
+    // Two admins on un-merged replicas can each authorize an AddMember spending
+    // the same nonce for a different actor; after merge both ops are valid, so
+    // pick the winner deterministically (lowest op hash) and evict the rest.
+    let mut by_nonce: BTreeMap<[u8; 16], Vec<(String, ActorId)>> = BTreeMap::new();
+    for h in &authorized {
+        if let Some(AclOp {
+            action: AclAction::AddMember { actor, .. },
+            nonce: Some(n),
+            ..
+        }) = decoded[h].as_ref()
+        {
+            by_nonce.entry(*n).or_default().push((h.clone(), actor.clone()));
+        }
+    }
+    for (_n, mut group) in by_nonce {
+        let distinct: BTreeSet<&ActorId> = group.iter().map(|(_, a)| a).collect();
+        if distinct.len() <= 1 {
+            continue; // idempotent re-admits of the same actor are fine
+        }
+        group.sort_by(|a, b| a.0.cmp(&b.0));
+        let winner = group[0].1.clone();
+        for (_, actor) in &group {
+            if *actor != winner {
+                members.remove(actor);
+                agents.remove(actor);
+            }
+        }
+    }
+
     (AclState { members, agents }, audit)
 }
 
@@ -505,6 +542,7 @@ mod tests {
                     action,
                     by: self.actors[&by].clone(),
                     actor_asof: asof,
+                    nonce: None,
                 },
                 parents,
                 &self.genesis.workspace_id,
@@ -629,6 +667,7 @@ mod tests {
                 },
                 by: f.a(1).clone(),
                 actor_asof: vec![add_dev.hash()],
+                nonce: None,
             },
             vec![],
             &f.genesis.workspace_id,

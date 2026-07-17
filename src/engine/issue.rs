@@ -21,7 +21,7 @@ use anyhow::{anyhow, Result};
 use loro::{ExportMode, Frontiers, LoroDoc};
 
 use crate::dto::{CommentDto, Priority, DEFAULT_STATUS};
-use crate::ids::{DocId, LabelId, ProjectId, UserId, WorkspaceId};
+use crate::ids::{ActorId, DocId, LabelId, ProjectId, UserId, WorkspaceId};
 
 use super::loro_ext as lx;
 use super::op::{self, OpCtx};
@@ -47,7 +47,10 @@ pub struct NewIssue {
     pub project_id: ProjectId,
     pub title: String,
     pub priority: Priority,
-    pub created_by: UserId,
+    /// The authoring **actor** (identity), stable across the author's devices.
+    pub created_by: ActorId,
+    /// The device that committed (the advisory commit stamp — non-goal 6).
+    pub committed_by: UserId,
     pub created_at: u64,
     pub body: Option<String>,
     /// The store's stable peer id (contract §5): one version-vector entry per
@@ -76,6 +79,7 @@ impl IssueDoc {
         root.insert(K_PRIORITY, spec.priority.as_str())?;
         root.insert(K_CREATED_BY, spec.created_by.as_str())?;
         root.insert(K_CREATED_AT, spec.created_at as i64)?;
+        let committed_by = spec.committed_by.clone();
         // create the description text container (empty or seeded body)
         let desc = root.insert_container(C_DESCRIPTION, loro::LoroText::new())?;
         if let Some(body) = spec.body {
@@ -86,7 +90,7 @@ impl IssueDoc {
         root.insert_container(C_ASSIGNEES, loro::LoroMap::new())?;
         root.insert_container(C_LABELS, loro::LoroMap::new())?;
         root.insert_container(C_COMMENTS, loro::LoroList::new())?;
-        op::commit_with(&doc, &OpCtx::content("created", &spec.created_by));
+        op::commit_with(&doc, &OpCtx::content("created", &committed_by));
         Ok(Self { doc })
     }
 
@@ -194,8 +198,8 @@ impl IssueDoc {
             .and_then(|s| Priority::parse(&s))
             .unwrap_or_default()
     }
-    pub fn created_by(&self) -> Option<UserId> {
-        lx::get_str(&self.root(), K_CREATED_BY).map(UserId::from_key_string)
+    pub fn created_by(&self) -> Option<ActorId> {
+        lx::get_str(&self.root(), K_CREATED_BY).and_then(|s| ActorId::parse(&s))
     }
     pub fn created_at(&self) -> u64 {
         lx::get_u64(&self.root(), K_CREATED_AT).unwrap_or(0)
@@ -206,13 +210,15 @@ impl IssueDoc {
             .unwrap_or_default()
     }
 
-    /// Assignee keys present in the set (S§5.2).
-    pub fn assignees(&self) -> Vec<UserId> {
-        let mut out: Vec<UserId> = lx::get_map(&self.root(), C_ASSIGNEES)
+    /// Assignee **actors** present in the set (S§5.2). Actor-keyed since the
+    /// lait/actor/1 cutover, so an actor's assignment is stable across its
+    /// devices.
+    pub fn assignees(&self) -> Vec<ActorId> {
+        let mut out: Vec<ActorId> = lx::get_map(&self.root(), C_ASSIGNEES)
             .map(|m| lx::present_keys(&m))
             .unwrap_or_default()
             .into_iter()
-            .map(UserId::from_key_string)
+            .filter_map(|s| ActorId::parse(&s))
             .collect();
         out.sort();
         out
@@ -285,16 +291,16 @@ impl IssueDoc {
         Ok(())
     }
 
-    pub fn add_assignee(&self, user: &UserId) -> Result<()> {
+    pub fn add_assignee(&self, actor: &ActorId) -> Result<()> {
         lx::get_map(&self.root(), C_ASSIGNEES)
             .ok_or_else(|| anyhow!("assignees container missing"))?
-            .insert(user.as_str(), true)?;
+            .insert(actor.as_str(), true)?;
         Ok(())
     }
-    pub fn remove_assignee(&self, user: &UserId) -> Result<()> {
+    pub fn remove_assignee(&self, actor: &ActorId) -> Result<()> {
         if let Some(m) = lx::get_map(&self.root(), C_ASSIGNEES) {
-            if m.get(user.as_str()).is_some() {
-                m.delete(user.as_str())?;
+            if m.get(actor.as_str()).is_some() {
+                m.delete(actor.as_str())?;
             }
         }
         Ok(())
@@ -350,6 +356,9 @@ mod tests {
     fn user() -> UserId {
         UserId::from_key_string("a".repeat(64))
     }
+    fn actor(c: char) -> ActorId {
+        ActorId::from_incept_hash(&c.to_string().repeat(64))
+    }
     fn ctx(kind: &str) -> OpCtx {
         OpCtx::content(kind, &user())
     }
@@ -361,7 +370,8 @@ mod tests {
             project_id: prj(),
             title: "fix login".into(),
             priority: Priority::High,
-            created_by: user(),
+            created_by: actor('a'),
+            committed_by: user(),
             created_at: 1000,
             body: Some("the token refresh races".into()),
             peer: None,
@@ -396,8 +406,8 @@ mod tests {
     #[test]
     fn assignees_are_a_present_key_set() {
         let i = sample();
-        let u1 = UserId::from_key_string("a".repeat(64));
-        let u2 = UserId::from_key_string("b".repeat(64));
+        let u1 = actor('c');
+        let u2 = actor('d');
         i.add_assignee(&u1).unwrap();
         i.add_assignee(&u2).unwrap();
         i.apply(&ctx("assigned"));

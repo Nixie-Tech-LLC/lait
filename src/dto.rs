@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{DocId, LabelId, ProjectId, UserId, WorkspaceId};
+use crate::ids::{ActorId, DocId, LabelId, ProjectId, UserId, WorkspaceId};
 
 /// Schema version gate (SCHEMA §9). Every top-level DTO carries it so a reader
 /// can detect drift; bump on any additive change.
@@ -190,7 +190,7 @@ pub struct Row {
     /// already in `RowMeta` (cached viewer-neutrally, precisely so the summary can
     /// be computed per-viewer), so this projects them rather than making every
     /// graphical client open N issue docs to learn what the catalog already knows.
-    pub assignees: Vec<UserId>,
+    pub assignees: Vec<ActorId>,
     pub tombstone: bool,
     pub provisional: bool,
 }
@@ -234,11 +234,11 @@ pub struct IssueView {
     pub description: String,
     pub status: String,
     pub priority: Priority,
-    pub assignees: Vec<UserId>,
+    pub assignees: Vec<ActorId>,
     pub labels: Vec<LabelId>,
     pub label_names: Vec<String>,
     pub comments: Vec<CommentDto>,
-    pub created_by: UserId,
+    pub created_by: ActorId,
     pub created_at: u64,
     pub provisional: bool,
 }

@@ -39,7 +39,7 @@ use loro::{
 use crate::dto::{
     default_workflow, LabelDto, Priority, ProjectDto, StatusCategory, WorkflowState, SCHEMA_VERSION,
 };
-use crate::ids::{DocId, LabelId, ProjectId, UserId, WorkspaceId};
+use crate::ids::{ActorId, DocId, LabelId, ProjectId, UserId, WorkspaceId};
 
 use super::issue::IssueDoc;
 use super::loro_ext as lx;
@@ -82,7 +82,7 @@ pub struct RowMeta {
     /// faithful extension of the S§4 `assigneeSummary` cache: a shared cache
     /// cannot store a viewer-relative "you", so we cache the keys and render the
     /// summary per-viewer (recorded in the decision log).
-    pub assignees: Vec<UserId>,
+    pub assignees: Vec<ActorId>,
     pub head: Vec<u8>,
     /// True when the issue doc itself hasn't been loaded yet (post-P1); the row
     /// is provisional (UI.md §3.3). At P0 every doc is local, so always false.
@@ -464,7 +464,7 @@ impl CatalogDoc {
             .unwrap_or_default()
             .split(',')
             .filter(|s| !s.is_empty())
-            .map(|s| UserId::from_key_string(s.to_string()))
+            .filter_map(ActorId::parse)
             .collect();
         Some(RowMeta {
             doc_id: doc_id.clone(),
@@ -854,6 +854,9 @@ mod tests {
     fn user() -> UserId {
         UserId::from_key_string("a".repeat(64))
     }
+    fn actor() -> ActorId {
+        ActorId::from_incept_hash(&"a".repeat(64))
+    }
     fn ctx(kind: &str) -> OpCtx {
         OpCtx::structure(kind, &user())
     }
@@ -874,7 +877,8 @@ mod tests {
             project_id: p.clone(),
             title: title.into(),
             priority: Priority::Medium,
-            created_by: user(),
+            created_by: actor(),
+            committed_by: user(),
             created_at: 42,
             body: None,
             peer: None,

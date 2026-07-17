@@ -350,6 +350,7 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
     match &leaf.dispatch {
         Dispatch::Special(Special::Init) => return run_init(m, out).await,
         Dispatch::Special(Special::Join) => return run_join_cli(m, out).await,
+        Dispatch::Special(Special::DeviceAccept) => return run_device_accept(m, out),
         _ => {}
     }
     // Everything else binds an existing store or gets the guided error —
@@ -487,6 +488,7 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
             | Special::ConfigList
             | Special::Init
             | Special::Join
+            | Special::DeviceAccept
             | Special::Serve
             | Special::Update => {
                 unreachable!("handled before home resolution")
@@ -566,6 +568,41 @@ async fn run_init(m: &ArgMatches, out: Out) -> Result<()> {
         println!("home:    {}", home.display());
         println!();
         println!("invite someone: `lait invite`");
+    }
+    Ok(())
+}
+
+/// New-machine side of device enrollment (no daemon, no store): consume a
+/// `device invite` token (`<actor_id> <workspace_id>`), sign this identity's
+/// consent to join that actor, and print the blob to hand back to `device add`.
+fn run_device_accept(m: &ArgMatches, out: Out) -> Result<()> {
+    let token = m.get_one::<String>("token").cloned().unwrap_or_default();
+    let mut parts = token.split_whitespace();
+    let actor = parts
+        .next()
+        .and_then(crate::ids::ActorId::parse)
+        .ok_or_else(|| anyhow!("invalid device token (expected `<actor_id> <workspace_id>`)"))?;
+    let workspace = parts
+        .next()
+        .filter(|w| w.starts_with("ws_"))
+        .ok_or_else(|| anyhow!("invalid device token (missing workspace id)"))?
+        .to_string();
+    let key = load_or_create_identity(&config::identity_dir()?)?;
+    let seed = key.to_bytes();
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce).map_err(|e| anyhow!("getrandom: {e}"))?;
+    let binding = crate::actor::consent_sign(
+        &seed,
+        &workspace,
+        nonce,
+        &crate::actor::ConsentCtx::Member { actor: &actor },
+    );
+    let blob = data_encoding::HEXLOWER.encode(&postcard::to_stdvec(&binding)?);
+    if out.json {
+        crate::cli::emit_ok(&blob, out);
+    } else {
+        println!("{blob}");
+        eprintln!("hand this to `lait device add <blob>` on a device already in the actor.");
     }
     Ok(())
 }

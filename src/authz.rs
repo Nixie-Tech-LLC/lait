@@ -313,6 +313,7 @@ mod tests {
                     action,
                     by: by_actor,
                     actor_asof: vec![head],
+                    nonce: None,
                 },
                 parents,
                 self.ws(),

@@ -59,6 +59,9 @@ pub enum Special {
     ConfigUnset,
     ConfigList,
     Update,
+    /// New-machine side of device enrollment: consume a `device invite` token
+    /// and print a consent blob (no daemon, no store — just this identity).
+    DeviceAccept,
 }
 
 /// One command (or nested group) in the tree.
@@ -1089,6 +1092,60 @@ pub fn specs() -> Vec<Spec> {
                 |_| Ok(Request::Members),
             )
         },
+        Spec {
+            subs: vec![
+                Spec::req(
+                    "invite",
+                    "Print a token to enroll another device into your actor.",
+                    vec![],
+                    |_| Ok(Request::DeviceInvite),
+                ),
+                Spec::special(
+                    "accept",
+                    "On a new machine: consume a `device invite` token and print a \
+                     consent blob to hand back for `device add`.",
+                    vec![A::pos("token", "The token from `lait device invite`.")],
+                    Special::DeviceAccept,
+                ),
+                Spec::req(
+                    "add",
+                    "Add a device to your actor from its consent blob, sealing it \
+                     the space key.",
+                    vec![A::pos("consent", "The blob from `device accept`.")],
+                    |m| {
+                        Ok(Request::DeviceAdd {
+                            consent: req_str(m, "consent"),
+                        })
+                    },
+                ),
+                Spec::req(
+                    "revoke",
+                    "Revoke a device from your actor and rotate the key to fence it.",
+                    vec![A::pos("device", "The device's 64-hex key.")],
+                    |m| {
+                        Ok(Request::DeviceRevoke {
+                            device: req_str(m, "device"),
+                        })
+                    },
+                ),
+                Spec::req("ls", "List your actor's devices.", vec![], |_| {
+                    Ok(Request::DeviceList)
+                }),
+            ],
+            ..Spec::req(
+                "device",
+                "Manage the devices of your actor (multi-device identity).",
+                vec![],
+                |_| Ok(Request::DeviceList),
+            )
+        },
+        Spec::req(
+            "recover",
+            "Recover your actor with the offline recovery key: reset the device \
+             set to this device (content access re-seals once a peer syncs).",
+            vec![],
+            |_| Ok(Request::Recover),
+        ),
         Spec::req(
             "activity",
             "Workspace-wide recent transitions.",

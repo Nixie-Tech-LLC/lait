@@ -1326,7 +1326,12 @@ impl Node {
             | Request::Activity { .. }
             | Request::MemberRemove { .. }
             | Request::MemberLog
-            | Request::KeyRotate => {
+            | Request::KeyRotate
+            | Request::DeviceInvite
+            | Request::DeviceAdd { .. }
+            | Request::DeviceRevoke { .. }
+            | Request::DeviceList
+            | Request::Recover => {
                 let (resp, changed) = self.dispatch_tracker(req);
                 if changed {
                     // our catalog head moved — announce so peers pull (A§8).

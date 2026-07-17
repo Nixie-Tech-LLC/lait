@@ -27,7 +27,7 @@ use proptest::prelude::*;
 use lait::catalog::CatalogDoc;
 use lait::dto::Priority;
 use lait::engine::op::OpCtx;
-use lait::ids::{DocId, LabelId, ProjectId, SystemUlidSource, UserId, WorkspaceId};
+use lait::ids::{ActorId, DocId, LabelId, ProjectId, SystemUlidSource, UserId, WorkspaceId};
 use lait::issue::{IssueDoc, NewIssue};
 
 /// A fixed creation timestamp — never varied, so it can never be the reason two
@@ -134,7 +134,8 @@ fn base_issue() -> IssueDoc {
         project_id: ProjectId::mint(&SystemUlidSource),
         title: "base title".into(),
         priority: Priority::None,
-        created_by: tester(),
+        created_by: ActorId::from_incept_hash(&"a".repeat(64)),
+        committed_by: tester(),
         created_at: CREATED_AT,
         body: None,
         peer: None,
@@ -252,8 +253,8 @@ proptest! {
     ) {
         // Fixed pools of 4 users and 4 labels, minted once and shared by every
         // replica (so add/remove target the same keys across replicas).
-        let users: Vec<UserId> =
-            (0..4).map(|i| UserId::from_key_string(format!("{:064x}", i + 1))).collect();
+        let users: Vec<ActorId> =
+            (0..4).map(|i| ActorId::from_incept_hash(&format!("{:064x}", i + 1))).collect();
         let labels: Vec<LabelId> = (0..4).map(|_| LabelId::mint(&SystemUlidSource)).collect();
 
         let snap = base_issue().snapshot().unwrap();
@@ -340,7 +341,8 @@ proptest! {
                 project_id: project.clone(),
                 title: format!("issue {n}"),
                 priority: Priority::None,
-                created_by: tester(),
+                created_by: ActorId::from_incept_hash(&"a".repeat(64)),
+                committed_by: tester(),
                 created_at: CREATED_AT,
                 body: None,
                 peer: None,
@@ -433,7 +435,8 @@ proptest! {
                 project_id: project.clone(),
                 title: "grow".into(),
                 priority: Priority::None,
-                created_by: tester(),
+                created_by: ActorId::from_incept_hash(&"a".repeat(64)),
+                committed_by: tester(),
                 created_at: CREATED_AT,
                 body: None,
                 peer: None,

@@ -279,6 +279,25 @@ pub enum Request {
         key: String,
     },
     KeyRotate,
+    /// Print a device-enrollment token for adding another device to *this*
+    /// actor (lait/actor/1). The new machine consumes it with `device accept`.
+    DeviceInvite,
+    /// Add a device to our actor from its consent blob (produced by
+    /// `device accept`), sealing it the workspace key.
+    DeviceAdd {
+        /// Hex-encoded consent binding from the joining device.
+        consent: String,
+    },
+    /// Revoke a device from our actor and rotate the key to fence it.
+    DeviceRevoke {
+        device: String,
+    },
+    /// List the device keys currently bound to our actor.
+    DeviceList,
+    /// Recover our actor with the offline recovery key: reset the device set to
+    /// this device (identity is restored; content-key access is re-sealed lazily
+    /// by an admin/peer).
+    Recover,
     Members,
     /// The membership audit log: the signed ACL DAG replayed in causal order
     /// with each op's authorization verdict (cryptographic provenance).

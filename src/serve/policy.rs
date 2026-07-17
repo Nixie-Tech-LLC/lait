@@ -32,6 +32,8 @@ pub fn is_read(req: &Request) -> bool {
         | Request::Members
         | Request::MemberLog
         | Request::MemberRequests
+        | Request::DeviceInvite
+        | Request::DeviceList
         | Request::Status
         | Request::Diagnose { .. }
         | Request::Id
@@ -68,6 +70,9 @@ pub fn is_read(req: &Request) -> bool {
         | Request::MemberApprove { .. }
         | Request::MemberAlias { .. }
         | Request::KeyRotate
+        | Request::DeviceAdd { .. }
+        | Request::DeviceRevoke { .. }
+        | Request::Recover
         // …joining and inviting, which act *as* an identity on the wire…
         | Request::Invite { .. }
         | Request::Join { .. }

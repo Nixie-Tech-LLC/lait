@@ -40,19 +40,20 @@ use crate::store::{Genesis, Store};
 /// symmetric and canonicalized (sorted endpoints) so one edge represents it.
 pub const LINK_KINDS: [&str; 3] = ["blocks", "relates", "duplicates"];
 
-/// A 4-byte big-endian epoch tag prefixed to every AEAD ciphertext so the reader
-/// selects the right key-epoch from its keyring (lazy revocation, A§11).
-fn epoch_prefix(epoch: u32, mut blob: Vec<u8>) -> Vec<u8> {
-    let mut out = epoch.to_be_bytes().to_vec();
+/// A 16-byte content-addressed epoch id prefixed to every AEAD ciphertext so the
+/// reader selects the right key from its keyring (lazy revocation, A§11).
+/// Content-addressed (not a counter) so concurrent rotations never collide.
+fn epoch_prefix(id: &[u8; 16], mut blob: Vec<u8>) -> Vec<u8> {
+    let mut out = id.to_vec();
     out.append(&mut blob);
     out
 }
-fn split_epoch(blob: &[u8]) -> Option<(u32, &[u8])> {
-    if blob.len() < 4 {
+fn split_epoch(blob: &[u8]) -> Option<([u8; 16], &[u8])> {
+    if blob.len() < 16 {
         return None;
     }
-    let (e, rest) = blob.split_at(4);
-    Some((u32::from_be_bytes([e[0], e[1], e[2], e[3]]), rest))
+    let (e, rest) = blob.split_at(16);
+    Some((e.try_into().ok()?, rest))
 }
 
 /// The batched, project-keyed dirty-set a mutation produces (UI.md §4.2). The
@@ -164,7 +165,7 @@ pub struct Tracker {
     seed: [u8; 32],
     /// Every key-epoch we can unseal (a keyring; older epochs stay decryptable —
     /// lazy revocation). Empty ⇒ we are not a member and see only ciphertext.
-    keyring: BTreeMap<u32, WorkspaceKey>,
+    keyring: BTreeMap<[u8; 16], WorkspaceKey>,
 }
 
 /// Derive a project key from a human name: ≥2 words → uppercase initials (max
@@ -228,15 +229,19 @@ pub fn found_workspace(
 
     let genesis = Genesis {
         workspace_id: ws.clone(),
-        founding_actors: vec![actor_id],
+        founding_actors: vec![actor_id.clone()],
     };
     store.write_genesis(&genesis)?;
     store.save_catalog(&cat)?;
     let membership = MembershipDoc::create(&ws, Some(store.peer_id()), me)?;
     membership.add_actor_event(&incept_ev)?;
+    // Mint the founding key epoch (id-addressed, generation 0), sealed to the
+    // founder's device.
     let key = crypto::random_key();
+    let epoch0 = rand16();
+    membership.add_epoch(&epoch0, 0, &[actor_id.to_string()])?;
     if let Some(sealed) = crypto::seal_to(me, &key) {
-        membership.put_sealed(0, me, &sealed)?;
+        membership.put_sealed(&epoch0, me, &sealed)?;
     }
     membership.apply(&OpCtx::authority("found", me));
     store.save_membership(&membership)?;
@@ -394,48 +399,52 @@ impl Tracker {
         Ok(tracker)
     }
 
-    /// Rebuild the keyring: unseal every epoch's envelope addressed to us (A§11
-    /// lazy revocation — we keep older epoch keys so already-synced content stays
-    /// readable). Called after any membership change/import.
+    /// Rebuild the keyring: unseal every epoch's envelope addressed to *any* of
+    /// our own devices (A§11 lazy revocation — we keep older keys so already-
+    /// synced content stays readable). Called after any membership change/import.
     fn refresh_keyring(&mut self) {
-        for epoch in 0..=self.membership.current_epoch() {
-            if self.keyring.contains_key(&epoch) {
+        for e in self.membership.epochs() {
+            if self.keyring.contains_key(&e.id) {
                 continue;
             }
-            if let Some(sealed) = self.membership.get_sealed(epoch, &self.me) {
+            if let Some(sealed) = self.membership.get_sealed(&e.id, &self.me) {
                 if let Some(raw) = crypto::open_sealed(&self.seed, &self.me, &sealed) {
                     if let Ok(key) = <WorkspaceKey>::try_from(raw.as_slice()) {
-                        self.keyring.insert(epoch, key);
+                        self.keyring.insert(e.id, key);
                     }
                 }
             }
         }
     }
 
-    fn current_epoch(&self) -> u32 {
-        self.membership.current_epoch()
-    }
-    fn current_key(&self) -> Option<&WorkspaceKey> {
-        self.keyring.get(&self.current_epoch())
+    /// The deterministic active epoch (the encryption target): highest
+    /// generation, ties broken by the largest id — a pure function of the epoch
+    /// set, so every replica agrees even after concurrent rotations.
+    fn active_epoch(&self) -> Option<crate::membership::EpochRec> {
+        self.membership
+            .epochs()
+            .into_iter()
+            .max_by(|a, b| a.gen.cmp(&b.gen).then_with(|| a.id.cmp(&b.id)))
     }
 
-    /// Encrypt a sync payload with the current-epoch key (epoch-tagged). If we
-    /// hold no key (shouldn't happen for a provider — it's a member), the payload
-    /// passes through in the clear so a single-node P0 workspace still works.
+    /// Encrypt a sync payload with the active-epoch key (id-tagged). If we hold
+    /// no key (a single-node P0 workspace), the payload passes through in clear.
     fn encrypt_payload(&self, plaintext: Vec<u8>) -> Vec<u8> {
-        match self.current_key() {
-            Some(key) => epoch_prefix(self.current_epoch(), crypto::aead_encrypt(key, &plaintext)),
+        match self
+            .active_epoch()
+            .and_then(|e| self.keyring.get(&e.id).map(|k| (e.id, *k)))
+        {
+            Some((id, key)) => epoch_prefix(&id, crypto::aead_encrypt(&key, &plaintext)),
             None => plaintext,
         }
     }
-    /// Decrypt a sync payload using the epoch tag + our keyring. `None` if we
+    /// Decrypt a sync payload using the epoch id tag + our keyring. `None` if we
     /// lack that epoch's key — the blind-relay / non-member outcome: a non-member
     /// (empty keyring) or a removed member (missing the new epoch) learns nothing
-    /// and simply imports nothing (A§11). Every provider is a member and thus
-    /// always encrypts, so there is no plaintext-passthrough case.
+    /// and simply imports nothing (A§11).
     fn decrypt_payload(&self, blob: &[u8]) -> Option<Vec<u8>> {
-        let (epoch, ct) = split_epoch(blob)?;
-        let key = self.keyring.get(&epoch)?;
+        let (id, ct) = split_epoch(blob)?;
+        let key = self.keyring.get(&id)?;
         crypto::aead_decrypt(key, ct)
     }
 
@@ -579,6 +588,11 @@ impl Tracker {
             Request::MemberRemove { who } => Ok(self.member_remove_cmd(who)),
             Request::AgentAdd { key } => Ok(self.agent_add_cmd(key)),
             Request::KeyRotate => Ok(self.key_rotate_cmd()),
+            Request::DeviceInvite => Ok(self.device_invite_cmd()),
+            Request::DeviceAdd { consent } => Ok(self.device_add_cmd(consent)),
+            Request::DeviceRevoke { device } => Ok(self.device_revoke_cmd(device)),
+            Request::DeviceList => Ok((self.device_list_response(), None)),
+            Request::Recover => Ok(self.recover()),
             Request::Members => Ok((self.members_response(), None)),
             Request::MemberLog => Ok((self.member_log_response(), None)),
             other => Err(anyhow!("not a tracker request: {other:?}")),
@@ -697,9 +711,14 @@ impl Tracker {
         // resolve assignees + labels up front (validate-then-commit)
         let mut assignee_ids = Vec::new();
         for a in &assignees {
-            match index::resolve_user(a, &self.me) {
-                Some(u) => assignee_ids.push(u),
-                None => return Ok((Response::not_found(format!("no user matches '{a}'")), None)),
+            match self.resolve_actor(a) {
+                Some(act) => assignee_ids.push(act),
+                None => {
+                    return Ok((
+                        Response::not_found(format!("no known member matches '{a}'")),
+                        None,
+                    ))
+                }
             }
         }
         // Labels resolve-or-create (first use = creation, UI.md §2.2) — but the
@@ -724,7 +743,11 @@ impl Tracker {
             project_id: project.id.clone(),
             title: title.clone(),
             priority,
-            created_by: self.me.clone(),
+            created_by: match self.my_actor() {
+                Some(a) => a,
+                None => return Ok((Response::err("this device has no actor identity"), None)),
+            },
+            committed_by: self.me.clone(),
             created_at: self.now_secs(),
             body,
             peer: Some(self.store.peer_id()),
@@ -893,7 +916,10 @@ impl Tracker {
                 None,
             ));
         };
-        let me = self.me.clone();
+        let me = match self.my_actor() {
+            Some(a) => a,
+            None => return Ok((Response::err("this device has no actor identity"), None)),
+        };
         let ctx = OpCtx::content(kind, &self.me);
 
         let project_id;
@@ -1072,9 +1098,14 @@ impl Tracker {
         };
         let mut users = Vec::new();
         for w in &who {
-            match index::resolve_user(w, &self.me) {
-                Some(u) => users.push(u),
-                None => return Ok((Response::not_found(format!("no user matches '{w}'")), None)),
+            match self.resolve_actor(w) {
+                Some(a) => users.push(a),
+                None => {
+                    return Ok((
+                        Response::not_found(format!("no known member matches '{w}'")),
+                        None,
+                    ))
+                }
             }
         }
         let kind = if add { "assigned" } else { "unassigned" };
@@ -1660,11 +1691,12 @@ impl Tracker {
     }
 
     /// Viewer-aware assignee summary (UI.md §5.1): "you", "you +2", "ab", "".
-    fn assignee_summary(&self, assignees: &[UserId]) -> String {
+    /// Actor-keyed: any of an actor's devices renders as "you".
+    fn assignee_summary(&self, assignees: &[ActorId]) -> String {
         if assignees.is_empty() {
             return String::new();
         }
-        let mine = assignees.contains(&self.me);
+        let mine = self.my_actor().is_some_and(|a| assignees.contains(&a));
         let head = if mine {
             "you".to_string()
         } else {
@@ -1726,7 +1758,12 @@ impl Tracker {
                     .map(|s| &r.status == s)
                     .unwrap_or(true)
             })
-            .filter(|r| !filter.mine || r.assignees.contains(&self.me))
+            .filter(|r| {
+                !filter.mine
+                    || self
+                        .my_actor()
+                        .is_some_and(|a| r.assignees.contains(&a))
+            })
             .map(|r| self.project_row(&r))
             .collect();
         // label filter requires the issue doc's labels (not cached in the row);
@@ -1825,7 +1862,6 @@ impl Tracker {
         };
         // Clone viewer context up front so it doesn't conflict with the issue
         // borrow below.
-        let me = self.me.clone();
         let ws = self.workspace_id.clone();
         let canonical = self.aliases.canonical_for(&doc_id);
         let row = self.catalog.row(&doc_id);
@@ -1861,7 +1897,9 @@ impl Tracker {
                     labels: vec![],
                     label_names: vec![],
                     comments: vec![],
-                    created_by: me.clone(),
+                    // Provisional row: the body (hence the authoring actor) hasn't
+                    // synced yet.
+                    created_by: ActorId::from_incept_hash(&"0".repeat(64)),
                     created_at: row.created_at,
                     provisional: true,
                 })));
@@ -1896,7 +1934,9 @@ impl Tracker {
             labels,
             label_names: label_display,
             comments,
-            created_by: issue.created_by().unwrap_or_else(|| me.clone()),
+            created_by: issue
+                .created_by()
+                .unwrap_or_else(|| ActorId::from_incept_hash(&"0".repeat(64))),
             created_at: issue.created_at(),
             provisional: false,
         };
@@ -2045,6 +2085,13 @@ impl Tracker {
         self.membership.import(update)?;
         self.store.save_membership(&self.membership)?;
         self.refresh_keyring();
+        // Propagate any key we now hold to our own actor's other devices (SEAL-2
+        // backstop for a device the rotating author hadn't seen).
+        self.heal_own_device_envelopes()?;
+        // Two admins removing different members concurrently can leave the active
+        // epoch sealed to a since-removed actor after merge; re-seal to the true
+        // current set (convergent, admin-only).
+        self.heal_stale_epoch()?;
         Ok(())
     }
 
@@ -2141,6 +2188,14 @@ impl Tracker {
     /// Author a membership op as our own actor, embedding our current actor-log
     /// frontier so a replica resolves our device→actor binding at position.
     fn author_acl(&self, action: AclAction) -> Result<SignedOp> {
+        self.author_acl_nonce(action, None)
+    }
+
+    /// [`author_acl`] carrying an invite nonce (for `AddMember` via a single-use
+    /// invite) so replay can dedup concurrent redemptions.
+    ///
+    /// [`author_acl`]: Self::author_acl
+    fn author_acl_nonce(&self, action: AclAction, nonce: Option<[u8; 16]>) -> Result<SignedOp> {
         let by = self
             .my_actor()
             .ok_or_else(|| anyhow!("this device has no actor identity in this space yet"))?;
@@ -2151,6 +2206,7 @@ impl Tracker {
                 action,
                 by,
                 actor_asof,
+                nonce,
             },
             self.membership.heads(),
             &self.workspace_id,
@@ -2164,11 +2220,11 @@ impl Tracker {
     /// be present (callers import it first).
     fn seal_epochs_to_actor(t: &mut Self, actor: &ActorId) -> Result<()> {
         let devices = t.actor_plane().devices_of(actor);
-        let epochs: Vec<(u32, WorkspaceKey)> = t.keyring.iter().map(|(e, k)| (*e, *k)).collect();
+        let epochs: Vec<([u8; 16], WorkspaceKey)> = t.keyring.iter().map(|(e, k)| (*e, *k)).collect();
         for (epoch, key) in epochs {
             for d in &devices {
                 if let Some(sealed) = crypto::seal_to(d, &key) {
-                    t.membership.put_sealed(epoch, d, &sealed)?;
+                    t.membership.put_sealed(&epoch, d, &sealed)?;
                 }
             }
         }
@@ -2350,10 +2406,16 @@ impl Tracker {
                 None,
             );
         }
-        let op = match self.author_acl(AclAction::AddMember {
-            actor: joiner_actor.clone(),
-            grants: vec![Grant::Write],
-        }) {
+        // Bind the nonce into the op for single-use invites so concurrent
+        // redemptions of the same invite converge to one admitted actor.
+        let op_nonce = if single_use { Some(*nonce) } else { None };
+        let op = match self.author_acl_nonce(
+            AclAction::AddMember {
+                actor: joiner_actor.clone(),
+                grants: vec![Grant::Write],
+            },
+            op_nonce,
+        ) {
             Ok(op) => op,
             Err(e) => return (Response::err(format!("{e:#}")), None),
         };
@@ -2434,9 +2496,10 @@ impl Tracker {
                 if let Err(e) = self.persist_membership("key_rotate") {
                     return (Response::err(format!("{e:#}")), None);
                 }
+                let gen = self.active_epoch().map(|e| e.gen).unwrap_or(0);
                 (
                     Response::Ok {
-                        message: Some(format!("rotated to key epoch {}", self.current_epoch())),
+                        message: Some(format!("rotated the workspace key (generation {gen})")),
                     },
                     Some(DirtySet::catalog(CatalogScope::Acl)),
                 )
@@ -2632,6 +2695,231 @@ impl Tracker {
         )
     }
 
+    // ---- multi-device (lait/actor/1 device management) ----
+
+    /// A device-enrollment token for adding another device to *this* actor:
+    /// `<actor_id> <workspace_id>`. The new machine consumes it with
+    /// `device accept`, which produces a consent blob for `device add`.
+    fn device_invite_cmd(&self) -> (Response, Option<DirtySet>) {
+        match self.my_actor() {
+            Some(a) => (
+                Response::Text {
+                    text: format!("{} {}", a, self.workspace_id),
+                },
+                None,
+            ),
+            None => (
+                Response::err("this device has no actor identity in this space yet"),
+                None,
+            ),
+        }
+    }
+
+    fn device_list_response(&self) -> Response {
+        let devices: Vec<String> = self
+            .my_actor()
+            .map(|a| self.actor_plane().devices_of(&a))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|d| {
+                let me = if d == self.me { " (this device)" } else { "" };
+                format!("{}{}", d.as_str(), me)
+            })
+            .collect();
+        Response::Text {
+            text: if devices.is_empty() {
+                "no devices".to_string()
+            } else {
+                devices.join("\n")
+            },
+        }
+    }
+
+    /// Add a device to our actor from its consent blob (hex-encoded
+    /// [`actor::DeviceBinding`] from `device accept`), authored by this device,
+    /// and **seal every held epoch to it** so it can decrypt immediately (SEAL-1).
+    fn device_add_cmd(&mut self, consent_hex: String) -> (Response, Option<DirtySet>) {
+        let Some(actor) = self.my_actor() else {
+            return (Response::err("this device has no actor identity"), None);
+        };
+        let binding: actor::DeviceBinding = match data_encoding::HEXLOWER_PERMISSIVE
+            .decode(consent_hex.as_bytes())
+            .ok()
+            .and_then(|b| postcard::from_bytes(&b).ok())
+        {
+            Some(b) => b,
+            None => return (Response::err("could not decode device consent blob"), None),
+        };
+        if !actor::consent_verify(
+            self.workspace_id.as_str(),
+            &binding,
+            &actor::ConsentCtx::Member { actor: &actor },
+        ) {
+            return (
+                Response::err("device consent is not valid for this actor"),
+                None,
+            );
+        }
+        let new_device = binding.device.clone();
+        let ev = actor::sign_event(
+            &self.seed,
+            &actor::ActorOp::AddDevice {
+                actor: actor.clone(),
+                binding,
+            },
+            self.membership.actor_heads(&actor),
+            &self.workspace_id,
+        );
+        let res = (|| -> Result<()> {
+            self.membership.add_actor_event(&ev)?;
+            let held: Vec<([u8; 16], WorkspaceKey)> =
+                self.keyring.iter().map(|(e, k)| (*e, *k)).collect();
+            for (id, key) in held {
+                if let Some(sealed) = crypto::seal_to(&new_device, &key) {
+                    self.membership.put_sealed(&id, &new_device, &sealed)?;
+                }
+            }
+            self.persist_membership("device_add")
+        })();
+        if let Err(e) = res {
+            return (Response::err(format!("{e:#}")), None);
+        }
+        (
+            Response::Ok {
+                message: Some(format!("added device {}", new_device.short())),
+            },
+            Some(DirtySet::catalog(CatalogScope::Acl)),
+        )
+    }
+
+    /// Revoke a device from our actor and rotate the workspace key so the revoked
+    /// device is fenced from future content (self-protection — any member may do
+    /// this for their own actor; it re-seals the fresh epoch only to the
+    /// remaining devices).
+    fn device_revoke_cmd(&mut self, device: String) -> (Response, Option<DirtySet>) {
+        let Some(actor) = self.my_actor() else {
+            return (Response::err("this device has no actor identity"), None);
+        };
+        let Some(device) = UserId::parse(&device) else {
+            return (Response::err("a device is a 64-hex ed25519 key"), None);
+        };
+        let devices = self.actor_plane().devices_of(&actor);
+        if !devices.contains(&device) {
+            return (Response::err("not a device of your actor"), None);
+        }
+        if devices.len() <= 1 {
+            return (
+                Response::err("cannot revoke your only device — use `recover` instead"),
+                None,
+            );
+        }
+        let ev = actor::sign_event(
+            &self.seed,
+            &actor::ActorOp::RevokeDevice {
+                actor: actor.clone(),
+                device: device.clone(),
+            },
+            self.membership.actor_heads(&actor),
+            &self.workspace_id,
+        );
+        let res = (|| -> Result<()> {
+            self.membership.add_actor_event(&ev)?;
+            // Lazy revocation of a device == a key rotation: the fresh epoch is
+            // sealed only to the remaining devices (the revoked one is now absent
+            // from devices_of), so it loses future content access.
+            self.rotate_key()?;
+            self.persist_membership("device_revoke")
+        })();
+        if let Err(e) = res {
+            return (Response::err(format!("{e:#}")), None);
+        }
+        (
+            Response::Ok {
+                message: Some(format!(
+                    "revoked device {} and rotated the key",
+                    device.short()
+                )),
+            },
+            Some(DirtySet::catalog(CatalogScope::Acl)),
+        )
+    }
+
+    fn read_recovery_key(&self) -> Option<[u8; 32]> {
+        let path = self.store.home_path().join("recovery.key");
+        let hex = std::fs::read_to_string(path).ok()?;
+        let raw = data_encoding::HEXLOWER_PERMISSIVE
+            .decode(hex.trim().as_bytes())
+            .ok()?;
+        raw.as_slice().try_into().ok()
+    }
+
+    /// Recover our actor with the offline recovery key: authored by the recovery
+    /// key (which must match the standing pre-rotation commitment), it resets the
+    /// device set to *this* device. **Lazy** (design): identity/standing is
+    /// restored immediately, but this fresh device holds no workspace key until
+    /// an admin or surviving peer re-seals it (self-heal on their next sync).
+    pub fn recover(&mut self) -> (Response, Option<DirtySet>) {
+        let Some(seed) = self.read_recovery_key() else {
+            return (
+                Response::err(
+                    "no recovery.key found beside the store — restore your offline recovery key first",
+                ),
+                None,
+            );
+        };
+        let Some(actor) = self.my_actor() else {
+            return (
+                Response::err("cannot resolve which actor to recover from this device"),
+                None,
+            );
+        };
+        let binding = actor::consent_sign(
+            &self.seed,
+            self.workspace_id.as_str(),
+            rand16(),
+            &actor::ConsentCtx::Member { actor: &actor },
+        );
+        let ev = actor::sign_event(
+            &seed,
+            &actor::ActorOp::Recover {
+                actor: actor.clone(),
+                devices: vec![binding],
+                next_commit: None,
+            },
+            self.membership.actor_heads(&actor),
+            &self.workspace_id,
+        );
+        // Validate the recovery actually took (commitment match) before persisting.
+        let mut candidate = self.membership.actor_events();
+        candidate.push(ev.clone());
+        let recovered = actor::replay(&self.workspace_id, &candidate)
+            .state(&actor)
+            .map(|s| s.recovered)
+            .unwrap_or(false);
+        if !recovered {
+            return (
+                Response::err("recovery key does not match this actor's commitment"),
+                None,
+            );
+        }
+        let res = (|| -> Result<()> {
+            self.membership.add_actor_event(&ev)?;
+            self.persist_membership("recover")
+        })();
+        if let Err(e) = res {
+            return (Response::err(format!("{e:#}")), None);
+        }
+        (
+            Response::Ok {
+                message: Some(format!(
+                    "recovered actor {} — device set reset to this device; content access re-seals once a peer syncs",
+                    actor.short()
+                )),
+            },
+            Some(DirtySet::catalog(CatalogScope::Acl)),
+        )
+    }
+
     /// Apply a signed op + an extra key-sealing step, then commit + persist.
     fn member_apply(
         &mut self,
@@ -2652,25 +2940,85 @@ impl Tracker {
         Ok(())
     }
 
-    /// Mint a new key-epoch, sealed to every *current* member (computed AFTER any
-    /// just-applied remove op), and adopt it into our keyring.
+    /// Mint a fresh content-addressed key epoch, sealed to every device of every
+    /// *current* member (computed AFTER any just-applied remove), and adopt it.
+    /// A removed actor's devices are never in this set — the lazy-revocation
+    /// fence. Concurrent rotations mint distinct ids, so they coexist rather than
+    /// clobber; the deterministic active tip picks one for encryption and
+    /// [`heal_stale_epoch`] re-rotates if a merge leaves the tip sealed to a
+    /// since-removed actor.
+    ///
+    /// [`heal_stale_epoch`]: Self::heal_stale_epoch
     fn rotate_key(&mut self) -> Result<()> {
-        let new_epoch = self.current_epoch() + 1;
+        let gen = self.active_epoch().map(|e| e.gen + 1).unwrap_or(0);
+        let id = rand16();
         let new_key = crypto::random_key();
-        self.membership.set_epoch(new_epoch)?;
-        // Seal the new epoch to every device of every *current* member actor
-        // (computed AFTER any just-applied remove). A removed actor's devices
-        // are never in this set — the lazy-revocation fence. Reaching one live
-        // device per actor is sufficient (SEAL-1); the actor self-heals the rest.
+        let members: Vec<(ActorId, Vec<Grant>)> = self.acl_state().members();
+        let member_ids: Vec<String> = members.iter().map(|(a, _)| a.to_string()).collect();
+        self.membership.add_epoch(&id, gen, &member_ids)?;
         let plane = self.actor_plane();
-        for (actor, _grants) in self.acl_state().members() {
-            for d in plane.devices_of(&actor) {
+        for (actor, _grants) in &members {
+            for d in plane.devices_of(actor) {
                 if let Some(sealed) = crypto::seal_to(&d, &new_key) {
-                    self.membership.put_sealed(new_epoch, &d, &sealed)?;
+                    self.membership.put_sealed(&id, &d, &sealed)?;
                 }
             }
         }
-        self.keyring.insert(new_epoch, new_key);
+        self.keyring.insert(id, new_key);
+        Ok(())
+    }
+
+    /// Self-heal (SEAL-2): seal every epoch key we hold to any sibling device of
+    /// our own actor that still lacks an envelope. Admin-ungated and safe — we
+    /// only ever re-seal keys we already hold, and only to our own actor's
+    /// devices. This is the backstop that lets an actor propagate a key to a
+    /// device added (or reinstated) after a rotation whose author didn't yet see
+    /// that device, so `seal to ≥1 device` suffices (SEAL-1).
+    fn heal_own_device_envelopes(&mut self) -> Result<()> {
+        let Some(me_actor) = self.my_actor() else {
+            return Ok(());
+        };
+        let siblings = self.actor_plane().devices_of(&me_actor);
+        let held: Vec<([u8; 16], WorkspaceKey)> =
+            self.keyring.iter().map(|(e, k)| (*e, *k)).collect();
+        let mut sealed_any = false;
+        for (id, key) in held {
+            for dev in &siblings {
+                if self.membership.get_sealed(&id, dev).is_none() {
+                    if let Some(sealed) = crypto::seal_to(dev, &key) {
+                        self.membership.put_sealed(&id, dev, &sealed)?;
+                        sealed_any = true;
+                    }
+                }
+            }
+        }
+        if sealed_any {
+            self.persist_membership("device_heal")?;
+        }
+        Ok(())
+    }
+
+    /// Convergent re-seal: if the active epoch's recorded recipient set still
+    /// includes an actor who is no longer a member (a concurrent removal of a
+    /// *different* member left a stale tip), mint a fresh epoch sealed to the
+    /// actual current member set. Deterministic + monotone (the fresh epoch has a
+    /// higher generation and a correct recipient set, so it is not itself stale),
+    /// so all admins converge on a fenced tip. Admin-only; a non-admin waits.
+    fn heal_stale_epoch(&mut self) -> Result<()> {
+        let Some(active) = self.active_epoch() else {
+            return Ok(());
+        };
+        let members: std::collections::BTreeSet<String> = self
+            .acl_state()
+            .members()
+            .into_iter()
+            .map(|(a, _)| a.to_string())
+            .collect();
+        let stale = active.members.iter().any(|m| !members.contains(m));
+        if stale && self.am_i_admin() {
+            self.rotate_key()?;
+            self.persist_membership("epoch_heal")?;
+        }
         Ok(())
     }
 
@@ -2782,7 +3130,12 @@ impl Tracker {
         let prior = self
             .issues
             .get(&id)
-            .map(|i| (i.assignees().contains(&self.me), i.status()));
+            .map(|i| {
+                let mine = self
+                    .my_actor()
+                    .is_some_and(|a| i.assignees().contains(&a));
+                (mine, i.status())
+            });
         let mark = self.issues.get(&id).map(|i| i.import_mark());
         // ensure a doc exists to import into (new docs arrive as a snapshot).
         if !self.issues.contains_key(&id) {
@@ -2862,12 +3215,12 @@ impl Tracker {
         let Some(issue) = self.issues.get(id) else {
             return;
         };
-        let me = &self.me;
+        let my_actor = self.my_actor();
         let now = self.clock.now_ms() / 1000;
         let title = issue.title();
         let assignees = issue.assignees();
-        let assigned_to_me = assignees.contains(me);
-        let my_issue = assigned_to_me || issue.created_by().as_ref() == Some(me);
+        let assigned_to_me = my_actor.as_ref().is_some_and(|a| assignees.contains(a));
+        let my_issue = assigned_to_me || (my_actor.is_some() && issue.created_by() == my_actor);
         let entry = |kind: &str, detail: String, actor: Option<String>| crate::dto::InboxEntry {
             ts: now,
             kind: kind.into(),
@@ -2895,7 +3248,12 @@ impl Tracker {
                 }
                 let mention = format!("@{}", self.my_nick).to_ascii_lowercase();
                 for c in &delta.new_comments {
-                    if &c.author == me {
+                    // A comment's author is the committing device (advisory); skip
+                    // our own comments regardless of which of our devices wrote it.
+                    if my_actor
+                        .as_ref()
+                        .is_some_and(|a| self.actor_plane().actor_of_device(&c.author) == Some(a))
+                    {
                         continue;
                     }
                     let mentioned =
@@ -3434,6 +3792,198 @@ mod tests {
     }
 
     #[test]
+    fn recover_resets_device_set_with_the_offline_key() {
+        let mut a = new_node(); // founder, recovery.key provisioned beside the store
+        let x = a.tracker.my_actor().unwrap();
+        let da = a.tracker.me.clone();
+
+        // Add a second device dB.
+        let db_seed = [60u8; 32];
+        let db = user_from_seed(db_seed);
+        let binding = actor::consent_sign(
+            &db_seed,
+            &a.tracker.workspace_str(),
+            [61u8; 16],
+            &actor::ConsentCtx::Member { actor: &x },
+        );
+        let hex = data_encoding::HEXLOWER.encode(&postcard::to_stdvec(&binding).unwrap());
+        a.tracker.device_add_cmd(hex);
+        assert!(a.tracker.actor_plane().is_device_of(&x, &db));
+
+        // Recover with the offline key: device set resets to just this device.
+        let (resp, _) = a.tracker.recover();
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        let devices = a.tracker.actor_plane().devices_of(&x);
+        assert_eq!(devices, vec![da], "recovery reset the set to this device");
+        assert!(a.tracker.actor_plane().state(&x).unwrap().recovered);
+    }
+
+    #[test]
+    fn second_device_decrypts_then_revocation_fences_it() {
+        // Multi-device end to end: A adds a second device dB to its actor (seal-
+        // on-add), dB decrypts the workspace; A then revokes dB and rotates, and
+        // dB is fenced from post-revocation content.
+        let mut a = new_node(); // founder, device dA
+        with_project(&mut a.tracker);
+        new_issue(&mut a.tracker, "secret");
+        let x = a.tracker.my_actor().unwrap(); // the founder actor
+        let a_ws = a.tracker.workspace_str();
+
+        // dB (seed 50) consents into actor X (as `device accept` would).
+        let db_seed = [50u8; 32];
+        let db_user = user_from_seed(db_seed);
+        let binding = actor::consent_sign(
+            &db_seed,
+            &a_ws,
+            [51u8; 16],
+            &actor::ConsentCtx::Member { actor: &x },
+        );
+        let consent_hex = data_encoding::HEXLOWER.encode(&postcard::to_stdvec(&binding).unwrap());
+
+        // A adds dB.
+        let (resp, _) = a.tracker.device_add_cmd(consent_hex);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        assert!(
+            a.tracker.actor_plane().is_device_of(&x, &db_user),
+            "dB is now a device of X"
+        );
+
+        // dB bootstraps its own store on X's workspace and syncs — it is the SAME
+        // actor (the founder), so it unseals the key and decrypts.
+        let mut b = new_joiner_node_as(db_user.clone(), db_seed, &a_ws, &x.to_string());
+        sync_all(&mut a.tracker, &mut b.tracker);
+        assert_eq!(b.tracker.my_actor(), Some(x.clone()), "dB resolves to actor X");
+        assert!(
+            titles(&mut b.tracker).contains(&"secret".to_string()),
+            "second device decrypts the workspace (seal-on-add)"
+        );
+
+        // A revokes dB and rotates; dB loses future content.
+        let (resp, _) = a.tracker.device_revoke_cmd(db_user.as_str().to_string());
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        assert!(
+            !a.tracker.actor_plane().is_device_of(&x, &db_user),
+            "dB revoked from X"
+        );
+        new_issue(&mut a.tracker, "after-revoke");
+        sync_all(&mut a.tracker, &mut b.tracker);
+        assert!(
+            !titles(&mut b.tracker).iter().any(|t| t == "after-revoke"),
+            "a revoked device is fenced from post-revocation content"
+        );
+    }
+
+    #[test]
+    fn single_use_invite_admits_exactly_one_actor_under_concurrency() {
+        // 5b regression: two admins concurrently redeem the SAME single-use
+        // invite for different actors; after merge exactly one is admitted, and
+        // both replicas agree (nonce bound into the op + deterministic dedup).
+        let mut a = new_node(); // founder/admin
+        let a_actor = a.tracker.my_actor().unwrap().to_string();
+        let a_ws = a.tracker.workspace_str();
+
+        let mut b = new_joiner_node_as(user_from_seed([2; 32]), [2; 32], &a_ws, &a_actor);
+        let b_incept = b.tracker.self_inception().unwrap();
+        a.tracker
+            .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
+        sync_all(&mut a.tracker, &mut b.tracker);
+        assert!(b.tracker.am_i_admin());
+
+        let nonce = [7u8; 16];
+        let j1 = incept_for([8; 32], &a.tracker);
+        let j2 = incept_for([9; 32], &a.tracker);
+        let j1a = actor_of(&j1);
+        let j2a = actor_of(&j2);
+        let issuer = a.tracker.me.clone(); // an admin's device signed the invite
+
+        // Concurrent redemptions on the two un-merged admins.
+        a.tracker.redeem_invite(&issuer, &j1, &nonce, true);
+        b.tracker.redeem_invite(&issuer, &j2, &nonce, true);
+
+        sync_all(&mut a.tracker, &mut b.tracker);
+        sync_all(&mut b.tracker, &mut a.tracker);
+
+        let a1 = a.tracker.is_member_actor(&j1a);
+        let a2 = a.tracker.is_member_actor(&j2a);
+        let b1 = b.tracker.is_member_actor(&j1a);
+        let b2 = b.tracker.is_member_actor(&j2a);
+        assert_eq!((a1, a2), (b1, b2), "both replicas agree on the winner");
+        assert!(a1 ^ a2, "a single-use invite admits exactly one actor");
+    }
+
+    #[test]
+    fn concurrent_rotations_converge_and_fence() {
+        // 5a regression: two admins remove *different* members concurrently, each
+        // rotating the key. Content-addressed epochs + the heal on merge must
+        // converge (both admins read post-heal content) and fence both removed
+        // members — no split-brain undecryptable key.
+        let mut a = new_node(); // founder/admin
+        with_project(&mut a.tracker);
+        let a_actor = a.tracker.my_actor().unwrap().to_string();
+        let a_ws = a.tracker.workspace_str();
+
+        let mut b = new_joiner_node_as(user_from_seed([2; 32]), [2; 32], &a_ws, &a_actor);
+        let mut c = new_joiner_node_as(user_from_seed([3; 32]), [3; 32], &a_ws, &a_actor);
+        let mut d = new_joiner_node_as(user_from_seed([4; 32]), [4; 32], &a_ws, &a_actor);
+        let b_incept = b.tracker.self_inception().unwrap();
+        let c_incept = c.tracker.self_inception().unwrap();
+        let d_incept = d.tracker.self_inception().unwrap();
+        let c_actor = actor_of(&c_incept);
+        let d_actor = actor_of(&d_incept);
+
+        // B is a second admin; C and D are members.
+        a.tracker
+            .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
+        a.tracker.admit_member(&c_incept, vec![Grant::Write]);
+        a.tracker.admit_member(&d_incept, vec![Grant::Write]);
+        for n in [&mut b, &mut c, &mut d] {
+            sync_all(&mut a.tracker, &mut n.tracker);
+        }
+        assert!(b.tracker.am_i_admin(), "B synced admin standing");
+
+        // Concurrent removals (no sync between): A removes C, B removes D. Each
+        // rotates locally to a fresh content-addressed epoch.
+        a.tracker.member_remove(&c_actor);
+        b.tracker.member_remove(&d_actor);
+
+        // Merge both ways + a settling round so the heal epoch propagates.
+        sync_all(&mut a.tracker, &mut b.tracker);
+        sync_all(&mut b.tracker, &mut a.tracker);
+        sync_all(&mut a.tracker, &mut b.tracker);
+        sync_all(&mut b.tracker, &mut a.tracker);
+
+        // The active epoch converged (both admins agree) — no key split-brain.
+        assert_eq!(
+            a.tracker.active_epoch().map(|e| e.id),
+            b.tracker.active_epoch().map(|e| e.id),
+            "admins converge on one active epoch after concurrent rotations"
+        );
+
+        // Post-heal content is written under the fenced tip and is readable by
+        // both surviving admins but not by either removed member.
+        new_issue(&mut a.tracker, "afterHeal");
+        sync_all(&mut a.tracker, &mut b.tracker);
+        assert!(
+            titles(&mut a.tracker).contains(&"afterHeal".to_string()),
+            "A reads post-heal content"
+        );
+        assert!(
+            titles(&mut b.tracker).contains(&"afterHeal".to_string()),
+            "B reads post-heal content (no split-brain key)"
+        );
+        sync_all(&mut a.tracker, &mut c.tracker);
+        sync_all(&mut a.tracker, &mut d.tracker);
+        assert!(
+            !titles(&mut c.tracker).iter().any(|t| t == "afterHeal"),
+            "removed C is fenced from post-heal content"
+        );
+        assert!(
+            !titles(&mut d.tracker).iter().any(|t| t == "afterHeal"),
+            "removed D is fenced from post-heal content"
+        );
+    }
+
+    #[test]
     fn e2ee_membership_gates_decryption() {
         let mut a = new_node(); // founder + admin
         with_project(&mut a.tracker);
@@ -3771,7 +4321,7 @@ mod tests {
         let mut n = new_node();
         with_project(&mut n.tracker);
         let reff = new_issue(&mut n.tracker, "flaky reconnect");
-        let me = me();
+        let me_actor = n.tracker.my_actor().unwrap();
 
         // start: one request = assignee + status in ONE commit / ONE activity row.
         let before = n.tracker.activity_high_water();
@@ -3781,7 +4331,7 @@ mod tests {
             other => panic!("start returns the fresh snapshot, got {other:?}"),
         };
         assert_eq!(v.status, "in_progress", "first Active-category state");
-        assert!(v.assignees.contains(&me), "start assigns the caller");
+        assert!(v.assignees.contains(&me_actor), "start assigns the caller");
         assert!(dirty.is_some());
         assert_eq!(
             n.tracker.activity_high_water(),
@@ -3802,7 +4352,7 @@ mod tests {
             other => panic!("{other:?}"),
         };
         assert_eq!(v.status, "done");
-        assert!(v.assignees.contains(&me), "done keeps the assignee");
+        assert!(v.assignees.contains(&me_actor), "done keeps the assignee");
 
         // stop: back to backlog, unassigned.
         let (resp, _) = n.tracker.handle(Request::IssueStop { reff });
@@ -3811,7 +4361,7 @@ mod tests {
             other => panic!("{other:?}"),
         };
         assert_eq!(v.status, "backlog", "first Backlog-category state");
-        assert!(!v.assignees.contains(&me), "stop unassigns the caller");
+        assert!(!v.assignees.contains(&me_actor), "stop unassigns the caller");
     }
 
     #[test]
