@@ -2533,8 +2533,11 @@ impl Tracker {
         if acl.is_invite_revoked(nonce) {
             return (Response::err("this invite has been revoked"), None);
         }
-        // Single-use replay guard.
-        if single_use && self.membership.is_redeemed(nonce) {
+        // Single-use replay guard — read from the SIGNED ACL (an authorized
+        // AddMember that spent this nonce), never an unsigned side container.
+        // The convergent nonce dedup in replay is the real guarantee; this is the
+        // fast-fail so we don't author a doomed op.
+        if single_use && acl.is_nonce_spent(nonce) {
             return (Response::err("invite already redeemed"), None);
         }
         // Idempotent: already a member ⇒ nothing to seal, no ACL churn.
@@ -2559,17 +2562,14 @@ impl Tracker {
             Ok(op) => op,
             Err(e) => return (Response::err(format!("{e:#}")), None),
         };
-        let nonce = *nonce;
         let incept = joiner_incept.clone();
-        let redeemer = joiner_incept.author.clone();
         let target = joiner_actor.clone();
         if let Err(e) = self.member_apply(op, "invite_redeem", |t| {
             // Import the joiner's identity, then seal every epoch to its devices.
+            // The single-use nonce is recorded by the AddMember op itself (bound
+            // above), so replay is the redemption record — no side container.
             t.membership.add_actor_event(&incept)?;
             Self::seal_epochs_to_actor(t, &target)?;
-            if single_use {
-                t.membership.mark_redeemed(&nonce, &redeemer)?;
-            }
             Ok(())
         }) {
             return (Response::err(format!("{e:#}")), None);
@@ -4760,7 +4760,7 @@ mod tests {
             "joiner is now a member"
         );
         assert!(
-            a.tracker.membership.is_redeemed(&nonce),
+            a.tracker.acl_state().is_nonce_spent(&nonce),
             "single-use nonce is burned in the same commit"
         );
 
@@ -4856,7 +4856,7 @@ mod tests {
             a.tracker.is_member_actor(&actor_of(&j1)) && a.tracker.is_member_actor(&actor_of(&j2))
         );
         assert!(
-            !a.tracker.membership.is_redeemed(&nonce),
+            !a.tracker.acl_state().is_nonce_spent(&nonce),
             "a reusable pass is never burned"
         );
     }

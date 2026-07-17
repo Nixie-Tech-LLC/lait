@@ -34,7 +34,6 @@ const C_ACTORS: &str = "actors"; // the lait/actor/1 key-event log (flat, grow-o
                                  // envelopes are unsigned ciphertext, but each is bound to its mint by
                                  // `blake3(key) == mint.key_commit`, so a forged envelope is inert.
 const C_KEYS: &str = "keys"; // epoch_id(hex) -> Map<device UserId, sealed bytes>
-const C_REDEEMED: &str = "redeemed"; // invite nonce(hex) -> redeemer UserId
 
 fn epoch_hex(id: &[u8; 16]) -> String {
     data_encoding::HEXLOWER.encode(id)
@@ -54,7 +53,6 @@ impl MembershipDoc {
         root.insert_container(C_ACL, LoroList::new())?;
         root.insert_container(C_ACTORS, LoroList::new())?;
         root.insert_container(C_KEYS, LoroMap::new())?;
-        root.insert_container(C_REDEEMED, LoroMap::new())?;
         op::commit_with(&doc, &OpCtx::authority("init", founder));
         Ok(Self { doc })
     }
@@ -290,39 +288,6 @@ impl MembershipDoc {
     }
 
     // ---- single-use invite replay guard (Pattern A) ----
-
-    /// The redeemed-nonce map, created on demand so a workspace founded before
-    /// invites existed still records redemptions (the container syncs like the
-    /// rest of the membership doc, giving multi-admin replay safety).
-    fn redeemed_map(&self, create: bool) -> Option<LoroMap> {
-        match self.root().get(C_REDEEMED) {
-            Some(ValueOrContainer::Container(Container::Map(m))) => Some(m),
-            _ if create => self
-                .root()
-                .insert_container(C_REDEEMED, LoroMap::new())
-                .ok(),
-            _ => None,
-        }
-    }
-
-    /// Whether a single-use invite `nonce` has already been spent.
-    pub fn is_redeemed(&self, nonce: &[u8]) -> bool {
-        let key = data_encoding::HEXLOWER.encode(nonce);
-        self.redeemed_map(false)
-            .map(|m| m.get(&key).is_some())
-            .unwrap_or(false)
-    }
-
-    /// Burn a single-use invite `nonce`, recording who redeemed it. The caller is
-    /// responsible for committing/persisting the doc (e.g. via `member_apply`).
-    pub fn mark_redeemed(&self, nonce: &[u8], redeemer: &UserId) -> Result<()> {
-        let key = data_encoding::HEXLOWER.encode(nonce);
-        let m = self
-            .redeemed_map(true)
-            .ok_or_else(|| anyhow!("redeemed container missing"))?;
-        m.insert(&key, redeemer.as_str())?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -415,25 +380,6 @@ mod tests {
         let mut expect = vec![user(1), user(2)];
         expect.sort();
         assert_eq!(devs, expect);
-    }
-
-    #[test]
-    fn redeemed_nonces_record_and_survive_a_snapshot() {
-        let m = fresh(&ws());
-        let nonce = [7u8; 16];
-        assert!(!m.is_redeemed(&nonce), "unseen nonce is not redeemed");
-        m.mark_redeemed(&nonce, &user(3)).unwrap();
-        m.apply(&ctx("invite_redeem"));
-        assert!(m.is_redeemed(&nonce), "burned nonce reads back as redeemed");
-        assert!(
-            !m.is_redeemed(&[8u8; 16]),
-            "a different nonce is still fresh"
-        );
-        // The guard is synced state, so it must survive a snapshot round-trip
-        // (this is what gives a second admin the same replay protection).
-        let snap = m.snapshot().unwrap();
-        let loaded = MembershipDoc::from_snapshot(&snap, None).unwrap();
-        assert!(loaded.is_redeemed(&nonce), "redemption survives snapshot");
     }
 
     #[test]

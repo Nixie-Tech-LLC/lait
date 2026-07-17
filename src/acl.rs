@@ -192,6 +192,9 @@ pub struct AclState {
     /// Invite nonces revoked by an admin ([`AclAction::RevokeInvite`]). Admission
     /// via a revoked nonce is refused — the kill switch for a leaked invite.
     revoked_invites: BTreeSet<[u8; 16]>,
+    /// Single-use invite nonces already spent by an authorized `AddMember` — the
+    /// signed redemption record, so single-use rides replay, not an unsigned doc.
+    spent_nonces: BTreeSet<[u8; 16]>,
 }
 
 impl AclState {
@@ -203,6 +206,11 @@ impl AclState {
     /// Whether an invite nonce has been revoked by an admin.
     pub fn is_invite_revoked(&self, nonce: &[u8; 16]) -> bool {
         self.revoked_invites.contains(nonce)
+    }
+    /// Whether a single-use invite nonce has already been spent by an authorized
+    /// admission — the signed single-use guard.
+    pub fn is_nonce_spent(&self, nonce: &[u8; 16]) -> bool {
+        self.spent_nonces.contains(nonce)
     }
     /// The authorized epoch with a given id, if any (its `key_commit` binds the
     /// sealed envelopes).
@@ -493,9 +501,15 @@ pub fn replay_with_audit(
     // idempotent — the id is content-random so this only happens on replay).
     let mut epochs: BTreeMap<[u8; 16], EpochAuth> = BTreeMap::new();
     let mut revoked_invites: BTreeSet<[u8; 16]> = BTreeSet::new();
+    // Single-use invite nonces already spent by an authorized AddMember — the
+    // *signed* record of redemption (replaces the unsigned `C_REDEEMED` doc).
+    let mut spent_nonces: BTreeSet<[u8; 16]> = BTreeSet::new();
 
     for h in &authorized {
         let op = decoded[h].as_ref().expect("authorized ops decoded");
+        if let (AclAction::AddMember { .. }, Some(nonce)) = (&op.action, &op.nonce) {
+            spent_nonces.insert(*nonce);
+        }
         match &op.action {
             AclAction::AddMember { actor, grants } | AclAction::SetGrants { actor, grants } => {
                 members.insert(actor.clone(), grants.iter().copied().collect());
@@ -664,6 +678,7 @@ pub fn replay_with_audit(
             agents,
             epochs,
             revoked_invites,
+            spent_nonces,
         },
         audit,
     )
