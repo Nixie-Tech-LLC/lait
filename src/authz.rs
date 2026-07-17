@@ -11,10 +11,12 @@
 //! exists to avoid).
 //!
 //! **At-position authorization.** Each op embeds the membership heads its
-//! author observed (`asof`); validation replays membership *up to that
-//! frontier* and requires the author to be a **human member** then (agents are
-//! sealed the key but hold no content authority — contract §3.4). Offboarding
-//! therefore never resurrects a departed teammate's legitimate deletes.
+//! author observed (`asof`); validation replays membership *up to that frontier*
+//! and requires the author to hold **content-write standing** then — `can_write`
+//! (Admin or Write grant). A grant-less viewer and an agent are both sealed the
+//! key but hold no content authority (contract §3.4), so neither can tombstone.
+//! Offboarding therefore never resurrects a departed teammate's legitimate
+//! deletes.
 //!
 //! **Why self-declared `asof` is safe here — the ban-evasion hole and its
 //! fence.** Matrix found at-position authorization alone insufficient: a banned
@@ -190,6 +192,21 @@ pub fn replay(
         st
     };
 
+    // Actor-plane-at-frontier cache: the device→actor binding resolves
+    // identically everywhere for a given `actor_asof`, so replay the actor plane
+    // once per distinct frontier rather than once per op (the acl.rs shape).
+    let mut actor_cache: HashMap<BTreeSet<String>, crate::actor::ActorPlane> = HashMap::new();
+    let mut speaks_for = |device: &crate::ids::UserId,
+                          by: &crate::ids::ActorId,
+                          asof: &[String]|
+     -> bool {
+        let key: BTreeSet<String> = asof.iter().cloned().collect();
+        actor_cache
+            .entry(key)
+            .or_insert_with(|| crate::actor::replay_at(&genesis.workspace_id, actor_events, asof))
+            .is_device_of(by, device)
+    };
+
     // Authorize + apply in topo order (last-writer per doc), remembering the
     // per-doc authorized ops for the restore-wins override.
     let mut value: BTreeMap<DocId, bool> = BTreeMap::new();
@@ -204,16 +221,17 @@ pub fn replay(
         // The signing device must speak for the claimed actor at the declared
         // actor-log frontier (device→actor binding at position)...
         let author = &nodes[h].author;
-        let bound = crate::actor::replay_at(&genesis.workspace_id, actor_events, &op.actor_asof)
-            .is_device_of(&op.by, author);
-        if !bound {
+        if !speaks_for(author, &op.by, &op.actor_asof) {
             continue;
         }
-        // ...and that actor must be a human member at the op's membership
-        // position: agents hold no content authority (§3.4), and a
-        // non-member-at-position never did.
+        // ...and that actor must hold **content-write standing** at the op's
+        // membership position (`can_write` = Admin or Write grant). This is the
+        // cross-replica enforcement of the view-only member: a grant-less viewer
+        // — like an agent (§3.4) or a non-member-at-position — has no content
+        // authority, so its tombstone is void on every replica, not merely
+        // refused on the author's own node.
         let st = membership_at(&op.asof);
-        if !st.is_human_member(&op.by) {
+        if !st.can_write(&op.by) {
             continue;
         }
         match &op.action {
@@ -391,6 +409,33 @@ mod tests {
             "an agent holds no content authority (§3.4)"
         );
         assert!(st.governs(&d1) && !st.governs(&d2) && !st.governs(&d3));
+    }
+
+    #[test]
+    fn a_view_only_member_cannot_tombstone() {
+        // A member with empty grants (a viewer) is sealed the key but holds no
+        // content authority: `can_write` is false, so its tombstone is void on
+        // every replica — not merely refused on its own node.
+        let f = fx(1, &[2]);
+        let add_viewer = f.add_member(2, vec![], vec![]); // sealed in, zero grants
+        let d = doc();
+        let del = f.tomb(2, 2, &d, true, vec![add_viewer.hash()], vec![]);
+        let st = f.replay(&[add_viewer], &[del]);
+        assert!(
+            !st.is_tombstoned(&d) && !st.governs(&d),
+            "a viewer's delete carries no content authority"
+        );
+
+        // Control: the same actor, granted Write, deletes validly.
+        let f = fx(1, &[2]);
+        let add_writer = f.add_member(2, vec![Grant::Write], vec![]);
+        let d = doc();
+        let del = f.tomb(2, 2, &d, true, vec![add_writer.hash()], vec![]);
+        let st = f.replay(&[add_writer], &[del]);
+        assert!(
+            st.is_tombstoned(&d),
+            "a Write-granted member's delete stands"
+        );
     }
 
     #[test]

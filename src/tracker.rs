@@ -535,10 +535,58 @@ impl Tracker {
 
     // ---- dispatch ----
 
+    /// Whether this request mutates workspace **content** (and so needs write
+    /// standing). Membership, device, and recovery ops are excluded — they carry
+    /// their own admin/self gates. Anything unlisted defaults to un-gated here,
+    /// so a missed variant fails open to today's behavior, never a false denial.
+    fn requires_write(req: &Request) -> bool {
+        matches!(
+            req,
+            Request::IssueNew { .. }
+                | Request::IssueEdit { .. }
+                | Request::IssueMove { .. }
+                | Request::Assign { .. }
+                | Request::Label { .. }
+                | Request::Comment { .. }
+                | Request::IssueDelete { .. }
+                | Request::IssueRestore { .. }
+                | Request::IssueLink { .. }
+                | Request::IssueUnlink { .. }
+                | Request::IssueParent { .. }
+                | Request::IssueStart { .. }
+                | Request::IssueDone { .. }
+                | Request::IssueStop { .. }
+                | Request::ProjectNew { .. }
+                | Request::LabelNew { .. }
+        )
+    }
+
+    /// Whether this device's actor currently holds content-write standing
+    /// (`can_write` = Admin or Write grant). A viewer, agent, or non-member is
+    /// false.
+    fn can_write_now(&self) -> bool {
+        self.my_actor()
+            .is_some_and(|a| self.acl_state().can_write(&a))
+    }
+
     /// Handle a tracker request. Returns the response plus an optional dirty-set
     /// (present only when a commit happened — never on error, so a doorbell never
     /// rings for a rejected write; UI.md §4.3).
     pub fn handle(&mut self, req: Request) -> (Response, Option<DirtySet>) {
+        // View-only enforcement. A member with no Write/Admin grant (a viewer)
+        // is sealed the key and reads freely, but holds no content authority, so
+        // it may not mutate workspace content. Non-members and agents are refused
+        // for the same reason. Device/membership/recovery ops are self- or admin-
+        // gated in their own handlers, so they are NOT gated here (a viewer must
+        // still manage its own devices and recover). Signed content ops
+        // (tombstones) are additionally void in the authz plane on every replica;
+        // this gate refuses the unsigned-CRDT writes up front with a clear reason.
+        if Self::requires_write(&req) && !self.can_write_now() {
+            return (
+                Response::err("view-only: your membership grants no write access"),
+                None,
+            );
+        }
         let r = match req {
             Request::IssueNew {
                 title,
@@ -1253,11 +1301,15 @@ impl Tracker {
             .row(&doc_id)
             .map(|r| r.project_id)
             .ok_or_else(|| anyhow!("no such row"))?;
+        // Content authority = `can_write` (Admin or Write grant): agents and
+        // grant-less viewers hold the key but no delete authority. The authz
+        // plane voids their tombstone on every replica; we mirror that here so a
+        // direct caller gets a clear refusal rather than a silently-void op.
         let me_actor = match self.my_actor() {
-            Some(a) if self.acl_state().is_human_member(&a) => a,
+            Some(a) if self.acl_state().can_write(&a) => a,
             _ => {
                 return Ok((
-                    Response::err("agents may not delete issues (no content authority)"),
+                    Response::err("no content authority to delete issues (view-only or agent)"),
                     None,
                 ))
             }
@@ -4141,6 +4193,71 @@ mod tests {
         assert!(
             !titles(&mut b.tracker).iter().any(|t| t == "post-removal"),
             "lazy revocation: removed member can't read post-removal content"
+        );
+    }
+
+    #[test]
+    fn a_viewer_reads_but_is_refused_writes_until_granted() {
+        // The view-only member end to end: B is admitted with EMPTY grants, syncs
+        // and decrypts (reads), but every content write is refused until an admin
+        // grants Write — then the identical write succeeds.
+        let mut a = new_node(); // founder/admin
+        let proj = with_project(&mut a.tracker);
+        new_issue(&mut a.tracker, "existing");
+        let a_ws = a.tracker.workspace_str();
+        let a_actor = a.tracker.my_actor().unwrap().to_string();
+
+        let b_seed = [12u8; 32];
+        let b_user = user_from_seed(b_seed);
+        let mut b = new_joiner_node_as(b_user, b_seed, &a_ws, &a_actor);
+        let b_incept = b.tracker.self_inception().unwrap();
+        let b_actor = actor_of(&b_incept);
+
+        // Admit B as a VIEWER (no grants), then sync.
+        let (resp, _) = a.tracker.admit_member(&b_incept, vec![]);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        sync_all(&mut a.tracker, &mut b.tracker);
+        assert!(b.tracker.am_i_member(), "a viewer is a member");
+        assert_eq!(
+            b.tracker.acl_state().standing(&b_actor),
+            Some("viewer"),
+            "empty grants ⇒ viewer standing"
+        );
+        // Reads work: the viewer decrypts existing content.
+        assert!(
+            titles(&mut b.tracker).contains(&"existing".to_string()),
+            "a viewer decrypts and reads the workspace"
+        );
+
+        // Writes are refused, and nothing is committed (no dirty-set).
+        let write = |title: &str| Request::IssueNew {
+            title: title.into(),
+            project: Some(proj.clone()),
+            project_hint: None,
+            assignees: vec![],
+            priority: None,
+            labels: vec![],
+            body: None,
+        };
+        let (resp, dirty) = b.tracker.handle(write("sneaky"));
+        assert!(
+            matches!(resp, Response::Error { .. }) && dirty.is_none(),
+            "a viewer's write is refused with no commit: {resp:?}"
+        );
+
+        // Admin grants B Write; the same write now succeeds.
+        let (resp, _) = a
+            .tracker
+            .member_add(&b_actor, vec![Grant::Admin, Grant::Write]);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        // member_add re-grant is authored against the *actor* frontier; grant
+        // Write specifically (Admin+Write here) and sync so B sees its new grant.
+        sync_all(&mut a.tracker, &mut b.tracker);
+        assert!(b.tracker.can_write_now(), "B now holds write standing");
+        let (resp, dirty) = b.tracker.handle(write("now allowed"));
+        assert!(
+            matches!(resp, Response::Ref { .. }) && dirty.is_some(),
+            "a granted member's write succeeds: {resp:?}"
         );
     }
 

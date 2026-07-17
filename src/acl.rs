@@ -447,18 +447,6 @@ pub fn replay_with_audit(
         }
     }
 
-    // ---- sponsor cascade: an agent stands only while its sponsor does.
-    // Sponsors are never agents (AddAgent authorization), so one pass suffices.
-    let orphaned: Vec<ActorId> = agents
-        .iter()
-        .filter(|(_, sponsor)| !members.contains_key(*sponsor))
-        .map(|(k, _)| k.clone())
-        .collect();
-    for k in orphaned {
-        agents.remove(&k);
-        members.remove(&k);
-    }
-
     // ---- single-use invite convergence: a nonce admits exactly one actor.
     // Two admins on un-merged replicas can each authorize an AddMember spending
     // the same nonce for a different actor; after merge both ops are valid, so
@@ -522,6 +510,20 @@ pub fn replay_with_audit(
                 agents.remove(actor);
             }
         }
+    }
+
+    // ---- sponsor cascade: an agent stands only while its sponsor does. Run
+    // LAST, after every member removal (remove-wins AND nonce-race eviction), so
+    // an agent whose sponsor was evicted by either path cannot survive orphaned.
+    // Sponsors are never agents (AddAgent authorization), so one pass suffices.
+    let orphaned: Vec<ActorId> = agents
+        .iter()
+        .filter(|(_, sponsor)| !members.contains_key(*sponsor))
+        .map(|(k, _)| k.clone())
+        .collect();
+    for k in orphaned {
+        agents.remove(&k);
+        members.remove(&k);
     }
 
     (AclState { members, agents }, audit)
@@ -1001,6 +1003,62 @@ mod tests {
         assert!(
             st.is_member(g.a(4)) ^ st.is_member(g.a(5)),
             "a single nonce admits exactly one actor when neither has another seat"
+        );
+    }
+
+    #[test]
+    fn nonce_race_loser_cannot_leave_an_orphaned_agent() {
+        // A nonce-race LOSER that sponsored an agent before it was evicted must
+        // not leave that agent standing. The sponsor cascade runs after the
+        // nonce eviction precisely so an agent whose sponsor loses its only seat
+        // cascades away — otherwise it survives orphaned (the bug this guards).
+        let f = fx(1, &[2, 3, 7]);
+        // Find a nonce where actor 3 LOSES to actor 2 (actor 2's op hash sorts
+        // first). Deterministic; some fill in 0..=255 always makes 3 lose.
+        let build = |fill: u8| {
+            let n = [fill; 16];
+            let win = f.op_nonce(
+                1,
+                1,
+                AclAction::AddMember {
+                    actor: f.a(2).clone(),
+                    grants: vec![Grant::Write],
+                },
+                n,
+                vec![],
+            );
+            let lose = f.op_nonce(
+                1,
+                1,
+                AclAction::AddMember {
+                    actor: f.a(3).clone(),
+                    grants: vec![Grant::Write],
+                },
+                n,
+                vec![],
+            );
+            (win, lose)
+        };
+        let (win, lose) = (0u8..=255)
+            .map(build)
+            .find(|(w, l)| w.hash() < l.hash())
+            .expect("some fill makes actor 3 lose the tie-break");
+        // Actor 3 (the loser) sponsors agent 7, causally after its own admission
+        // — so the AddAgent authorizes in pass 1 while 3 is still a member.
+        let sponsor = f.op(
+            3,
+            3,
+            AclAction::AddAgent {
+                actor: f.a(7).clone(),
+            },
+            vec![lose.hash()],
+        );
+        let st = f.replay(&[win, lose, sponsor]);
+        assert!(st.is_member(f.a(2)), "the nonce winner stands");
+        assert!(!st.is_member(f.a(3)), "the nonce-race loser is evicted");
+        assert!(
+            !st.is_member(f.a(7)) && !st.is_agent(f.a(7)),
+            "an agent sponsored by an evicted loser cannot survive orphaned"
         );
     }
 
