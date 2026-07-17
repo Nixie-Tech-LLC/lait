@@ -279,6 +279,12 @@ pub enum Request {
         key: String,
     },
     KeyRotate,
+    /// Revoke an outstanding invite so it can no longer admit anyone (admin-
+    /// only). Accepts the invite ticket or its 32-hex nonce.
+    InviteRevoke {
+        /// The invite ticket, or its raw 32-hex nonce.
+        invite: String,
+    },
     /// Print a device-enrollment token for adding another device to *this*
     /// actor (lait/actor/1). The new machine consumes it with `device accept`.
     DeviceInvite,

@@ -70,6 +70,7 @@ pub fn is_read(req: &Request) -> bool {
         | Request::MemberApprove { .. }
         | Request::MemberAlias { .. }
         | Request::KeyRotate
+        | Request::InviteRevoke { .. }
         | Request::DeviceAdd { .. }
         | Request::DeviceRevoke { .. }
         | Request::Recover

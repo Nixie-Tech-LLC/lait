@@ -1327,6 +1327,7 @@ impl Node {
             | Request::MemberRemove { .. }
             | Request::MemberLog
             | Request::KeyRotate
+            | Request::InviteRevoke { .. }
             | Request::DeviceInvite
             | Request::DeviceAdd { .. }
             | Request::DeviceRevoke { .. }
@@ -1594,6 +1595,15 @@ impl Node {
             } => {
                 let (workspace, name) = {
                     let t = self.tracker.lock().unwrap();
+                    // Only an admin can meaningfully onboard: `redeem_invite`
+                    // honors a pre-authorization only from an admin device, and a
+                    // manual approve is admin-gated too. Refuse up front rather
+                    // than hand back a ticket that can never admit anyone.
+                    if !t.am_i_admin() {
+                        return Ok(Response::err(
+                            "only an admin can mint an invite — ask a workspace admin",
+                        ));
+                    }
                     (t.workspace_str(), t.workspace_name())
                 };
                 // Default: embed a signed, single-use pre-authorization so the

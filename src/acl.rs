@@ -95,6 +95,13 @@ pub enum AclAction {
         /// The actor set the minter sealed the key to (for stale-tip healing).
         members: Vec<ActorId>,
     },
+    /// Revoke an outstanding invite by its nonce (admin-only). A leaked reusable
+    /// invite has no other kill switch; this is the convergent one — a replica
+    /// refuses to admit via a revoked nonce once the signed revoke has synced.
+    /// No subject actor; grow-only.
+    RevokeInvite {
+        nonce: [u8; 16],
+    },
 }
 
 impl AclAction {
@@ -106,7 +113,7 @@ impl AclAction {
             | AclAction::RemoveMember { actor }
             | AclAction::SetGrants { actor, .. }
             | AclAction::AddAgent { actor } => Some(actor),
-            AclAction::MintEpoch { .. } => None,
+            AclAction::MintEpoch { .. } | AclAction::RevokeInvite { .. } => None,
         }
     }
 }
@@ -182,6 +189,9 @@ pub struct AclState {
     /// keyed by id. The trusted epoch set — key selection and keyring adoption
     /// read this, never the raw synced doc, so an injected epoch is never live.
     epochs: BTreeMap<[u8; 16], EpochAuth>,
+    /// Invite nonces revoked by an admin ([`AclAction::RevokeInvite`]). Admission
+    /// via a revoked nonce is refused — the kill switch for a leaked invite.
+    revoked_invites: BTreeSet<[u8; 16]>,
 }
 
 impl AclState {
@@ -189,6 +199,10 @@ impl AclState {
     /// `(gen, id)` among these (the deterministic active tip).
     pub fn epochs(&self) -> Vec<EpochAuth> {
         self.epochs.values().cloned().collect()
+    }
+    /// Whether an invite nonce has been revoked by an admin.
+    pub fn is_invite_revoked(&self, nonce: &[u8; 16]) -> bool {
+        self.revoked_invites.contains(nonce)
     }
     /// The authorized epoch with a given id, if any (its `key_commit` binds the
     /// sealed envelopes).
@@ -369,6 +383,7 @@ pub fn replay_with_audit(
             AclAction::SetGrants { .. } => "set_grants",
             AclAction::AddAgent { .. } => "add_agent",
             AclAction::MintEpoch { .. } => "mint_epoch",
+            AclAction::RevokeInvite { .. } => "revoke_invite",
         };
         if let AclAction::AddMember { grants, .. } | AclAction::SetGrants { grants, .. } =
             &op.action
@@ -425,6 +440,8 @@ pub fn replay_with_audit(
                         *gen <= ceiling
                     }
                 }
+                // Revoking an invite is a membership-authority action — admin only.
+                AclAction::RevokeInvite { .. } => admins.contains(by),
             };
         entry.authorized = ok;
         audit.push(entry);
@@ -458,6 +475,9 @@ pub fn replay_with_audit(
             AclAction::MintEpoch { gen, .. } => {
                 epoch_gens.insert(h.clone(), *gen);
             }
+            // Invite revocation touches neither the member set nor epochs;
+            // materialized in pass 2.
+            AclAction::RevokeInvite { .. } => {}
         }
     }
 
@@ -472,6 +492,7 @@ pub fn replay_with_audit(
     // Authorized epoch mints, keyed by id (grow-only; a re-mint of the same id is
     // idempotent — the id is content-random so this only happens on replay).
     let mut epochs: BTreeMap<[u8; 16], EpochAuth> = BTreeMap::new();
+    let mut revoked_invites: BTreeSet<[u8; 16]> = BTreeSet::new();
 
     for h in &authorized {
         let op = decoded[h].as_ref().expect("authorized ops decoded");
@@ -501,6 +522,9 @@ pub fn replay_with_audit(
                     members: recipients.clone(),
                     minted_by: op.by.clone(),
                 });
+            }
+            AclAction::RevokeInvite { nonce } => {
+                revoked_invites.insert(*nonce);
             }
         }
     }
@@ -639,6 +663,7 @@ pub fn replay_with_audit(
             members,
             agents,
             epochs,
+            revoked_invites,
         },
         audit,
     )
@@ -1336,6 +1361,47 @@ mod tests {
         assert!(
             st.epoch(&[0x03; 16]).is_some_and(|e| e.gen == 1),
             "a mint that increments the generation by one is accepted"
+        );
+    }
+
+    #[test]
+    fn only_an_admin_may_revoke_an_invite() {
+        // Invite revocation is a membership-authority action, so a plain writer
+        // cannot revoke — only the revoke set materialized from an admin-signed
+        // op gates admission.
+        let f = fx(1, &[2]);
+        let add_writer = f.op(
+            1,
+            1,
+            AclAction::AddMember {
+                actor: f.a(2).clone(),
+                grants: vec![Grant::Write],
+            },
+            vec![],
+        );
+        let nonce = [5u8; 16];
+        let writer_revoke = f.op(
+            2,
+            2,
+            AclAction::RevokeInvite { nonce },
+            vec![add_writer.hash()],
+        );
+        let st = f.replay(&[add_writer.clone(), writer_revoke]);
+        assert!(
+            !st.is_invite_revoked(&nonce),
+            "a non-admin's revoke is not authorized"
+        );
+
+        let admin_revoke = f.op(
+            1,
+            1,
+            AclAction::RevokeInvite { nonce },
+            vec![add_writer.hash()],
+        );
+        let st = f.replay(&[add_writer, admin_revoke]);
+        assert!(
+            st.is_invite_revoked(&nonce),
+            "an admin's revoke is authorized and gates admission"
         );
     }
 }

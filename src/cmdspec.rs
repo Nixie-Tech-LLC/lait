@@ -1298,33 +1298,48 @@ pub fn specs() -> Vec<Spec> {
         Spec::req("status", "Show node and space status.", vec![], |_| {
             Ok(Request::Status)
         }),
-        Spec::special(
-            "invite",
-            "Print a base32 ticket (+ QR) others use to join your space.",
-            vec![
-                A::val(
-                    "email",
-                    "Open your mail client with a prefilled invite to this address.",
-                ),
-                A::flag(
-                    "require_approval",
-                    "Mint a pass-less ticket: the joiner lands as a pending request.",
-                )
-                .long("require-approval")
-                .conflicts(&["reusable", "ttl_hours"]),
-                A::flag(
-                    "reusable",
-                    "Let one ticket admit your whole team until it expires.",
-                ),
-                A::val(
-                    "ttl_hours",
-                    "Hours until the pass expires (default 168 = 7 days).",
-                )
-                .long("ttl-hours")
-                .value_name("HOURS"),
-            ],
-            Special::Invite,
-        ),
+        Spec {
+            subs: vec![Spec::req(
+                "revoke",
+                "Revoke an invite so it can no longer admit anyone (admin only).",
+                vec![A::pos(
+                    "invite",
+                    "The invite ticket, or its 32-hex nonce.",
+                )],
+                |m| {
+                    Ok(Request::InviteRevoke {
+                        invite: req_str(m, "invite"),
+                    })
+                },
+            )],
+            ..Spec::special(
+                "invite",
+                "Print a base32 ticket (+ QR) others use to join your space.",
+                vec![
+                    A::val(
+                        "email",
+                        "Open your mail client with a prefilled invite to this address.",
+                    ),
+                    A::flag(
+                        "require_approval",
+                        "Mint a pass-less ticket: the joiner lands as a pending request.",
+                    )
+                    .long("require-approval")
+                    .conflicts(&["reusable", "ttl_hours"]),
+                    A::flag(
+                        "reusable",
+                        "Let one ticket admit your whole team until it expires.",
+                    ),
+                    A::val(
+                        "ttl_hours",
+                        "Hours until the pass expires (default 168 = 7 days).",
+                    )
+                    .long("ttl-hours")
+                    .value_name("HOURS"),
+                ],
+                Special::Invite,
+            )
+        },
         Spec::special(
             "join",
             "Join a space from an invite link (creates the store here, or at --dir).",

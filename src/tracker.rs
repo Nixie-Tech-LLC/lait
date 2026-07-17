@@ -675,6 +675,7 @@ impl Tracker {
             Request::MemberRemove { who } => Ok(self.member_remove_cmd(who)),
             Request::AgentAdd { key } => Ok(self.agent_add_cmd(key)),
             Request::KeyRotate => Ok(self.key_rotate_cmd()),
+            Request::InviteRevoke { invite } => Ok(self.invite_revoke_cmd(invite)),
             Request::DeviceInvite => Ok(self.device_invite_cmd()),
             Request::DeviceAdd { consent } => Ok(self.device_add_cmd(consent)),
             Request::DeviceRevoke { device } => Ok(self.device_revoke_cmd(device)),
@@ -2494,6 +2495,11 @@ impl Tracker {
             Some(me) if acl.is_admin(&me) => {}
             _ => return (Response::err("this node is not an admin"), None),
         }
+        // Revocation kill switch: an admin-signed RevokeInvite voids this nonce
+        // convergently — the only way to retire a leaked (esp. reusable) invite.
+        if acl.is_invite_revoked(nonce) {
+            return (Response::err("this invite has been revoked"), None);
+        }
         // Single-use replay guard.
         if single_use && self.membership.is_redeemed(nonce) {
             return (Response::err("invite already redeemed"), None);
@@ -2613,6 +2619,50 @@ impl Tracker {
             }
             Err(e) => (Response::err(format!("{e:#}")), None),
         }
+    }
+
+    /// Revoke an outstanding invite (admin-only). Accepts the invite's 32-hex
+    /// nonce or a full ticket to lift it from. Authors a signed
+    /// [`AclAction::RevokeInvite`]; once it syncs, no admin admits via that nonce
+    /// — the kill switch for a leaked (especially reusable) invite.
+    pub fn invite_revoke_cmd(&mut self, invite: String) -> (Response, Option<DirtySet>) {
+        if !self.am_i_admin() {
+            return (Response::err("only an admin can revoke an invite"), None);
+        }
+        let Some(nonce) = Self::parse_invite_nonce(&invite) else {
+            return (
+                Response::err("not a valid invite — pass the ticket or its 32-hex nonce"),
+                None,
+            );
+        };
+        let op = match self.author_acl(AclAction::RevokeInvite { nonce }) {
+            Ok(op) => op,
+            Err(e) => return (Response::err(format!("{e:#}")), None),
+        };
+        if let Err(e) = self.member_apply(op, "invite_revoke", |_| Ok(())) {
+            return (Response::err(format!("{e:#}")), None);
+        }
+        (
+            Response::Ok {
+                message: Some("revoked the invite — it can no longer admit anyone".into()),
+            },
+            Some(DirtySet::catalog(CatalogScope::Acl)),
+        )
+    }
+
+    /// Extract an invite nonce from either a full ticket (via its signed invite)
+    /// or a raw 32-hex string.
+    fn parse_invite_nonce(input: &str) -> Option<[u8; 16]> {
+        let s = input.trim();
+        if let Ok(ticket) = s.parse::<crate::proto::WorkspaceTicket>() {
+            // A ticket only carries a nonce if it embeds a signed invite.
+            let (_pk, grant) = ticket.invite?.verify().ok()?;
+            return Some(grant.nonce);
+        }
+        let raw = data_encoding::HEXLOWER_PERMISSIVE
+            .decode(s.as_bytes())
+            .ok()?;
+        raw.as_slice().try_into().ok()
     }
 
     /// Resolve a `<who>` ref to a known actor: an `act_` id directly, or a
@@ -4653,6 +4703,37 @@ mod tests {
             !a.tracker.is_member_actor(&actor_of(&other)),
             "replay seats no one"
         );
+    }
+
+    #[test]
+    fn a_revoked_invite_admits_no_one() {
+        // The kill switch: once an admin revokes a nonce, no redemption via it
+        // seats anyone — the only way to retire a leaked (esp. reusable) invite.
+        let mut a = new_node(); // founder + admin
+        let nonce = [7u8; 16];
+        let j_incept = incept_for([61u8; 32], &a.tracker);
+        let j_actor = actor_of(&j_incept);
+
+        let (resp, _) = a
+            .tracker
+            .invite_revoke_cmd(data_encoding::HEXLOWER.encode(&nonce));
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        assert!(a.tracker.acl_state().is_invite_revoked(&nonce));
+
+        let (resp, dirty) = a.tracker.redeem_invite(&me(), &j_incept, &nonce, true);
+        assert!(
+            matches!(resp, Response::Error { .. }) && dirty.is_none(),
+            "a revoked invite admits no one: {resp:?}"
+        );
+        assert!(!a.tracker.is_member_actor(&j_actor));
+
+        // A different, un-revoked nonce still admits the same joiner.
+        let (resp, dirty) = a.tracker.redeem_invite(&me(), &j_incept, &[8u8; 16], true);
+        assert!(
+            matches!(resp, Response::Ok { .. }) && dirty.is_some(),
+            "{resp:?}"
+        );
+        assert!(a.tracker.is_member_actor(&j_actor));
     }
 
     #[test]
