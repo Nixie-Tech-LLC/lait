@@ -142,8 +142,10 @@ pub enum SpaceOp {
         /// Preimage of the recovery commitment being satisfied (must hash to the
         /// current `recovery_root`).
         set: RecoverySet,
-        /// The recovery commitment installed for the *next* recovery (one-shot
-        /// rotation of the break-glass keys).
+        /// The recovery commitment installed for the *next* recovery. May rotate
+        /// the break-glass keys, but v1's driver keeps it equal to the current
+        /// commitment (rotating the set in a distributed K-of-N needs custody
+        /// coordination — a deliberate follow-up); `gen` alone fences replay.
         next_recovery_root: [u8; 32],
         /// Strictly `current_gen + 1` — monotone, so an old recovery can't replay.
         gen: u32,
