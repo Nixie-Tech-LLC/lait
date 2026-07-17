@@ -32,6 +32,7 @@ pub mod control;
 pub mod crypto;
 pub mod daemon_spawn;
 pub mod diagnose;
+pub mod dkg;
 pub mod dto;
 pub mod engine;
 pub mod ids;
