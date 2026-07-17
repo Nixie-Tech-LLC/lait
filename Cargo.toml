@@ -188,6 +188,8 @@ tar = "0.4"
 # turns on, and all cargo-dist's zip uses. The default feature set drags in
 # aes/bzip2/zstd/lzma for codecs no release archive contains.
 zip = { version = "6", default-features = false, features = ["deflate"] }
+frost-ed25519 = "3.0.0"
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 # The profile that 'dist' will build with
 [profile.dist]
