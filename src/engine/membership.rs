@@ -61,7 +61,7 @@ impl MembershipDoc {
         Ok(Self { doc })
     }
 
-    /// Load from stored snapshot bytes, applying the contract's kernel config.
+    /// Load from stored snapshot bytes, applying the contract's engine config.
     pub fn from_snapshot(bytes: &[u8], peer: Option<u64>) -> Result<Self> {
         let doc = LoroDoc::new();
         op::configure(&doc, peer);

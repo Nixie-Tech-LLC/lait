@@ -79,7 +79,7 @@ pub struct Store {
     /// once per store and persisted beside the docs, so a daemon restart reuses
     /// it (no version-vector growth per session) while a re-created store mints
     /// a fresh one (reusing a peer id over an empty store and then importing
-    /// the old ops silently drops them — verified against the kernel). Copying
+    /// the old ops silently drops them — verified against the engine). Copying
     /// a store directory to a second live node stays forbidden, as it already
     /// was for the identity key.
     peer_id: u64,
@@ -109,7 +109,7 @@ impl Store {
         })
     }
 
-    /// The stable per-store kernel peer id (see the field docs).
+    /// The stable per-store engine peer id (see the field docs).
     pub fn peer_id(&self) -> u64 {
         self.peer_id
     }

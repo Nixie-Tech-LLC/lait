@@ -55,7 +55,7 @@ pub struct NewIssue {
     pub body: Option<String>,
     /// The store's stable peer id (contract §5): one version-vector entry per
     /// store lifetime instead of one per session. `None` (tests, replicas)
-    /// keeps the kernel's fresh random peer.
+    /// keeps the engine's fresh random peer.
     pub peer: Option<u64>,
 }
 
@@ -95,7 +95,7 @@ impl IssueDoc {
     }
 
     /// Load from stored/synced snapshot bytes (the only public constructor from
-    /// bytes — it applies the contract's kernel configuration before any write
+    /// bytes — it applies the contract's engine configuration before any write
     /// can happen on the loaded doc).
     pub fn from_snapshot(bytes: &[u8], peer: Option<u64>) -> Result<Self> {
         let doc = LoroDoc::new();
@@ -105,7 +105,7 @@ impl IssueDoc {
         Ok(Self { doc })
     }
 
-    /// The raw kernel handle — never leaves the engine (contract §6).
+    /// The raw engine handle — never leaves the engine (contract §6).
     pub(in crate::engine) fn raw(&self) -> &LoroDoc {
         &self.doc
     }
@@ -277,7 +277,7 @@ impl IssueDoc {
         Ok(())
     }
 
-    /// Set the description as a **splice**: the kernel computes the minimal
+    /// Set the description as a **splice**: the engine computes the minimal
     /// edit, so a concurrent edit by another peer RGA-merges cleanly instead of
     /// concatenating both full bodies (the P0 full-buffer replace did exactly
     /// that — contract §3.1), and the oplog records the actual edit instead of

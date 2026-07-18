@@ -4,7 +4,7 @@
 //! columns, the sub-issue hierarchy, the issue-link edge set, and the `DocMeta`
 //! row cache that lets lists/boards render without opening issue docs.
 //!
-//! The catalog is the multi-document container the kernel structurally lacks
+//! The catalog is the multi-document container the engine structurally lacks
 //! (one Loro doc = one tree): issue docs are *content*, the catalog is *nodes,
 //! ordering, hierarchy, and edges* (LAIT-DATA-CONTRACT §3.2).
 //!
@@ -23,7 +23,7 @@
 //! **`subs` (contract §3.2).** Sub-issue hierarchy as a real tree-move CRDT,
 //! never an LWW `parentId`: two peers concurrently moving A under B and B under
 //! A each perform a locally-legal write whose combination is a cycle — only the
-//! merge can adjudicate, and the kernel's move algorithm (Kleppmann et al.,
+//! merge can adjudicate, and the engine's move algorithm (Kleppmann et al.,
 //! IEEE TPDS 2022) converges it to a valid tree on every replica.
 //!
 //! **`edges` (contract §3.2).** Issue links as an add-wins set keyed
@@ -135,7 +135,7 @@ impl CatalogDoc {
         Ok(Self { doc })
     }
 
-    /// Load from stored snapshot bytes, applying the contract's kernel config.
+    /// Load from stored snapshot bytes, applying the contract's engine config.
     pub fn from_snapshot(bytes: &[u8], peer: Option<u64>) -> Result<Self> {
         let doc = LoroDoc::new();
         op::configure(&doc, peer);
@@ -688,7 +688,7 @@ impl CatalogDoc {
 
     /// Parent `child` under `parent`, or unparent it (`None` → back to root).
     /// A *locally visible* cycle is rejected with a friendly error; a cycle
-    /// formed only by concurrent moves is resolved by the kernel's merge
+    /// formed only by concurrent moves is resolved by the engine's merge
     /// (greater-timestamped move ignored — Kleppmann et al. §3.5).
     pub fn set_parent(&self, child: &DocId, parent: Option<&DocId>) -> Result<()> {
         let tree = self

@@ -1,6 +1,6 @@
 //! The operation contract (LAIT-DATA-CONTRACT §2, §4, §5): every commit in
 //! lait carries a request kind, an (advisory) actor, and a **trust tier** — and
-//! the kernel is configured so those commits survive as distinct, timestamped,
+//! the engine is configured so those commits survive as distinct, timestamped,
 //! self-labelled changes in the oplog instead of fusing into one anonymous blob.
 //!
 //! Kernel configuration facts this module encodes (verified empirically against
@@ -117,7 +117,7 @@ impl OpMeta {
     }
 }
 
-/// Contract §5 kernel configuration — applied by every wrapper constructor,
+/// Contract §5 engine configuration — applied by every wrapper constructor,
 /// before any op is written or imported.
 pub(super) fn configure(doc: &LoroDoc, peer: Option<u64>) {
     doc.set_record_timestamp(true);
@@ -161,7 +161,7 @@ mod tests {
     fn commits_stay_distinct_and_survive_reload() {
         // The load-bearing fact: N applies = N changes in the oplog, with real
         // timestamps and messages, after an export/import round trip. Under
-        // kernel defaults this collapses to ONE anonymous change.
+        // engine defaults this collapses to ONE anonymous change.
         let doc = LoroDoc::new();
         configure(&doc, Some(7));
         for i in 0..5 {
