@@ -30,8 +30,7 @@ use interprocess::local_socket::{
     ListenerOptions,
 };
 use iroh::{
-    address_lookup::memory::MemoryLookup,
-    endpoint::{presets, Connection},
+    endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler, Router},
     Endpoint, EndpointId, SecretKey,
 };
@@ -2079,12 +2078,10 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     }
     let tracker = Arc::new(Mutex::new(tracker));
 
-    let memory_lookup = MemoryLookup::new();
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(secret_key.clone())
-        .address_lookup(memory_lookup.clone())
-        .bind()
-        .await?;
+    // lait states its network requirement; iroh executes it (crate::net is the
+    // sole place relay/discovery vocabulary lives). Defaults to Public.
+    let network = crate::net::Network::from_env()?;
+    let endpoint = crate::net::build_endpoint(&secret_key, &network).await?;
     let my_id = endpoint.id();
 
     let gossip = Gossip::builder().spawn(endpoint.clone());
@@ -2107,7 +2104,10 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         )
         .spawn();
 
-    endpoint.online().await;
+    // Waiting for a home relay only makes sense when the policy provides one.
+    if network.uses_relay() {
+        endpoint.online().await;
+    }
 
     // The topic is a pure function of the workspace id — no user-settable
     // network name, so a cold boot can never subscribe to the wrong topic.

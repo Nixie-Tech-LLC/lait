@@ -34,6 +34,7 @@ pub mod install;
 pub mod list_picker;
 pub mod mcp;
 pub mod members_ui;
+pub mod net;
 pub mod node;
 pub mod presence;
 pub mod proto;
