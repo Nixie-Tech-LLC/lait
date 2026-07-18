@@ -13,6 +13,7 @@
 //! gates to test builds; that lives here (a dev-dependency), never in the
 //! shipped `build_endpoint`.
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use iroh::{
@@ -115,6 +116,63 @@ async fn local_endpoints_converge_by_bare_id_over_an_in_process_relay() {
     assert_eq!(
         &result, b"pong",
         "two Local endpoints converged by bare-id dial over the local relay"
+    );
+    server_task.await.expect("server task");
+}
+
+/// `Isolated`, end-to-end through the PRODUCTION code: two endpoints built by the
+/// real `build_endpoint(Isolated)` connect by **bare-id dial** on loopback with
+/// NO relay and NO discovery — the client registers the server's carried direct
+/// address via the real `PeerBook::learn_direct` (the ticket path). No relay
+/// means no self-signed cert, so this needs no test-only TLS skip at all.
+#[tokio::test]
+async fn isolated_endpoints_converge_by_carried_direct_address() {
+    let (server, _server_peers) =
+        build_endpoint(&SecretKey::from_bytes(&[33u8; 32]), &Network::Isolated)
+            .await
+            .expect("build isolated server");
+    let (client, client_peers) =
+        build_endpoint(&SecretKey::from_bytes(&[44u8; 32]), &Network::Isolated)
+            .await
+            .expect("build isolated client");
+    server.set_alpns(vec![TEST_ALPN.to_vec()]);
+    let server_id = server.id();
+    // The addresses a ticket would carry under Isolated.
+    let server_addrs: Vec<SocketAddr> = server.addr().ip_addrs().copied().collect();
+    assert!(
+        !server_addrs.is_empty(),
+        "an Isolated endpoint must expose direct addresses to advertise"
+    );
+
+    let server_task = tokio::spawn(async move {
+        let incoming = server.accept().await.expect("incoming");
+        let conn = incoming.await.expect("accept conn");
+        let (mut send, mut recv) = conn.accept_bi().await.expect("accept bi");
+        let mut buf = [0u8; 4];
+        recv.read_exact(&mut buf).await.expect("read ping");
+        send.write_all(b"pong").await.expect("write pong");
+        send.finish().expect("finish");
+        conn.closed().await;
+    });
+
+    // Register the host's carried addresses exactly as the join path does, then
+    // dial by BARE ID — resolution goes through the direct address, no relay.
+    client_peers.learn_direct(server_id, &server_addrs);
+    let result = tokio::time::timeout(Duration::from_secs(20), async move {
+        let conn = client.connect(server_id, TEST_ALPN).await.expect("connect");
+        let (mut send, mut recv) = conn.open_bi().await.expect("open bi");
+        send.write_all(b"ping").await.expect("write ping");
+        send.finish().expect("finish");
+        let mut buf = [0u8; 4];
+        recv.read_exact(&mut buf).await.expect("read pong");
+        buf
+    })
+    .await
+    .expect("isolated round trip timed out");
+
+    assert_eq!(
+        &result, b"pong",
+        "two Isolated endpoints converged by bare-id dial over a carried address"
     );
     server_task.await.expect("server task");
 }

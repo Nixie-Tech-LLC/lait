@@ -47,11 +47,12 @@ fn endpoint_of(user: &UserId) -> Result<EndpointId> {
 /// function of the genesis identity — there is no user-settable network name,
 /// so it can never drift, be renamed apart, or collide across workspaces the
 /// way the old folder-seeded "room" string could. Domain-separated so the topic
-/// space is disjoint from any other blake3 use; the `lait/topic/v1` tag also
+/// space is disjoint from any other blake3 use; the `lait/topic/v2` tag also
 /// serves as the gossip protocol **epoch** — bump it on any breaking change to
-/// [`Payload`] so old and new nodes partition onto different topics instead of
-/// silently failing to decode each other's frames (postcard is not
-/// self-describing; that drop is also logged in node.rs).
+/// [`Payload`] *or the message-signing preimage* so old and new nodes partition
+/// onto different topics instead of silently failing to decode/verify each
+/// other's frames (postcard is not self-describing; that drop is logged in
+/// node.rs). It was bumped to v2 with the domain/workspace-bound signatures.
 pub fn topic_for_workspace(workspace: &str) -> TopicId {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"lait/topic/v2");
@@ -304,6 +305,13 @@ pub struct WorkspaceTicket {
     /// in its signed `JoinRequest`.
     #[serde(default)]
     pub invite: Option<SignedInvite>,
+    /// The host's direct socket addresses, for the **Isolated** network policy
+    /// only (no relay, no discovery). Empty in a normal `Public`/`Local` ticket —
+    /// there the ticket stays address-free and iroh/relay resolves the host from
+    /// its id. Present, the joiner registers `{host, these addrs}` and dials the
+    /// host directly on a LAN with no infrastructure.
+    #[serde(default)]
+    pub host_addrs: Vec<std::net::SocketAddr>,
 }
 
 impl WorkspaceTicket {
@@ -433,6 +441,7 @@ mod tests {
             recovery_root: [0u8; 32],
             founder_inception: None,
             invite: None,
+            host_addrs: vec![],
         }
     }
 

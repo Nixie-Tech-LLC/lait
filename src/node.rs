@@ -855,6 +855,10 @@ impl Node {
                 ticket.workspace
             );
         }
+        // Under Isolated the host is reachable only at the addresses the ticket
+        // carries — register them so the bare-id dial below resolves. A no-op for
+        // Public/Local tickets (which carry none and resolve by relay/discovery).
+        self.peers.learn_direct(ticket.host, &ticket.host_addrs);
         self.join_topic(ticket.topic(), vec![ticket.host]).await?;
         // Mint (or recover) our actor inception so an admin can admit our actor.
         let incept = self.tracker.lock().unwrap().self_inception().ok();
@@ -1709,6 +1713,14 @@ impl Node {
                             ))
                         }
                     };
+                // Under Isolated (no relay, no discovery) a ticket must carry the
+                // host's direct addresses so a joiner can reach it. Public/Local
+                // tickets stay address-free (iroh/relay resolves the host by id).
+                let host_addrs = if self.peers.is_isolated() {
+                    self.endpoint.addr().ip_addrs().copied().collect()
+                } else {
+                    vec![]
+                };
                 let ticket = WorkspaceTicket {
                     workspace,
                     name,
@@ -1718,6 +1730,7 @@ impl Node {
                     recovery_root,
                     founder_inception: Some(founder_inception),
                     invite,
+                    host_addrs,
                 };
                 Ok(Response::Text {
                     text: ticket.to_string(),
@@ -2101,9 +2114,10 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     // Local via the PeerBook we populate below. Isolated has no relay and needs
     // addresses to travel in tickets (not yet) — warn rather than fail silently.
     if matches!(network, crate::net::Network::Isolated) {
-        tracing::warn!(
-            "LAIT_NETWORK=isolated: no relay and no carried addresses yet — this \
-             daemon binds but cannot resolve peers, so it will not converge"
+        tracing::info!(
+            "LAIT_NETWORK=isolated: no relay and no discovery — peers are reached \
+             by addresses carried in the ticket (host-star on a LAN); a wider mesh \
+             beyond the ticket host is not resolved"
         );
     }
     let (endpoint, peers) = crate::net::build_endpoint(&secret_key, &network).await?;

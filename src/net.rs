@@ -123,16 +123,42 @@ pub fn relay_addr(relay: &RelayUrl, id: EndpointId) -> EndpointAddr {
 pub struct PeerBook {
     lookup: MemoryLookup,
     relay: Option<RelayUrl>,
+    /// True under `Isolated`: peers are reached by carried direct addresses, so a
+    /// minted ticket must ship the host's own addresses.
+    direct: bool,
 }
 
 impl PeerBook {
     /// Teach the endpoint how to reach `id`. Under `Local` that is `{id, relay}`;
     /// under `Public` n0 discovery already resolves ids (no-op); `Isolated` has
-    /// no relay and would need carried direct addresses (no-op for now).
+    /// no relay, so a bare `learn` cannot help it — its peers are registered by
+    /// [`learn_direct`] from addresses carried in the ticket.
+    ///
+    /// [`learn_direct`]: PeerBook::learn_direct
     pub fn learn(&self, id: EndpointId) {
         if let Some(relay) = &self.relay {
             self.lookup.add_endpoint_info(relay_addr(relay, id));
         }
+    }
+
+    /// Register `id` reachable at explicit direct socket addresses — the
+    /// `Isolated` path, where a peer's address travels in the ticket (there is no
+    /// relay and no discovery). A no-op if `addrs` is empty.
+    pub fn learn_direct(&self, id: EndpointId, addrs: &[std::net::SocketAddr]) {
+        if addrs.is_empty() {
+            return;
+        }
+        let mut addr = EndpointAddr::new(id);
+        for a in addrs {
+            addr = addr.with_ip_addr(*a);
+        }
+        self.lookup.add_endpoint_info(addr);
+    }
+
+    /// Whether this policy carries peer addresses explicitly (Isolated), so the
+    /// ticket must ship the host's direct addresses.
+    pub fn is_isolated(&self) -> bool {
+        self.direct
     }
 }
 
@@ -170,7 +196,15 @@ pub async fn build_endpoint(secret_key: &SecretKey, net: &Network) -> Result<(En
         .bind()
         .await
         .context("bind iroh endpoint")?;
-    Ok((endpoint, PeerBook { lookup, relay }))
+    let direct = matches!(net, Network::Isolated);
+    Ok((
+        endpoint,
+        PeerBook {
+            lookup,
+            relay,
+            direct,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -192,6 +226,7 @@ mod tests {
         let local = PeerBook {
             lookup: MemoryLookup::new(),
             relay: Some(relay),
+            direct: false,
         };
         assert!(local.lookup.get_endpoint_info(id).is_none());
         local.learn(id);
@@ -200,15 +235,31 @@ mod tests {
             "Local registers the peer so bare-id resolution succeeds"
         );
 
-        // Public / Isolated (no relay): learn is a no-op — Public resolves via n0.
+        // Public (no relay): learn is a no-op — Public resolves via n0 discovery.
         let public = PeerBook {
             lookup: MemoryLookup::new(),
             relay: None,
+            direct: false,
         };
         public.learn(id);
         assert!(
             public.lookup.get_endpoint_info(id).is_none(),
             "without a relay, learn registers nothing"
+        );
+
+        // Isolated: learn_direct registers explicit addresses (carried in a ticket).
+        let isolated = PeerBook {
+            lookup: MemoryLookup::new(),
+            relay: None,
+            direct: true,
+        };
+        assert!(isolated.is_isolated());
+        isolated.learn(id); // no relay → still nothing
+        assert!(isolated.lookup.get_endpoint_info(id).is_none());
+        isolated.learn_direct(id, &["127.0.0.1:4000".parse().unwrap()]);
+        assert!(
+            isolated.lookup.get_endpoint_info(id).is_some(),
+            "Isolated registers the peer's carried direct address"
         );
     }
 }
