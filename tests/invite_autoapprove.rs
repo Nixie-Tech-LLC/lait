@@ -118,16 +118,10 @@ fn membership(home: &Path) -> Option<String> {
 /// uninitialized store — so every founder home goes through this first.
 fn found_home(home: &Path) {
     let key = lait::config::load_or_create_identity(home).expect("identity");
-    let me = lait::ids::UserId::from_key_string(key.public().to_string());
+    let me = lait::crypto::user_from_seed(&key);
     let store = lait::store::Store::open(home).expect("store");
-    lait::tracker::found_workspace(
-        &store,
-        &me,
-        &key.to_bytes(),
-        "test",
-        &lait::ids::SystemUlidSource,
-    )
-    .expect("found workspace");
+    lait::tracker::found_workspace(&store, &me, &key, "test", &lait::ids::SystemUlidSource)
+        .expect("found workspace");
 }
 
 /// Bootstrap a joiner store from a ticket (the client half of `lait join`), so

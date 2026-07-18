@@ -25,11 +25,10 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{anyhow, Context, Result};
-use serde::{Deserialize, Serialize};
 
 use crate::catalog::CatalogDoc;
 use crate::genesis::Genesis;
-use crate::ids::{DocId, WorkspaceId};
+use crate::ids::DocId;
 use crate::issue::IssueDoc;
 
 /// Whether `home` holds an initialized store — a pure probe (no dirs created,
@@ -376,6 +375,7 @@ fn check_schema_version(found: u32) -> Result<()> {
 mod tests {
     use super::*;
     use crate::dto::{Priority, SCHEMA_VERSION};
+    use crate::ids::WorkspaceId;
 
     #[test]
     fn schema_gate_accepts_supported_and_refuses_newer() {

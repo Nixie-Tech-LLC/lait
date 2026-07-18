@@ -36,6 +36,23 @@ pub fn random_key() -> WorkspaceKey {
     k
 }
 
+/// A fresh random 32-byte identity seed. A lait identity is just this seed; the
+/// transport constructs its keypair from it (see [`user_from_seed`]).
+pub fn random_seed() -> [u8; 32] {
+    let mut s = [0u8; 32];
+    getrandom::fill(&mut s).expect("getrandom");
+    s
+}
+
+/// The lait [`UserId`] (device key) of an identity seed: the ed25519 public key
+/// of the 32-byte seed, hex-encoded. A `UserId` *is* this public key (SCHEMA §2),
+/// and it equals the transport's node id for the same seed (see [`crate::ids`]) —
+/// so identity is defined here, in lait's own terms, with no transport type.
+pub fn user_from_seed(seed: &[u8; 32]) -> UserId {
+    let pk = ed25519_dalek::SigningKey::from_bytes(seed).verifying_key();
+    UserId::from_key_string(data_encoding::HEXLOWER.encode(pk.as_bytes()))
+}
+
 fn random_nonce() -> [u8; NONCE_LEN] {
     let mut n = [0u8; NONCE_LEN];
     getrandom::fill(&mut n).expect("getrandom");

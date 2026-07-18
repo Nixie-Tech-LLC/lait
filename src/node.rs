@@ -2043,7 +2043,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
 
     // Identity is global by default (DUR-5); store (repo/lock/socket/config) is
     // this per-repo home. `$LAIT_HOME` collapses both back into `home`.
-    let secret_key = load_or_create_identity(&crate::config::identity_dir()?)?;
+    let identity_seed = load_or_create_identity(&crate::config::identity_dir()?)?;
     let settings = Settings::load(Some(&home));
     let nick = settings.nick();
 
@@ -2051,8 +2051,10 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     // initialized (`lait init` / `lait join`) — a daemon never founds a
     // workspace as a side effect of starting.
     let store = Store::open(&home)?;
+    // The transport keypair is constructed from lait's identity seed here, at the
+    // net edge — the seed itself is the identity (see config::load_or_create_identity).
+    let secret_key = SecretKey::from_bytes(&identity_seed);
     let me = UserId::from_key_string(secret_key.public().to_string());
-    let identity_seed = secret_key.to_bytes();
     let tracker = Tracker::open(
         store,
         me,

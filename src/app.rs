@@ -23,7 +23,7 @@ use crate::{
     cmdspec::{self, Dispatch, Special},
     config::{self, load_or_create_identity},
     control::Request,
-    ids::{SystemUlidSource, UserId},
+    ids::SystemUlidSource,
     install::{self, Client, Scope},
     mcp, node,
     store::Store,
@@ -415,8 +415,8 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
                 crate::cli::run_workstate(&home, Request::IssueStop { reff }, out).await?
             }
             Special::Id => {
-                let key = load_or_create_identity(&config::identity_dir()?)?;
-                crate::cli::emit_text(&key.public().to_string(), out);
+                let seed = load_or_create_identity(&config::identity_dir()?)?;
+                crate::cli::emit_text(crate::crypto::user_from_seed(&seed).as_str(), out);
             }
             Special::Daemon => {
                 tracing_subscriber::fmt()
@@ -529,11 +529,11 @@ async fn run_init(m: &ArgMatches, out: Out) -> Result<()> {
         cfg.set("user.nick", n);
         cfg.save(&p)?;
     }
-    let key = load_or_create_identity(&config::identity_dir()?)?;
-    let me = UserId::from_key_string(key.public().to_string());
+    let seed = load_or_create_identity(&config::identity_dir()?)?;
+    let me = crate::crypto::user_from_seed(&seed);
     let store = Store::open(&home)?;
     let (ws, project) =
-        crate::tracker::found_workspace(&store, &me, &key.to_bytes(), &name, &SystemUlidSource)?;
+        crate::tracker::found_workspace(&store, &me, &seed, &name, &SystemUlidSource)?;
     // Register the founder — this is what makes `lait workspaces` complete.
     if let Err(e) = workspaces::upsert(workspaces::WorkspaceEntry {
         workspace: ws.to_string(),
@@ -560,7 +560,7 @@ async fn run_init(m: &ArgMatches, out: Out) -> Result<()> {
         );
     } else {
         println!("founded space '{name}' ({ws})");
-        println!("id:      {}", key.public());
+        println!("id:      {}", me);
         println!(
             "project: {} ({}) — `lait new \"...\"` files into it",
             project.name, project.key
@@ -587,8 +587,7 @@ fn run_device_accept(m: &ArgMatches, out: Out) -> Result<()> {
         .filter(|w| w.starts_with("ws_"))
         .ok_or_else(|| anyhow!("invalid device token (missing workspace id)"))?
         .to_string();
-    let key = load_or_create_identity(&config::identity_dir()?)?;
-    let seed = key.to_bytes();
+    let seed = load_or_create_identity(&config::identity_dir()?)?;
     let mut nonce = [0u8; 16];
     getrandom::fill(&mut nonce).map_err(|e| anyhow!("getrandom: {e}"))?;
     let binding = crate::actor::consent_sign(
