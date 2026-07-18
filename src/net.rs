@@ -20,6 +20,15 @@
 //! discovered over the wire and nothing is faked — the exact pattern iroh-gossip
 //! uses for bootstrap. `Isolated` still has no wired connectivity (it would need
 //! direct addresses to travel in tickets — a separate change).
+//!
+//! **Scope.** `Local` converges cleanly for the common seed-hub / small-N
+//! topology. It does NOT reproduce `Public`'s immediate full-mesh: an id that
+//! iroh-gossip learns *through the swarm* (overlay promotion) is registered only
+//! once an application message from that peer is seen, so some promotion dials in
+//! a large overlay resolve eventually rather than at once. And the hermetic proof
+//! here is at the *endpoint* level (in-process); a spawned-process two-daemon
+//! `Local` test needs a CA-valid relay cert, because the self-signed skip is
+//! gated to test builds and absent from the shipped binary.
 
 use anyhow::{Context, Result};
 use iroh::{
@@ -31,27 +40,28 @@ use iroh::{
 #[derive(Debug, Clone)]
 pub enum Network {
     /// The public relay mesh + public discovery (n0). The default — unchanged
-    /// behaviour, now stated rather than inherited. The **only** policy whose
-    /// daemon peer-connectivity is wired today (n0 discovery resolves the bare
-    /// `EndpointId`s that every dial in `node.rs` uses).
+    /// behaviour, now stated rather than inherited. n0 discovery resolves the
+    /// bare `EndpointId`s that every dial in `node.rs` uses.
     Public,
     /// A single relay lait supplies (self-hosted, or a test harness's in-process
-    /// relay). The endpoint is configured for it, but **daemon connectivity is
-    /// not yet wired**: lait dials peers by bare `EndpointId` and relies on
-    /// discovery to resolve them (`crate::proto` §"address-free"), and `Local`
-    /// provides no discovery — so a peer id resolves to nothing until the dial
-    /// paths attach `{id, relay}` addresses (the follow-up). See the crate docs.
+    /// relay). Wired: lait dials peers by bare `EndpointId` and resolves them
+    /// through a [`PeerBook`] it populates with `{id, relay}` for each peer it
+    /// learns — no discovery service. Converges cleanly for the seed-hub /
+    /// small-N case; for larger overlays, an id iroh-gossip learns *through the
+    /// swarm* isn't registered until an application message from it is seen, so
+    /// some promotion dials resolve only eventually — not the immediate full
+    /// mesh `Public` gives.
     Local(LocalNet),
-    /// No relay, no discovery — direct reach only. Same wiring gap as `Local`,
-    /// plus it would need addresses to travel in tickets. Endpoint construction
-    /// is defined; daemon connectivity is not.
+    /// No relay, no discovery — direct reach only. Not wired: it would need
+    /// addresses to travel in tickets (a separate change). Endpoint construction
+    /// is defined; daemon connectivity is not, and the daemon warns at startup.
     Isolated,
 }
 
-/// A single relay lait supplies. Once the dial paths attach `{id, relay}`
-/// addresses (see the crate-level status note), reachability is relay-based — a
-/// peer is `{its id, this relay}`, needing no public discovery, which is what
-/// makes it hermetic. lait names the relay in a plain URL; iroh is the contractor.
+/// A single relay lait supplies. Reachability is relay-based — a peer is
+/// `{its id, this relay}`, which lait builds directly (it knows the relay) and
+/// registers via [`PeerBook`], needing no public discovery. lait names the relay
+/// in a plain URL; iroh is the contractor.
 #[derive(Debug, Clone)]
 pub struct LocalNet {
     /// The relay URL peers rendezvous through (`https://…` / `http://…`). A
@@ -161,4 +171,44 @@ pub async fn build_endpoint(secret_key: &SecretKey, net: &Network) -> Result<(En
         .await
         .context("bind iroh endpoint")?;
     Ok((endpoint, PeerBook { lookup, relay }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_env_default_is_public_and_trims() {
+        // (Reads process env, but the default/whitespace cases don't set it.)
+        assert!(matches!(Network::from_env(), Ok(Network::Public)));
+    }
+
+    #[test]
+    fn peerbook_registers_under_local_and_noops_without_a_relay() {
+        let id = SecretKey::from_bytes(&[7u8; 32]).public();
+
+        // Local: learn registers `{id, relay}` so a bare-id dial can resolve it.
+        let relay: RelayUrl = "https://relay.example".parse().unwrap();
+        let local = PeerBook {
+            lookup: MemoryLookup::new(),
+            relay: Some(relay),
+        };
+        assert!(local.lookup.get_endpoint_info(id).is_none());
+        local.learn(id);
+        assert!(
+            local.lookup.get_endpoint_info(id).is_some(),
+            "Local registers the peer so bare-id resolution succeeds"
+        );
+
+        // Public / Isolated (no relay): learn is a no-op — Public resolves via n0.
+        let public = PeerBook {
+            lookup: MemoryLookup::new(),
+            relay: None,
+        };
+        public.learn(id);
+        assert!(
+            public.lookup.get_endpoint_info(id).is_none(),
+            "without a relay, learn registers nothing"
+        );
+    }
 }
