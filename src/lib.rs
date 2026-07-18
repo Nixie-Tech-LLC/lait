@@ -42,6 +42,7 @@ pub mod registry;
 pub mod serve;
 pub mod sync;
 pub mod tracker;
+pub mod transport;
 pub mod workspaces;
 
 // The **kernel** (`lait-kernel`) holds lait's roots — identity, the trust

@@ -2821,6 +2821,7 @@ name = "lait"
 version = "0.5.2"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "blake3",
  "bytes",
