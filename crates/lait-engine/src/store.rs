@@ -436,7 +436,7 @@ mod tests {
         })
         .unwrap();
         cat.upsert_row(&issue).unwrap();
-        cat.apply(&crate::engine::op::OpCtx::structure("seed", &me));
+        cat.apply(&crate::op::OpCtx::structure("seed", &me));
         store.save_catalog(&cat).unwrap();
         store.save_issue(&issue).unwrap();
 

@@ -26,7 +26,7 @@ pub const SCHEMA_VERSION: u32 = 2;
 /// string leaf and projected here.
 ///
 /// ```
-/// use lait::dto::Priority;
+/// use lait_kernel::dto::Priority;
 /// assert_eq!(Priority::parse("urgent"), Some(Priority::Urgent));
 /// assert_eq!(Priority::parse("h"), Some(Priority::High)); // one-letter alias
 /// assert!(Priority::Urgent > Priority::Low);              // orders low→high

@@ -28,3 +28,7 @@ serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 data-encoding = "2.6"
 anyhow = "1"
+
+[dev-dependencies]
+# dto's serialization doctests/round-trips only.
+serde_json = "1"

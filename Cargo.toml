@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/lait-kernel"]
+members = ["crates/lait-kernel", "crates/lait-engine"]
 
 [package]
 name = "lait"
@@ -65,8 +65,10 @@ path = "src/main.rs"
 # scaffold; re-exported at this crate's root so the app layer reaches it by its
 # historical paths (`crate::acl`, `lait::ids`, …).
 lait-kernel = { path = "crates/lait-kernel" }
-# Loro CRDT — the storage/truth layer (Layer A). Issue docs + the catalog doc.
-loro = "=1.13.6"
+# The engine — Loro sealed behind typed wrappers. The app depends on this, not on
+# Loro: `loro` is intentionally absent from THIS manifest, so `loro::*` cannot be
+# named in the app layer. The seal is the dependency edge.
+lait-engine = { path = "crates/lait-engine" }
 # randomness for ULID minting (app-minted DocId/ProjectId/… ids).
 getrandom = "0.3"
 

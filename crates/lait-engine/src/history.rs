@@ -19,9 +19,9 @@ use loro::{Container, Frontiers, LoroDoc, ID};
 use crate::dto::{CommentDto, FieldChange};
 use crate::ids::UserId;
 
-use super::issue::IssueDoc;
-use super::loro_ext as lx;
-use super::op::OpMeta;
+use crate::issue::IssueDoc;
+use crate::loro_ext as lx;
+use crate::op::OpMeta;
 
 /// One oplog change of an issue doc, projected for the history feed.
 #[derive(Debug, Clone)]

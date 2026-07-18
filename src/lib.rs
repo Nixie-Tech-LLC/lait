@@ -28,8 +28,6 @@ pub mod config;
 pub mod control;
 pub mod daemon_spawn;
 pub mod diagnose;
-pub mod dto;
-pub mod engine;
 pub mod inbox;
 pub mod index;
 pub mod install;
@@ -41,7 +39,6 @@ pub mod presence;
 pub mod proto;
 pub mod registry;
 pub mod serve;
-pub mod store;
 pub mod sync;
 pub mod tracker;
 pub mod workspaces;
@@ -52,9 +49,11 @@ pub mod workspaces;
 // keeps reaching them by their historical crate-root paths (`crate::acl`,
 // `lait::ids`, …); the boundary is enforced by the kernel crate's manifest, not
 // by these aliases.
-pub use lait_kernel::{acl, actor, authz, crypto, dkg, genesis, ids, sigdag, space};
+pub use lait_kernel::{acl, actor, authz, crypto, dkg, dto, genesis, ids, sigdag, space};
 
-// Path compatibility: the engine wrappers keep their historical crate-root
-// paths (`crate::issue::IssueDoc`, …) while living behind the sealed
-// `engine` module boundary.
-pub use engine::{catalog, issue, membership};
+// The **engine** (`lait-engine`) is the only crate that names Loro. Re-exported
+// here — as the `engine` module and its wrappers — so the app layer keeps its
+// historical paths (`crate::engine::op`, `crate::catalog`, `crate::store`, …)
+// while the app crate's manifest lists no `loro`, so `loro::*` is unnameable
+// outside the engine.
+pub use lait_engine::{self as engine, catalog, issue, membership, store};

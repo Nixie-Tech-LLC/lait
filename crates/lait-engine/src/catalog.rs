@@ -41,9 +41,9 @@ use crate::dto::{
 };
 use crate::ids::{ActorId, DocId, LabelId, ProjectId, UserId, WorkspaceId};
 
-use super::issue::IssueDoc;
-use super::loro_ext as lx;
-use super::op::{self, OpCtx};
+use crate::issue::IssueDoc;
+use crate::loro_ext as lx;
+use crate::op::{self, OpCtx};
 
 const ROOT: &str = "catalog";
 const K_SCHEMA: &str = "schemaVersion";
@@ -173,7 +173,7 @@ impl CatalogDoc {
             .map_err(|e| anyhow!("import catalog update: {e}"))
     }
     /// The catalog's own oplog frontiers — the catalog-first sync digest (A§8).
-    pub(in crate::engine) fn head(&self) -> Frontiers {
+    pub(crate) fn head(&self) -> Frontiers {
         self.doc.oplog_frontiers()
     }
     /// The catalog head digest, wire form (gossip announce, A§8).
@@ -820,7 +820,7 @@ impl CatalogDoc {
 
 /// The opaque `DocMeta.head` digest: `blake3(frontiers.encode())` → 32 bytes
 /// (SCHEMA §3.2, `head: value<bytes32>`).
-pub(in crate::engine) fn head_hash(frontiers: &Frontiers) -> Vec<u8> {
+pub(crate) fn head_hash(frontiers: &Frontiers) -> Vec<u8> {
     blake3::hash(&frontiers.encode()).as_bytes().to_vec()
 }
 

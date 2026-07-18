@@ -20,8 +20,8 @@ use loro::{Container, ExportMode, Frontiers, LoroDoc, LoroList, LoroMap, ValueOr
 use crate::acl::SignedOp;
 use crate::ids::{UserId, WorkspaceId};
 
-use super::loro_ext as lx;
-use super::op::{self, OpCtx};
+use crate::loro_ext as lx;
+use crate::op::{self, OpCtx};
 
 const ROOT: &str = "membership";
 const K_WORKSPACE: &str = "workspaceId";
@@ -94,7 +94,7 @@ impl MembershipDoc {
             .map(|_| ())
             .map_err(|e| anyhow!("import membership update: {e}"))
     }
-    pub(in crate::engine) fn head(&self) -> Frontiers {
+    pub(crate) fn head(&self) -> Frontiers {
         self.doc.oplog_frontiers()
     }
     /// The raw encoded frontiers (input to the combined sync head, A§8).

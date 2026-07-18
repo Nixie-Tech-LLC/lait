@@ -23,8 +23,8 @@ use loro::{ExportMode, Frontiers, LoroDoc};
 use crate::dto::{CommentDto, Priority, DEFAULT_STATUS};
 use crate::ids::{ActorId, DocId, LabelId, ProjectId, UserId, WorkspaceId};
 
-use super::loro_ext as lx;
-use super::op::{self, OpCtx};
+use crate::loro_ext as lx;
+use crate::op::{self, OpCtx};
 
 const ROOT: &str = "issue";
 const K_ID: &str = "id";
@@ -106,7 +106,7 @@ impl IssueDoc {
     }
 
     /// The raw engine handle — never leaves the engine (contract §6).
-    pub(in crate::engine) fn raw(&self) -> &LoroDoc {
+    pub(crate) fn raw(&self) -> &LoroDoc {
         &self.doc
     }
 
@@ -128,13 +128,13 @@ impl IssueDoc {
 
     /// The issue doc's oplog frontiers — the causal head used as the sync digest
     /// (SCHEMA §3.2, §8). Engine-internal; the world sees [`Self::head_hash`].
-    pub(in crate::engine) fn head(&self) -> Frontiers {
+    pub(crate) fn head(&self) -> Frontiers {
         self.doc.oplog_frontiers()
     }
 
     /// The opaque `DocMeta.head` digest of this doc (S§3.2).
     pub fn head_hash(&self) -> Vec<u8> {
-        super::catalog::head_hash(&self.head())
+        crate::catalog::head_hash(&self.head())
     }
 
     /// This doc's oplog version vector, wire-encoded (per-doc VV-diff sync, A§8).
@@ -487,7 +487,7 @@ mod tests {
         i.set_status("done").unwrap();
         i.apply(&ctx("finished"));
         let loaded = IssueDoc::from_snapshot(&i.snapshot().unwrap(), None).unwrap();
-        let hist = crate::engine::history::issue_history(&loaded);
+        let hist = crate::history::issue_history(&loaded);
         assert_eq!(hist.len(), 3, "created + started + finished");
         assert_eq!(hist[0].kind.as_deref(), Some("created"));
         assert_eq!(hist[1].kind.as_deref(), Some("started"));
