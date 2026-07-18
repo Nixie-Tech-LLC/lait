@@ -18,8 +18,9 @@
 //! it learns into a [`PeerBook`] (an in-process `MemoryLookup`), because lait
 //! already knows its relay and can build the address directly. Nothing is
 //! discovered over the wire and nothing is faked — the exact pattern iroh-gossip
-//! uses for bootstrap. `Isolated` still has no wired connectivity (it would need
-//! direct addresses to travel in tickets — a separate change).
+//! uses for bootstrap. `Isolated` has neither relay nor discovery: a peer's
+//! direct addresses travel in the ticket, and the joiner registers them via
+//! [`PeerBook::learn_direct`] — a LAN/offline host-star with zero infrastructure.
 //!
 //! **Scope.** `Local` converges cleanly for the common seed-hub / small-N
 //! topology. It does NOT reproduce `Public`'s immediate full-mesh: an id that
@@ -52,9 +53,11 @@ pub enum Network {
     /// some promotion dials resolve only eventually — not the immediate full
     /// mesh `Public` gives.
     Local(LocalNet),
-    /// No relay, no discovery — direct reach only. Not wired: it would need
-    /// addresses to travel in tickets (a separate change). Endpoint construction
-    /// is defined; daemon connectivity is not, and the daemon warns at startup.
+    /// No relay, no discovery — direct reach only. Wired for the host-star case:
+    /// an Isolated ticket carries the host's direct addresses, and the joiner
+    /// registers them via [`PeerBook::learn_direct`], so a LAN/offline workspace
+    /// connects with zero infrastructure. A wider mesh beyond the ticket host is
+    /// out of scope (peers past the host aren't resolved).
     Isolated,
 }
 
