@@ -5158,6 +5158,12 @@ impl Tracker {
         if already {
             return Ok(false);
         }
+        // The arrangement operating the new key is the candidate ceremony's own
+        // configuration — committed on the space plane by the Rotate (C0), so
+        // every replica (holder or not) learns the standing arrangement by
+        // replay. Deterministic from the accepted proposal, so all group holders
+        // sign byte-identical rotate ops.
+        let next_configuration = self.dkg_manifest(dkg).map(|m| m.configuration.id());
         // An INDISPENSABLE arrangement must not install until every custodian
         // has verified a portable backup. Otherwise an N-of-N authority can be
         // created in a state where one holder's share exists only behind a
@@ -5184,6 +5190,7 @@ impl Tracker {
             {
                 let op = crate::space::SpaceOp::Rotate {
                     new_recovery_key: group_key,
+                    next_configuration,
                     gen: cur.gen + 1,
                 };
                 let ev = crate::space::sign_op(&secret, &op, vec![], &self.workspace_id);
@@ -5208,7 +5215,8 @@ impl Tracker {
         // participant in the new ceremony — never reaches this point and so
         // never signs.
         if self.active_dkg_session().is_some() {
-            let (_, changed) = self.open_rotation_request(&group_key, cur.gen + 1)?;
+            let (_, changed) =
+                self.open_rotation_request(&group_key, next_configuration, cur.gen + 1)?;
             return Ok(changed);
         }
         Ok(false)
@@ -5226,6 +5234,7 @@ impl Tracker {
     fn open_rotation_request(
         &mut self,
         new_key: &UserId,
+        next_configuration: Option<crate::authority::AuthorityConfigurationId>,
         gen: u32,
     ) -> Result<(crate::dkg::TranscriptId, bool)> {
         let authority = self
@@ -5233,6 +5242,7 @@ impl Tracker {
             .ok_or_else(|| anyhow!("this device holds no share of the current group key"))?;
         let op = crate::space::SpaceOp::Rotate {
             new_recovery_key: new_key.clone(),
+            next_configuration,
             gen,
         };
         let op_bytes = postcard::to_stdvec(&op)?;
@@ -7554,6 +7564,28 @@ mod tests {
             &b.tracker.membership.space_events(),
         );
         assert_eq!(after.recovery_commit, b_after.recovery_commit);
+
+        // C0: the standing ARRANGEMENT is on the plane, not just the key. Both
+        // replicas agree on it, it is no longer `Single`, and it is the exact
+        // 2-of-2 configuration the elevation built — learnable by replay without
+        // holding a share.
+        assert_eq!(after.configuration, b_after.configuration);
+        assert_ne!(
+            after.configuration,
+            crate::authority::AuthorityConfigurationId::single(),
+            "the workspace is no longer a solo authority"
+        );
+        let dkg = a.tracker.standing_dkg_session().expect("standing group");
+        let expected = a
+            .tracker
+            .dkg_manifest(&dkg)
+            .expect("manifest")
+            .configuration
+            .id();
+        assert_eq!(
+            after.configuration, expected,
+            "the on-plane configuration is the arrangement the ceremony produced"
+        );
 
         // A's solo key is retired: recovery now runs through the group ceremony,
         // and a lone holder cannot meet the 2-of-2 threshold by itself.

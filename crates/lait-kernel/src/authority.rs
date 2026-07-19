@@ -121,6 +121,15 @@ impl AuthorityConfigurationId {
     pub fn to_hex(&self) -> String {
         data_encoding::HEXLOWER.encode(&self.0)
     }
+    /// The configuration id of the bootstrap single-holder authority.
+    ///
+    /// Every workspace is born `Single` (the founder mints one solo recovery
+    /// key), so this is the standing configuration at genesis and the value an
+    /// old key-only `Rotate` — which never named a configuration — replays to.
+    /// Content-addressed like any other, just from a fixed input.
+    pub fn single() -> Self {
+        AuthorityConfiguration::single().id()
+    }
 }
 
 /// Flat K-of-N FROST over a fixed participant list.

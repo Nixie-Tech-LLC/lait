@@ -41,6 +41,7 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::actor::{self, SignedEvent};
+use crate::authority::AuthorityConfigurationId;
 use crate::genesis::Genesis;
 use crate::ids::{ActorId, UserId, WorkspaceId};
 use crate::sigdag::{self, SignedNode};
@@ -87,27 +88,70 @@ fn hex32(s: &str) -> Option<[u8; 32]> {
     v.as_slice().try_into().ok()
 }
 
-/// A workspace-plane op. Both are signed by the **current recovery key** (a solo
+/// A workspace-plane op. All are signed by the **current recovery key** (a solo
 /// key or a FROST group key); planned admin governance rides the ACL.
+///
+/// # The standing-authority commitment (C0)
+///
+/// The plane commits to the **complete** standing authority: its public key
+/// (via `recovery_commit`) and the *arrangement operating it* (via an opaque
+/// [`AuthorityConfigurationId`]). The plane never decodes the configuration — it
+/// carries a 32-byte commitment and stays blind to signing topology, exactly as
+/// it is blind to the threshold behind a group key. What the commitment buys is
+/// that **every replica, holder or not, learns the standing arrangement by
+/// replay** rather than by holding a share; before C0 the arrangement lived only
+/// in a holder's local acceptance records, so a non-holder could not learn it.
+///
+/// A configuration id on a `Rotate`/`Reshare` is an *attestation by the current
+/// authority* about the next arrangement. The plane cannot verify it is truthful
+/// — but the current recovery authority already has unlimited power to rotate to
+/// any key it controls, so a false configuration id grants nothing new; it only
+/// guarantees a single, signed, replayable view that cannot differ between
+/// replicas.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpaceOp {
     /// Break-glass re-root: replace the bootstrap root that seeds `acl::replay`.
+    /// Leaves the recovery authority (key and arrangement) untouched.
     Recover {
         /// The new root (non-empty); the recovered admin re-adds the team + re-keys.
         new_root: Vec<ActorId>,
         /// Strictly `current_gen + 1` — monotone, so an old op can't replay.
         gen: u32,
     },
-    /// Rotate the recovery authority to a new key (e.g. elevate a solo key to a
-    /// DKG group key). Signed by the current key; the new key's commitment becomes
-    /// the authority for the next op.
-    Rotate { new_recovery_key: UserId, gen: u32 },
+    /// Rotate the recovery authority to a **new key** (e.g. elevate a solo key to
+    /// a DKG group key). Signed by the current key; the new key's commitment
+    /// becomes the authority for the next op.
+    Rotate {
+        new_recovery_key: UserId,
+        /// The arrangement operating the new key.
+        ///
+        /// `None` is the migration rule: an old key-only `Rotate` never named a
+        /// configuration, and every such rotate was solo→solo, so absence
+        /// replays to [`AuthorityConfigurationId::single`].
+        #[serde(default)]
+        next_configuration: Option<AuthorityConfigurationId>,
+        gen: u32,
+    },
+    /// Reshare the **same key** under a new arrangement — the standing key is
+    /// unchanged, only the configuration operating it changes.
+    ///
+    /// Defined here so replay can *represent* a same-key transition; the
+    /// off-plane authorization refuses to author one until D4's proactive
+    /// resharing protocol exists (mirroring `ProposedTransition::Reshare`, which
+    /// round-trips but is refused). The plane applying it is not the same as the
+    /// product performing it.
+    Reshare {
+        next_configuration: AuthorityConfigurationId,
+        gen: u32,
+    },
 }
 
 impl SpaceOp {
     fn gen(&self) -> u32 {
         match self {
-            SpaceOp::Recover { gen, .. } | SpaceOp::Rotate { gen, .. } => *gen,
+            SpaceOp::Recover { gen, .. }
+            | SpaceOp::Rotate { gen, .. }
+            | SpaceOp::Reshare { gen, .. } => *gen,
         }
     }
     fn encode(&self) -> Vec<u8> {
@@ -141,6 +185,11 @@ pub struct RootState {
     pub root: Vec<ActorId>,
     /// The commitment to the current recovery key (rotated by each `Rotate`).
     pub recovery_commit: [u8; 32],
+    /// The **standing arrangement** operating the recovery key (C0). Genesis is
+    /// [`AuthorityConfigurationId::single`]; each `Rotate`/`Reshare` sets it. The
+    /// plane never decodes it — it is the opaque commitment other layers read to
+    /// learn the authority's topology without holding a share.
+    pub configuration: AuthorityConfigurationId,
     /// Generation of the last applied op (0 at birth).
     pub gen: u32,
     /// Whether any break-glass `Recover` has been applied.
@@ -194,6 +243,8 @@ pub fn replay(genesis: &Genesis, ws_id: &WorkspaceId, events: &[SignedSpaceEvent
     let mut state = RootState {
         root: genesis.founding_actors.clone(),
         recovery_commit: genesis.recovery_root,
+        // Every workspace is born a solo authority; a `Rotate`/`Reshare` moves it.
+        configuration: AuthorityConfigurationId::single(),
         gen: 0,
         recovered: false,
     };
@@ -231,12 +282,24 @@ pub fn replay(genesis: &Genesis, ws_id: &WorkspaceId, events: &[SignedSpaceEvent
                     state.recovered = true;
                 }
                 SpaceOp::Rotate {
-                    new_recovery_key, ..
+                    new_recovery_key,
+                    next_configuration,
+                    ..
                 } => {
                     let Some(c) = recovery_commit(new_recovery_key) else {
                         continue;
                     };
                     state.recovery_commit = c;
+                    // Migration rule: an old key-only rotate (no configuration)
+                    // was always solo→solo.
+                    state.configuration =
+                        next_configuration.unwrap_or_else(AuthorityConfigurationId::single);
+                }
+                SpaceOp::Reshare {
+                    next_configuration, ..
+                } => {
+                    // Same key, new arrangement. Key commitment untouched.
+                    state.configuration = *next_configuration;
                 }
             }
             state.gen = *gen;
@@ -338,6 +401,7 @@ mod tests {
 
         let rotate = SpaceOp::Rotate {
             new_recovery_key: recovery_pub_of(&r2),
+            next_configuration: None,
             gen: 1,
         };
         let recover = SpaceOp::Recover {
@@ -362,6 +426,93 @@ mod tests {
         assert!(
             !replay(&genesis, &ws, &events2).recovered,
             "the spent key cannot recover"
+        );
+    }
+
+    #[test]
+    fn genesis_is_a_solo_authority_and_a_configured_rotate_moves_it() {
+        use crate::authority::{
+            AuthorityConfiguration, AuthorityConfigurationId, FrostThresholdConfig, PrincipalId,
+        };
+        let r1 = [21u8; 32];
+        let r2 = [22u8; 32];
+        let rc1 = recovery_commit(&recovery_pub_of(&r1)).unwrap();
+        let (ws, _i, founder) = founding([7u8; 32], [9u8; 16], rc1);
+        let genesis = genesis_with(&ws, &founder, [9u8; 16], rc1);
+
+        // Born solo.
+        assert_eq!(
+            replay(&genesis, &ws, &[]).configuration,
+            AuthorityConfigurationId::single()
+        );
+
+        // A rotate that names a 2-of-3 group arrangement moves the standing
+        // configuration to it — visible to any replayer, holder or not.
+        let mut members: Vec<PrincipalId> = (30..33u8)
+            .map(|n| PrincipalId::of_device(&recovery_pub_of(&[n; 32])))
+            .collect();
+        members.sort();
+        let cfg = AuthorityConfiguration::frost_threshold(&FrostThresholdConfig {
+            k: 2,
+            participants: members,
+        });
+        let rotate = SpaceOp::Rotate {
+            new_recovery_key: recovery_pub_of(&r2),
+            next_configuration: Some(cfg.id()),
+            gen: 1,
+        };
+        let st = replay(&genesis, &ws, &[sign_op(&r1, &rotate, vec![], &ws)]);
+        assert_eq!(
+            st.configuration,
+            cfg.id(),
+            "the arrangement is on-plane now"
+        );
+        assert_eq!(
+            st.recovery_commit,
+            recovery_commit(&recovery_pub_of(&r2)).unwrap()
+        );
+
+        // Migration: an old key-only rotate (no configuration) stays solo.
+        let plain = SpaceOp::Rotate {
+            new_recovery_key: recovery_pub_of(&r2),
+            next_configuration: None,
+            gen: 1,
+        };
+        assert_eq!(
+            replay(&genesis, &ws, &[sign_op(&r1, &plain, vec![], &ws)]).configuration,
+            AuthorityConfigurationId::single()
+        );
+    }
+
+    #[test]
+    fn a_reshare_changes_the_arrangement_without_changing_the_key() {
+        use crate::authority::{
+            AuthorityConfiguration, AuthorityConfigurationId, FrostThresholdConfig, PrincipalId,
+        };
+        let r = [21u8; 32];
+        let rc = recovery_commit(&recovery_pub_of(&r)).unwrap();
+        let (ws, _i, founder) = founding([7u8; 32], [9u8; 16], rc);
+        let genesis = genesis_with(&ws, &founder, [9u8; 16], rc);
+
+        let mut members: Vec<PrincipalId> = (30..33u8)
+            .map(|n| PrincipalId::of_device(&recovery_pub_of(&[n; 32])))
+            .collect();
+        members.sort();
+        let cfg = AuthorityConfiguration::frost_threshold(&FrostThresholdConfig {
+            k: 2,
+            participants: members,
+        });
+        let reshare = SpaceOp::Reshare {
+            next_configuration: cfg.id(),
+            gen: 1,
+        };
+        let st = replay(&genesis, &ws, &[sign_op(&r, &reshare, vec![], &ws)]);
+        assert_eq!(st.configuration, cfg.id(), "arrangement moved");
+        assert_eq!(st.recovery_commit, rc, "but the KEY is unchanged");
+        assert_ne!(
+            st.configuration,
+            AuthorityConfigurationId::single(),
+            "no longer solo"
         );
     }
 
