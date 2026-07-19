@@ -123,14 +123,20 @@ pub enum SpaceOp {
     /// becomes the authority for the next op.
     Rotate {
         new_recovery_key: UserId,
-        /// The arrangement operating the new key.
-        ///
-        /// `None` is the migration rule: an old key-only `Rotate` never named a
-        /// configuration, and every such rotate was solo→solo, so absence
-        /// replays to [`AuthorityConfigurationId::single`].
-        #[serde(default)]
-        next_configuration: Option<AuthorityConfigurationId>,
         gen: u32,
+        /// The arrangement operating the new key (C0). **Required.**
+        ///
+        /// Postcard is positional and non-self-describing: a missing field does
+        /// not default, it fails to decode. There is no wire migration from the
+        /// pre-C0 two-field `Rotate` — and none is needed, because no `Rotate`
+        /// event is deployed. The only producer of a `Rotate` is the FROST
+        /// elevation install path (unreleased ceremony/2); solo workspaces carry
+        /// no space events beyond genesis, and genesis is `Single` by
+        /// construction. An old two-field `Rotate`, were one to exist, would fail
+        /// to decode and be skipped in replay — never silently mis-read as a
+        /// valid rotate with a bogus configuration (pinned by
+        /// `an_old_two_field_rotate_does_not_misdecode`).
+        next_configuration: AuthorityConfigurationId,
     },
     /// Reshare the **same key** under a new arrangement — the standing key is
     /// unchanged, only the configuration operating it changes.
@@ -290,10 +296,7 @@ pub fn replay(genesis: &Genesis, ws_id: &WorkspaceId, events: &[SignedSpaceEvent
                         continue;
                     };
                     state.recovery_commit = c;
-                    // Migration rule: an old key-only rotate (no configuration)
-                    // was always solo→solo.
-                    state.configuration =
-                        next_configuration.unwrap_or_else(AuthorityConfigurationId::single);
+                    state.configuration = *next_configuration;
                 }
                 SpaceOp::Reshare {
                     next_configuration, ..
@@ -399,9 +402,10 @@ mod tests {
         let (ws, _i, founder) = founding([7u8; 32], [9u8; 16], rc1);
         let genesis = genesis_with(&ws, &founder, [9u8; 16], rc1);
 
+        // Solo→solo rotate: the new key is another solo key, so Single.
         let rotate = SpaceOp::Rotate {
             new_recovery_key: recovery_pub_of(&r2),
-            next_configuration: None,
+            next_configuration: AuthorityConfigurationId::single(),
             gen: 1,
         };
         let recover = SpaceOp::Recover {
@@ -458,7 +462,7 @@ mod tests {
         });
         let rotate = SpaceOp::Rotate {
             new_recovery_key: recovery_pub_of(&r2),
-            next_configuration: Some(cfg.id()),
+            next_configuration: cfg.id(),
             gen: 1,
         };
         let st = replay(&genesis, &ws, &[sign_op(&r1, &rotate, vec![], &ws)]);
@@ -471,17 +475,39 @@ mod tests {
             st.recovery_commit,
             recovery_commit(&recovery_pub_of(&r2)).unwrap()
         );
+    }
 
-        // Migration: an old key-only rotate (no configuration) stays solo.
-        let plain = SpaceOp::Rotate {
-            new_recovery_key: recovery_pub_of(&r2),
-            next_configuration: None,
+    /// The pre-C0 `Rotate` had two fields `{new_recovery_key, gen}`. Postcard is
+    /// positional and non-self-describing, so a field cannot be added compatibly
+    /// — this pins that an old two-field encoding fails to decode as the new
+    /// three-field `Rotate` rather than silently mis-reading `gen`'s bytes as a
+    /// configuration id. (No such events are deployed; this guards the claim.)
+    #[test]
+    fn an_old_two_field_rotate_does_not_misdecode() {
+        #[derive(serde::Serialize)]
+        enum OldSpaceOp {
+            #[allow(dead_code)]
+            Recover {
+                new_root: Vec<ActorId>,
+                gen: u32,
+            },
+            Rotate {
+                new_recovery_key: UserId,
+                gen: u32,
+            },
+        }
+        let old = OldSpaceOp::Rotate {
+            new_recovery_key: recovery_pub_of(&[5u8; 32]),
             gen: 1,
         };
-        assert_eq!(
-            replay(&genesis, &ws, &[sign_op(&r1, &plain, vec![], &ws)]).configuration,
-            AuthorityConfigurationId::single()
-        );
+        let bytes = postcard::to_stdvec(&old).unwrap();
+        match postcard::from_bytes::<SpaceOp>(&bytes) {
+            Err(_) => {}
+            Ok(SpaceOp::Rotate { .. }) => {
+                panic!("old two-field bytes silently mis-decoded into a new Rotate")
+            }
+            Ok(_) => {}
+        }
     }
 
     #[test]

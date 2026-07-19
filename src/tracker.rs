@@ -5139,7 +5139,9 @@ impl Tracker {
         // every replica (holder or not) learns the standing arrangement by
         // replay. Deterministic from the accepted proposal, so all group holders
         // sign byte-identical rotate ops.
-        let next_configuration = self.dkg_manifest(dkg).map(|m| m.configuration.id());
+        let Some(next_configuration) = self.dkg_manifest(dkg).map(|m| m.configuration.id()) else {
+            return Ok(false);
+        };
         // An INDISPENSABLE arrangement must not install until every custodian
         // has verified a portable backup. Otherwise an N-of-N authority can be
         // created in a state where one holder's share exists only behind a
@@ -5210,7 +5212,7 @@ impl Tracker {
     fn open_rotation_request(
         &mut self,
         new_key: &UserId,
-        next_configuration: Option<crate::authority::AuthorityConfigurationId>,
+        next_configuration: crate::authority::AuthorityConfigurationId,
         gen: u32,
     ) -> Result<(crate::dkg::TranscriptId, bool)> {
         let authority = self
