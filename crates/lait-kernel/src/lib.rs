@@ -20,6 +20,7 @@
 
 pub mod acl;
 pub mod actor;
+pub mod authority;
 pub mod authz;
 pub mod crypto;
 pub mod dkg;

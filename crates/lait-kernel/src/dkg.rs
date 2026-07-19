@@ -19,6 +19,9 @@ use anyhow::{anyhow, Result};
 use frost_ed25519 as frost;
 use serde::{Deserialize, Serialize};
 
+use crate::authority::{
+    AuthorityConfiguration, AuthorityId, AuthorityScheme, FrostThresholdConfig, PrincipalId,
+};
 use crate::ids::{UserId, WorkspaceId};
 use crate::sigdag::{self, SignedNode};
 
@@ -107,16 +110,9 @@ pub enum SignTarget {
 /// [`CeremonyOp::dkg`] and [`CeremonyOp::signing`] return `None` for them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CeremonyOp {
-    /// Open a DKG transcript: the ordered participant devices + threshold.
-    /// Authorization is *not* the device signature on this node — see
-    /// [`ProposalAuth`].
-    DkgPropose {
-        nonce: [u8; 16],
-        n: u16,
-        k: u16,
-        /// Participant devices, sorted + deduped (index = position + 1).
-        participants: Vec<UserId>,
-    },
+    /// Open a key-ceremony transcript. Authorization is *not* the device
+    /// signature on this node — see [`AuthorityGrant`].
+    DkgPropose(KeyCeremonyProposal),
     /// The recovery authority's authorization for a `DkgPropose`, as an ordinary
     /// signed node under [`AUTHORITY_GRANT_DOMAIN`].
     ///
@@ -176,6 +172,80 @@ impl CeremonyOp {
     }
 }
 
+/// A proposed key ceremony: what arrangement to create, and what it replaces.
+///
+/// Scheme-neutral on purpose. The lifecycle — propose, authorize, generate,
+/// install — is identical whether the outcome is a flat threshold or, later, a
+/// compiled policy, so the proposal carries an opaque
+/// [`AuthorityConfiguration`] rather than threshold fields. Adding a backend
+/// must not reshape the ceremony around it.
+///
+/// The proposal's signed-node hash is its transcript identity, and that hash
+/// therefore commits to everything above: scheme, configuration payload,
+/// transition kind, the authority being replaced, the nonce, and the
+/// workspace-scoped envelope. An [`AuthorityGrant`] needs only the id because
+/// the id already covers the whole decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyCeremonyProposal {
+    /// Uniqueness. Ed25519 signing is deterministic (RFC 8032), so without it a
+    /// device re-proposing an identical ceremony would collide on hash.
+    pub nonce: [u8; 16],
+    pub configuration: AuthorityConfiguration,
+    pub transition: ProposedTransition,
+}
+
+/// What kind of change a proposal asks for.
+///
+/// Naming the *current* authority — key and arrangement both — is what stops a
+/// proposal authorized under one authority being replayed against another. A
+/// grant says "this ceremony may run"; it must not silently become "this
+/// ceremony may run against whatever authority happens to be standing later".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProposedTransition {
+    /// Create a new key under a new arrangement, replacing `current`.
+    RotateKey { current: AuthorityId },
+    /// Redistribute the SAME key under a new arrangement. Reserved for Phase D:
+    /// same-key resharing needs a reviewed protocol that never reconstructs the
+    /// secret, so accepting one here would promise something unimplemented.
+    Reshare { authority: AuthorityId },
+}
+
+impl KeyCeremonyProposal {
+    /// The flat-FROST configuration this proposal creates, if it is one and it
+    /// is well formed for a transition this phase implements.
+    ///
+    /// Returns `None` for a `Reshare` — the variant exists so the format does
+    /// not need changing when Phase D arrives, not so it can be honoured now.
+    pub fn frost_config(&self) -> Option<FrostThresholdConfig> {
+        if !matches!(self.transition, ProposedTransition::RotateKey { .. }) {
+            return None;
+        }
+        if self.configuration.scheme != AuthorityScheme::FrostThreshold
+            || !self.configuration.is_well_formed()
+        {
+            return None;
+        }
+        self.configuration.as_frost_threshold()
+    }
+
+    /// The authority this proposal replaces or reshares.
+    pub fn current_authority(&self) -> &AuthorityId {
+        match &self.transition {
+            ProposedTransition::RotateKey { current } => current,
+            ProposedTransition::Reshare { authority } => authority,
+        }
+    }
+
+    /// Participant devices, in canonical index order, for a flat-FROST proposal.
+    pub fn frost_devices(&self) -> Option<Vec<UserId>> {
+        self.frost_config()?
+            .participants
+            .iter()
+            .map(|p| p.as_device())
+            .collect()
+    }
+}
+
 /// Domain for an authority grant. Distinct from [`CEREMONY_DOMAIN`] and from
 /// [`crate::space::SPACE_EVENT_DOMAIN`], so a grant can never verify as a
 /// ceremony contribution or a space operation, nor either as a grant.
@@ -202,6 +272,23 @@ pub struct AuthorityGrant {
 /// representation of the same decision to keep in sync — and no detached-message
 /// mode inside threshold signing, which is where signature-confusion bugs live.
 pub type SignedAuthorityGrant = SignedNode;
+
+/// Build a flat-FROST rotation proposal replacing `current`.
+pub fn frost_rotation_proposal(
+    nonce: [u8; 16],
+    k: u16,
+    participants: Vec<PrincipalId>,
+    current: AuthorityId,
+) -> KeyCeremonyProposal {
+    KeyCeremonyProposal {
+        nonce,
+        configuration: AuthorityConfiguration::frost_threshold(&FrostThresholdConfig {
+            k,
+            participants,
+        }),
+        transition: ProposedTransition::RotateKey { current },
+    }
+}
 
 /// Author an authority grant with a solo recovery secret.
 pub fn sign_authority_grant(
@@ -430,7 +517,7 @@ fn retain(board: &mut CeremonyBoard) {
     board.signing.retain(|_, t| t.request.is_some());
     for t in board.dkg.values_mut() {
         let participants: Vec<UserId> = match t.proposal.as_ref().map(|p| &p.op) {
-            Some(CeremonyOp::DkgPropose { participants, .. }) => participants.clone(),
+            Some(CeremonyOp::DkgPropose(p)) => p.frost_devices().unwrap_or_default(),
             _ => Vec::new(),
         };
         let mut seen: BTreeMap<(UserId, u8), ()> = BTreeMap::new();
@@ -447,7 +534,7 @@ impl CeremonyBoard {
     /// The participant set of a DKG transcript's proposal, if the board holds it.
     fn dkg_participants(&self, id: &TranscriptId) -> Option<Vec<UserId>> {
         match self.dkg.get(id)?.proposal.as_ref().map(|p| &p.op) {
-            Some(CeremonyOp::DkgPropose { participants, .. }) => Some(participants.clone()),
+            Some(CeremonyOp::DkgPropose(p)) => p.frost_devices(),
             _ => None,
         }
     }
@@ -528,9 +615,13 @@ pub struct DkgManifest {
     /// that *that* authorization is still on the board — the record pins which
     /// decision was accepted, it does not stand in for one.
     pub authorized_by: UserId,
-    pub n: u16,
-    pub k: u16,
-    pub participants: Vec<UserId>,
+    /// The arrangement this ceremony creates.
+    ///
+    /// Stored whole rather than as decoded threshold fields, so the record works
+    /// for any scheme, and so resolving "what governs the standing key" does not
+    /// have to re-derive acceptance — which is what made that resolution
+    /// mutually recursive with acceptance itself.
+    pub configuration: AuthorityConfiguration,
 }
 
 /// One signing transcript's single-use nonce state.
@@ -861,6 +952,22 @@ mod tests {
         );
     }
 
+    /// A flat-FROST rotation proposal for tests. `n` is now derived from the
+    /// participant list rather than stated separately, so it cannot disagree
+    /// with it.
+    fn test_proposal(nonce: [u8; 16], k: u16, participants: Vec<UserId>) -> KeyCeremonyProposal {
+        let mut principals: Vec<PrincipalId> =
+            participants.iter().map(PrincipalId::of_device).collect();
+        principals.sort();
+        principals.dedup();
+        frost_rotation_proposal(
+            nonce,
+            k,
+            principals,
+            crate::authority::AuthorityId::single(crate::crypto::user_from_seed(&[200u8; 32])),
+        )
+    }
+
     fn hex32(s: &str) -> Option<[u8; 32]> {
         data_encoding::HEXLOWER_PERMISSIVE
             .decode(s.as_bytes())
@@ -911,12 +1018,7 @@ mod tests {
     #[test]
     fn a_transcript_id_is_the_opening_nodes_hash() {
         let w = ws();
-        let op = CeremonyOp::DkgPropose {
-            nonce: [1u8; 16],
-            n: 2,
-            k: 2,
-            participants: vec![],
-        };
+        let op = CeremonyOp::DkgPropose(test_proposal([1u8; 16], 2, vec![]));
         let ev = sign_ceremony(&[7u8; 32], &op, &w);
         assert_eq!(TranscriptId::of(&ev).unwrap().to_hex(), ev.hash());
     }
@@ -926,12 +1028,7 @@ mod tests {
     /// the `SignedNode`, and this pins that asymmetry.
     #[test]
     fn openers_report_no_transcript_of_their_own() {
-        let opener = CeremonyOp::DkgPropose {
-            nonce: [1u8; 16],
-            n: 2,
-            k: 2,
-            participants: vec![],
-        };
+        let opener = CeremonyOp::DkgPropose(test_proposal([1u8; 16], 2, vec![]));
         assert!(opener.dkg().is_none() && opener.signing().is_none());
         let id = TranscriptId::parse_hex(&"b".repeat(64)).unwrap();
         let round = CeremonyOp::DkgRound1 {
@@ -950,12 +1047,7 @@ mod tests {
     #[test]
     fn the_board_drops_events_whose_signature_does_not_verify() {
         let w = ws();
-        let op = CeremonyOp::DkgPropose {
-            nonce: [1u8; 16],
-            n: 2,
-            k: 2,
-            participants: vec![],
-        };
+        let op = CeremonyOp::DkgPropose(test_proposal([1u8; 16], 2, vec![]));
         let mut ev = sign_ceremony(&[7u8; 32], &op, &w);
         assert_eq!(parse_board(std::slice::from_ref(&ev), &w).dkg.len(), 1);
         ev.sig = vec![0u8; 64];
@@ -974,12 +1066,7 @@ mod tests {
             .map(|i| {
                 sign_ceremony(
                     &[9u8; 32],
-                    &CeremonyOp::DkgPropose {
-                        nonce: [i; 16],
-                        n: 2,
-                        k: 2,
-                        participants: vec![],
-                    },
+                    &CeremonyOp::DkgPropose(test_proposal([i; 16], 2, vec![])),
                     &w,
                 )
             })
@@ -1114,12 +1201,7 @@ mod tests {
     #[test]
     fn the_board_files_only_verifiable_authorizations() {
         let w = ws();
-        let propose = CeremonyOp::DkgPropose {
-            nonce: [1u8; 16],
-            n: 2,
-            k: 2,
-            participants: vec![],
-        };
+        let propose = CeremonyOp::DkgPropose(test_proposal([1u8; 16], 2, vec![]));
         let pev = sign_ceremony(&[7u8; 32], &propose, &w);
         let id = TranscriptId::of(&pev).unwrap();
 
@@ -1188,13 +1270,9 @@ mod tests {
         let w = ws();
         let seed = [4u8; 32];
         // Bytes that are a structurally valid DkgPropose...
-        let op_bytes = postcard::to_stdvec(&CeremonyOp::DkgPropose {
-            nonce: [0u8; 16],
-            n: 2,
-            k: 2,
-            participants: vec![],
-        })
-        .unwrap();
+        let op_bytes =
+            postcard::to_stdvec(&CeremonyOp::DkgPropose(test_proposal([0u8; 16], 2, vec![])))
+                .unwrap();
         // ...and which postcard will also happily read as a SpaceOp, since the
         // encoding carries no type information. This is the hazard itself.
         assert!(
@@ -1229,12 +1307,7 @@ mod tests {
 
     /// Build a proposal and `count` authorizations from distinct keys.
     fn proposal_with_auths(w: &WorkspaceId, seeds: &[[u8; 32]]) -> (TranscriptId, Vec<SignedNode>) {
-        let propose = CeremonyOp::DkgPropose {
-            nonce: [1u8; 16],
-            n: 2,
-            k: 2,
-            participants: vec![],
-        };
+        let propose = CeremonyOp::DkgPropose(test_proposal([1u8; 16], 2, vec![]));
         let pev = sign_ceremony(&[7u8; 32], &propose, w);
         let id = TranscriptId::of(&pev).unwrap();
         let mut evs = vec![pev];
@@ -1318,12 +1391,7 @@ mod tests {
         w: &WorkspaceId,
         participants: Vec<UserId>,
     ) -> (TranscriptId, TranscriptId, Vec<SignedNode>) {
-        let propose = CeremonyOp::DkgPropose {
-            nonce: [1u8; 16],
-            n: participants.len() as u16,
-            k: 2,
-            participants,
-        };
+        let propose = CeremonyOp::DkgPropose(test_proposal([1u8; 16], 2, participants));
         let pev = sign_ceremony(&[7u8; 32], &propose, w);
         let authority = TranscriptId::of(&pev).unwrap();
         let req = CeremonyOp::SignRequest {
@@ -1344,7 +1412,10 @@ mod tests {
     fn signing_rounds_from_nonparticipant_keys_retain_nothing() {
         let w = ws();
         let insider = crate::crypto::user_from_seed(&[11u8; 32]);
-        let (_authority, signing, mut evs) = dkg_and_request(&w, vec![insider.clone()]);
+        let (_authority, signing, mut evs) = dkg_and_request(
+            &w,
+            vec![insider.clone(), crate::crypto::user_from_seed(&[12u8; 32])],
+        );
         // 500 distinct attacker keys, one round each — under any per-author cap.
         for i in 0..500u32 {
             let mut seed = [0u8; 32];
@@ -1448,14 +1519,16 @@ mod tests {
         let insider = crate::crypto::user_from_seed(&[11u8; 32]);
 
         // Authority A names only the insider.
-        let (_a_id, signing, mut evs) = dkg_and_request(&w, vec![insider]);
+        let (_a_id, signing, mut evs) = dkg_and_request(
+            &w,
+            vec![insider, crate::crypto::user_from_seed(&[12u8; 32])],
+        );
         // An unrelated DKG B names the outsider — irrelevant to this request.
-        let other = CeremonyOp::DkgPropose {
-            nonce: [9u8; 16],
-            n: 1,
-            k: 1,
-            participants: vec![outsider],
-        };
+        let other = CeremonyOp::DkgPropose(test_proposal(
+            [9u8; 16],
+            2,
+            vec![outsider, crate::crypto::user_from_seed(&[13u8; 32])],
+        ));
         evs.push(sign_ceremony(&[7u8; 32], &other, &w));
         evs.push(sign_ceremony(
             &[42u8; 32],
@@ -1500,12 +1573,11 @@ mod tests {
     fn rounds_from_non_participants_are_dropped() {
         let w = ws();
         let insider = crate::crypto::user_from_seed(&[11u8; 32]);
-        let propose = CeremonyOp::DkgPropose {
-            nonce: [1u8; 16],
-            n: 2,
-            k: 2,
-            participants: vec![insider.clone()],
-        };
+        let propose = CeremonyOp::DkgPropose(test_proposal(
+            [1u8; 16],
+            2,
+            vec![insider.clone(), crate::crypto::user_from_seed(&[12u8; 32])],
+        ));
         let pev = sign_ceremony(&[11u8; 32], &propose, &w);
         let id = TranscriptId::of(&pev).unwrap();
         let good = sign_ceremony(
@@ -1536,12 +1608,11 @@ mod tests {
     fn one_round_per_author_per_kind_is_retained() {
         let w = ws();
         let me = crate::crypto::user_from_seed(&[11u8; 32]);
-        let propose = CeremonyOp::DkgPropose {
-            nonce: [1u8; 16],
-            n: 2,
-            k: 2,
-            participants: vec![me.clone()],
-        };
+        let propose = CeremonyOp::DkgPropose(test_proposal(
+            [1u8; 16],
+            2,
+            vec![me.clone(), crate::crypto::user_from_seed(&[12u8; 32])],
+        ));
         let pev = sign_ceremony(&[11u8; 32], &propose, &w);
         let id = TranscriptId::of(&pev).unwrap();
         let mut events = vec![pev];

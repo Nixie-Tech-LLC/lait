@@ -3465,12 +3465,25 @@ impl Tracker {
         // does not exist until now. `nonce` keeps two identical elevations by
         // the same initiator from colliding — Ed25519 signing is deterministic,
         // so without it the same (n, k, participants) would hash identically.
-        let propose = crate::dkg::CeremonyOp::DkgPropose {
-            nonce: rand16(),
-            n,
-            k,
-            participants,
+        let Some(current) = self.current_authority() else {
+            return (
+                Response::err(
+                    "cannot determine the arrangement operating the current recovery key — sync the ceremony that produced it first",
+                ),
+                None,
+            );
         };
+        let principals: Vec<crate::authority::PrincipalId> = participants
+            .iter()
+            .map(crate::authority::PrincipalId::of_device)
+            .collect();
+        let propose = crate::dkg::CeremonyOp::DkgPropose(crate::dkg::frost_rotation_proposal(
+            rand16(),
+            k,
+            principals,
+            current,
+        ));
+        let _ = n;
         let ev = crate::dkg::sign_ceremony(&self.seed, &propose, &self.workspace_id);
         let Some(transcript) = crate::dkg::TranscriptId::of(&ev) else {
             return (Response::err("could not derive the proposal id"), None);
@@ -3584,6 +3597,129 @@ impl Tracker {
         Ok(progressed)
     }
 
+    /// Whether `claimed` really is the authority standing here.
+    ///
+    /// Two checks, and the second is only available to some nodes:
+    ///
+    /// - **The key must commit to the standing commitment.** Every node can do
+    ///   this, holder or not, because the commitment is on the space plane.
+    /// - **If this node can determine the arrangement, it must match.** A
+    ///   commitment is a hash, so a node that holds neither the solo secret nor
+    ///   an acceptance record cannot reconstruct the arrangement, and demanding
+    ///   it would make acceptance impossible for exactly the joiners a ceremony
+    ///   needs.
+    ///
+    /// Accepting on the key alone is sound *in Phase B* because the only
+    /// transition implemented is `RotateKey`, which always changes the key — so
+    /// key identity implies arrangement identity. That stops being true when
+    /// Phase D adds `Reshare`, which changes the arrangement while keeping the
+    /// key; at that point the configuration check becomes load-bearing rather
+    /// than corroborating, and every acceptor will need a way to learn the
+    /// standing arrangement. `ProposedTransition::Reshare` is refused today
+    /// precisely so that gap cannot be reached before it is closed.
+    fn claims_the_standing_authority(&self, claimed: &crate::authority::AuthorityId) -> bool {
+        let cur = crate::space::replay(
+            &self.genesis,
+            &self.workspace_id,
+            &self.membership.space_events(),
+        );
+        if crate::space::recovery_commit(&claimed.public_key) != Some(cur.recovery_commit) {
+            return false;
+        }
+        match self.known_configuration_of(&claimed.public_key) {
+            Some(known) => claimed.configuration == known,
+            None => true,
+        }
+    }
+
+    /// The arrangement this device knows operates `key`, if it knows one: the
+    /// bootstrap `Single` shape for a solo secret we hold, or the configuration
+    /// recorded when we accepted the ceremony that produced a group key.
+    fn known_configuration_of(
+        &self,
+        key: &UserId,
+    ) -> Option<crate::authority::AuthorityConfigurationId> {
+        if let Some(secret) = self.read_space_recovery_key() {
+            if &crate::space::recovery_pub_of(&secret) == key {
+                return Some(crate::authority::AuthorityConfiguration::single().id());
+            }
+        }
+        self.dkg_manifests().into_iter().find_map(|(id, m)| {
+            (self.group_key_of_transcript(&id).as_ref() == Some(key)).then(|| m.configuration.id())
+        })
+    }
+
+    /// The authority standing right now: its public key, and the arrangement
+    /// operating it.
+    ///
+    /// The key comes from the space plane. The *arrangement* does not — the
+    /// plane deliberately knows nothing about signing topology — so it comes
+    /// from this device's own acceptance record for the ceremony that produced
+    /// the key. A solo bootstrap key has no ceremony and is `Single` by
+    /// construction.
+    ///
+    /// Deliberately reads manifests rather than re-deriving acceptance from the
+    /// board: acceptance already asks "does this proposal replace the standing
+    /// authority?", so resolving the standing authority through acceptance would
+    /// be mutually recursive. The manifest is written only *after* a genuine
+    /// acceptance, and the group key is still DERIVED from the public-key
+    /// package rather than read from a file naming it, so the filesystem is an
+    /// index here and not a source of authority.
+    ///
+    /// `None` when a group key is standing that this device cannot attribute to
+    /// any accepted ceremony: we know a key is in force but not what governs it,
+    /// and answering `Single` there would let a proposal claim to replace an
+    /// arrangement nobody has seen.
+    fn current_authority(&self) -> Option<crate::authority::AuthorityId> {
+        let cur = crate::space::replay(
+            &self.genesis,
+            &self.workspace_id,
+            &self.membership.space_events(),
+        );
+        if let Some(secret) = self.read_space_recovery_key() {
+            let pubkey = crate::space::recovery_pub_of(&secret);
+            if crate::space::recovery_commit(&pubkey) == Some(cur.recovery_commit) {
+                return Some(crate::authority::AuthorityId::single(pubkey));
+            }
+        }
+        for (id, manifest) in self.dkg_manifests() {
+            let Some(group_key) = self.group_key_of_transcript(&id) else {
+                continue;
+            };
+            if crate::space::recovery_commit(&group_key) == Some(cur.recovery_commit) {
+                return Some(crate::authority::AuthorityId::new(
+                    group_key,
+                    &manifest.configuration,
+                ));
+            }
+        }
+        None
+    }
+
+    /// Every acceptance record on this device, keyed by transcript.
+    fn dkg_manifests(&self) -> Vec<(crate::dkg::TranscriptId, crate::dkg::DkgManifest)> {
+        let dir = self.store.home_path().join("dkg");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(hex) = name.strip_suffix("-manifest") else {
+                continue;
+            };
+            // Strict: a non-canonical filename names no transcript.
+            let Some(id) = crate::dkg::TranscriptId::parse_hex(hex) else {
+                continue;
+            };
+            if let Some(m) = self.dkg_manifest(&id) {
+                out.push((id, m));
+            }
+        }
+        out
+    }
+
     /// The verified, retention-filtered ceremony board.
     ///
     /// The **only** way this file obtains a board. `parse_board` alone leaves
@@ -3600,7 +3736,14 @@ impl Tracker {
     ) -> crate::dkg::CeremonyBoard {
         let mut board = crate::dkg::parse_board(events, &self.workspace_id);
         board.restrict_signing_rounds(|authority| {
-            self.dkg_manifest(authority).map(|m| m.participants)
+            self.dkg_manifest(authority).and_then(|m| {
+                m.configuration
+                    .as_frost_threshold()?
+                    .participants
+                    .iter()
+                    .map(|p| p.as_device())
+                    .collect()
+            })
         });
         board
     }
@@ -3630,23 +3773,17 @@ impl Tracker {
         t: &crate::dkg::DkgTranscript,
     ) -> Option<(u16, u16, Vec<UserId>)> {
         let proposal = t.proposal.as_ref()?;
-        let crate::dkg::CeremonyOp::DkgPropose {
-            n, k, participants, ..
-        } = &proposal.op
-        else {
+        let crate::dkg::CeremonyOp::DkgPropose(p) = &proposal.op else {
             return None;
         };
-        let mut sorted = participants.clone();
-        sorted.sort();
-        sorted.dedup();
-        let well_formed = *n as usize == participants.len()
-            && sorted.len() == participants.len()
-            && &sorted == participants
-            && *n >= 2
-            && (1..=*n).contains(k);
-        if !well_formed {
-            return None;
-        }
+        // Well-formedness and scheme support are the configuration's own rules,
+        // re-checked at every acceptor rather than trusted from the proposer.
+        // `frost_config` also refuses a transition this phase does not implement
+        // (Reshare), so an unimplemented promise cannot enter a ceremony.
+        let cfg = p.frost_config()?;
+        let participants = p.frost_devices()?;
+        let (n, k) = (participants.len() as u16, cfg.k);
+
         let cur = crate::space::replay(
             &self.genesis,
             &self.workspace_id,
@@ -3657,10 +3794,17 @@ impl Tracker {
         // authorizations — rather than one slot — is what stops a wrong-key
         // authorization from displacing the right one, and makes the outcome a
         // function of authority validation rather than of board order.
-        let fresh = t
-            .auths
-            .values()
-            .any(|g| crate::space::recovery_commit(&g.author) == Some(cur.recovery_commit));
+        // Fresh acceptance needs BOTH: the proposal targets the authority
+        // standing right now, and a grant from that authority is present.
+        //
+        // The target check lives here rather than as a hard gate because a
+        // successful ceremony rotates the authority it named — so a gate would
+        // make every transcript un-accept itself at the moment it succeeded,
+        // stranding holders mid-DKG and orphaning the very group it created.
+        let fresh = self.claims_the_standing_authority(p.current_authority())
+            && t.auths
+                .values()
+                .any(|g| crate::space::recovery_commit(&g.author) == Some(cur.recovery_commit));
         // Or: the authority that was standing when we accepted, whose
         // authorization must still be present. A successful elevation rotates
         // the authority, so `fresh` alone would un-accept every transcript at the
@@ -3668,12 +3812,10 @@ impl Tracker {
         let recorded = self.dkg_manifest(dkg).is_some_and(|m| {
             m.proposal == *dkg
                 && m.proposal_author == proposal.author
-                && m.n == *n
-                && m.k == *k
-                && m.participants == *participants
+                && m.configuration == p.configuration
                 && t.auths.contains_key(&m.authorized_by)
         });
-        (fresh || recorded).then(|| (*n, *k, participants.clone()))
+        (fresh || recorded).then(|| (n, k, participants.clone()))
     }
 
     /// This transcript's local acceptance record, if we wrote one.
@@ -3956,13 +4098,14 @@ impl Tracker {
                 .find(|g| crate::space::recovery_commit(&g.author) == Some(cur.recovery_commit))
                 .map(|g| g.author.clone());
             if let (Some(proposal), Some(authorized_by)) = (t.proposal.as_ref(), authorized_by) {
+                let crate::dkg::CeremonyOp::DkgPropose(p) = &proposal.op else {
+                    return Ok(false);
+                };
                 let manifest = crate::dkg::DkgManifest {
                     proposal: *dkg,
                     proposal_author: proposal.author.clone(),
                     authorized_by,
-                    n,
-                    k,
-                    participants: participants.clone(),
+                    configuration: p.configuration.clone(),
                 };
                 self.dkg_write(dkg, "manifest", &postcard::to_stdvec(&manifest)?)?;
             }
@@ -5070,6 +5213,27 @@ mod tests {
     }
 
     const ME_SEED: [u8; 32] = [7u8; 32];
+    /// A flat-FROST rotation proposal naming `t`'s CURRENT authority, so the
+    /// only reason a test proposal is rejected is the thing that test is about.
+    fn test_proposal(
+        t: &Tracker,
+        nonce: [u8; 16],
+        k: u16,
+        participants: Vec<UserId>,
+    ) -> crate::dkg::KeyCeremonyProposal {
+        let principals: Vec<crate::authority::PrincipalId> = participants
+            .iter()
+            .map(crate::authority::PrincipalId::of_device)
+            .collect();
+        crate::dkg::frost_rotation_proposal(
+            nonce,
+            k,
+            principals,
+            t.current_authority()
+                .expect("a fresh node knows its solo authority"),
+        )
+    }
+
     fn me() -> UserId {
         // A real ed25519 key (so the founder can seal the workspace key to itself).
         crypto::user_from_seed(&ME_SEED)
@@ -6656,12 +6820,12 @@ mod tests {
         );
 
         // Put a transcript for it on the board so it is a candidate at all.
-        let propose = crate::dkg::CeremonyOp::DkgPropose {
-            nonce: [5u8; 16],
-            n: 2,
-            k: 2,
-            participants: vec![a.tracker.me.clone(), user_from_seed([31u8; 32])],
-        };
+        let propose = crate::dkg::CeremonyOp::DkgPropose(test_proposal(
+            &a.tracker,
+            [5u8; 16],
+            2,
+            vec![a.tracker.me.clone(), user_from_seed([31u8; 32])],
+        ));
         let ev = crate::dkg::sign_ceremony(&[31u8; 32], &propose, &a.tracker.workspace_id);
         let id = crate::dkg::TranscriptId::of(&ev).unwrap();
         a.tracker.membership.add_ceremony_event(&ev).unwrap();
@@ -6788,6 +6952,105 @@ mod tests {
         );
     }
 
+    /// A proposal names the authority it replaces, so one authorized under a
+    /// past authority cannot be replayed against the current one. Without this,
+    /// a grant would mean "some ceremony may run" rather than "this ceremony may
+    /// replace this exact authority".
+    #[test]
+    fn a_proposal_naming_the_wrong_authority_is_rejected() {
+        let mut a = new_node();
+        let secret = a.tracker.read_space_recovery_key().expect("solo key");
+
+        // A well-formed proposal whose `current` is some other authority.
+        let stranger = crate::authority::AuthorityId::single(user_from_seed([123u8; 32]));
+        let principals = {
+            let mut v: Vec<crate::authority::PrincipalId> =
+                [a.tracker.me.clone(), user_from_seed([44u8; 32])]
+                    .iter()
+                    .map(crate::authority::PrincipalId::of_device)
+                    .collect();
+            v.sort();
+            v
+        };
+        let propose = crate::dkg::CeremonyOp::DkgPropose(crate::dkg::frost_rotation_proposal(
+            [6u8; 16], 2, principals, stranger,
+        ));
+        let ev = crate::dkg::sign_ceremony(&[44u8; 32], &propose, &a.tracker.workspace_id);
+        let id = crate::dkg::TranscriptId::of(&ev).unwrap();
+        // Authorized by the REAL recovery key: only the named authority is wrong.
+        let grant = crate::dkg::sign_authority_grant(&secret, &a.tracker.workspace_id, &id);
+        let aev = crate::dkg::sign_ceremony(
+            &[44u8; 32],
+            &crate::dkg::CeremonyOp::DkgAuthorize(grant),
+            &a.tracker.workspace_id,
+        );
+        a.tracker.membership.add_ceremony_event(&ev).unwrap();
+        a.tracker.membership.add_ceremony_event(&aev).unwrap();
+        a.tracker.persist_membership("wrong_authority").unwrap();
+
+        a.tracker.dkg_advance().unwrap();
+        assert!(
+            a.tracker.dkg_manifest(&id).is_none(),
+            "a proposal must name the authority it actually replaces"
+        );
+    }
+
+    /// `Reshare` keeps the public key and changes only the arrangement. It needs
+    /// a protocol that never reconstructs the secret, which does not exist yet —
+    /// so the variant round-trips in the format but must never be acted on.
+    /// Accepting one would promise a transition the code cannot perform.
+    #[test]
+    fn a_reshare_proposal_is_refused_until_the_protocol_exists() {
+        let mut a = new_node();
+        let secret = a.tracker.read_space_recovery_key().expect("solo key");
+        let current = a.tracker.current_authority().expect("solo authority");
+        let mut principals: Vec<crate::authority::PrincipalId> =
+            [a.tracker.me.clone(), user_from_seed([45u8; 32])]
+                .iter()
+                .map(crate::authority::PrincipalId::of_device)
+                .collect();
+        principals.sort();
+
+        let proposal = crate::dkg::KeyCeremonyProposal {
+            nonce: [7u8; 16],
+            configuration: crate::authority::AuthorityConfiguration::frost_threshold(
+                &crate::authority::FrostThresholdConfig {
+                    k: 2,
+                    participants: principals,
+                },
+            ),
+            transition: crate::dkg::ProposedTransition::Reshare { authority: current },
+        };
+        // Everything else is impeccable: well-formed configuration, real grant.
+        assert!(proposal.configuration.is_well_formed());
+        assert!(
+            proposal.frost_config().is_none(),
+            "an unimplemented transition yields no usable configuration"
+        );
+
+        let ev = crate::dkg::sign_ceremony(
+            &[45u8; 32],
+            &crate::dkg::CeremonyOp::DkgPropose(proposal),
+            &a.tracker.workspace_id,
+        );
+        let id = crate::dkg::TranscriptId::of(&ev).unwrap();
+        let grant = crate::dkg::sign_authority_grant(&secret, &a.tracker.workspace_id, &id);
+        let aev = crate::dkg::sign_ceremony(
+            &[45u8; 32],
+            &crate::dkg::CeremonyOp::DkgAuthorize(grant),
+            &a.tracker.workspace_id,
+        );
+        a.tracker.membership.add_ceremony_event(&ev).unwrap();
+        a.tracker.membership.add_ceremony_event(&aev).unwrap();
+        a.tracker.persist_membership("reshare").unwrap();
+
+        a.tracker.dkg_advance().unwrap();
+        assert!(
+            a.tracker.dkg_manifest(&id).is_none() && a.tracker.dkg_read(&id, "r1").is_none(),
+            "resharing must not be attempted before a same-key protocol exists"
+        );
+    }
+
     /// F1 regression, the headline one. A rogue proposal carries a perfectly
     /// valid *device* signature — authentication was never the missing piece.
     /// Without an authorization from the recovery authority, no honest node may
@@ -6801,16 +7064,12 @@ mod tests {
         let rogue = user_from_seed(rogue_seed);
 
         // The attacker names A as a participant, with a threshold they control.
-        let propose = crate::dkg::CeremonyOp::DkgPropose {
-            nonce: [1u8; 16],
-            n: 2,
-            k: 2,
-            participants: {
+        let propose =
+            crate::dkg::CeremonyOp::DkgPropose(test_proposal(&a.tracker, [1u8; 16], 2, {
                 let mut v = vec![a.tracker.me.clone(), rogue.clone()];
                 v.sort();
                 v
-            },
-        };
+            }));
         let ev = crate::dkg::sign_ceremony(&rogue_seed, &propose, &a.tracker.workspace_id);
         assert!(
             ev.verify_sig(crate::dkg::CEREMONY_DOMAIN, &a_ws),
@@ -6849,16 +7108,12 @@ mod tests {
         let rogue = user_from_seed(rogue_seed);
         let secret = a.tracker.read_space_recovery_key().expect("solo key");
 
-        let propose = crate::dkg::CeremonyOp::DkgPropose {
-            nonce: [2u8; 16],
-            n: 2,
-            k: 2,
-            participants: {
+        let propose =
+            crate::dkg::CeremonyOp::DkgPropose(test_proposal(&a.tracker, [2u8; 16], 2, {
                 let mut v = vec![a.tracker.me.clone(), rogue.clone()];
                 v.sort();
                 v
-            },
-        };
+            }));
         let ev = crate::dkg::sign_ceremony(&rogue_seed, &propose, &a.tracker.workspace_id);
         let rogue_id = crate::dkg::TranscriptId::of(&ev).unwrap();
 
@@ -6898,16 +7153,12 @@ mod tests {
         let stale_seed = [66u8; 32]; // never the workspace's recovery key
         let rogue = user_from_seed([79u8; 32]);
 
-        let propose = crate::dkg::CeremonyOp::DkgPropose {
-            nonce: [3u8; 16],
-            n: 2,
-            k: 2,
-            participants: {
+        let propose =
+            crate::dkg::CeremonyOp::DkgPropose(test_proposal(&a.tracker, [3u8; 16], 2, {
                 let mut v = vec![a.tracker.me.clone(), rogue];
                 v.sort();
                 v
-            },
-        };
+            }));
         let ev = crate::dkg::sign_ceremony(&stale_seed, &propose, &a.tracker.workspace_id);
         let id = crate::dkg::TranscriptId::of(&ev).unwrap();
         // Well-formed authorization, signed by a key that is not the authority.
@@ -6942,12 +7193,12 @@ mod tests {
         let me = a.tracker.me.clone();
 
         // Duplicated participant, and n disagreeing with the list length.
-        let propose = crate::dkg::CeremonyOp::DkgPropose {
-            nonce: [4u8; 16],
-            n: 3,
-            k: 2,
-            participants: vec![me.clone(), me.clone()],
-        };
+        let propose = crate::dkg::CeremonyOp::DkgPropose(test_proposal(
+            &a.tracker,
+            [4u8; 16],
+            2,
+            vec![me.clone(), me.clone()],
+        ));
         let ev = crate::dkg::sign_ceremony(&[80u8; 32], &propose, &a.tracker.workspace_id);
         let id = crate::dkg::TranscriptId::of(&ev).unwrap();
         // Authorized by the REAL recovery key — only the shape is wrong.

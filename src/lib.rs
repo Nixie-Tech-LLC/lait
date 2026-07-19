@@ -52,7 +52,9 @@ pub mod workspaces;
 // keeps reaching them by their historical crate-root paths (`crate::acl`,
 // `lait::ids`, …); the boundary is enforced by the kernel crate's manifest, not
 // by these aliases.
-pub use lait_kernel::{acl, actor, authz, crypto, dkg, dto, genesis, ids, sigdag, space};
+pub use lait_kernel::{
+    acl, actor, authority, authz, crypto, dkg, dto, genesis, ids, sigdag, space,
+};
 
 // The **engine** (`lait-engine`) is the only crate that names Loro. Re-exported
 // here — as the `engine` module and its wrappers — so the app layer keeps its
