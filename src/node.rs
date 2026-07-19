@@ -1413,6 +1413,9 @@ impl Node {
             | Request::Recover
             | Request::SpaceElevate { .. }
             | Request::SpaceRecoverApprove { .. }
+            | Request::SpaceElevateApprove { .. }
+            | Request::SpaceCustodyExport { .. }
+            | Request::SpaceCustodyImport { .. }
             | Request::SpaceRecover => {
                 let (resp, changed) = self.dispatch_tracker(req);
                 if changed {

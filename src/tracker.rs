@@ -830,6 +830,17 @@ impl Tracker {
             Request::Recover => Ok(self.recover()),
             Request::SpaceRecover => Ok(self.space_recover_cmd()),
             Request::SpaceElevate { cofounders, k } => Ok(self.space_elevate_cmd(cofounders, k)),
+            Request::SpaceElevateApprove { session, proposal } => {
+                Ok(self.space_elevate_approve_cmd(session, proposal))
+            }
+            Request::SpaceCustodyExport { path, passphrase } => {
+                Ok(self.space_custody_export_cmd(path, passphrase))
+            }
+            Request::SpaceCustodyImport {
+                path,
+                passphrase,
+                force,
+            } => Ok(self.space_custody_import_cmd(path, passphrase, force)),
             Request::SpaceRecoverApprove { session, expect } => {
                 Ok(self.space_recover_approve_cmd(session, expect))
             }

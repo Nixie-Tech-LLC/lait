@@ -77,6 +77,12 @@ pub fn is_read(req: &Request) -> bool {
         | Request::SpaceRecover
         | Request::SpaceElevate { .. }
         | Request::SpaceRecoverApprove { .. }
+        | Request::SpaceElevateApprove { .. }
+        // …and custody, which handles a holder's own key material and a
+        // passphrase, so it belongs to the operator at the machine and not to a
+        // browser session…
+        | Request::SpaceCustodyExport { .. }
+        | Request::SpaceCustodyImport { .. }
         // …joining and inviting, which act *as* an identity on the wire…
         | Request::Invite { .. }
         | Request::Join { .. }

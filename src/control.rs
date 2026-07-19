@@ -322,6 +322,28 @@ pub enum Request {
         /// refused before any share is contributed.
         expect: Vec<String>,
     },
+    /// Co-sign a pending authority grant as a holder of the current group key,
+    /// authorizing a replacement ceremony. Consent binds to the PROPOSAL, not to
+    /// the session id: a request for a different proposal is refused.
+    SpaceElevateApprove {
+        session: String,
+        proposal: String,
+    },
+    /// Export this device's recovery share as a portable, passphrase-protected
+    /// package, verify it by reopening, and attest that on the board. An
+    /// all-holders arrangement will not install until every custodian has done
+    /// this.
+    SpaceCustodyExport {
+        path: String,
+        passphrase: String,
+    },
+    /// Restore a recovery share from a portable package written by
+    /// `SpaceCustodyExport`. Refuses to replace a readable share unless `force`.
+    SpaceCustodyImport {
+        path: String,
+        passphrase: String,
+        force: bool,
+    },
     /// Recover our actor with the offline recovery key: reset the device set to
     /// this device (identity is restored; content-key access is re-sealed lazily
     /// by an admin/peer).

@@ -1179,6 +1179,69 @@ pub fn specs() -> Vec<Spec> {
             },
         ),
         Spec::req(
+            "elevate-approve",
+            "Co-sign a proposed change to the recovery arrangement, as a holder \
+             of the current group key. You must name the proposal you expect \
+             (`--proposal`); a request authorizing a different one is refused \
+             before your share is used.",
+            vec![
+                A::pos(
+                    "session",
+                    "The request id (from the proposer's `elevate-recovery`).",
+                ),
+                A::val(
+                    "proposal",
+                    "The proposal id you expect this to authorize.",
+                )
+                .required(),
+            ],
+            |m| {
+                Ok(Request::SpaceElevateApprove {
+                    session: req_str(m, "session"),
+                    proposal: req_str(m, "proposal"),
+                })
+            },
+        ),
+        Spec::req(
+            "custody-export",
+            "Export your share of the group recovery key as a portable, \
+             passphrase-protected package, and verify it by reopening it. An \
+             all-holders arrangement will NOT install until every custodian has \
+             done this — a share that only your Windows account can open is one \
+             profile loss from gone. Store the file where the passphrase cannot \
+             also be found.",
+            vec![
+                A::pos("path", "Where to write the package."),
+                A::val("passphrase", "Passphrase protecting the package (min 12 chars).")
+                    .required(),
+            ],
+            |m| {
+                Ok(Request::SpaceCustodyExport {
+                    path: req_str(m, "path"),
+                    passphrase: req_str(m, "passphrase"),
+                })
+            },
+        ),
+        Spec::req(
+            "custody-import",
+            "Restore your share of the group recovery key from a package written \
+             by `custody-export` — after losing the account or machine that held \
+             it. Refuses to overwrite a share this device can already read unless \
+             you pass `--force`.",
+            vec![
+                A::pos("path", "The package to restore from."),
+                A::val("passphrase", "The passphrase the package was written with.").required(),
+                A::flag("force", "Replace a share this device can already read."),
+            ],
+            |m| {
+                Ok(Request::SpaceCustodyImport {
+                    path: req_str(m, "path"),
+                    passphrase: req_str(m, "passphrase"),
+                    force: flag(m, "force"),
+                })
+            },
+        ),
+        Spec::req(
             "elevate-recovery",
             "Elevate the workspace recovery authority from your solo bootstrap key \
              to a K-of-N group key (dealer-free FROST DKG), sharing the recovery \
