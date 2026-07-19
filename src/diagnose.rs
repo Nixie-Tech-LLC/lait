@@ -23,6 +23,11 @@ pub enum GateState {
     Pass,
     Wait,
     Fail,
+    /// Something needs attention but does not stop you working. Deliberately
+    /// **not** blocking: key-custody problems are urgent to fix and irrelevant
+    /// to whether you are onboarded, so a warning must not hijack `blocked_on`
+    /// and tell a joiner they are stuck.
+    Warn,
     Skip,
 }
 
@@ -31,6 +36,7 @@ impl GateState {
     /// so the three surfaces read identically. Colour is layered on separately.
     pub fn glyph(self) -> &'static str {
         match self {
+            GateState::Warn => "\u{26a0}", // ⚠
             GateState::Pass => "\u{2714}", // ✔
             GateState::Wait => "\u{231b}", // ⌛
             GateState::Fail => "\u{2718}", // ✘
@@ -97,6 +103,13 @@ pub struct DiagnoseInput<'a> {
     /// (from the invite ticket) so a directory/store mismatch is caught. `None`
     /// for a standalone `doctor`, which can't know intent.
     pub expected_workspace: Option<&'a str>,
+    /// Recovery shares present on this device that cannot be used. Borrowed as a
+    /// slice so the struct stays `Copy`.
+    pub degraded_recovery: &'a [crate::tracker::DegradedRecoveryHolder],
+    /// An outstanding rekey obligation this node cannot discharge itself — an
+    /// actor evicted by a revoked invite still holds live keys and no admin has
+    /// rotated past the fence yet.
+    pub rekey_pending: Option<&'a str>,
 }
 
 /// Project daemon state into the ordered gate list (pure — the validation core).
@@ -227,7 +240,35 @@ pub fn diagnose(input: DiagnoseInput<'_>) -> DiagnosisView {
         )
     };
 
-    let gates = vec![workspace, daemon, membership, peer, synced];
+    // 6. keys — custody health. Last, and never blocking: these are urgent to
+    //    fix but say nothing about whether you are onboarded. A joiner mid-setup
+    //    must not be told they are blocked because a founder share is stranded.
+    let mut key_notes: Vec<String> = Vec::new();
+    for h in input.degraded_recovery {
+        let scope = match h.is_current_authority {
+            Some(true) => "the workspace recovery key",
+            // Currency could not be established; say so rather than assert it.
+            _ => "a recovery key (group unidentified)",
+        };
+        key_notes.push(format!(
+            "your share of {scope} is unusable ({})",
+            match &h.reason {
+                crate::tracker::RecoveryArtifactFailure::Undecryptable(_) =>
+                    "protected under another Windows account or machine",
+                crate::tracker::RecoveryArtifactFailure::Io(_) => "present but could not be read",
+            }
+        ));
+    }
+    if let Some(note) = input.rekey_pending {
+        key_notes.push(note.to_string());
+    }
+    let keys = if key_notes.is_empty() {
+        DiagnosisGate::new("keys", "keys", GateState::Pass, "custody healthy")
+    } else {
+        DiagnosisGate::new("keys", "keys", GateState::Warn, key_notes.join("; "))
+    };
+
+    let gates = vec![workspace, daemon, membership, peer, synced, keys];
     let blocked = gates.iter().find(|g| g.state.is_blocking());
     let blocked_on = blocked.map(|g| g.id.clone());
     let summary = summarize(blocked, input.projects, input.issues);
@@ -281,7 +322,73 @@ mod tests {
             projects: 2,
             issues: 3,
             expected_workspace: None,
+            degraded_recovery: &[],
+            rekey_pending: None,
         }
+    }
+
+    fn degraded(current: Option<bool>) -> crate::tracker::DegradedRecoveryHolder {
+        crate::tracker::DegradedRecoveryHolder {
+            transcript: "a".repeat(64),
+            reason: crate::tracker::RecoveryArtifactFailure::Undecryptable("dpapi".into()),
+            is_current_authority: current,
+        }
+    }
+
+    #[test]
+    fn a_degraded_share_warns_without_blocking_onboarding() {
+        let held = vec![degraded(Some(true))];
+        let v = diagnose(DiagnoseInput {
+            degraded_recovery: &held,
+            ..input()
+        });
+        assert_eq!(gate(&v, "keys").state, GateState::Warn);
+        assert!(gate(&v, "keys").detail.contains("workspace recovery key"));
+        assert!(gate(&v, "keys").detail.contains("another Windows account"));
+        // The whole point: a custody problem is not an onboarding blocker.
+        assert_eq!(
+            v.blocked_on, None,
+            "a warning must never hijack the onboarding blocker"
+        );
+    }
+
+    #[test]
+    fn an_unidentified_group_is_not_claimed_to_be_the_recovery_key() {
+        let held = vec![degraded(None)];
+        let v = diagnose(DiagnoseInput {
+            degraded_recovery: &held,
+            ..input()
+        });
+        assert!(gate(&v, "keys").detail.contains("group unidentified"));
+        assert!(!gate(&v, "keys")
+            .detail
+            .contains("the workspace recovery key"));
+    }
+
+    #[test]
+    fn a_pending_rekey_warns_on_the_same_gate() {
+        let v = diagnose(DiagnoseInput {
+            rekey_pending: Some("revoked invite: xyz still holds a workspace key"),
+            ..input()
+        });
+        assert_eq!(gate(&v, "keys").state, GateState::Warn);
+        assert!(gate(&v, "keys")
+            .detail
+            .contains("still holds a workspace key"));
+        assert_eq!(v.blocked_on, None);
+    }
+
+    #[test]
+    fn a_blocked_joiner_still_reports_custody_separately() {
+        let held = vec![degraded(Some(true))];
+        let v = diagnose(DiagnoseInput {
+            membership: "pending",
+            degraded_recovery: &held,
+            ..input()
+        });
+        // The onboarding blocker is unchanged, and the warning rides alongside.
+        assert_eq!(v.blocked_on.as_deref(), Some("membership"));
+        assert_eq!(gate(&v, "keys").state, GateState::Warn);
     }
 
     fn gate<'a>(v: &'a DiagnosisView, id: &str) -> &'a DiagnosisGate {
@@ -293,6 +400,11 @@ mod tests {
         let v = diagnose(input());
         assert_eq!(v.blocked_on, None, "a fully-synced member has no blocker");
         assert!(v.gates.iter().all(|g| g.state == GateState::Pass));
+        assert_eq!(
+            gate(&v, "keys").state,
+            GateState::Pass,
+            "custody is healthy"
+        );
         assert!(v.summary.contains("get to work"));
     }
 
@@ -415,6 +527,18 @@ mod tests {
     fn gate_ordering_is_stable() {
         let v = diagnose(input());
         let ids: Vec<&str> = v.gates.iter().map(|g| g.id.as_str()).collect();
-        assert_eq!(ids, ["workspace", "daemon", "membership", "peer", "synced"]);
+        //  is LAST on purpose: the first five are the onboarding sequence a
+        // joiner walks, and custody health is orthogonal to it.
+        assert_eq!(
+            ids,
+            [
+                "workspace",
+                "daemon",
+                "membership",
+                "peer",
+                "synced",
+                "keys"
+            ]
+        );
     }
 }

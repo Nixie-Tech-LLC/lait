@@ -1657,6 +1657,10 @@ impl Node {
                         membership.to_string(),
                     )
                 };
+                let (degraded_recovery, rekey_pending) = {
+                    let t = self.tracker.lock().unwrap();
+                    (t.degraded_recovery_holders(), t.rekey_pending_notice())
+                };
                 let view = crate::diagnose::diagnose(crate::diagnose::DiagnoseInput {
                     workspace: Some(workspace.as_str()),
                     name: name.as_str(),
@@ -1665,6 +1669,8 @@ impl Node {
                     projects,
                     issues,
                     expected_workspace: expected_workspace.as_deref(),
+                    degraded_recovery: &degraded_recovery,
+                    rekey_pending: rekey_pending.as_deref(),
                 });
                 Ok(Response::Diagnosis(Box::new(view)))
             }

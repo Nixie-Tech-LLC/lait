@@ -710,6 +710,7 @@ fn print_diagnosis(v: &DiagnosisView, out: Out) {
         let code = match g.state {
             GateState::Pass => ansi::GREEN,
             GateState::Wait => ansi::YELLOW,
+            GateState::Warn => ansi::YELLOW,
             GateState::Fail => ansi::RED,
             GateState::Skip => ansi::DIM,
         };

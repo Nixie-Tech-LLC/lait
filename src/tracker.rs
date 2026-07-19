@@ -6706,6 +6706,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A node that cannot mint must be TOLD it is waiting on one. The automatic
+    /// repair covers admins; a plain member observing a revoke-fenced eviction
+    /// has no way to discharge the fence itself, and until now nothing said so.
+    ///
+    /// This is the accessor the diagnose `keys` gate reads, so it is worth
+    /// pinning that it actually fires rather than being permanently `None`.
+    #[test]
+    fn a_non_admin_is_told_a_rekey_is_pending() {
+        let mut a = new_node(); // founder/admin A
+        with_project(&mut a.tracker);
+        let a_ws = a.tracker.workspace_str();
+        let proof = a.tracker.founding_proof().unwrap();
+
+        // B is a second ADMIN (so it can redeem), C a plain writer.
+        let b_seed = [21u8; 32];
+        let b_user = user_from_seed(b_seed);
+        let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, &proof);
+        let c_seed = [31u8; 32];
+        let mut c = new_joiner_node_as(user_from_seed(c_seed), c_seed, &a_ws, &proof);
+        let b_incept = b.tracker.self_inception().unwrap();
+        let c_incept = c.tracker.self_inception().unwrap();
+        a.tracker
+            .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
+        a.tracker.admit_member(&c_incept, vec![Grant::Write]);
+        sync_all(&mut a.tracker, &mut b.tracker);
+        sync_all(&mut a.tracker, &mut c.tracker);
+        assert!(!c.tracker.am_i_admin(), "C cannot mint");
+        assert!(
+            c.tracker.rekey_pending_notice().is_none(),
+            "nothing pending in the steady state"
+        );
+
+        // PARTITION: B redeems an invite that A concurrently revokes.
+        let nonce = [7u8; 16];
+        let x_incept = incept_for([61u8; 32], &b.tracker);
+        let x_actor = actor_of(&x_incept);
+        let (resp, _) = b.tracker.redeem_invite(&b_user, &x_incept, &nonce, true);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        let (resp, _) = a
+            .tracker
+            .invite_revoke_cmd(data_encoding::HEXLOWER.encode(&nonce));
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+
+        // C observes BOTH branches before any admin has rotated past the fence.
+        sync_membership(&mut b.tracker, &mut c.tracker);
+        sync_membership(&mut a.tracker, &mut c.tracker);
+
+        assert!(
+            !c.tracker.is_member_actor(&x_actor),
+            "revoke wins on C as well"
+        );
+        let notice = c
+            .tracker
+            .rekey_pending_notice()
+            .expect("C cannot discharge the fence and must be told");
+        assert!(
+            notice.contains(&x_actor.short()),
+            "names the evicted actor: {notice}"
+        );
+        assert!(
+            notice.contains("admin must sync"),
+            "says who can fix it: {notice}"
+        );
+        assert!(
+            notice.contains("already shared"),
+            "states the residual — rotation fences future content only: {notice}"
+        );
+
+        // Once an admin rotates past the fence, the notice clears.
+        sync_membership(&mut b.tracker, &mut a.tracker);
+        sync_membership(&mut a.tracker, &mut c.tracker);
+        assert!(
+            c.tracker.rekey_pending_notice().is_none(),
+            "a discharged fence stops warning"
+        );
+    }
+
     /// F1 regression, the headline one. A rogue proposal carries a perfectly
     /// valid *device* signature — authentication was never the missing piece.
     /// Without an authorization from the recovery authority, no honest node may
