@@ -2953,8 +2953,10 @@ impl Tracker {
             return (
                 Response::err(format!(
                     "this device holds a FROST share that cannot be used:\n{detail}\n\
-                     This holder is unavailable rather than absent — the other threshold \
-                     holders can still recover the workspace if enough of them remain."
+                     This device cannot take part in recovery. Recovery remains \
+                     possible only if the configured authority requirements can \
+                     still be satisfied by the other holders, which this device \
+                     cannot verify."
                 )),
                 None,
             );
@@ -7598,8 +7600,12 @@ mod tests {
                     "must name the transcript: {message}"
                 );
                 assert!(
-                    message.contains("other threshold holders"),
-                    "must say whether the workspace is still recoverable: {message}"
+                    message.contains("cannot take part in recovery"),
+                    "must say what THIS device can do: {message}"
+                );
+                assert!(
+                    !message.contains("can still recover the workspace"),
+                    "must not claim other holders can recover — this device cannot know that: {message}"
                 );
             }
             other => panic!("expected a typed failure, got {other:?}"),

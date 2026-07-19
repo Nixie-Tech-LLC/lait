@@ -658,6 +658,11 @@ pub struct StatusInfo {
     /// which is exactly the day it is too late to fix.
     #[serde(default)]
     pub degraded_recovery: Vec<crate::tracker::DegradedRecoveryHolder>,
+    /// This device's recovery readiness: the standing authority's shape and our
+    /// own custody standing. Reports what THIS node knows; it deliberately makes
+    /// no claim about whether other holders still have their shares.
+    #[serde(default)]
+    pub recovery: Option<crate::tracker::RecoveryStatus>,
 }
 
 /// What probing a home's control channel found. These three must be told apart

@@ -110,6 +110,9 @@ pub struct DiagnoseInput<'a> {
     /// actor evicted by a revoked invite still holds live keys and no admin has
     /// rotated past the fence yet.
     pub rekey_pending: Option<&'a str>,
+    /// This device's custody standing for the recovery authority. Borrowed so
+    /// the struct stays `Copy`.
+    pub local_custody: Option<&'a crate::tracker::LocalCustodyState>,
 }
 
 /// Project daemon state into the ordered gate list (pure — the validation core).
@@ -262,6 +265,18 @@ pub fn diagnose(input: DiagnoseInput<'_>) -> DiagnosisView {
     if let Some(note) = input.rekey_pending {
         key_notes.push(note.to_string());
     }
+    match input.local_custody {
+        // Usable today, unrecoverable tomorrow — and the difference is invisible
+        // until it matters, which is exactly why it is worth a standing warning.
+        Some(crate::tracker::LocalCustodyState::BackupUnverified) => key_notes.push(
+            "your share of an all-holders arrangement has no verified portable backup              (`space custody-export`)"
+                .into(),
+        ),
+        Some(crate::tracker::LocalCustodyState::Missing) => {
+            key_notes.push("this device should hold a recovery share and does not".into())
+        }
+        _ => {}
+    }
     let keys = if key_notes.is_empty() {
         DiagnosisGate::new("keys", "keys", GateState::Pass, "custody healthy")
     } else {
@@ -324,6 +339,7 @@ mod tests {
             expected_workspace: None,
             degraded_recovery: &[],
             rekey_pending: None,
+            local_custody: None,
         }
     }
 
@@ -363,6 +379,26 @@ mod tests {
         assert!(!gate(&v, "keys")
             .detail
             .contains("the workspace recovery key"));
+    }
+
+    #[test]
+    fn an_unbacked_indispensable_share_warns() {
+        let v = diagnose(DiagnoseInput {
+            local_custody: Some(&crate::tracker::LocalCustodyState::BackupUnverified),
+            ..input()
+        });
+        assert_eq!(gate(&v, "keys").state, GateState::Warn);
+        assert!(gate(&v, "keys").detail.contains("portable backup"));
+        assert_eq!(v.blocked_on, None, "custody is not an onboarding blocker");
+    }
+
+    #[test]
+    fn a_ready_holder_does_not_warn() {
+        let v = diagnose(DiagnoseInput {
+            local_custody: Some(&crate::tracker::LocalCustodyState::Ready),
+            ..input()
+        });
+        assert_eq!(gate(&v, "keys").state, GateState::Pass);
     }
 
     #[test]

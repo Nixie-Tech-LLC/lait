@@ -1615,7 +1615,10 @@ impl Node {
                     )
                 };
                 let pending_requests = self.pending_join_requests().len();
-                let degraded_recovery = self.tracker.lock().unwrap().degraded_recovery_holders();
+                let (degraded_recovery, recovery) = {
+                    let t = self.tracker.lock().unwrap();
+                    (t.degraded_recovery_holders(), Some(t.recovery_status()))
+                };
                 Ok(Response::Status(Box::new(StatusInfo {
                     id: self.shared.my_id.to_string(),
                     nick: self.shared.nick(),
@@ -1627,6 +1630,7 @@ impl Node {
                     membership,
                     pending_requests,
                     degraded_recovery,
+                    recovery,
                 })))
             }
             Request::Diagnose { expected_workspace } => {
@@ -1657,9 +1661,13 @@ impl Node {
                         membership.to_string(),
                     )
                 };
-                let (degraded_recovery, rekey_pending) = {
+                let (degraded_recovery, rekey_pending, local_custody) = {
                     let t = self.tracker.lock().unwrap();
-                    (t.degraded_recovery_holders(), t.rekey_pending_notice())
+                    (
+                        t.degraded_recovery_holders(),
+                        t.rekey_pending_notice(),
+                        t.recovery_status().local_custody,
+                    )
                 };
                 let view = crate::diagnose::diagnose(crate::diagnose::DiagnoseInput {
                     workspace: Some(workspace.as_str()),
@@ -1671,6 +1679,7 @@ impl Node {
                     expected_workspace: expected_workspace.as_deref(),
                     degraded_recovery: &degraded_recovery,
                     rekey_pending: rekey_pending.as_deref(),
+                    local_custody: Some(&local_custody),
                 });
                 Ok(Response::Diagnosis(Box::new(view)))
             }
