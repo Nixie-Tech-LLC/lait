@@ -53,8 +53,8 @@ pub mod workspaces;
 // `lait::ids`, …); the boundary is enforced by the kernel crate's manifest, not
 // by these aliases.
 pub use lait_kernel::{
-    acl, actor, authority, authz, crypto, custody, dkg, dto, expand, genesis, ids, policy, sigdag,
-    space,
+    acl, actor, authority, authz, compile, crypto, custody, dkg, dto, expand, genesis, ids, policy,
+    sigdag, space,
 };
 
 // The **engine** (`lait-engine`) is the only crate that names Loro. Re-exported
