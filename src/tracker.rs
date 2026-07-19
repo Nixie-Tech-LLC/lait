@@ -3916,52 +3916,28 @@ impl Tracker {
     ///
     /// Two checks, and the second is only available to some nodes:
     ///
-    /// - **The key must commit to the standing commitment.** Every node can do
-    ///   this, holder or not, because the commitment is on the space plane.
-    /// - **If this node can determine the arrangement, it must match.** A
-    ///   commitment is a hash, so a node that holds neither the solo secret nor
-    ///   an acceptance record cannot reconstruct the arrangement, and demanding
-    ///   it would make acceptance impossible for exactly the joiners a ceremony
-    ///   needs.
+    /// Both halves are now checkable by every node, holder or not (C0b):
     ///
-    /// Accepting on the key alone is sound *in Phase B* because the only
-    /// transition implemented is `RotateKey`, which always changes the key — so
-    /// key identity implies arrangement identity. That stops being true when
-    /// Phase D adds `Reshare`, which changes the arrangement while keeping the
-    /// key; at that point the configuration check becomes load-bearing rather
-    /// than corroborating, and every acceptor will need a way to learn the
-    /// standing arrangement. `ProposedTransition::Reshare` is refused today
-    /// precisely so that gap cannot be reached before it is closed.
+    /// - **The key must commit to the standing commitment.** A hash comparison
+    ///   against `RootState.recovery_commit`; always worked.
+    /// - **The arrangement must match the standing configuration.** C0 put the
+    ///   configuration id on the space plane, so `RootState.configuration` gives
+    ///   it to every replica by replay. Before C0, a non-holder could not learn
+    ///   the arrangement and acceptance fell back to key-alone — sound only while
+    ///   `RotateKey` always changed the key. `Reshare` breaks that, which is why
+    ///   the gap had to close before same-key transitions exist.
+    ///
+    /// The public key still arrives *in the proposal* (the proposer names it) and
+    /// is verified against the on-plane commitment; the configuration now arrives
+    /// on-plane too, so the "accept because we cannot tell" escape hatch is gone.
     fn claims_the_standing_authority(&self, claimed: &crate::authority::AuthorityId) -> bool {
         let cur = crate::space::replay(
             &self.genesis,
             &self.workspace_id,
             &self.membership.space_events(),
         );
-        if crate::space::recovery_commit(&claimed.public_key) != Some(cur.recovery_commit) {
-            return false;
-        }
-        match self.known_configuration_of(&claimed.public_key) {
-            Some(known) => claimed.configuration == known,
-            None => true,
-        }
-    }
-
-    /// The arrangement this device knows operates `key`, if it knows one: the
-    /// bootstrap `Single` shape for a solo secret we hold, or the configuration
-    /// recorded when we accepted the ceremony that produced a group key.
-    fn known_configuration_of(
-        &self,
-        key: &UserId,
-    ) -> Option<crate::authority::AuthorityConfigurationId> {
-        if let Some(secret) = self.read_space_recovery_key() {
-            if &crate::space::recovery_pub_of(&secret) == key {
-                return Some(crate::authority::AuthorityConfiguration::single().id());
-            }
-        }
-        self.dkg_manifests().into_iter().find_map(|(id, m)| {
-            (self.group_key_of_transcript(&id).as_ref() == Some(key)).then(|| m.configuration.id())
-        })
+        crate::space::recovery_commit(&claimed.public_key) == Some(cur.recovery_commit)
+            && claimed.configuration == cur.configuration
     }
 
     /// Whether a proposed participant set leaves the current group able to
@@ -8109,6 +8085,63 @@ mod tests {
         assert!(
             a.tracker.dkg_manifest(&id).is_none(),
             "a proposal must name the authority it actually replaces"
+        );
+    }
+
+    /// C0b: acceptance now checks the arrangement against the ON-PLANE standing
+    /// configuration, so a proposal naming the correct key but the wrong
+    /// configuration is rejected — the case the old key-alone acceptance let
+    /// through, and the one that had to close before same-key transitions.
+    #[test]
+    fn a_proposal_with_the_right_key_but_wrong_configuration_is_rejected() {
+        let mut a = new_node();
+        let secret = a.tracker.read_space_recovery_key().expect("solo key");
+        let standing = a.tracker.current_authority().expect("solo authority");
+
+        // Same key (the real standing solo key), but claim it is operated by a
+        // group arrangement it is not.
+        let mut members: Vec<crate::authority::PrincipalId> =
+            [a.tracker.me.clone(), user_from_seed([44u8; 32])]
+                .iter()
+                .map(crate::authority::PrincipalId::of_device)
+                .collect();
+        members.sort();
+        let lying_cfg = crate::authority::AuthorityConfiguration::frost_threshold(
+            &crate::authority::FrostThresholdConfig {
+                k: 2,
+                participants: members.clone(),
+            },
+        );
+        let lie = crate::authority::AuthorityId::new(standing.public_key.clone(), &lying_cfg);
+        assert_eq!(
+            crate::space::recovery_commit(&lie.public_key),
+            crate::space::recovery_commit(&standing.public_key),
+            "the KEY is genuinely the standing one"
+        );
+        assert_ne!(
+            lie.configuration, standing.configuration,
+            "only the claimed arrangement differs"
+        );
+
+        let propose = crate::dkg::CeremonyOp::DkgPropose(crate::dkg::frost_rotation_proposal(
+            [6u8; 16], 2, members, lie,
+        ));
+        let ev = crate::dkg::sign_ceremony(&[44u8; 32], &propose, &a.tracker.workspace_id);
+        let id = crate::dkg::TranscriptId::of(&ev).unwrap();
+        let grant = crate::dkg::sign_authority_grant(&secret, &a.tracker.workspace_id, &id);
+        let aev = crate::dkg::sign_ceremony(
+            &[44u8; 32],
+            &crate::dkg::CeremonyOp::DkgAuthorize(grant),
+            &a.tracker.workspace_id,
+        );
+        a.tracker.membership.add_ceremony_event(&ev).unwrap();
+        a.tracker.membership.add_ceremony_event(&aev).unwrap();
+        a.tracker.persist_membership("wrong_config").unwrap();
+
+        a.tracker.dkg_advance().unwrap();
+        assert!(
+            a.tracker.dkg_manifest(&id).is_none(),
+            "a proposal must name the standing configuration, not just the standing key"
         );
     }
 
