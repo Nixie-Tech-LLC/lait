@@ -23,8 +23,20 @@
 //! again", and for recovery material that is a worse outcome than the disclosure
 //! it prevents. See [`Wrap::Portable`].
 //!
-//! Wrapped payloads carry [`DPAPI_MAGIC`] so [`read_private`] reads both forms;
-//! a store written before this module existed still opens.
+//! # Legacy compatibility is lazy, not a migration
+//!
+//! Wrapped payloads carry [`DPAPI_MAGIC`]; unprefixed files read back verbatim,
+//! so a store written before this module existed still opens. That is **lazy
+//! compatibility only**: a legacy plaintext artifact is wrapped when something
+//! rewrites it, and a completed DKG share may never be written again. Nothing
+//! here eagerly migrates, and it would be wrong to describe existing stores as
+//! having been migrated.
+//!
+//! Eager migration, if it is added, has to: secure the containing directory
+//! first; enumerate only recognized artifact names and kinds; rewrite
+//! device-bound artifacts atomically; leave deliberately portable recovery keys
+//! unwrapped; surface failures rather than swallowing them; and be resumable
+//! after interruption.
 
 use std::path::Path;
 
@@ -76,15 +88,41 @@ pub fn write_private(path: &Path, bytes: &[u8], create: Create, wrap: Wrap) -> R
     imp::write_private(path, &payload, create)
 }
 
-/// Read a file written by [`write_private`], unwrapping if needed. `Ok(None)`
-/// if it does not exist; an error if it exists but cannot be read or unwrapped
-/// (a DPAPI blob restored onto a different machine lands here — deliberately
-/// loud, since silently treating it as absent would look like key loss).
-pub fn read_private(path: &Path) -> Result<Option<Vec<u8>>> {
+/// Why a secret that exists could not be produced.
+///
+/// `Undecryptable` is the operationally important variant: the bytes are on disk
+/// but this Windows identity cannot open them. Collapsing that into "absent"
+/// would report the loss of a holder's share as though no share had ever been
+/// stored — for an N-of-N recovery group, the difference between a degraded
+/// holder and an unrecoverable workspace.
+#[derive(Debug)]
+pub enum SecretError {
+    /// The file exists but could not be read.
+    Io(std::io::Error),
+    /// The file exists and is wrapped, but not for this account/machine.
+    Undecryptable(String),
+}
+
+impl std::fmt::Display for SecretError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SecretError::Io(e) => write!(f, "{e}"),
+            SecretError::Undecryptable(m) => write!(f, "{m}"),
+        }
+    }
+}
+impl std::error::Error for SecretError {}
+
+/// Read a file written by [`write_private`], unwrapping if needed.
+///
+/// `Ok(None)` means **absent**. A file that exists but cannot be produced is an
+/// `Err`, never `None`, so callers can distinguish "no secret was ever stored"
+/// from "a secret is here and this identity cannot open it".
+pub fn read_private(path: &Path) -> std::result::Result<Option<Vec<u8>>, SecretError> {
     let raw = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).context("read secret"),
+        Err(e) => return Err(SecretError::Io(e)),
     };
     match raw.strip_prefix(DPAPI_MAGIC) {
         Some(blob) => imp::unwrap(blob).map(Some),
@@ -123,8 +161,11 @@ mod imp {
     pub(super) fn wrap(bytes: &[u8]) -> Result<Vec<u8>> {
         Ok(bytes.to_vec())
     }
-    pub(super) fn unwrap(_blob: &[u8]) -> Result<Vec<u8>> {
-        anyhow::bail!("this secret is DPAPI-wrapped and can only be read on the Windows account that wrote it")
+    pub(super) fn unwrap(_blob: &[u8]) -> std::result::Result<Vec<u8>, SecretError> {
+        Err(SecretError::Undecryptable(
+            "this secret is DPAPI-wrapped and can only be read on the Windows account that wrote it"
+                .into(),
+        ))
     }
 }
 
@@ -363,7 +404,7 @@ mod imp {
         }
     }
 
-    pub(super) fn unwrap(blob: &[u8]) -> Result<Vec<u8>> {
+    pub(super) fn unwrap(blob: &[u8]) -> std::result::Result<Vec<u8>, SecretError> {
         unsafe {
             let input = CRYPT_INTEGER_BLOB {
                 cbData: blob.len() as u32,
@@ -383,9 +424,10 @@ mod imp {
                 &mut out,
             ) == 0
             {
-                return Err(last_error(
-                    "CryptUnprotectData (this secret belongs to a different Windows account or machine)",
-                ));
+                return Err(SecretError::Undecryptable(format!(
+                    "this secret was protected under a different Windows account or machine ({})",
+                    std::io::Error::last_os_error()
+                )));
             }
             let plain = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
             LocalFree(out.pbData.cast());
@@ -453,6 +495,69 @@ mod tests {
         assert_eq!(
             read_private(&path).unwrap().as_deref(),
             Some(&b"second"[..])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file written before this module existed has no magic prefix and reads
+    /// back verbatim. This is *lazy* compatibility: such a file is wrapped only
+    /// if something rewrites it, and a completed DKG share may never be written
+    /// again. Nothing here eagerly migrates.
+    #[test]
+    fn an_unprefixed_legacy_secret_reads_verbatim() {
+        let dir = tmp("legacy");
+        create_private_dir(&dir).unwrap();
+        let path = dir.join("share");
+        std::fs::write(&path, b"legacy-plaintext").unwrap();
+        assert_eq!(
+            read_private(&path).unwrap().as_deref(),
+            Some(&b"legacy-plaintext"[..])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A present-but-unreadable secret is an error, never `Ok(None)`. Reporting
+    /// it as absent would present the loss of a holder's share as though no
+    /// share had ever been stored.
+    #[test]
+    fn an_unreadable_secret_is_an_error_not_an_absence() {
+        let dir = tmp("unreadable");
+        create_private_dir(&dir).unwrap();
+        let path = dir.join("share");
+        // A wrapped payload whose ciphertext cannot be opened by this identity:
+        // the magic says "wrapped", the body is not a valid blob.
+        let mut corrupt = DPAPI_MAGIC.to_vec();
+        corrupt.extend_from_slice(&[0xAB; 64]);
+        std::fs::write(&path, &corrupt).unwrap();
+
+        match read_private(&path) {
+            Err(SecretError::Undecryptable(_)) => {}
+            other => panic!("expected Undecryptable, got {other:?}"),
+        }
+        // And it is emphatically not reported as missing.
+        assert!(
+            !matches!(read_private(&path), Ok(None)),
+            "an existing secret must never read as absent"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One unreadable artifact does not poison its neighbours.
+    #[test]
+    fn an_unreadable_secret_does_not_affect_other_artifacts() {
+        let dir = tmp("mixed");
+        create_private_dir(&dir).unwrap();
+        let bad = dir.join("broken");
+        let mut corrupt = DPAPI_MAGIC.to_vec();
+        corrupt.extend_from_slice(&[0xAB; 64]);
+        std::fs::write(&bad, &corrupt).unwrap();
+
+        let good = dir.join("fine");
+        write_private(&good, b"usable", Create::New, Wrap::DeviceBound).unwrap();
+        assert!(read_private(&bad).is_err());
+        assert_eq!(
+            read_private(&good).unwrap().as_deref(),
+            Some(&b"usable"[..])
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

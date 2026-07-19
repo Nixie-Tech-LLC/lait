@@ -258,9 +258,18 @@ pub struct Verified {
 pub struct DkgTranscript {
     /// The opening proposal, if it has been seen.
     pub proposal: Option<Verified>,
-    /// The recovery authority's authorization, if posted. Signature-checked
-    /// here; whether `by` is the *standing* authority is the caller's rule.
-    pub auth: Option<ProposalAuth>,
+    /// **Every** distinct signature-valid authorization, keyed by signing key.
+    ///
+    /// A map rather than a single slot because a signature-valid authorization
+    /// from the *wrong* key must not be able to displace the right one. With one
+    /// slot, whichever landed later won, so anyone able to post to the board
+    /// could suppress a proposal by spamming authorizations — a denial of
+    /// service on recovery, decided by CRDT iteration order rather than by
+    /// authority. Keying by signer also makes re-posts of one decision converge.
+    ///
+    /// Signatures are checked here; whether a signer is the *standing* authority
+    /// is the caller's rule, since it needs the space plane.
+    pub auths: BTreeMap<UserId, ProposalAuth>,
     /// Round packages referencing this transcript (openers excluded).
     pub rounds: Vec<Verified>,
 }
@@ -331,7 +340,12 @@ pub fn parse_board(events: &[SignedNode], ws: &WorkspaceId) -> CeremonyBoard {
             CeremonyOp::DkgAuthorize(auth) => {
                 if verify_proposal_auth(auth, ws) {
                     let (proposal, auth) = (auth.proposal, auth.clone());
-                    board.dkg.entry(proposal).or_default().auth = Some(auth);
+                    board
+                        .dkg
+                        .entry(proposal)
+                        .or_default()
+                        .auths
+                        .insert(auth.by.clone(), auth);
                 }
             }
             // Rounds are keyed by the transcript they name.
@@ -379,6 +393,13 @@ fn round_kind(op: &CeremonyOp) -> Option<u8> {
 /// Per-author caps are a backstop, not the mechanism: an attacker can mint
 /// arbitrary keys and stay under any per-author limit, which is why the opener
 /// and participant rules do the real work.
+///
+/// **This bounds the materialized projection, not storage.** Dropping entries
+/// here stops replay work; it does not reclaim raw Loro oplog history, which
+/// still holds every event ever synced. Actual reclamation needs a separately
+/// designed mechanism — ceremony-document rotation, an authenticated checkpoint,
+/// or snapshot compaction with retained terminal proofs — and none of that is
+/// what this function does. Do not describe it as garbage collection.
 fn retain(board: &mut CeremonyBoard) {
     board.dkg.retain(|_, t| t.proposal.is_some());
     board.signing.retain(|_, t| t.request.is_some());
@@ -395,14 +416,63 @@ fn retain(board: &mut CeremonyBoard) {
             participants.contains(&v.author) && seen.insert((v.author.clone(), kind), ()).is_none()
         });
     }
-    for t in board.signing.values_mut() {
-        let mut seen: BTreeMap<(UserId, u8), ()> = BTreeMap::new();
-        t.rounds.retain(|v| {
-            let Some(kind) = round_kind(&v.op) else {
-                return false;
-            };
-            seen.insert((v.author.clone(), kind), ()).is_none()
-        });
+}
+
+impl CeremonyBoard {
+    /// The participant set of a DKG transcript's proposal, if the board holds it.
+    fn dkg_participants(&self, id: &TranscriptId) -> Option<Vec<UserId>> {
+        match self.dkg.get(id)?.proposal.as_ref().map(|p| &p.op) {
+            Some(CeremonyOp::DkgPropose { participants, .. }) => Some(participants.clone()),
+            _ => None,
+        }
+    }
+
+    /// Restrict signing rounds to the participants of the DKG authority each
+    /// request names, dropping everything else.
+    ///
+    /// **Required for retention to bound anything on the signing side.** DKG
+    /// rounds are filtered against their proposal's participants, but a
+    /// `SignRequest` names no participants of its own, so one-contribution-
+    /// per-author is not a bound: an attacker mints as many keys as they like
+    /// and stays under any per-author limit forever.
+    ///
+    /// Participants are resolved through the request's `authority` — the DKG
+    /// that produced the group — and **never** from the request itself, which is
+    /// attacker-supplied. `fallback` covers an authority whose proposal is not in
+    /// this projection (pruned or not yet synced); callers should back it with an
+    /// authenticated local record. An authority resolvable by neither retains no
+    /// rounds, since nothing can establish who may contribute.
+    pub fn restrict_signing_rounds(
+        &mut self,
+        fallback: impl Fn(&TranscriptId) -> Option<Vec<UserId>>,
+    ) {
+        let resolved: BTreeMap<TranscriptId, Option<Vec<UserId>>> = self
+            .signing
+            .iter()
+            .map(|(id, t)| {
+                let authority = match t.request.as_ref().map(|r| &r.op) {
+                    Some(CeremonyOp::SignRequest { authority, .. }) => *authority,
+                    // No resolvable authority ⇒ no permitted authors.
+                    _ => return (*id, None),
+                };
+                (
+                    *id,
+                    self.dkg_participants(&authority)
+                        .or_else(|| fallback(&authority)),
+                )
+            })
+            .collect();
+        for (id, t) in self.signing.iter_mut() {
+            let participants = resolved.get(id).and_then(|p| p.clone());
+            let mut seen: BTreeMap<(UserId, u8), ()> = BTreeMap::new();
+            t.rounds.retain(|v| {
+                let Some(kind) = round_kind(&v.op) else {
+                    return false;
+                };
+                participants.as_ref().is_some_and(|p| p.contains(&v.author))
+                    && seen.insert((v.author.clone(), kind), ()).is_none()
+            });
+        }
     }
 }
 
@@ -428,6 +498,11 @@ pub type Packages = BTreeMap<u16, Vec<u8>>;
 pub struct DkgManifest {
     pub proposal: TranscriptId,
     pub proposal_author: UserId,
+    /// The recovery authority whose authorization we accepted. Recorded so a
+    /// later rotation does not un-accept the transcript, while still requiring
+    /// that *that* authorization is still on the board — the record pins which
+    /// decision was accepted, it does not stand in for one.
+    pub authorized_by: UserId,
     pub n: u16,
     pub k: u16,
     pub participants: Vec<UserId>,
@@ -941,14 +1016,14 @@ mod tests {
         let aev = sign_ceremony(&[7u8; 32], &CeremonyOp::DkgAuthorize(auth), &w);
         let board = parse_board(&[pev.clone(), aev], &w);
         assert!(
-            board.dkg[&id].auth.is_none(),
+            board.dkg[&id].auths.is_empty(),
             "a broken authorization is not filed"
         );
 
         let good = sign_proposal_auth(&[3u8; 32], &w, &id);
         let aev = sign_ceremony(&[7u8; 32], &CeremonyOp::DkgAuthorize(good), &w);
         let board = parse_board(&[pev, aev], &w);
-        assert!(board.dkg[&id].auth.is_some());
+        assert!(board.dkg[&id].auths.len() == 1);
     }
 
     // ---- nonce binding ----
@@ -1035,6 +1110,255 @@ mod tests {
         assert!(
             !node.verify_sig(crate::space::SPACE_EVENT_DOMAIN, w.as_str()),
             "a ceremony-plane signature must never verify as a space event"
+        );
+    }
+
+    // ---- multi-authorization retention (§3) ----
+
+    /// Build a proposal and `count` authorizations from distinct keys.
+    fn proposal_with_auths(w: &WorkspaceId, seeds: &[[u8; 32]]) -> (TranscriptId, Vec<SignedNode>) {
+        let propose = CeremonyOp::DkgPropose {
+            nonce: [1u8; 16],
+            n: 2,
+            k: 2,
+            participants: vec![],
+        };
+        let pev = sign_ceremony(&[7u8; 32], &propose, w);
+        let id = TranscriptId::of(&pev).unwrap();
+        let mut evs = vec![pev];
+        for seed in seeds {
+            let auth = sign_proposal_auth(seed, w, &id);
+            evs.push(sign_ceremony(
+                &[7u8; 32],
+                &CeremonyOp::DkgAuthorize(auth),
+                w,
+            ));
+        }
+        (id, evs)
+    }
+
+    /// A signature-valid authorization from the WRONG key must not displace the
+    /// right one. With a single slot, whichever landed later won — so anyone able
+    /// to post could suppress a proposal, making recovery a denial-of-service
+    /// target decided by board order rather than by authority.
+    #[test]
+    fn a_wrong_key_authorization_cannot_displace_the_right_one() {
+        let w = ws();
+        let right = [3u8; 32];
+        let wrong = [4u8; 32];
+        let right_key = crate::crypto::user_from_seed(&right);
+
+        // Both orders must give the same answer.
+        for seeds in [[right, wrong], [wrong, right]] {
+            let (id, evs) = proposal_with_auths(&w, &seeds);
+            let board = parse_board(&evs, &w);
+            let auths = &board.dkg[&id].auths;
+            assert_eq!(auths.len(), 2, "both are retained");
+            assert!(
+                auths.contains_key(&right_key),
+                "the correct authorization survives regardless of order"
+            );
+        }
+    }
+
+    /// Many wrong-key authorizations cannot crowd out a correct one: they are
+    /// keyed by signer, so the correct signer always has its own entry.
+    #[test]
+    fn many_wrong_authorizations_cannot_suppress_a_correct_one() {
+        let w = ws();
+        let right = [3u8; 32];
+        let right_key = crate::crypto::user_from_seed(&right);
+        // Correct authorization FIRST: a last-wins single slot would lose it,
+        // so this fails against the behaviour being replaced.
+        let mut seeds: Vec<[u8; 32]> = vec![right];
+        seeds.extend((10..60u8).map(|i| [i; 32]));
+        let (id, evs) = proposal_with_auths(&w, &seeds);
+        let board = parse_board(&evs, &w);
+        assert!(board.dkg[&id].auths.contains_key(&right_key));
+    }
+
+    /// Two postings of the SAME authority decision converge to one entry, so a
+    /// participant cannot inflate retained state by re-posting.
+    #[test]
+    fn repeated_postings_of_one_authority_decision_converge() {
+        let w = ws();
+        let (id, mut evs) = proposal_with_auths(&w, &[[3u8; 32]]);
+        // Post the same decision again, under a different carrier signature.
+        let auth = sign_proposal_auth(&[3u8; 32], &w, &id);
+        evs.push(sign_ceremony(
+            &[8u8; 32],
+            &CeremonyOp::DkgAuthorize(auth),
+            &w,
+        ));
+        let board = parse_board(&evs, &w);
+        assert_eq!(
+            board.dkg[&id].auths.len(),
+            1,
+            "one authority, one retained decision"
+        );
+    }
+
+    // ---- signing-round participant filtering (§4) ----
+
+    /// Build a DKG whose proposal names `participants`, plus a signing request
+    /// against it.
+    fn dkg_and_request(
+        w: &WorkspaceId,
+        participants: Vec<UserId>,
+    ) -> (TranscriptId, TranscriptId, Vec<SignedNode>) {
+        let propose = CeremonyOp::DkgPropose {
+            nonce: [1u8; 16],
+            n: participants.len() as u16,
+            k: 2,
+            participants,
+        };
+        let pev = sign_ceremony(&[7u8; 32], &propose, w);
+        let authority = TranscriptId::of(&pev).unwrap();
+        let req = CeremonyOp::SignRequest {
+            nonce: [2u8; 16],
+            authority,
+            target: SignTarget::SpaceOp,
+            op: vec![1, 2, 3],
+        };
+        let rev = sign_ceremony(&[7u8; 32], &req, w);
+        let signing = TranscriptId::of(&rev).unwrap();
+        (authority, signing, vec![pev, rev])
+    }
+
+    /// One-contribution-per-author is not a bound on the signing side: an
+    /// attacker mints as many keys as they like. Participants must be resolved
+    /// through the request's named authority.
+    #[test]
+    fn signing_rounds_from_nonparticipant_keys_retain_nothing() {
+        let w = ws();
+        let insider = crate::crypto::user_from_seed(&[11u8; 32]);
+        let (_authority, signing, mut evs) = dkg_and_request(&w, vec![insider.clone()]);
+        // 500 distinct attacker keys, one round each — under any per-author cap.
+        for i in 0..500u32 {
+            let mut seed = [0u8; 32];
+            seed[..4].copy_from_slice(&i.to_le_bytes());
+            seed[8] = 1; // keep clear of the insider seed
+            evs.push(sign_ceremony(
+                &seed,
+                &CeremonyOp::SignRound1 {
+                    signing,
+                    commitments: vec![0u8; 8],
+                },
+                &w,
+            ));
+        }
+        let mut board = parse_board(&evs, &w);
+        board.restrict_signing_rounds(|_| None);
+        assert_eq!(
+            board.signing[&signing].rounds.len(),
+            0,
+            "no attacker key is a participant of the named authority"
+        );
+
+        // The insider's round is retained, and is not displaced by the flood.
+        evs.push(sign_ceremony(
+            &[11u8; 32],
+            &CeremonyOp::SignRound1 {
+                signing,
+                commitments: vec![9u8; 8],
+            },
+            &w,
+        ));
+        let mut board = parse_board(&evs, &w);
+        board.restrict_signing_rounds(|_| None);
+        assert_eq!(board.signing[&signing].rounds.len(), 1);
+        assert_eq!(board.signing[&signing].rounds[0].author, insider);
+    }
+
+    /// An authority the projection cannot resolve, and for which the caller has
+    /// no authenticated local record, retains no actionable rounds — nothing can
+    /// establish who is permitted to contribute.
+    #[test]
+    fn a_request_naming_an_unknown_authority_retains_no_rounds() {
+        let w = ws();
+        let unknown = TranscriptId::parse_hex(&"e".repeat(64)).unwrap();
+        let req = CeremonyOp::SignRequest {
+            nonce: [2u8; 16],
+            authority: unknown,
+            target: SignTarget::SpaceOp,
+            op: vec![1],
+        };
+        let rev = sign_ceremony(&[11u8; 32], &req, &w);
+        let signing = TranscriptId::of(&rev).unwrap();
+        let round = sign_ceremony(
+            &[11u8; 32],
+            &CeremonyOp::SignRound1 {
+                signing,
+                commitments: vec![1],
+            },
+            &w,
+        );
+        let mut board = parse_board(&[rev, round], &w);
+        board.restrict_signing_rounds(|_| None);
+        assert_eq!(board.signing[&signing].rounds.len(), 0);
+    }
+
+    /// The fallback resolves an authority missing from the projection, so a
+    /// pruned or not-yet-synced proposal does not strand a live group.
+    #[test]
+    fn an_authenticated_fallback_resolves_a_missing_authority() {
+        let w = ws();
+        let holder = crate::crypto::user_from_seed(&[11u8; 32]);
+        let missing = TranscriptId::parse_hex(&"e".repeat(64)).unwrap();
+        let req = CeremonyOp::SignRequest {
+            nonce: [2u8; 16],
+            authority: missing,
+            target: SignTarget::SpaceOp,
+            op: vec![1],
+        };
+        let rev = sign_ceremony(&[11u8; 32], &req, &w);
+        let signing = TranscriptId::of(&rev).unwrap();
+        let round = sign_ceremony(
+            &[11u8; 32],
+            &CeremonyOp::SignRound1 {
+                signing,
+                commitments: vec![1],
+            },
+            &w,
+        );
+        let mut board = parse_board(&[rev, round], &w);
+        board.restrict_signing_rounds(|id| (*id == missing).then(|| vec![holder.clone()]));
+        assert_eq!(board.signing[&signing].rounds.len(), 1);
+    }
+
+    /// A signing request cannot smuggle in its own participant set: the filter
+    /// reads the authority's proposal, never the request. Here the request names
+    /// authority A while the attacker holds a slot only in an unrelated DKG B.
+    #[test]
+    fn a_signing_request_cannot_borrow_another_dkgs_participants() {
+        let w = ws();
+        let outsider = crate::crypto::user_from_seed(&[42u8; 32]);
+        let insider = crate::crypto::user_from_seed(&[11u8; 32]);
+
+        // Authority A names only the insider.
+        let (_a_id, signing, mut evs) = dkg_and_request(&w, vec![insider]);
+        // An unrelated DKG B names the outsider — irrelevant to this request.
+        let other = CeremonyOp::DkgPropose {
+            nonce: [9u8; 16],
+            n: 1,
+            k: 1,
+            participants: vec![outsider],
+        };
+        evs.push(sign_ceremony(&[7u8; 32], &other, &w));
+        evs.push(sign_ceremony(
+            &[42u8; 32],
+            &CeremonyOp::SignRound1 {
+                signing,
+                commitments: vec![1],
+            },
+            &w,
+        ));
+        let mut board = parse_board(&evs, &w);
+        board.restrict_signing_rounds(|_| None);
+        assert_eq!(
+            board.signing[&signing].rounds.len(),
+            0,
+            "membership of another DKG grants nothing here"
         );
     }
 

@@ -312,6 +312,18 @@ fn mint_recovery() -> ([u8; 32], [u8; 32]) {
 /// pre-rotation escrow — losing it forfeits recovery, never workspace access),
 /// so it is created **owner-only from the start** (never world-readable, even
 /// for an instant) and any permission error is propagated, never swallowed.
+/// The state of a device-local ceremony artifact.
+///
+/// Three states, not two: an artifact that is present but undecryptable under
+/// this Windows identity is neither usable nor absent, and reporting it as
+/// absent would hide the loss of a holder's recovery capability.
+#[derive(Debug)]
+pub enum ArtifactRead {
+    Missing,
+    Present(Vec<u8>),
+    Unreadable(String),
+}
+
 fn persist_recovery_key(store: &Store, seed: &[u8; 32]) -> Result<()> {
     let home = store.home_path();
     // Tighten the parent dir to owner-only before writing the secret.
@@ -2820,6 +2832,28 @@ impl Tracker {
         if self.active_dkg_session().is_some() {
             return self.space_recover_group(&cur);
         }
+        // Distinguish "this device never held a share" from "the share is right
+        // here and Windows will not decrypt it". Collapsing those would tell a
+        // holder to look elsewhere when the material they need is on the disk in
+        // front of them, protected under an account they no longer have.
+        let unreadable = self.unreadable_shares();
+        if !unreadable.is_empty() {
+            let detail = unreadable
+                .iter()
+                .map(|(id, why)| format!("  transcript {id}: {why}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return (
+                Response::err(format!(
+                    "this device has a FROST share for the workspace recovery key, but \
+                     cannot decrypt it: the share was protected under another Windows \
+                     account or machine.\n{detail}\nThis holder is unavailable rather \
+                     than absent — the other threshold holders can still recover the \
+                     workspace if enough of them remain."
+                )),
+                None,
+            );
+        }
         (
             Response::err(
                 "no way to recover from this device — need either the workspace's current space-recovery.key beside the store, or a threshold share of the current group recovery key",
@@ -2948,7 +2982,7 @@ impl Tracker {
             Err(e) => return (Response::err(format!("encode recover op: {e}")), None),
         };
         let events = self.membership.ceremony_events();
-        let board = crate::dkg::parse_board(&events, &self.workspace_id);
+        let board = self.ceremony_board(&events);
         let threshold = board
             .dkg
             .get(&authority)
@@ -3073,7 +3107,7 @@ impl Tracker {
         // VERIFIED board and from the transcript the id names — not from the
         // first raw decode that happens to match.
         let events = self.membership.ceremony_events();
-        let board = crate::dkg::parse_board(&events, &self.workspace_id);
+        let board = self.ceremony_board(&events);
         let request = board.signing.get(&session).and_then(|t| t.request.as_ref());
         let Some((op_bytes, req_target)) = request.and_then(|r| match &r.op {
             crate::dkg::CeremonyOp::SignRequest { op, target, .. } => Some((op.clone(), *target)),
@@ -3185,22 +3219,54 @@ impl Tracker {
     fn dkg_has(&self, t: &crate::dkg::TranscriptId, label: &str) -> bool {
         self.dkg_path(t, label).exists()
     }
-    /// Read a ceremony artifact. An artifact that exists but cannot be
-    /// unwrapped is **logged at error** rather than folded into `None`: that
-    /// happens when a store is restored onto a different Windows account or
-    /// machine, and reporting it as "no share" would present the loss of a
-    /// holder's recovery capability as an ordinary absence.
-    fn dkg_read(&self, t: &crate::dkg::TranscriptId, label: &str) -> Option<Vec<u8>> {
+    /// The state of a ceremony artifact on this device.
+    ///
+    /// `Unreadable` must never be flattened into `Missing`. A share protected
+    /// under a different Windows account or machine is *present* — the holder
+    /// exists but cannot act — and for an N-of-N group that is the difference
+    /// between a degraded holder and an unrecoverable workspace. Operators need
+    /// to see which one they have.
+    fn dkg_artifact(&self, t: &crate::dkg::TranscriptId, label: &str) -> ArtifactRead {
         match crate::secretfs::read_private(&self.dkg_path(t, label)) {
-            Ok(v) => v,
+            Ok(Some(v)) => ArtifactRead::Present(v),
+            Ok(None) => ArtifactRead::Missing,
             Err(e) => {
                 tracing::error!(
-                    "ceremony artifact {label} for transcript {} exists but could not be read: {e:#}",
+                    "ceremony artifact {label} for transcript {} is present but unreadable: {e}",
                     t.to_hex()
                 );
-                None
+                ArtifactRead::Unreadable(e.to_string())
             }
         }
+    }
+
+    /// The bytes of a ceremony artifact, or `None` if it is absent **or**
+    /// unreadable. Callers that must distinguish those — anything reporting to
+    /// an operator — use [`Self::dkg_artifact`] instead.
+    fn dkg_read(&self, t: &crate::dkg::TranscriptId, label: &str) -> Option<Vec<u8>> {
+        match self.dkg_artifact(t, label) {
+            ArtifactRead::Present(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Every transcript on this device holding a share that exists but cannot be
+    /// decrypted, with the reason. Empty in the normal case.
+    ///
+    /// This is the operator-facing signal for the DPAPI custody hazard: a store
+    /// restored onto another Windows account keeps the bytes and loses the
+    /// ability to use them, and nothing else in the system would say so.
+    pub fn unreadable_shares(&self) -> Vec<(String, String)> {
+        let events = self.membership.ceremony_events();
+        let board = self.ceremony_board(&events);
+        board
+            .dkg
+            .keys()
+            .filter_map(|id| match self.dkg_artifact(id, "share") {
+                ArtifactRead::Unreadable(why) => Some((id.to_hex(), why)),
+                _ => None,
+            })
+            .collect()
     }
     /// Write a ceremony artifact owner-only. Device-bound: shares, round secrets
     /// and nonces belong to this holder on this machine and are never carried
@@ -3372,7 +3438,7 @@ impl Tracker {
         // multiplied the work (`transcripts × board`, attacker-controlled on
         // both axes).
         let events = self.membership.ceremony_events();
-        let board = crate::dkg::parse_board(&events, &self.workspace_id);
+        let board = self.ceremony_board(&events);
         // Per-transcript advancement is best-effort: a malformed, signature-valid
         // package from one participant must never fail the whole import (which
         // would wedge membership sync permanently on the persisted event). Isolate
@@ -3407,6 +3473,27 @@ impl Tracker {
             }
         }
         Ok(progressed)
+    }
+
+    /// The verified, retention-filtered ceremony board.
+    ///
+    /// The **only** way this file obtains a board. `parse_board` alone leaves
+    /// signing rounds unrestricted, so a caller that forgot the second step
+    /// would silently reintroduce an unbounded signing projection; routing every
+    /// caller through here makes that impossible to forget.
+    ///
+    /// The fallback resolves an authority whose proposal is not in the
+    /// projection through this device's own accepted manifest — authenticated
+    /// local state, never a participant list taken from the signing request.
+    fn ceremony_board(
+        &self,
+        events: &[crate::space::SignedSpaceEvent],
+    ) -> crate::dkg::CeremonyBoard {
+        let mut board = crate::dkg::parse_board(events, &self.workspace_id);
+        board.restrict_signing_rounds(|authority| {
+            self.dkg_manifest(authority).map(|m| m.participants)
+        });
+        board
     }
 
     /// A DKG transcript's configuration, **only if the proposal is accepted**.
@@ -3456,18 +3543,26 @@ impl Tracker {
             &self.workspace_id,
             &self.membership.space_events(),
         );
-        // `parse_board` already checked the detached signature; what it cannot
-        // know is whether that key is the standing authority.
+        // `parse_board` already checked every detached signature; what it cannot
+        // know is which signer is the standing authority. Scanning ALL retained
+        // authorizations — rather than one slot — is what stops a wrong-key
+        // authorization from displacing the right one, and makes the outcome a
+        // function of authority validation rather than of board order.
         let fresh = t
-            .auth
-            .as_ref()
-            .is_some_and(|a| crate::space::recovery_commit(&a.by) == Some(cur.recovery_commit));
+            .auths
+            .values()
+            .any(|a| crate::space::recovery_commit(&a.by) == Some(cur.recovery_commit));
+        // Or: the authority that was standing when we accepted, whose
+        // authorization must still be present. A successful elevation rotates
+        // the authority, so `fresh` alone would un-accept every transcript at the
+        // moment it succeeds and orphan holders mid-DKG.
         let recorded = self.dkg_manifest(dkg).is_some_and(|m| {
             m.proposal == *dkg
                 && m.proposal_author == proposal.author
                 && m.n == *n
                 && m.k == *k
                 && m.participants == *participants
+                && t.auths.contains_key(&m.authorized_by)
         });
         (fresh || recorded).then(|| (*n, *k, participants.clone()))
     }
@@ -3491,7 +3586,7 @@ impl Tracker {
             &self.membership.space_events(),
         );
         let events = self.membership.ceremony_events();
-        let board = crate::dkg::parse_board(&events, &self.workspace_id);
+        let board = self.ceremony_board(&events);
         board.dkg.keys().copied().find(|id| {
             self.dkg_read(id, "share").is_some()
                 && self
@@ -3735,10 +3830,22 @@ impl Tracker {
         // Record acceptance the first time we act on this proposal, so a later
         // rotation of the authority cannot orphan a transcript mid-DKG.
         if self.dkg_manifest(dkg).is_none() {
-            if let Some(proposal) = t.proposal.as_ref() {
+            let cur = crate::space::replay(
+                &self.genesis,
+                &self.workspace_id,
+                &self.membership.space_events(),
+            );
+            // Pin WHICH authorization we accepted, not merely that one existed.
+            let authorized_by = t
+                .auths
+                .values()
+                .find(|a| crate::space::recovery_commit(&a.by) == Some(cur.recovery_commit))
+                .map(|a| a.by.clone());
+            if let (Some(proposal), Some(authorized_by)) = (t.proposal.as_ref(), authorized_by) {
                 let manifest = crate::dkg::DkgManifest {
                     proposal: *dkg,
                     proposal_author: proposal.author.clone(),
+                    authorized_by,
                     n,
                     k,
                     participants: participants.clone(),
@@ -6300,6 +6407,77 @@ mod tests {
             b.tracker.dkg_read(&signing, "nonce").is_some(),
             "the record is kept for inspection rather than silently replaced"
         );
+    }
+
+    /// §5. A share protected under a different Windows account is *present*, not
+    /// absent — the holder exists and cannot act. Break-glass recovery must say
+    /// which of those it is, because for an N-of-N group it is the difference
+    /// between a degraded holder and an unrecoverable workspace.
+    #[test]
+    fn an_unreadable_share_is_reported_as_degraded_not_absent() {
+        let mut a = new_node();
+        let a_ws = a.tracker.workspace_str();
+        let b_seed = [21u8; 32];
+        let b_user = user_from_seed(b_seed);
+        let mut b = new_joiner_node_as(
+            b_user.clone(),
+            b_seed,
+            &a_ws,
+            &a.tracker.founding_proof().unwrap(),
+        );
+        let b_incept = b.tracker.self_inception().unwrap();
+        a.tracker
+            .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
+        sync_all(&mut a.tracker, &mut b.tracker);
+        let (resp, _) = a
+            .tracker
+            .space_elevate_cmd(vec![b_user.as_str().to_string()], 2);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        for _ in 0..6 {
+            sync_all(&mut a.tracker, &mut b.tracker);
+            sync_all(&mut b.tracker, &mut a.tracker);
+        }
+        let dkg_id = b.tracker.active_dkg_session().expect("B holds a share");
+        assert!(
+            b.tracker.unreadable_shares().is_empty(),
+            "a healthy holder reports nothing"
+        );
+
+        // Simulate a store restored onto another Windows account: the bytes are
+        // present and wrapped, but this identity cannot open them.
+        let mut corrupt = b"lait-dpapi-1\n".to_vec();
+        corrupt.extend_from_slice(&[0xAB; 96]);
+        std::fs::write(b.tracker.dkg_path(&dkg_id, "share"), &corrupt).unwrap();
+
+        // The share is neither usable nor absent, and is named as such.
+        assert!(matches!(
+            b.tracker.dkg_artifact(&dkg_id, "share"),
+            ArtifactRead::Unreadable(_)
+        ));
+        let reported = b.tracker.unreadable_shares();
+        assert_eq!(reported.len(), 1, "one degraded transcript");
+        assert_eq!(reported[0].0, dkg_id.to_hex(), "named by transcript");
+
+        // Break-glass tells the operator what actually happened rather than
+        // "no way to recover from this device".
+        let (resp, _) = b.tracker.space_recover_cmd();
+        match resp {
+            Response::Error { message, .. } => {
+                assert!(
+                    message.contains("cannot") && message.contains("decrypt"),
+                    "must say the share is undecryptable: {message}"
+                );
+                assert!(
+                    message.contains(&dkg_id.to_hex()),
+                    "must name the transcript: {message}"
+                );
+                assert!(
+                    message.contains("other threshold holders"),
+                    "must say whether the workspace is still recoverable: {message}"
+                );
+            }
+            other => panic!("expected a typed failure, got {other:?}"),
+        }
     }
 
     /// F1 regression, the headline one. A rogue proposal carries a perfectly
