@@ -475,13 +475,22 @@ pub fn parse_board(events: &[SignedNode], ws: &WorkspaceId) -> CeremonyBoard {
     board
 }
 
-/// Which round an entry is, for the one-per-author-per-round cap.
-fn round_kind(op: &CeremonyOp) -> Option<u8> {
+/// The dedup key for a round contribution: which round it is, plus whatever
+/// else legitimately distinguishes two posts by one author.
+///
+/// Round 2 of a DKG is the reason this is not simply "which round". Each
+/// participant sends a *targeted* secret share to every other participant, so it
+/// posts `n - 1` round-2 events, and capping at one per author silently breaks
+/// every DKG with more than two participants. It happens to work at n = 2 —
+/// which is exactly how such a bug survives a test suite whose ceremonies are
+/// all 2-of-2. The recipient therefore belongs in the key: one contribution per
+/// author **per recipient**, which still bounds flooding at `n - 1`.
+fn round_key(op: &CeremonyOp) -> Option<(u8, &str)> {
     match op {
-        CeremonyOp::DkgRound1 { .. } => Some(1),
-        CeremonyOp::DkgRound2 { .. } => Some(2),
-        CeremonyOp::SignRound1 { .. } => Some(3),
-        CeremonyOp::SignRound2 { .. } => Some(4),
+        CeremonyOp::DkgRound1 { .. } => Some((1, "")),
+        CeremonyOp::DkgRound2 { to, .. } => Some((2, to.as_str())),
+        CeremonyOp::SignRound1 { .. } => Some((3, "")),
+        CeremonyOp::SignRound2 { .. } => Some((4, "")),
         _ => None,
     }
 }
@@ -520,12 +529,15 @@ fn retain(board: &mut CeremonyBoard) {
             Some(CeremonyOp::DkgPropose(p)) => p.frost_devices().unwrap_or_default(),
             _ => Vec::new(),
         };
-        let mut seen: BTreeMap<(UserId, u8), ()> = BTreeMap::new();
+        let mut seen: BTreeMap<(UserId, u8, String), ()> = BTreeMap::new();
         t.rounds.retain(|v| {
-            let Some(kind) = round_kind(&v.op) else {
+            let Some((kind, extra)) = round_key(&v.op) else {
                 return false;
             };
-            participants.contains(&v.author) && seen.insert((v.author.clone(), kind), ()).is_none()
+            participants.contains(&v.author)
+                && seen
+                    .insert((v.author.clone(), kind, extra.to_string()), ())
+                    .is_none()
         });
     }
 }
@@ -576,13 +588,15 @@ impl CeremonyBoard {
             .collect();
         for (id, t) in self.signing.iter_mut() {
             let participants = resolved.get(id).and_then(|p| p.clone());
-            let mut seen: BTreeMap<(UserId, u8), ()> = BTreeMap::new();
+            let mut seen: BTreeMap<(UserId, u8, String), ()> = BTreeMap::new();
             t.rounds.retain(|v| {
-                let Some(kind) = round_kind(&v.op) else {
+                let Some((kind, extra)) = round_key(&v.op) else {
                     return false;
                 };
                 participants.as_ref().is_some_and(|p| p.contains(&v.author))
-                    && seen.insert((v.author.clone(), kind), ()).is_none()
+                    && seen
+                        .insert((v.author.clone(), kind, extra.to_string()), ())
+                        .is_none()
             });
         }
     }
@@ -1451,6 +1465,61 @@ mod tests {
         board.restrict_signing_rounds(|_| None);
         assert_eq!(board.signing[&signing].rounds.len(), 1);
         assert_eq!(board.signing[&signing].rounds[0].author, insider);
+    }
+
+    /// Regression: a DKG round 2 is a *targeted* share, so each participant
+    /// posts `n - 1` of them. Capping retention at one per author silently broke
+    /// every ceremony with more than two participants while passing at n = 2 —
+    /// which is what the whole suite used, so nothing caught it until a 3-party
+    /// group→group rotation stalled with no shares derived.
+    #[test]
+    fn every_targeted_round_two_share_is_retained() {
+        let w = ws();
+        let devices: Vec<UserId> = (20..23u8)
+            .map(|i| crate::crypto::user_from_seed(&[i; 32]))
+            .collect();
+        let mut sorted = devices.clone();
+        sorted.sort();
+        let propose = CeremonyOp::DkgPropose(test_proposal([1u8; 16], 2, sorted.clone()));
+        let pev = sign_ceremony(&[20u8; 32], &propose, &w);
+        let id = TranscriptId::of(&pev).unwrap();
+        let mut evs = vec![pev];
+        // One author sends a sealed share to each of the other two.
+        for to in sorted.iter().filter(|d| **d != devices[0]) {
+            evs.push(sign_ceremony(
+                &[20u8; 32],
+                &CeremonyOp::DkgRound2 {
+                    dkg: id,
+                    to: to.clone(),
+                    sealed: vec![1, 2, 3],
+                },
+                &w,
+            ));
+        }
+        let board = parse_board(&evs, &w);
+        assert_eq!(
+            board.dkg[&id].rounds.len(),
+            2,
+            "n - 1 targeted shares from one author are all legitimate"
+        );
+
+        // But a second share to the SAME recipient is still capped, so the bound
+        // is n - 1 per author rather than unlimited.
+        evs.push(sign_ceremony(
+            &[20u8; 32],
+            &CeremonyOp::DkgRound2 {
+                dkg: id,
+                to: sorted.iter().find(|d| **d != devices[0]).unwrap().clone(),
+                sealed: vec![9, 9, 9],
+            },
+            &w,
+        ));
+        let board = parse_board(&evs, &w);
+        assert_eq!(
+            board.dkg[&id].rounds.len(),
+            2,
+            "one contribution per author PER RECIPIENT"
+        );
     }
 
     /// An authority the projection cannot resolve, and for which the caller has

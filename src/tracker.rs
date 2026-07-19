@@ -3421,14 +3421,17 @@ impl Tracker {
             &self.workspace_id,
             &self.membership.space_events(),
         );
-        let holds_current = self
+        let holds_solo = self
             .read_space_recovery_key()
             .and_then(|s| crate::space::recovery_commit(&crate::space::recovery_pub_of(&s)))
             == Some(cur.recovery_commit);
-        if !holds_current {
+        // Group→group reconfiguration: we hold a share of the standing group, so
+        // we can OPEN the grant request even though we cannot sign it alone.
+        let holds_share = self.active_dkg_session().is_some();
+        if !holds_solo && !holds_share {
             return (
                 Response::err(
-                    "only the holder of the current recovery key can elevate it (run this where space-recovery.key lives)",
+                    "only the current recovery authority can elevate: run this where space-recovery.key lives, or on a device holding a share of the current group key",
                 ),
                 None,
             );
@@ -3488,40 +3491,255 @@ impl Tracker {
         let Some(transcript) = crate::dkg::TranscriptId::of(&ev) else {
             return (Response::err("could not derive the proposal id"), None);
         };
-        // Authorize it with the recovery key we just proved we hold. THIS is
-        // what every participant checks — the device signature above only proves
-        // control of a device, not authority to configure an elevation.
-        let Some(secret) = self.read_space_recovery_key() else {
-            return (
-                Response::err("recovery key disappeared mid-elevation"),
-                None,
-            );
-        };
-        let grant = crate::dkg::sign_authority_grant(&secret, &self.workspace_id, &transcript);
-        // Local consent record, keyed by the transcript it consents to. Written
-        // before posting so a crash leaves an orphan marker (harmless) rather
-        // than a proposal nobody will install (also safe, but less useful).
+        // Local consent record for the ceremony itself, keyed by the transcript
+        // it consents to. Written before posting so a crash leaves an orphan
+        // marker (harmless) rather than a proposal nobody will install.
         if let Err(e) = self.dkg_write(&transcript, "intent", transcript.to_hex().as_bytes()) {
             return (Response::err(format!("{e:#}")), None);
         }
-        let auth_ev = crate::dkg::sign_ceremony(
-            &self.seed,
-            &crate::dkg::CeremonyOp::DkgAuthorize(grant),
-            &self.workspace_id,
-        );
         if let Err(e) = self
             .membership
             .add_ceremony_event(&ev)
-            .and_then(|()| self.membership.add_ceremony_event(&auth_ev))
             .and_then(|()| self.persist_membership("dkg_propose"))
         {
             return (Response::err(format!("{e:#}")), None);
         }
+
+        // Authorization. The device signature on the proposal proves only
+        // control of a device; what every participant checks is a grant from the
+        // standing authority. How that grant is produced is the ONLY thing that
+        // differs between a solo and a group authority — the grant object itself
+        // is identical either way, which is what B1 bought.
+        let message = if holds_solo {
+            let Some(secret) = self.read_space_recovery_key() else {
+                return (
+                    Response::err("recovery key disappeared mid-elevation"),
+                    None,
+                );
+            };
+            let grant = crate::dkg::sign_authority_grant(&secret, &self.workspace_id, &transcript);
+            let auth_ev = crate::dkg::sign_ceremony(
+                &self.seed,
+                &crate::dkg::CeremonyOp::DkgAuthorize(grant),
+                &self.workspace_id,
+            );
+            if let Err(e) = self
+                .membership
+                .add_ceremony_event(&auth_ev)
+                .and_then(|()| self.persist_membership("dkg_authorize"))
+            {
+                return (Response::err(format!("{e:#}")), None);
+            }
+            format!(
+                "started {k}-of-{n} recovery elevation — the DKG completes automatically as the co-founders' nodes sync; the group key installs once every share is in"
+            )
+        } else {
+            // The standing authority is a group, so the grant needs a threshold
+            // signature. Open a signing request for it; the other holders consent
+            // with `space elevate-approve`, and the aggregate lands as the grant.
+            match self.open_grant_request(&transcript).map(|(id, _)| id) {
+                Ok(signing) => format!(
+                    "proposed a {k}-of-{n} recovery arrangement (proposal {}) — the current group must authorize it: each holder runs `space elevate-approve {} --proposal {}`",
+                    transcript.to_hex(),
+                    signing.to_hex(),
+                    transcript.to_hex(),
+                ),
+                Err(e) => return (Response::err(format!("{e:#}")), None),
+            }
+        };
         let _ = self.dkg_advance();
         (
             Response::Ok {
+                message: Some(message),
+            },
+            Some(DirtySet::catalog(CatalogScope::Acl)),
+        )
+    }
+
+    /// Open (or join) a threshold-signing transcript asking the standing group to
+    /// authorize `proposal`, and record our own consent to it.
+    ///
+    /// The request carries the grant bytes verbatim as its op, so what the group
+    /// signs is exactly the object `authority_grant_of` will later verify — the
+    /// signing path never constructs the payload a second way.
+    fn open_grant_request(
+        &mut self,
+        proposal: &crate::dkg::TranscriptId,
+    ) -> Result<(crate::dkg::TranscriptId, bool)> {
+        let authority = self
+            .active_dkg_session()
+            .ok_or_else(|| anyhow!("this device holds no share of the current group key"))?;
+        let group_key = self
+            .group_key_of_transcript(&authority)
+            .ok_or_else(|| anyhow!("cannot derive the current group key"))?;
+        let (op_bytes, _payload) =
+            crate::dkg::authority_grant_payload(&self.workspace_id, &group_key, proposal);
+        let events = self.membership.ceremony_events();
+        let board = self.ceremony_board(&events);
+        let threshold = board
+            .dkg
+            .get(&authority)
+            .and_then(|t| self.accepted_proposal(&authority, t))
+            .map(|(_, k, _)| k)
+            .unwrap_or(0);
+        let mut changed = false;
+        let signing = match self.canonical_signing_session(
+            &board,
+            &authority,
+            crate::dkg::SignTarget::AuthorityGrant,
+            &op_bytes,
+            threshold,
+        ) {
+            Some(id) => id,
+            None => {
+                let req = crate::dkg::CeremonyOp::SignRequest {
+                    nonce: rand16(),
+                    authority,
+                    target: crate::dkg::SignTarget::AuthorityGrant,
+                    op: op_bytes.clone(),
+                };
+                let ev = crate::dkg::sign_ceremony(&self.seed, &req, &self.workspace_id);
+                let id = crate::dkg::TranscriptId::of(&ev)
+                    .ok_or_else(|| anyhow!("could not derive the request id"))?;
+                self.membership.add_ceremony_event(&ev)?;
+                self.persist_membership("grant_request")?;
+                changed = true;
+                id
+            }
+        };
+        if self.dkg_read(&signing, "intent").as_deref() != Some(op_bytes.as_slice()) {
+            self.dkg_write(&signing, "intent", &op_bytes)?;
+            changed = true;
+        }
+        Ok((signing, changed))
+    }
+
+    /// Co-sign a pending authority-grant request as a holder of the current
+    /// group key.
+    ///
+    /// Consent binds to the **proposal**, not to an opaque session id: the caller
+    /// must name the proposal they believe is being authorized, and the request
+    /// must actually be for that one. Approving a session blind would mean
+    /// lending a share to whatever configuration happened to be proposed —
+    /// including one that hands the next authority to someone else.
+    pub fn space_elevate_approve_cmd(
+        &mut self,
+        session_hex: String,
+        expect_proposal: String,
+    ) -> (Response, Option<DirtySet>) {
+        let Some(session) = crate::dkg::TranscriptId::parse_hex(session_hex.trim()) else {
+            return (
+                Response::err("not a valid request id (64 lowercase hex chars)"),
+                None,
+            );
+        };
+        let Some(expected) = crate::dkg::TranscriptId::parse_hex(expect_proposal.trim()) else {
+            return (
+                Response::err(
+                    "name the proposal you expect this to authorize (`--proposal <64-hex>`)",
+                ),
+                None,
+            );
+        };
+        if self.active_dkg_session().is_none() {
+            return (
+                Response::err(
+                    "this device holds no share of the current group key — nothing to co-sign",
+                ),
+                None,
+            );
+        }
+        let events = self.membership.ceremony_events();
+        let board = self.ceremony_board(&events);
+        let Some((op_bytes, target)) = board
+            .signing
+            .get(&session)
+            .and_then(|t| t.request.as_ref())
+            .and_then(|r| match &r.op {
+                crate::dkg::CeremonyOp::SignRequest { op, target, .. } => {
+                    Some((op.clone(), *target))
+                }
+                _ => None,
+            })
+        else {
+            return (
+                Response::err("no pending request for that id (sync from the initiator first)"),
+                None,
+            );
+        };
+        if target != crate::dkg::SignTarget::AuthorityGrant {
+            return (
+                Response::err("that request is not an authority grant — refusing to co-sign"),
+                None,
+            );
+        }
+        let Ok(grant) = postcard::from_bytes::<crate::dkg::AuthorityGrant>(&op_bytes) else {
+            return (
+                Response::err("that request does not carry a well-formed grant"),
+                None,
+            );
+        };
+        if grant.proposal != expected {
+            return (
+                Response::err(format!(
+                    "that request authorizes proposal {}, not the one you named — refusing to co-sign",
+                    grant.proposal.to_hex()
+                )),
+                None,
+            );
+        }
+        // The proposal must be one we can see and would accept on its own terms:
+        // well formed, a transition we implement, and replacing the authority
+        // actually standing. Otherwise a holder could be talked into authorizing
+        // a ceremony that is unusable or aimed at the wrong authority.
+        let Some(proposal) = board
+            .dkg
+            .get(&expected)
+            .and_then(|t| t.proposal.as_ref())
+            .and_then(|v| match &v.op {
+                crate::dkg::CeremonyOp::DkgPropose(p) => Some(p.clone()),
+                _ => None,
+            })
+        else {
+            return (
+                Response::err("that proposal has not synced here yet — sync and retry"),
+                None,
+            );
+        };
+        let Some(cfg) = proposal.frost_config() else {
+            return (
+                Response::err("that proposal is malformed or uses an unsupported transition"),
+                None,
+            );
+        };
+        if !self.claims_the_standing_authority(proposal.current_authority()) {
+            return (
+                Response::err(
+                    "that proposal does not replace the authority standing here — refusing to co-sign",
+                ),
+                None,
+            );
+        }
+        if let Err(e) = self.dkg_write(&session, "intent", &op_bytes) {
+            return (Response::err(format!("{e:#}")), None);
+        }
+        // Consent to the CEREMONY as well, not only to the grant that authorizes
+        // it. The holder named this proposal explicitly, so this is exactly what
+        // they agreed to — and without it they would authorize a ceremony they
+        // then refuse to help install, stalling the rotation at the last step
+        // with no indication why.
+        if let Err(e) = self.dkg_write(&expected, "intent", expected.to_hex().as_bytes()) {
+            return (Response::err(format!("{e:#}")), None);
+        }
+        if let Err(e) = self.dkg_advance() {
+            return (Response::err(format!("{e:#}")), None);
+        }
+        (
+            Response::Ok {
                 message: Some(format!(
-                    "started {k}-of-{n} recovery elevation — the DKG completes automatically as the co-founders' nodes sync; the group key installs once every share is in"
+                    "co-signed the authorization for a {}-of-{} arrangement — it takes effect once the threshold has signed",
+                    cfg.k,
+                    cfg.participants.len()
                 )),
             },
             Some(DirtySet::catalog(CatalogScope::Acl)),
@@ -4243,10 +4461,14 @@ impl Tracker {
             &self.membership.space_events(),
         );
         let already = crate::space::recovery_commit(&group_key) == Some(cur.recovery_commit);
+        if already {
+            return Ok(false);
+        }
+        // Solo authority: sign the rotation directly.
         if let Some(secret) = self.read_space_recovery_key() {
-            let hold = crate::space::recovery_commit(&crate::space::recovery_pub_of(&secret))
-                == Some(cur.recovery_commit);
-            if hold && !already {
+            if crate::space::recovery_commit(&crate::space::recovery_pub_of(&secret))
+                == Some(cur.recovery_commit)
+            {
                 let op = crate::space::SpaceOp::Rotate {
                     new_recovery_key: group_key,
                     gen: cur.gen + 1,
@@ -4257,7 +4479,88 @@ impl Tracker {
                 return Ok(true);
             }
         }
+        // Group authority: the rotation itself needs a threshold signature.
+        //
+        // The grant said "this ceremony may create a candidate authority"; the
+        // rotation says "install this exact candidate key". They are separate
+        // authorizations, and the second must not be inferred from the first —
+        // otherwise consenting to a ceremony would silently consent to whatever
+        // key someone later claims it produced.
+        //
+        // What makes it safe to open and consent automatically here is that
+        // `group_key` was DERIVED from this device's own public-key package for
+        // this transcript, moments ago. Every holder does the same derivation
+        // independently on its own node, so no holder is ever asked to trust a
+        // key it did not compute. A holder that cannot derive it — not a
+        // participant in the new ceremony — never reaches this point and so
+        // never signs.
+        if self.active_dkg_session().is_some() {
+            let (_, changed) = self.open_rotation_request(&group_key, cur.gen + 1)?;
+            return Ok(changed);
+        }
         Ok(false)
+    }
+
+    /// Open (or join) a threshold-signing transcript asking the standing group to
+    /// install `new_key` as the recovery authority, and record our consent.
+    ///
+    /// Requires the caller to have derived `new_key` itself. Note the resulting
+    /// constraint: the signing threshold of the *current* group must overlap the
+    /// participants of the *new* ceremony, because only a new participant holds
+    /// the package the key is derived from. Replacing one holder satisfies this
+    /// easily; a handover to a wholly disjoint set does not, and would need an
+    /// attested candidate key rather than a locally derived one.
+    fn open_rotation_request(
+        &mut self,
+        new_key: &UserId,
+        gen: u32,
+    ) -> Result<(crate::dkg::TranscriptId, bool)> {
+        let authority = self
+            .active_dkg_session()
+            .ok_or_else(|| anyhow!("this device holds no share of the current group key"))?;
+        let op = crate::space::SpaceOp::Rotate {
+            new_recovery_key: new_key.clone(),
+            gen,
+        };
+        let op_bytes = postcard::to_stdvec(&op)?;
+        let events = self.membership.ceremony_events();
+        let board = self.ceremony_board(&events);
+        let threshold = board
+            .dkg
+            .get(&authority)
+            .and_then(|t| self.accepted_proposal(&authority, t))
+            .map(|(_, k, _)| k)
+            .unwrap_or(0);
+        let mut changed = false;
+        let signing = match self.canonical_signing_session(
+            &board,
+            &authority,
+            crate::dkg::SignTarget::SpaceOp,
+            &op_bytes,
+            threshold,
+        ) {
+            Some(id) => id,
+            None => {
+                let req = crate::dkg::CeremonyOp::SignRequest {
+                    nonce: rand16(),
+                    authority,
+                    target: crate::dkg::SignTarget::SpaceOp,
+                    op: op_bytes.clone(),
+                };
+                let ev = crate::dkg::sign_ceremony(&self.seed, &req, &self.workspace_id);
+                let id = crate::dkg::TranscriptId::of(&ev)
+                    .ok_or_else(|| anyhow!("could not derive the request id"))?;
+                self.membership.add_ceremony_event(&ev)?;
+                self.persist_membership("rotate_request")?;
+                changed = true;
+                id
+            }
+        };
+        if self.dkg_read(&signing, "intent").as_deref() != Some(op_bytes.as_slice()) {
+            self.dkg_write(&signing, "intent", &op_bytes)?;
+            changed = true;
+        }
+        Ok((signing, changed))
     }
 
     fn post_ceremony(&mut self, op: crate::dkg::CeremonyOp) -> Result<()> {
@@ -7048,6 +7351,166 @@ mod tests {
         assert!(
             a.tracker.dkg_manifest(&id).is_none() && a.tracker.dkg_read(&id, "r1").is_none(),
             "resharing must not be attempted before a same-key protocol exists"
+        );
+    }
+
+    /// B3 + B4 end to end: a standing GROUP authorizes its own replacement and
+    /// signs the rotation that installs it.
+    ///
+    /// This is the lifecycle the one-way door used to block. Nothing here can be
+    /// done by a solo key: the current authority is a group, so the grant needs
+    /// a threshold signature (B3) and so does the rotation (B4).
+    #[test]
+    fn a_group_authorizes_and_installs_its_own_replacement() {
+        let mut a = new_node(); // founder, holds the bootstrap solo key
+        let a_ws = a.tracker.workspace_str();
+        let proof = a.tracker.founding_proof().unwrap();
+
+        let b_seed = [21u8; 32];
+        let b_user = user_from_seed(b_seed);
+        let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, &proof);
+        let c_seed = [31u8; 32];
+        let c_user = user_from_seed(c_seed);
+        let mut c = new_joiner_node_as(c_user.clone(), c_seed, &a_ws, &proof);
+        for incept in [
+            b.tracker.self_inception().unwrap(),
+            c.tracker.self_inception().unwrap(),
+        ] {
+            a.tracker
+                .admit_member(&incept, vec![Grant::Admin, Grant::Write]);
+        }
+        sync_all(&mut a.tracker, &mut b.tracker);
+        sync_all(&mut a.tracker, &mut c.tracker);
+
+        // ---- solo → group: {A, B} 2-of-2.
+        let (resp, _) = a
+            .tracker
+            .space_elevate_cmd(vec![b_user.as_str().to_string()], 2);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        for _ in 0..8 {
+            sync_all(&mut a.tracker, &mut b.tracker);
+            sync_all(&mut b.tracker, &mut a.tracker);
+        }
+        let after_first = crate::space::replay(
+            &a.tracker.genesis,
+            &a.tracker.workspace_id,
+            &a.tracker.membership.space_events(),
+        );
+        assert_eq!(after_first.gen, 1, "the 2-of-2 group key is installed");
+        let first_authority = a
+            .tracker
+            .current_authority()
+            .expect("A can attribute the standing key");
+        assert_eq!(
+            first_authority.public_key,
+            a.tracker
+                .group_key_of_transcript(&a.tracker.active_dkg_session().unwrap())
+                .unwrap(),
+            "the standing authority IS the group we just built"
+        );
+
+        // ---- group → group: {A, B, C} 2-of-3, proposed by a group holder.
+        // A no longer has a usable solo key, so this can only proceed by
+        // threshold authorization.
+        let (resp, _) = a.tracker.space_elevate_cmd(
+            vec![b_user.as_str().to_string(), c_user.as_str().to_string()],
+            2,
+        );
+        let msg = match resp {
+            Response::Ok { message: Some(m) } => m,
+            other => panic!("expected a pending group authorization, got {other:?}"),
+        };
+        assert!(
+            msg.contains("elevate-approve"),
+            "a group elevation must ask the other holders to authorize: {msg}"
+        );
+
+        // Pull the request and the proposal ids off the verified board.
+        let events = a.tracker.membership.ceremony_events();
+        let board = crate::dkg::parse_board(&events, &a.tracker.workspace_id);
+        let (signing, proposal) = board
+            .signing
+            .iter()
+            .find_map(|(id, t)| match &t.request.as_ref()?.op {
+                crate::dkg::CeremonyOp::SignRequest {
+                    target: crate::dkg::SignTarget::AuthorityGrant,
+                    op,
+                    ..
+                } => {
+                    let g: crate::dkg::AuthorityGrant = postcard::from_bytes(op).ok()?;
+                    Some((*id, g.proposal))
+                }
+                _ => None,
+            })
+            .expect("A opened a grant request");
+
+        // B, the other current holder, must consent — and consent binds to the
+        // proposal, not to an opaque session id.
+        for _ in 0..4 {
+            sync_all(&mut a.tracker, &mut b.tracker);
+            sync_all(&mut b.tracker, &mut a.tracker);
+        }
+        let (bad, _) = b
+            .tracker
+            .space_elevate_approve_cmd(signing.to_hex(), "f".repeat(64));
+        assert!(
+            matches!(bad, Response::Error { .. }),
+            "approving a session while naming the wrong proposal must be refused: {bad:?}"
+        );
+        let (resp, _) = b
+            .tracker
+            .space_elevate_approve_cmd(signing.to_hex(), proposal.to_hex());
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+
+        // Everything else is automatic: the group signs the grant, the new DKG
+        // runs, the group signs the rotation, the plane installs it.
+        for _ in 0..8 {
+            sync_all(&mut a.tracker, &mut b.tracker);
+            sync_all(&mut b.tracker, &mut c.tracker);
+            sync_all(&mut c.tracker, &mut a.tracker);
+            sync_all(&mut b.tracker, &mut a.tracker);
+            sync_all(&mut c.tracker, &mut b.tracker);
+            sync_all(&mut a.tracker, &mut c.tracker);
+        }
+
+        let after_second = crate::space::replay(
+            &a.tracker.genesis,
+            &a.tracker.workspace_id,
+            &a.tracker.membership.space_events(),
+        );
+        assert_eq!(
+            after_second.gen, 2,
+            "the group authorized and installed its own replacement"
+        );
+        assert_ne!(
+            after_second.recovery_commit, after_first.recovery_commit,
+            "rotation produces a DIFFERENT key — this is not a reshare"
+        );
+
+        // C, who held no share of the old group, holds one of the new authority.
+        let c_authority = c
+            .tracker
+            .current_authority()
+            .expect("C can attribute the standing key");
+        assert_eq!(
+            c_authority.public_key.as_str(),
+            a.tracker.current_authority().unwrap().public_key.as_str(),
+            "every holder agrees on the standing authority"
+        );
+        let c_cfg = c
+            .tracker
+            .dkg_manifests()
+            .into_iter()
+            .find(|(id, _)| {
+                c.tracker.group_key_of_transcript(id).as_ref() == Some(&c_authority.public_key)
+            })
+            .map(|(_, m)| m.configuration)
+            .expect("C accepted the ceremony that produced it");
+        let frost = c_cfg.as_frost_threshold().unwrap();
+        assert_eq!(
+            (frost.k, frost.participants.len()),
+            (2, 3),
+            "the new arrangement is the 2-of-3 that was proposed"
         );
     }
 
