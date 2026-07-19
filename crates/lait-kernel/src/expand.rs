@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::authority::{LeafId, PrincipalId};
 use crate::ids::UserId;
-use crate::policy::{CanonicalPolicy, OwnershipPolicy, PolicyError};
+use crate::policy::{CanonicalPolicy, OwnershipPolicy, PolicyError, PolicyId};
 
 /// Domain for leaf-id derivation, separate from policy hashing.
 const LEAF_DOMAIN: &[u8] = b"lait/space/1/policy/1/leaf";
@@ -37,6 +37,17 @@ const LEAF_DOMAIN: &[u8] = b"lait/space/1/policy/1/leaf";
 /// Bound on federation nesting, so a chain of federated principals cannot expand
 /// without limit. A consensus input like the policy limits.
 pub const MAX_FEDERATION_DEPTH: usize = 16;
+
+/// Bound on the **expanded** leaf count. C1's `MAX_LEAVES` bounds the
+/// *unexpanded* policy, but every federated principal can expand into another
+/// full policy, so a 256-principal root could otherwise reach tens of thousands
+/// of leaves — a compile/solve exhaustion path. This bounds the artifact
+/// cryptography actually consumes, checked incrementally so a hostile policy
+/// cannot build a huge structure before the check fires.
+pub const MAX_EXPANDED_LEAVES: usize = 512;
+
+/// Bound on the **expanded** tree depth (federation inlines lengthen paths).
+pub const MAX_EXPANDED_DEPTH: usize = 64;
 
 /// How a principal is realized cryptographically.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,11 +90,16 @@ pub enum ExpandedPolicy {
     },
 }
 
-/// The result of expanding a policy: the leaf-level structure and every leaf's
-/// provenance, in canonical (tree) order.
+/// The result of expanding a policy: the source policy's identity, the leaf-level
+/// structure, and every leaf's provenance, in canonical (tree) order.
+///
+/// `id` is stamped from the [`CanonicalPolicy`] that was expanded, so the
+/// compiler cannot be handed a tree under a mismatched policy id — the identity
+/// travels with the expansion rather than being asserted alongside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Expansion {
-    pub policy: ExpandedPolicy,
+    pub id: PolicyId,
+    pub tree: ExpandedPolicy,
     pub leaves: Vec<LeafDescriptor>,
 }
 
@@ -96,6 +112,10 @@ pub enum ExpandError {
     Cycle(PrincipalId),
     /// Federation nests past [`MAX_FEDERATION_DEPTH`].
     TooDeep,
+    /// Expansion produced more than [`MAX_EXPANDED_LEAVES`] leaves.
+    TooManyLeaves,
+    /// The expanded tree is deeper than [`MAX_EXPANDED_DEPTH`].
+    TooDeepExpanded,
     /// A federated sub-policy is itself malformed.
     Policy(PolicyError),
 }
@@ -108,6 +128,12 @@ impl std::fmt::Display for ExpandError {
             }
             ExpandError::Cycle(p) => write!(f, "principal {} federates to itself", p.as_str()),
             ExpandError::TooDeep => write!(f, "federation nests past {MAX_FEDERATION_DEPTH}"),
+            ExpandError::TooManyLeaves => {
+                write!(f, "expansion exceeds {MAX_EXPANDED_LEAVES} leaves")
+            }
+            ExpandError::TooDeepExpanded => {
+                write!(f, "expanded tree deeper than {MAX_EXPANDED_DEPTH}")
+            }
             ExpandError::Policy(e) => write!(f, "federated sub-policy is malformed: {e}"),
         }
     }
@@ -125,9 +151,10 @@ pub fn expand(
 ) -> Result<Expansion, ExpandError> {
     let mut leaves = Vec::new();
     let mut stack = Vec::new();
-    let expanded = expand_rec(policy, resolve, &mut Vec::new(), &mut stack, &mut leaves)?;
+    let tree = expand_rec(policy, resolve, &mut Vec::new(), &mut stack, &mut leaves)?;
     Ok(Expansion {
-        policy: expanded,
+        id: policy.id(),
+        tree,
         leaves,
     })
 }
@@ -143,12 +170,18 @@ fn expand_rec(
     if stack.len() > MAX_FEDERATION_DEPTH {
         return Err(ExpandError::TooDeep);
     }
+    if path.len() > MAX_EXPANDED_DEPTH {
+        return Err(ExpandError::TooDeepExpanded);
+    }
     match policy {
         CanonicalPolicy::Key(principal) => {
             let descriptor = resolve(principal)
                 .ok_or_else(|| ExpandError::UnknownPrincipal(principal.clone()))?;
             match descriptor.custody {
                 PrincipalCustody::Direct { device } => {
+                    if leaves.len() >= MAX_EXPANDED_LEAVES {
+                        return Err(ExpandError::TooManyLeaves);
+                    }
                     let leaf = leaf_id(path, principal, &device);
                     leaves.push(LeafDescriptor {
                         leaf: leaf.clone(),
@@ -268,7 +301,7 @@ mod tests {
             assert_eq!(d.device, d.principal.as_device().unwrap());
         }
         // The structure is preserved, over leaves.
-        assert!(matches!(e.policy, ExpandedPolicy::Threshold { k: 2, .. }));
+        assert!(matches!(e.tree, ExpandedPolicy::Threshold { k: 2, .. }));
     }
 
     #[test]
@@ -291,7 +324,7 @@ mod tests {
         assert_eq!(e.leaves.len(), 4);
         // The federation flattened in — the top gate now has a threshold child,
         // not an opaque leaf for founder 1.
-        let ExpandedPolicy::Threshold { members, .. } = &e.policy else {
+        let ExpandedPolicy::Threshold { members, .. } = &e.tree else {
             panic!("expected a threshold root");
         };
         assert!(members
@@ -354,6 +387,41 @@ mod tests {
         assert!(matches!(
             expand(&policy, &resolver(fed)),
             Err(ExpandError::Cycle(_))
+        ));
+    }
+
+    /// Finding 2: C1 bounds the unexpanded policy, but federation can multiply
+    /// leaves — three federated principals, each a 200-key group, blow past
+    /// MAX_EXPANDED_LEAVES even though each sub-policy is within C1's limit. The
+    /// incremental check fires instead of building the whole structure.
+    #[test]
+    fn federation_that_exceeds_the_expanded_leaf_limit_is_rejected() {
+        let group = |base: u16| {
+            OwnershipPolicy::AnyOf(
+                (0..200u16)
+                    .map(|i| {
+                        let mut seed = [0u8; 32];
+                        seed[0] = (base & 0xff) as u8;
+                        seed[1] = (base >> 8) as u8;
+                        seed[2] = (i & 0xff) as u8;
+                        seed[3] = (i >> 8) as u8;
+                        OwnershipPolicy::Key(PrincipalId::of_device(
+                            &crate::crypto::user_from_seed(&seed),
+                        ))
+                    })
+                    .collect(),
+            )
+        };
+        let mut fed = BTreeMap::new();
+        fed.insert(prin(1), group(1));
+        fed.insert(prin(2), group(2));
+        fed.insert(prin(3), group(3));
+        let policy = OwnershipPolicy::AnyOf(vec![key(1), key(2), key(3)])
+            .canonicalize()
+            .unwrap();
+        assert!(matches!(
+            expand(&policy, &resolver(fed)),
+            Err(ExpandError::TooManyLeaves)
         ));
     }
 

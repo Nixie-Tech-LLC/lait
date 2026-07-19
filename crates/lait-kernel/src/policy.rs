@@ -98,9 +98,15 @@ pub enum PolicyError {
     Unsatisfiable { k: u16, members: usize },
     /// The same subtree appears twice in one gate. Repetition must not create
     /// silent voting weight (§18): a principal that should count twice needs two
-    /// *distinct* occurrences (distinct positions or, in C2, distinct custody
-    /// paths), not a literal duplicate. A duplicate is a modeling error, so it is
-    /// rejected rather than merged or boolean-reduced.
+    /// *distinct* occurrences, not a literal duplicate. A duplicate is a modeling
+    /// error, so it is rejected rather than merged or boolean-reduced.
+    ///
+    /// Note the deliberate limit: a distinct occurrence means a *structurally
+    /// different position* (a principal in two different branches gets
+    /// path-distinct leaves in C2). Two intentional identical sibling
+    /// occurrences of one principal — "count me twice, right here" — cannot be
+    /// expressed. Repeated sibling weight is unsupported by design; model it as
+    /// separate principals if it is genuinely wanted.
     DuplicateMember,
     /// Nesting deeper than [`MAX_DEPTH`].
     TooDeep,
