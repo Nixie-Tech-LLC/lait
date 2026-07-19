@@ -345,7 +345,65 @@ pub fn parse_board(events: &[SignedNode], ws: &WorkspaceId) -> CeremonyBoard {
             }
         }
     }
+    retain(&mut board);
     board
+}
+
+/// Which round an entry is, for the one-per-author-per-round cap.
+fn round_kind(op: &CeremonyOp) -> Option<u8> {
+    match op {
+        CeremonyOp::DkgRound1 { .. } => Some(1),
+        CeremonyOp::DkgRound2 { .. } => Some(2),
+        CeremonyOp::SignRound1 { .. } => Some(3),
+        CeremonyOp::SignRound2 { .. } => Some(4),
+        _ => None,
+    }
+}
+
+/// Drop what can never contribute, so a grow-only board cannot be padded into
+/// unbounded retained state.
+///
+/// Three rules, all structural — authorization is the caller's, since it needs
+/// the space plane that this layer cannot see:
+///
+/// - a transcript with **no opener** is dropped entirely: rounds naming an id
+///   nobody opened can never be acted on, and anyone can mint ids;
+/// - a DKG round whose author is **not a participant** of that transcript's
+///   proposal is dropped (a `SignRequest` names no participants of its own, so
+///   signing rounds are filtered against their authority at point of use);
+/// - at most **one round of each kind per author per transcript** is kept. Later
+///   duplicates were already ignored — `entry().or_insert` takes the first — but
+///   they were still retained, so a legitimate participant could flood a
+///   transcript they belong to.
+///
+/// Per-author caps are a backstop, not the mechanism: an attacker can mint
+/// arbitrary keys and stay under any per-author limit, which is why the opener
+/// and participant rules do the real work.
+fn retain(board: &mut CeremonyBoard) {
+    board.dkg.retain(|_, t| t.proposal.is_some());
+    board.signing.retain(|_, t| t.request.is_some());
+    for t in board.dkg.values_mut() {
+        let participants: Vec<UserId> = match t.proposal.as_ref().map(|p| &p.op) {
+            Some(CeremonyOp::DkgPropose { participants, .. }) => participants.clone(),
+            _ => Vec::new(),
+        };
+        let mut seen: BTreeMap<(UserId, u8), ()> = BTreeMap::new();
+        t.rounds.retain(|v| {
+            let Some(kind) = round_kind(&v.op) else {
+                return false;
+            };
+            participants.contains(&v.author) && seen.insert((v.author.clone(), kind), ()).is_none()
+        });
+    }
+    for t in board.signing.values_mut() {
+        let mut seen: BTreeMap<(UserId, u8), ()> = BTreeMap::new();
+        t.rounds.retain(|v| {
+            let Some(kind) = round_kind(&v.op) else {
+                return false;
+            };
+            seen.insert((v.author.clone(), kind), ()).is_none()
+        });
+    }
 }
 
 /// Serialized packages keyed by 1-based participant index — how a round's
@@ -928,6 +986,95 @@ mod tests {
 
         // Stable for identical input.
         assert_eq!(base, nonce_binding(&a, b"msg", &commitments));
+    }
+
+    // ---- retention ----
+
+    /// Rounds naming a transcript nobody opened can never be acted on, and
+    /// anyone can mint ids — so they must not accumulate as retained state.
+    #[test]
+    fn rounds_for_an_unopened_transcript_are_dropped() {
+        let w = ws();
+        let orphan = TranscriptId::parse_hex(&"d".repeat(64)).unwrap();
+        let ev = sign_ceremony(
+            &[5u8; 32],
+            &CeremonyOp::DkgRound1 {
+                dkg: orphan,
+                package: vec![1, 2, 3],
+            },
+            &w,
+        );
+        let board = parse_board(&[ev], &w);
+        assert!(board.dkg.is_empty(), "no opener, no transcript");
+    }
+
+    /// A round from a device the proposal never named cannot contribute, so it
+    /// is dropped rather than carried.
+    #[test]
+    fn rounds_from_non_participants_are_dropped() {
+        let w = ws();
+        let insider = crate::crypto::user_from_seed(&[11u8; 32]);
+        let propose = CeremonyOp::DkgPropose {
+            nonce: [1u8; 16],
+            n: 2,
+            k: 2,
+            participants: vec![insider.clone()],
+        };
+        let pev = sign_ceremony(&[11u8; 32], &propose, &w);
+        let id = TranscriptId::of(&pev).unwrap();
+        let good = sign_ceremony(
+            &[11u8; 32],
+            &CeremonyOp::DkgRound1 {
+                dkg: id,
+                package: vec![1],
+            },
+            &w,
+        );
+        let outsider = sign_ceremony(
+            &[99u8; 32],
+            &CeremonyOp::DkgRound1 {
+                dkg: id,
+                package: vec![2],
+            },
+            &w,
+        );
+        let board = parse_board(&[pev, good, outsider], &w);
+        assert_eq!(board.dkg[&id].rounds.len(), 1);
+        assert_eq!(board.dkg[&id].rounds[0].author, insider);
+    }
+
+    /// Duplicates past the first were already ignored by `entry().or_insert`,
+    /// but they were retained — so a legitimate participant could flood a
+    /// transcript they belong to.
+    #[test]
+    fn one_round_per_author_per_kind_is_retained() {
+        let w = ws();
+        let me = crate::crypto::user_from_seed(&[11u8; 32]);
+        let propose = CeremonyOp::DkgPropose {
+            nonce: [1u8; 16],
+            n: 2,
+            k: 2,
+            participants: vec![me.clone()],
+        };
+        let pev = sign_ceremony(&[11u8; 32], &propose, &w);
+        let id = TranscriptId::of(&pev).unwrap();
+        let mut events = vec![pev];
+        for i in 0..50u8 {
+            events.push(sign_ceremony(
+                &[11u8; 32],
+                &CeremonyOp::DkgRound1 {
+                    dkg: id,
+                    package: vec![i],
+                },
+                &w,
+            ));
+        }
+        let board = parse_board(&events, &w);
+        assert_eq!(
+            board.dkg[&id].rounds.len(),
+            1,
+            "50 round-1 posts from one author retain one"
+        );
     }
 
     /// The group key must be derivable from the public-key package, since that
