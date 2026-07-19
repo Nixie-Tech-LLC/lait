@@ -93,8 +93,9 @@ impl TranscriptId {
 pub enum SignTarget {
     /// A [`crate::space::SpaceOp`] — `Recover` or `Rotate`.
     SpaceOp,
-    /// A `DkgPropose` authorizing a new DKG (group→group reconfiguration).
-    CeremonyProposal,
+    /// An [`AuthorityGrant`] authorizing a new key ceremony (group→group
+    /// reconfiguration).
+    AuthorityGrant,
 }
 
 /// One participant's contribution to a FROST ceremony, posted to the shared
@@ -116,10 +117,15 @@ pub enum CeremonyOp {
         /// Participant devices, sorted + deduped (index = position + 1).
         participants: Vec<UserId>,
     },
-    /// The recovery authority's authorization for a `DkgPropose`. Carried as its
-    /// own board entry because what it signs is the proposal's *hash*, which
-    /// cannot be a field of the proposal.
-    DkgAuthorize(ProposalAuth),
+    /// The recovery authority's authorization for a `DkgPropose`, as an ordinary
+    /// signed node under [`AUTHORITY_GRANT_DOMAIN`].
+    ///
+    /// Two signatures, two jobs: the **outer** ceremony signature authenticates
+    /// the device that posted this to the board, and the **inner** grant
+    /// signature is the authorization proper. Carried as its own object because
+    /// what it signs is the proposal's *hash*, which cannot be a field of the
+    /// proposal.
+    DkgAuthorize(SignedAuthorityGrant),
     /// A broadcast DKG round-1 package.
     DkgRound1 { dkg: TranscriptId, package: Vec<u8> },
     /// A DKG round-2 secret share, sealed to recipient device `to`.
@@ -170,67 +176,84 @@ impl CeremonyOp {
     }
 }
 
-/// Authorization for a `DkgPropose`, detached from the proposal node.
+/// Domain for an authority grant. Distinct from [`CEREMONY_DOMAIN`] and from
+/// [`crate::space::SPACE_EVENT_DOMAIN`], so a grant can never verify as a
+/// ceremony contribution or a space operation, nor either as a grant.
+pub const AUTHORITY_GRANT_DOMAIN: &[u8] = b"lait/space/1/ceremony/2/authority-grant";
+
+/// The recovery authority's statement that one exact key ceremony may run.
 ///
-/// A ceremony signature proves only control of the declared **device** key. It
-/// says nothing about authority to configure an elevation, so acceptance rests
-/// on this instead: a signature by the recovery authority current at proposal
-/// time, over the proposal's own id.
-///
-/// Detached rather than a field on `DkgPropose`, because the thing being
-/// authorized is the proposal's *hash*, which cannot be a field of the proposal.
+/// The proposal's hash already commits to the whole configuration — scheme,
+/// threshold, participants, transition, nonce, workspace envelope — so naming it
+/// is the entire content of the decision. A struct rather than bare bytes so a
+/// later field (a policy commitment, say) can ride the same object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProposalAuth {
-    /// The proposal being authorized.
+pub struct AuthorityGrant {
     pub proposal: TranscriptId,
-    /// The key that authorized it — checked against the standing recovery
-    /// commitment by the acceptance rule, not trusted from here.
-    pub by: UserId,
-    /// Detached signature over the proposal id (see [`sign_proposal_auth`]).
-    pub sig: Vec<u8>,
 }
 
-/// Domain for the detached proposal authorization. Distinct from
-/// [`CEREMONY_DOMAIN`] so an authorization can never verify as a ceremony
-/// contribution, or vice versa.
-pub const PROPOSAL_AUTH_DOMAIN: &[u8] = b"lait/space/1/ceremony/2/proposal-auth";
+/// A grant carried as an ordinary signed node, authored by the recovery
+/// authority itself.
+///
+/// This is the point of the shape: a **solo** authority signs it with
+/// [`sigdag::sign_node`], and a **group** authority produces the byte-identical
+/// object by FROST-signing [`sigdag::payload_to_sign`] and assembling with
+/// [`sigdag::assemble_signed`]. One object, one verifier, no second
+/// representation of the same decision to keep in sync — and no detached-message
+/// mode inside threshold signing, which is where signature-confusion bugs live.
+pub type SignedAuthorityGrant = SignedNode;
 
-/// Authorize `proposal` with the current recovery secret. Rides
-/// [`sigdag::sign_message`], so it is domain-separated and workspace-bound: an
-/// authorization cannot be lifted to another workspace, replayed against a
-/// different proposal, or reused as any other kind of signature.
-pub fn sign_proposal_auth(
+/// Author an authority grant with a solo recovery secret.
+pub fn sign_authority_grant(
     recovery_seed: &[u8; 32],
     ws: &WorkspaceId,
     proposal: &TranscriptId,
-) -> ProposalAuth {
-    let (by, sig) = sigdag::sign_message(
-        PROPOSAL_AUTH_DOMAIN,
-        ws.as_str(),
-        recovery_seed,
-        &proposal.0,
-    );
-    ProposalAuth {
+) -> SignedAuthorityGrant {
+    let grant = AuthorityGrant {
         proposal: *proposal,
-        by,
-        sig: sig.to_vec(),
-    }
+    };
+    sigdag::sign_node(
+        AUTHORITY_GRANT_DOMAIN,
+        recovery_seed,
+        postcard::to_stdvec(&grant).expect("encode authority grant"),
+        vec![],
+        ws.as_str(),
+    )
 }
 
-/// Whether `auth` is a well-formed authorization for its named proposal. Says
-/// nothing about *whose* key signed it — the caller must still check
-/// `auth.by` against the standing recovery commitment.
-pub fn verify_proposal_auth(auth: &ProposalAuth, ws: &WorkspaceId) -> bool {
-    let Ok(sig) = <[u8; 64]>::try_from(auth.sig.as_slice()) else {
-        return false;
+/// The bytes a group must FROST-sign to produce a grant for `proposal` under
+/// `group_key`. The aggregated signature assembles into a node identical in
+/// shape to [`sign_authority_grant`]'s output.
+pub fn authority_grant_payload(
+    ws: &WorkspaceId,
+    group_key: &UserId,
+    proposal: &TranscriptId,
+) -> (Vec<u8>, [u8; 32]) {
+    let grant = AuthorityGrant {
+        proposal: *proposal,
     };
-    sigdag::verify_message(
-        PROPOSAL_AUTH_DOMAIN,
-        ws.as_str(),
-        &auth.by,
-        &auth.proposal.0,
-        &sig,
-    )
+    let op = postcard::to_stdvec(&grant).expect("encode authority grant");
+    let payload = sigdag::payload_to_sign(AUTHORITY_GRANT_DOMAIN, &op, group_key, &[], ws.as_str());
+    (op, payload)
+}
+
+/// The proposal a grant authorizes, if it is a well-formed grant for this
+/// workspace. `None` otherwise.
+///
+/// Checks, in order: the signature verifies under the grant domain for this
+/// workspace; the payload decodes as an [`AuthorityGrant`]; and the node has no
+/// parents. Parents are rejected because a grant is a standalone statement — an
+/// unconstrained parent list is signed-over data with no defined meaning, and
+/// leaving it free would let two grants for one decision differ in their hash
+/// and stop converging.
+///
+/// Says nothing about *whose* key signed it: the caller must still check the
+/// author against the standing recovery authority.
+pub fn authority_grant_of(node: &SignedAuthorityGrant, ws: &WorkspaceId) -> Option<AuthorityGrant> {
+    if !node.verify_sig(AUTHORITY_GRANT_DOMAIN, ws.as_str()) || !node.parents.is_empty() {
+        return None;
+    }
+    postcard::from_bytes::<AuthorityGrant>(&node.op).ok()
 }
 
 /// Sign a [`CeremonyOp`] with the contributing device's seed.
@@ -269,7 +292,7 @@ pub struct DkgTranscript {
     ///
     /// Signatures are checked here; whether a signer is the *standing* authority
     /// is the caller's rule, since it needs the space plane.
-    pub auths: BTreeMap<UserId, ProposalAuth>,
+    pub auths: BTreeMap<UserId, SignedAuthorityGrant>,
     /// Round packages referencing this transcript (openers excluded).
     pub rounds: Vec<Verified>,
 }
@@ -337,15 +360,17 @@ pub fn parse_board(events: &[SignedNode], ws: &WorkspaceId) -> CeremonyBoard {
             // Authorizations are filed against the proposal they name, and only
             // if the detached signature actually covers it — an unverifiable one
             // must never occupy the slot a real authorization would fill.
-            CeremonyOp::DkgAuthorize(auth) => {
-                if verify_proposal_auth(auth, ws) {
-                    let (proposal, auth) = (auth.proposal, auth.clone());
+            // The outer signature is already verified above; the inner grant is
+            // verified separately, so an invalid outer and an invalid inner are
+            // independently rejected and neither can carry the other.
+            CeremonyOp::DkgAuthorize(grant) => {
+                if let Some(inner) = authority_grant_of(grant, ws) {
                     board
                         .dkg
-                        .entry(proposal)
+                        .entry(inner.proposal)
                         .or_default()
                         .auths
-                        .insert(auth.by.clone(), auth);
+                        .insert(grant.author.clone(), grant.clone());
                 }
             }
             // Rounds are keyed by the transcript they name.
@@ -972,29 +997,116 @@ mod tests {
 
     // ---- proposal authorization ----
 
-    /// An authorization is bound to one proposal in one workspace: it cannot be
-    /// replayed against a different proposal, nor lifted to another workspace.
+    /// A grant is bound to one proposal in one workspace: it cannot be replayed
+    /// against a different proposal, nor lifted to another workspace.
     #[test]
-    fn a_proposal_authorization_binds_to_its_proposal_and_workspace() {
+    fn a_grant_binds_to_its_proposal_and_workspace() {
         let w = ws();
         let seed = [3u8; 32];
         let a = TranscriptId::parse_hex(&"a".repeat(64)).unwrap();
-        let b = TranscriptId::parse_hex(&"b".repeat(64)).unwrap();
 
-        let auth = sign_proposal_auth(&seed, &w, &a);
-        assert!(verify_proposal_auth(&auth, &w));
-        // Same signature, different proposal.
-        let swapped = ProposalAuth {
-            proposal: b,
-            ..auth.clone()
-        };
-        assert!(!verify_proposal_auth(&swapped, &w));
+        let grant = sign_authority_grant(&seed, &w, &a);
+        assert_eq!(authority_grant_of(&grant, &w).unwrap().proposal, a);
         // Same signature, different workspace.
-        assert!(!verify_proposal_auth(&auth, &ws()));
+        assert!(authority_grant_of(&grant, &ws()).is_none());
+        // Tampered payload: the signature no longer covers it.
+        let mut swapped = grant.clone();
+        swapped.op = postcard::to_stdvec(&AuthorityGrant {
+            proposal: TranscriptId::parse_hex(&"b".repeat(64)).unwrap(),
+        })
+        .unwrap();
+        assert!(authority_grant_of(&swapped, &w).is_none());
         // Tampered signature.
-        let mut bad = auth.clone();
+        let mut bad = grant.clone();
         bad.sig[0] ^= 0xff;
-        assert!(!verify_proposal_auth(&bad, &w));
+        assert!(authority_grant_of(&bad, &w).is_none());
+    }
+
+    /// Solo and group producers must yield the SAME object, verified by the same
+    /// rule — that is the entire point of the signed-node shape. Here the group
+    /// signature is stood in for by a plain key signing the group payload; what
+    /// matters is that the assembled node is byte-identical to the solo one and
+    /// passes one verifier.
+    #[test]
+    fn solo_and_assembled_grants_satisfy_one_verifier() {
+        let w = ws();
+        let seed = [3u8; 32];
+        let author = crate::crypto::user_from_seed(&seed);
+        let a = TranscriptId::parse_hex(&"a".repeat(64)).unwrap();
+
+        let solo = sign_authority_grant(&seed, &w, &a);
+        // The group path: derive the payload, sign it, assemble.
+        let (op, payload) = authority_grant_payload(&w, &author, &a);
+        let sig = {
+            use ed25519_dalek::Signer;
+            ed25519_dalek::SigningKey::from_bytes(&seed)
+                .sign(&payload)
+                .to_bytes()
+        };
+        let assembled = sigdag::assemble_signed(op, author, sig.to_vec(), vec![]);
+
+        assert_eq!(solo, assembled, "one object, however it was produced");
+        assert!(authority_grant_of(&assembled, &w).is_some());
+        assert_eq!(
+            solo.hash(),
+            assembled.hash(),
+            "identical decisions converge to one board entry"
+        );
+    }
+
+    /// A grant must not be a ceremony contribution or a space operation, and
+    /// neither may masquerade as a grant. Domains are the only thing separating
+    /// them, since postcard carries no type information.
+    #[test]
+    fn grants_do_not_cross_domains() {
+        let w = ws();
+        let seed = [3u8; 32];
+        let a = TranscriptId::parse_hex(&"a".repeat(64)).unwrap();
+        let grant = sign_authority_grant(&seed, &w, &a);
+
+        assert!(
+            !grant.verify_sig(CEREMONY_DOMAIN, w.as_str()),
+            "a grant is not a ceremony contribution"
+        );
+        assert!(
+            !grant.verify_sig(crate::space::SPACE_EVENT_DOMAIN, w.as_str()),
+            "a grant is not a space operation"
+        );
+
+        // And the reverse: a ceremony node over the same bytes is not a grant.
+        let ceremony =
+            sigdag::sign_node(CEREMONY_DOMAIN, &seed, grant.op.clone(), vec![], w.as_str());
+        assert!(authority_grant_of(&ceremony, &w).is_none());
+        let space = sigdag::sign_node(
+            crate::space::SPACE_EVENT_DOMAIN,
+            &seed,
+            grant.op.clone(),
+            vec![],
+            w.as_str(),
+        );
+        assert!(authority_grant_of(&space, &w).is_none());
+    }
+
+    /// A grant is a standalone statement. Parents are signed-over data with no
+    /// defined meaning here, and leaving them free would let two grants for one
+    /// decision differ in hash and stop converging.
+    #[test]
+    fn a_grant_with_parents_is_rejected() {
+        let w = ws();
+        let a = TranscriptId::parse_hex(&"a".repeat(64)).unwrap();
+        let op = postcard::to_stdvec(&AuthorityGrant { proposal: a }).unwrap();
+        let parented = sigdag::sign_node(
+            AUTHORITY_GRANT_DOMAIN,
+            &[3u8; 32],
+            op,
+            vec!["f".repeat(64)],
+            w.as_str(),
+        );
+        assert!(
+            parented.verify_sig(AUTHORITY_GRANT_DOMAIN, w.as_str()),
+            "the signature itself is valid — only the shape is wrong"
+        );
+        assert!(authority_grant_of(&parented, &w).is_none());
     }
 
     /// An unverifiable authorization must not occupy the slot a real one would
@@ -1011,16 +1123,16 @@ mod tests {
         let pev = sign_ceremony(&[7u8; 32], &propose, &w);
         let id = TranscriptId::of(&pev).unwrap();
 
-        let mut auth = sign_proposal_auth(&[3u8; 32], &w, &id);
-        auth.sig[0] ^= 0xff;
-        let aev = sign_ceremony(&[7u8; 32], &CeremonyOp::DkgAuthorize(auth), &w);
+        let mut grant = sign_authority_grant(&[3u8; 32], &w, &id);
+        grant.sig[0] ^= 0xff;
+        let aev = sign_ceremony(&[7u8; 32], &CeremonyOp::DkgAuthorize(grant), &w);
         let board = parse_board(&[pev.clone(), aev], &w);
         assert!(
             board.dkg[&id].auths.is_empty(),
-            "a broken authorization is not filed"
+            "a broken grant is not filed"
         );
 
-        let good = sign_proposal_auth(&[3u8; 32], &w, &id);
+        let good = sign_authority_grant(&[3u8; 32], &w, &id);
         let aev = sign_ceremony(&[7u8; 32], &CeremonyOp::DkgAuthorize(good), &w);
         let board = parse_board(&[pev, aev], &w);
         assert!(board.dkg[&id].auths.len() == 1);
@@ -1127,10 +1239,10 @@ mod tests {
         let id = TranscriptId::of(&pev).unwrap();
         let mut evs = vec![pev];
         for seed in seeds {
-            let auth = sign_proposal_auth(seed, w, &id);
+            let grant = sign_authority_grant(seed, w, &id);
             evs.push(sign_ceremony(
                 &[7u8; 32],
-                &CeremonyOp::DkgAuthorize(auth),
+                &CeremonyOp::DkgAuthorize(grant),
                 w,
             ));
         }
@@ -1184,10 +1296,10 @@ mod tests {
         let w = ws();
         let (id, mut evs) = proposal_with_auths(&w, &[[3u8; 32]]);
         // Post the same decision again, under a different carrier signature.
-        let auth = sign_proposal_auth(&[3u8; 32], &w, &id);
+        let grant = sign_authority_grant(&[3u8; 32], &w, &id);
         evs.push(sign_ceremony(
             &[8u8; 32],
-            &CeremonyOp::DkgAuthorize(auth),
+            &CeremonyOp::DkgAuthorize(grant),
             &w,
         ));
         let board = parse_board(&evs, &w);

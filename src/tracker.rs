@@ -3484,7 +3484,7 @@ impl Tracker {
                 None,
             );
         };
-        let auth = crate::dkg::sign_proposal_auth(&secret, &self.workspace_id, &transcript);
+        let grant = crate::dkg::sign_authority_grant(&secret, &self.workspace_id, &transcript);
         // Local consent record, keyed by the transcript it consents to. Written
         // before posting so a crash leaves an orphan marker (harmless) rather
         // than a proposal nobody will install (also safe, but less useful).
@@ -3493,7 +3493,7 @@ impl Tracker {
         }
         let auth_ev = crate::dkg::sign_ceremony(
             &self.seed,
-            &crate::dkg::CeremonyOp::DkgAuthorize(auth),
+            &crate::dkg::CeremonyOp::DkgAuthorize(grant),
             &self.workspace_id,
         );
         if let Err(e) = self
@@ -3660,7 +3660,7 @@ impl Tracker {
         let fresh = t
             .auths
             .values()
-            .any(|a| crate::space::recovery_commit(&a.by) == Some(cur.recovery_commit));
+            .any(|g| crate::space::recovery_commit(&g.author) == Some(cur.recovery_commit));
         // Or: the authority that was standing when we accepted, whose
         // authorization must still be present. A successful elevation rotates
         // the authority, so `fresh` alone would un-accept every transcript at the
@@ -3791,7 +3791,7 @@ impl Tracker {
         // future target must make an explicit choice here.
         let domain: &[u8] = match target {
             crate::dkg::SignTarget::SpaceOp => crate::space::SPACE_EVENT_DOMAIN,
-            crate::dkg::SignTarget::CeremonyProposal => crate::dkg::CEREMONY_DOMAIN,
+            crate::dkg::SignTarget::AuthorityGrant => crate::dkg::AUTHORITY_GRANT_DOMAIN,
         };
         let message = crate::sigdag::payload_to_sign(
             domain,
@@ -3904,18 +3904,23 @@ impl Tracker {
                         return Ok(true);
                     }
                 }
-                crate::dkg::SignTarget::CeremonyProposal => {
-                    let fresh = !self
-                        .membership
-                        .ceremony_events()
-                        .iter()
-                        .any(|e| e.hash() == node.hash());
-                    if fresh
-                        && node.verify_sig(crate::dkg::CEREMONY_DOMAIN, self.workspace_id.as_str())
-                    {
-                        self.membership.add_ceremony_event(&node)?;
-                        self.persist_membership("group_authorize")?;
-                        return Ok(true);
+                crate::dkg::SignTarget::AuthorityGrant => {
+                    // `node` IS the grant: byte-identical in shape to what a solo
+                    // authority produces with `sign_authority_grant`, so one
+                    // verifier serves both. It rides onto the board inside a
+                    // ceremony op signed by this device — outer signature says
+                    // who relayed it, inner says who authorized.
+                    if crate::dkg::authority_grant_of(&node, &self.workspace_id).is_some() {
+                        let already = self.membership.ceremony_events().iter().any(|e| {
+                            matches!(
+                                postcard::from_bytes::<crate::dkg::CeremonyOp>(&e.op),
+                                Ok(crate::dkg::CeremonyOp::DkgAuthorize(g)) if g.hash() == node.hash()
+                            )
+                        });
+                        if !already {
+                            self.post_ceremony(crate::dkg::CeremonyOp::DkgAuthorize(node))?;
+                            return Ok(true);
+                        }
                     }
                 }
             }
@@ -3948,8 +3953,8 @@ impl Tracker {
             let authorized_by = t
                 .auths
                 .values()
-                .find(|a| crate::space::recovery_commit(&a.by) == Some(cur.recovery_commit))
-                .map(|a| a.by.clone());
+                .find(|g| crate::space::recovery_commit(&g.author) == Some(cur.recovery_commit))
+                .map(|g| g.author.clone());
             if let (Some(proposal), Some(authorized_by)) = (t.proposal.as_ref(), authorized_by) {
                 let manifest = crate::dkg::DkgManifest {
                     proposal: *dkg,
@@ -6860,11 +6865,13 @@ mod tests {
         // A real authorization, by the real recovery key — but for a DIFFERENT
         // proposal id. Re-pointing it at the rogue proposal must not verify.
         let other = crate::dkg::TranscriptId::parse_hex(&"c".repeat(64)).unwrap();
-        let real = crate::dkg::sign_proposal_auth(&secret, &a.tracker.workspace_id, &other);
-        let lifted = crate::dkg::ProposalAuth {
-            proposal: rogue_id,
-            ..real
-        };
+        // A real grant, by the real recovery key — but for a DIFFERENT proposal.
+        // Re-pointing it at the rogue proposal breaks the signature, because the
+        // proposal id is inside the signed payload rather than beside it.
+        let real = crate::dkg::sign_authority_grant(&secret, &a.tracker.workspace_id, &other);
+        let mut lifted = real.clone();
+        lifted.op =
+            postcard::to_stdvec(&crate::dkg::AuthorityGrant { proposal: rogue_id }).unwrap();
         let aev = crate::dkg::sign_ceremony(
             &rogue_seed,
             &crate::dkg::CeremonyOp::DkgAuthorize(lifted),
@@ -6904,14 +6911,14 @@ mod tests {
         let ev = crate::dkg::sign_ceremony(&stale_seed, &propose, &a.tracker.workspace_id);
         let id = crate::dkg::TranscriptId::of(&ev).unwrap();
         // Well-formed authorization, signed by a key that is not the authority.
-        let auth = crate::dkg::sign_proposal_auth(&stale_seed, &a.tracker.workspace_id, &id);
+        let grant = crate::dkg::sign_authority_grant(&stale_seed, &a.tracker.workspace_id, &id);
         assert!(
-            crate::dkg::verify_proposal_auth(&auth, &a.tracker.workspace_id),
-            "the signature itself is valid — only the signer is wrong"
+            crate::dkg::authority_grant_of(&grant, &a.tracker.workspace_id).is_some(),
+            "the grant itself is well formed — only the signer is wrong"
         );
         let aev = crate::dkg::sign_ceremony(
             &stale_seed,
-            &crate::dkg::CeremonyOp::DkgAuthorize(auth),
+            &crate::dkg::CeremonyOp::DkgAuthorize(grant),
             &a.tracker.workspace_id,
         );
         a.tracker.membership.add_ceremony_event(&ev).unwrap();
@@ -6944,10 +6951,10 @@ mod tests {
         let ev = crate::dkg::sign_ceremony(&[80u8; 32], &propose, &a.tracker.workspace_id);
         let id = crate::dkg::TranscriptId::of(&ev).unwrap();
         // Authorized by the REAL recovery key — only the shape is wrong.
-        let auth = crate::dkg::sign_proposal_auth(&secret, &a.tracker.workspace_id, &id);
+        let grant = crate::dkg::sign_authority_grant(&secret, &a.tracker.workspace_id, &id);
         let aev = crate::dkg::sign_ceremony(
             &[80u8; 32],
-            &crate::dkg::CeremonyOp::DkgAuthorize(auth),
+            &crate::dkg::CeremonyOp::DkgAuthorize(grant),
             &a.tracker.workspace_id,
         );
         a.tracker.membership.add_ceremony_event(&ev).unwrap();
