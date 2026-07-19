@@ -125,12 +125,54 @@ pub struct EpochAuth {
     pub id: [u8; 16],
     pub gen: u32,
     pub key_commit: [u8; 32],
+    /// The recipient set the minter *declared*. *Advisory only* — nothing
+    /// validates the sealed envelopes against it, and [`RekeyFence`] resolution
+    /// must never consult it (see that type's docs). Staleness healing uses it
+    /// as a heuristic; no security property may rest on it.
     pub members: Vec<ActorId>,
     /// The actor that authored this mint (the op's `by`). Healing re-keys when
     /// the active epoch's minter is no longer a current member — a departed
     /// member's epoch (whose recipient list it controlled) never lingers as the
     /// tip, so its key cannot outlive its membership.
     pub minted_by: ActorId,
+    /// This mint's op hash — its position in the causal graph. Required to ask
+    /// "does this epoch causally descend fence F?", which is the only sound way
+    /// to know a key post-dates a revocation. On the (content-random id, so
+    /// effectively impossible) re-mint of one id under two hashes, first-in-topo
+    /// -order wins; deterministic because `authorized` is topo-ordered.
+    pub mint_hash: String,
+}
+
+/// A rekey obligation raised by replay: `evicted` was admitted by an invite
+/// nonce that a concurrent [`AclAction::RevokeInvite`] fenced, so they were
+/// removed from the member set — but they were sealed the epochs live at the
+/// time of their admission and still hold those keys.
+///
+/// Replay is pure and cannot rotate; it only *names* the obligation. A fence is
+/// discharged by an authorized epoch that **causally descends `fence`**, minted
+/// by an actor with admin standing. Descent is the whole predicate: a mint
+/// authored after the revoke generates a fresh random key and seals it only to
+/// actors who are members at that point — and the evicted actor is not one, so
+/// they never receive an envelope for it.
+///
+/// Deliberately *not* part of the predicate: the epoch's declared `members`
+/// list. It is unenforced metadata ([`EpochAuth::members`]), so a concurrent
+/// epoch on the pre-revoke branch could carry a correct-looking recipient list
+/// while its key is already held by the evicted actor.
+///
+/// **Residual:** rotation fences *future* content only. Content encrypted under
+/// epochs the evicted actor was sealed stays readable by them permanently. This
+/// is lazy revocation, the same accepted residual [`crate::actor`] names — it
+/// cannot be closed by any amount of re-keying, and callers reporting a fence
+/// must say so rather than implying the invite was un-rung.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RekeyFence {
+    /// Op hash of the `RevokeInvite` that fenced the admission.
+    pub fence: String,
+    /// The actor evicted, whose held keys the rotation supersedes.
+    pub evicted: ActorId,
+    /// The invite nonce whose redemption was fenced.
+    pub nonce: [u8; 16],
 }
 
 /// A membership op: the action, the actor its author claims to be, and the
@@ -195,6 +237,10 @@ pub struct AclState {
     /// Single-use invite nonces already spent by an authorized `AddMember` — the
     /// signed redemption record, so single-use rides replay, not an unsigned doc.
     spent_nonces: BTreeSet<[u8; 16]>,
+    /// Rekey obligations from revoke-fenced admissions ([`RekeyFence`]). Sorted
+    /// and deduped, so this is a pure function of the op set like everything else
+    /// here — an admin discharges them by rotating; replay only names them.
+    rekey_fences: Vec<RekeyFence>,
 }
 
 impl AclState {
@@ -216,6 +262,12 @@ impl AclState {
     /// sealed envelopes).
     pub fn epoch(&self, id: &[u8; 16]) -> Option<&EpochAuth> {
         self.epochs.get(id)
+    }
+    /// Rekey obligations still **outstanding** ([`RekeyFence`]). Replay itself
+    /// discharges any fence some epoch causally descends, so a non-empty result
+    /// means an admin must rotate. Empty is the steady state.
+    pub fn rekey_fences(&self) -> &[RekeyFence] {
+        &self.rekey_fences
     }
     /// Whether `a` is sealed into the workspace (humans and agents alike).
     pub fn is_member(&self, a: &ActorId) -> bool {
@@ -529,12 +581,16 @@ pub fn replay_with_audit(
                 key_commit,
                 members: recipients,
             } => {
+                // First-in-topo-order wins if one id were ever minted under two
+                // hashes (content-random id ⇒ effectively impossible); the
+                // choice is deterministic because `authorized` is topo-ordered.
                 epochs.entry(*id).or_insert_with(|| EpochAuth {
                     id: *id,
                     gen: *gen,
                     key_commit: *key_commit,
                     members: recipients.clone(),
                     minted_by: op.by.clone(),
+                    mint_hash: h.clone(),
                 });
             }
             AclAction::RevokeInvite { nonce } => {
@@ -618,11 +674,12 @@ pub fn replay_with_audit(
     // through by having each race point at the other's losing op.
     let mut all_losing: BTreeSet<String> = BTreeSet::new();
     let mut races: Vec<(ActorId, Vec<(String, ActorId)>)> = Vec::new();
-    for (_n, mut group) in by_nonce {
+    for group in by_nonce.values() {
         let distinct: BTreeSet<&ActorId> = group.iter().map(|(_, a)| a).collect();
         if distinct.len() <= 1 {
             continue; // idempotent re-admits of the same actor are fine
         }
+        let mut group = group.clone();
         group.sort_by(|a, b| a.0.cmp(&b.0));
         let winner = group[0].1.clone();
         for (h, actor) in &group {
@@ -632,6 +689,72 @@ pub fn replay_with_audit(
         }
         races.push((winner, group));
     }
+
+    // ---- revoke-wins over concurrent redemption. An admin-signed RevokeInvite
+    // voids every admission spending that nonce which the revoke did not
+    // causally *see*: a redemption the revoke descends was already complete and
+    // legitimate (retiring it is `RemoveMember`'s job, which rotates), while a
+    // concurrent one is exactly the leak the kill switch was fired to stop.
+    //
+    // Mirror of `actor`'s revoke-wins, inverted: there a re-add that saw the
+    // revoke wins, because re-adding a device after revocation is legitimate.
+    // Here nothing may follow a revoke — `redeem_invite` refuses a revoked
+    // nonce outright — so anything not preceding it is concurrent, hence void.
+    let revokes: Vec<([u8; 16], &String)> = authorized
+        .iter()
+        .filter_map(|h| match decoded[h].as_ref() {
+            Some(AclOp {
+                action: AclAction::RevokeInvite { nonce },
+                ..
+            }) => Some((*nonce, h)),
+            _ => None,
+        })
+        .collect();
+    let mut fenced: BTreeMap<String, RekeyFence> = BTreeMap::new();
+    for (nonce, rh) in &revokes {
+        let Some(group) = by_nonce.get(nonce) else {
+            continue;
+        };
+        for (dh, actor) in group {
+            // Causally preceded the revoke ⇒ a completed admission; leave it.
+            if ancestors.get(*rh).is_some_and(|anc| anc.contains(dh)) {
+                continue;
+            }
+            fenced.insert(
+                dh.clone(),
+                RekeyFence {
+                    fence: (*rh).clone(),
+                    evicted: actor.clone(),
+                    nonce: *nonce,
+                },
+            );
+        }
+    }
+
+    // Race losers ∪ revoke-fenced admissions: the ops that seat nobody. A void
+    // op must not vouch for its own subject (a single fenced redemption is the
+    // *only* op naming its actor, so checking it against `all_losing` alone
+    // would have it justify itself), nor for a peer that is also void — the
+    // double-spend case above, now reachable with a fence on either leg.
+    let disqualified: BTreeSet<String> = all_losing
+        .iter()
+        .cloned()
+        .chain(fenced.keys().cloned())
+        .collect();
+    let seated_independently = |actor: &ActorId| -> bool {
+        authorized.iter().any(|h| {
+            !disqualified.contains(h)
+                && decoded[h].as_ref().is_some_and(|op| {
+                    matches!(
+                        &op.action,
+                        AclAction::AddMember { actor: a, .. }
+                        | AclAction::SetGrants { actor: a, .. }
+                        | AclAction::AddAgent { actor: a } if a == actor
+                    )
+                })
+        })
+    };
+
     // Pass 2: evict a loser unless it holds a seat that is NOT itself a spent-
     // nonce admission — a nonce-less grant, a direct re-grant, an agent
     // sponsorship, or an admission that won its own race.
@@ -640,23 +763,26 @@ pub fn replay_with_audit(
             if *actor == winner {
                 continue;
             }
-            let seated_independently = authorized.iter().any(|h| {
-                !all_losing.contains(h)
-                    && decoded[h].as_ref().is_some_and(|op| {
-                        matches!(
-                            &op.action,
-                            AclAction::AddMember { actor: a, .. }
-                            | AclAction::SetGrants { actor: a, .. }
-                            | AclAction::AddAgent { actor: a } if a == actor
-                        )
-                    })
-            });
-            if !seated_independently {
+            if !seated_independently(actor) {
                 members.remove(actor);
                 agents.remove(actor);
             }
         }
     }
+    // Evict fenced admissions and raise the rekey obligation for each: the
+    // actor is out of the member set, but still holds every epoch key sealed to
+    // them at admission, so an admin must rotate past the fence.
+    let mut rekey_fences: Vec<RekeyFence> = Vec::new();
+    for f in fenced.values() {
+        if seated_independently(&f.evicted) {
+            continue; // a standing grant outside the invite flow
+        }
+        members.remove(&f.evicted);
+        agents.remove(&f.evicted);
+        rekey_fences.push(f.clone());
+    }
+    rekey_fences.sort();
+    rekey_fences.dedup();
 
     // ---- sponsor cascade: an agent stands only while its sponsor does. Run
     // LAST, after every member removal (remove-wins AND nonce-race eviction), so
@@ -672,6 +798,32 @@ pub fn replay_with_audit(
         members.remove(&k);
     }
 
+    // ---- discharge fences. A rekey obligation is met by an authorized epoch
+    // that **causally descends** the revoke: such a mint drew a fresh random key
+    // and sealed it only to actors who were members at that point — never the
+    // evicted one.
+    //
+    // Descent is the *entire* predicate. Two things deliberately absent:
+    // - the epoch's declared `members` list, which is unenforced metadata (a
+    //   pre-revoke branch could carry a correct-looking one over a key the
+    //   evicted actor already holds); and
+    // - the minter's *current* standing. `epochs` holds only mints authorized at
+    //   their causal position (pass 1 gates `MintEpoch` on admin standing there),
+    //   so the rotation was legitimate when it happened and later removing or
+    //   demoting that admin cannot un-rotate a key. Re-checking standing here
+    //   would also break monotonicity — the fence would re-raise on an unrelated
+    //   membership change, long after the key it names was superseded.
+    //
+    // Monotone as written: the op set only grows and descent is stable, so a
+    // discharged fence never re-raises.
+    rekey_fences.retain(|f| {
+        !epochs.values().any(|e| {
+            ancestors
+                .get(&e.mint_hash)
+                .is_some_and(|anc| anc.contains(&f.fence))
+        })
+    });
+
     (
         AclState {
             members,
@@ -679,6 +831,7 @@ pub fn replay_with_audit(
             epochs,
             revoked_invites,
             spent_nonces,
+            rekey_fences,
         },
         audit,
     )
@@ -1419,6 +1572,333 @@ mod tests {
         assert!(
             st.is_invite_revoked(&nonce),
             "an admin's revoke is authorized and gates admission"
+        );
+    }
+
+    /// Two admins partition: A revokes a leaked invite while B concurrently
+    /// redeems it. Neither op is in the other's ancestor set, so both authorize
+    /// independently. After merge the revoke must win — otherwise the documented
+    /// kill switch admits the very actor it was fired to keep out.
+    #[test]
+    fn revoke_beats_a_concurrent_redemption() {
+        let f = fx(1, &[2, 3]);
+        // Actor 2 becomes a second admin; this op is the shared parent both
+        // branches fork from.
+        let add_admin = f.op(
+            1,
+            1,
+            AclAction::AddMember {
+                actor: f.a(2).clone(),
+                grants: vec![Grant::Admin],
+            },
+            vec![],
+        );
+        let nonce = [7u8; 16];
+        // Branch A: admin 1 revokes the leaked invite.
+        let revoke = f.op(
+            1,
+            1,
+            AclAction::RevokeInvite { nonce },
+            vec![add_admin.hash()],
+        );
+        // Branch B: admin 2, not yet having seen the revoke, admits actor 3 by
+        // spending the same nonce. Same parent ⇒ concurrent with the revoke.
+        let redeem = f.op_nonce(
+            2,
+            2,
+            AclAction::AddMember {
+                actor: f.a(3).clone(),
+                grants: vec![Grant::Write],
+            },
+            nonce,
+            vec![add_admin.hash()],
+        );
+
+        let st = f.replay(&[add_admin, revoke, redeem]);
+        assert!(st.is_invite_revoked(&nonce), "the revoke is authorized");
+        assert!(
+            !st.is_member(f.a(3)),
+            "revoke must win over a concurrent redemption — an actor admitted \
+             by a nonce that was concurrently revoked keeps the workspace key"
+        );
+    }
+
+    /// A fenced eviction raises a rekey obligation naming the fence, the actor,
+    /// and the nonce — replay cannot rotate, so it must hand the tracker enough
+    /// to discharge the fence causally.
+    #[test]
+    fn a_fenced_eviction_raises_a_rekey_obligation() {
+        let f = fx(1, &[2, 3]);
+        let add_admin = f.op(
+            1,
+            1,
+            AclAction::AddMember {
+                actor: f.a(2).clone(),
+                grants: vec![Grant::Admin],
+            },
+            vec![],
+        );
+        let nonce = [7u8; 16];
+        let revoke = f.op(
+            1,
+            1,
+            AclAction::RevokeInvite { nonce },
+            vec![add_admin.hash()],
+        );
+        let redeem = f.op_nonce(
+            2,
+            2,
+            AclAction::AddMember {
+                actor: f.a(3).clone(),
+                grants: vec![Grant::Write],
+            },
+            nonce,
+            vec![add_admin.hash()],
+        );
+        let st = f.replay(&[add_admin, revoke.clone(), redeem]);
+        assert_eq!(
+            st.rekey_fences(),
+            &[RekeyFence {
+                fence: revoke.hash(),
+                evicted: f.a(3).clone(),
+                nonce,
+            }],
+            "the obligation names the revoke that fenced the admission"
+        );
+    }
+
+    /// An epoch minted after the revoke discharges the fence; one minted on the
+    /// pre-revoke branch does not, however correct its recipient list looks.
+    #[test]
+    fn only_an_epoch_descending_the_fence_discharges_it() {
+        let f = fx(1, &[2, 3]);
+        let add_admin = f.op(
+            1,
+            1,
+            AclAction::AddMember {
+                actor: f.a(2).clone(),
+                grants: vec![Grant::Admin],
+            },
+            vec![],
+        );
+        let nonce = [7u8; 16];
+        let revoke = f.op(
+            1,
+            1,
+            AclAction::RevokeInvite { nonce },
+            vec![add_admin.hash()],
+        );
+        let redeem = f.op_nonce(
+            2,
+            2,
+            AclAction::AddMember {
+                actor: f.a(3).clone(),
+                grants: vec![Grant::Write],
+            },
+            nonce,
+            vec![add_admin.hash()],
+        );
+        // A mint concurrent with the revoke (parent = add_admin), naming only
+        // the legitimate members — it looks clean but predates the fence.
+        let concurrent = f.op(
+            1,
+            1,
+            AclAction::MintEpoch {
+                id: [1u8; 16],
+                gen: 0,
+                key_commit: [0u8; 32],
+                members: vec![f.a(1).clone(), f.a(2).clone()],
+            },
+            vec![add_admin.hash()],
+        );
+        let st = f.replay(&[
+            add_admin.clone(),
+            revoke.clone(),
+            redeem.clone(),
+            concurrent.clone(),
+        ]);
+        assert_eq!(
+            st.rekey_fences().len(),
+            1,
+            "a concurrent epoch does not discharge the fence"
+        );
+
+        // The same set plus a mint that descends the revoke: discharged.
+        let after = f.op(
+            1,
+            1,
+            AclAction::MintEpoch {
+                id: [2u8; 16],
+                gen: 1,
+                key_commit: [0u8; 32],
+                members: vec![f.a(1).clone(), f.a(2).clone()],
+            },
+            vec![revoke.hash(), concurrent.hash()],
+        );
+        let st = f.replay(&[add_admin, revoke, redeem, concurrent, after]);
+        assert!(
+            st.rekey_fences().is_empty(),
+            "an epoch causally after the revoke discharges the fence"
+        );
+        assert!(!st.is_member(f.a(3)), "the eviction still stands");
+    }
+
+    /// A fenced redemption is void, but it must not drag down a seat the actor
+    /// holds legitimately: an admin's direct, nonce-less grant is a standing
+    /// authorization, not an invite admission, so it survives the fence.
+    #[test]
+    fn a_fenced_actor_with_an_independent_grant_keeps_their_seat() {
+        let f = fx(1, &[2, 3]);
+        let add_admin = f.op(
+            1,
+            1,
+            AclAction::AddMember {
+                actor: f.a(2).clone(),
+                grants: vec![Grant::Admin],
+            },
+            vec![],
+        );
+        let nonce = [7u8; 16];
+        let revoke = f.op(
+            1,
+            1,
+            AclAction::RevokeInvite { nonce },
+            vec![add_admin.hash()],
+        );
+        let redeem = f.op_nonce(
+            2,
+            2,
+            AclAction::AddMember {
+                actor: f.a(3).clone(),
+                grants: vec![Grant::Write],
+            },
+            nonce,
+            vec![add_admin.hash()],
+        );
+        // Admin 1 also grants actor 3 directly, with no invite nonce involved.
+        let direct = f.op(
+            1,
+            1,
+            AclAction::AddMember {
+                actor: f.a(3).clone(),
+                grants: vec![Grant::Write],
+            },
+            vec![revoke.hash()],
+        );
+        let st = f.replay(&[add_admin, revoke, redeem, direct]);
+        assert!(
+            st.is_member(f.a(3)),
+            "a standing nonce-less grant is not a spent-nonce admission"
+        );
+        assert!(
+            st.rekey_fences().is_empty(),
+            "no eviction ⇒ no rekey obligation"
+        );
+    }
+
+    /// Discharge is monotone: removing the admin who minted the fencing epoch
+    /// must not re-raise the fence. The rotation was authorized at its causal
+    /// position and already happened — a later demotion cannot un-rotate a key,
+    /// and re-raising would demand a pointless second rotation.
+    #[test]
+    fn a_discharged_fence_survives_its_minter_being_removed() {
+        let f = fx(1, &[2, 3]);
+        let add_admin = f.op(
+            1,
+            1,
+            AclAction::AddMember {
+                actor: f.a(2).clone(),
+                grants: vec![Grant::Admin],
+            },
+            vec![],
+        );
+        let nonce = [7u8; 16];
+        let revoke = f.op(
+            1,
+            1,
+            AclAction::RevokeInvite { nonce },
+            vec![add_admin.hash()],
+        );
+        let redeem = f.op_nonce(
+            2,
+            2,
+            AclAction::AddMember {
+                actor: f.a(3).clone(),
+                grants: vec![Grant::Write],
+            },
+            nonce,
+            vec![add_admin.hash()],
+        );
+        // Admin 2 mints the fencing epoch...
+        let mint = f.op(
+            2,
+            2,
+            AclAction::MintEpoch {
+                id: [1u8; 16],
+                gen: 0,
+                key_commit: [0u8; 32],
+                members: vec![f.a(1).clone(), f.a(2).clone()],
+            },
+            vec![revoke.hash(), redeem.hash()],
+        );
+        let st = f.replay(&[
+            add_admin.clone(),
+            revoke.clone(),
+            redeem.clone(),
+            mint.clone(),
+        ]);
+        assert!(
+            st.rekey_fences().is_empty(),
+            "the mint discharges the fence"
+        );
+
+        // ...and is then removed by the founder.
+        let remove = f.op(
+            1,
+            1,
+            AclAction::RemoveMember {
+                actor: f.a(2).clone(),
+            },
+            vec![mint.hash()],
+        );
+        let st = f.replay(&[add_admin, revoke, redeem, mint, remove]);
+        assert!(!st.is_member(f.a(2)), "the minter is gone");
+        assert!(
+            st.rekey_fences().is_empty(),
+            "a discharged fence never re-raises"
+        );
+    }
+
+    /// The other half of the rule: a redemption the revoke causally succeeds is
+    /// a legitimate, already-completed admission. Revoking afterwards closes the
+    /// invite to future joiners but must NOT retroactively evict that member —
+    /// `RemoveMember` is the tool for that, and it rotates the key.
+    #[test]
+    fn revoke_does_not_evict_a_redemption_it_causally_succeeds() {
+        let f = fx(1, &[2]);
+        let nonce = [8u8; 16];
+        let redeem = f.op_nonce(
+            1,
+            1,
+            AclAction::AddMember {
+                actor: f.a(2).clone(),
+                grants: vec![Grant::Write],
+            },
+            nonce,
+            vec![],
+        );
+        // The revoke declares the redemption as its parent, so it strictly
+        // follows it — the admission was already legitimately complete.
+        let revoke = f.op(1, 1, AclAction::RevokeInvite { nonce }, vec![redeem.hash()]);
+
+        let st = f.replay(&[redeem, revoke]);
+        assert!(
+            st.is_invite_revoked(&nonce),
+            "the invite is closed to future joiners"
+        );
+        assert!(
+            st.is_member(f.a(2)),
+            "a member admitted BEFORE the revoke keeps their seat"
         );
     }
 }

@@ -212,10 +212,7 @@ pub fn found_workspace(
     // workspace id, so the id cannot itself depend on the inception. Derive from
     // the SEED's public key (the inception's author), so the id commits to
     // exactly the key that signs the founding inception.
-    let founding_device = {
-        let sk = ed25519_dalek::SigningKey::from_bytes(device_seed);
-        UserId::from_key_string(data_encoding::HEXLOWER.encode(sk.verifying_key().as_bytes()))
-    };
+    let founding_device = crypto::user_from_seed(device_seed);
     let salt = rand16();
     // Mint the workspace's break-glass recovery key (a solo bootstrap key the
     // founder holds — later elevated to a FROST group key via Rotate) and fold its
@@ -306,8 +303,7 @@ fn rand16() -> [u8; 16] {
 fn mint_recovery() -> ([u8; 32], [u8; 32]) {
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).expect("getrandom");
-    let pk = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
-    let recovery_pub = UserId::from_key_string(data_encoding::HEXLOWER.encode(pk.as_bytes()));
+    let recovery_pub = crypto::user_from_seed(&seed);
     let commit = actor::recovery_commitment(&recovery_pub).expect("valid recovery pubkey");
     (commit, seed)
 }
@@ -377,6 +373,7 @@ fn persist_space_recovery(store: &Store, secret: &[u8; 32]) -> Result<()> {
 /// Errors if the store already holds a workspace; the CLI guarantees it doesn't.
 pub fn join_workspace_store(
     store: &Store,
+    me: &UserId,
     workspace: &str,
     salt: &[u8; 16],
     recovery_root: &[u8; 32],
@@ -403,9 +400,13 @@ pub fn join_workspace_store(
     store.write_genesis(&genesis)?;
     store.save_catalog(&CatalogDoc::empty(Some(store.peer_id())))?;
     // Seed the verified founding inception so the actor plane roots correctly
-    // from the first replay, before any sync.
+    // from the first replay, before any sync. The `apply` is load-bearing, not
+    // decoration: `save_membership` exports, and an export auto-commits whatever
+    // is staged — so without it the actor plane's trust root lands as an
+    // untagged, unattributed commit in every joiner's oplog, forever.
     let membership = MembershipDoc::empty(Some(store.peer_id()));
     membership.add_actor_event(founder_inception)?;
+    membership.apply(&OpCtx::authority("join", me));
     store.save_membership(&membership)?;
     store.commit("join workspace from ticket");
     Ok(ws_id)
@@ -1460,10 +1461,13 @@ impl Tracker {
     }
 
     /// The materialized content-authority state (deterministic replay of the
-    /// encrypted authz DAG against membership, contract §3.4).
+    /// encrypted authz DAG against membership, contract §3.4). Roots on the
+    /// **effective** genesis for the same reason [`Self::acl_state`] does: after
+    /// a break-glass `Recover`, content authority must follow the recovered
+    /// admins, not the superseded birth root.
     fn authz_state(&self) -> authz::AuthzState {
         authz::replay(
-            &self.genesis,
+            &self.effective_genesis(),
             &self.membership.actor_events(),
             &self.membership.ops(),
             &self.catalog.authz_ops(),
@@ -2244,7 +2248,7 @@ impl Tracker {
         // Two admins removing different members concurrently can leave the active
         // epoch sealed to a since-removed actor after merge; re-seal to the true
         // current set (convergent, admin-only).
-        self.heal_stale_epoch()?;
+        self.heal_epoch()?;
         // After a break-glass re-root syncs in, the new root's epochs are all the
         // old (de-authorized) admin's — mint a fresh one so the recovered root has
         // a readable, fenced content key.
@@ -2745,12 +2749,32 @@ impl Tracker {
             Ok(op) => op,
             Err(e) => return (Response::err(format!("{e:#}")), None),
         };
+        // Whether it was *already* spent decides what we can honestly promise.
+        let already_spent = self.acl_state().is_nonce_spent(&nonce);
         if let Err(e) = self.member_apply(op, "invite_revoke", |_| Ok(())) {
             return (Response::err(format!("{e:#}")), None);
         }
+        // Never claim the invite was undone. A redemption that causally precedes
+        // this revoke stands (it was legitimate); a concurrent one is evicted on
+        // merge and the key rotates — but in both cases content already shared
+        // stays readable by whoever was admitted. That is lazy revocation, and
+        // no amount of re-keying closes it.
+        // `spent_nonces` is grow-only, so a spent nonce says an admission
+        // *happened* — not that the actor is still a member. They may have been
+        // removed since. Point at the member list rather than asserting a seat.
+        let message = if already_spent {
+            "the invite had already been redeemed, so revoking it does not undo \
+             that admission. Check the member list and remove the actor if they \
+             should no longer have access."
+        } else {
+            "revoked the invite — it admits no one from here on. If it was \
+             redeemed elsewhere before this synced, that member is removed and \
+             the key rotates on merge, but content shared before then stays \
+             readable by them."
+        };
         (
             Response::Ok {
-                message: Some("revoked the invite — it can no longer admit anyone".into()),
+                message: Some(message.into()),
             },
             Some(DirtySet::catalog(CatalogScope::Acl)),
         )
@@ -3676,7 +3700,7 @@ impl Tracker {
     /// §3.4). Cryptographic provenance, distinct from the advisory activity feed.
     fn member_log_response(&self) -> Response {
         let (_state, audit) = acl::replay_with_audit(
-            &self.genesis,
+            &self.effective_genesis(),
             &self.membership.actor_events(),
             &self.membership.ops(),
         );
@@ -3974,10 +3998,7 @@ impl Tracker {
         // current device set (a genuine recovery runs from a fresh device that is
         // not in the set). The actor whose standing commitment matches our
         // recovery key is the one we can recover.
-        let recovery_pub = {
-            let pk = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
-            UserId::from_key_string(data_encoding::HEXLOWER.encode(pk.as_bytes()))
-        };
+        let recovery_pub = crypto::user_from_seed(&seed);
         let commit = actor::recovery_commitment(&recovery_pub);
         let plane = self.actor_plane();
         let Some(actor) = plane
@@ -4062,7 +4083,7 @@ impl Tracker {
     /// A removed actor's devices are never in this set — the lazy-revocation
     /// fence. Concurrent rotations mint distinct ids, so they coexist rather than
     /// clobber; the deterministic active tip picks one for encryption and
-    /// [`heal_stale_epoch`] re-rotates if a merge leaves the tip sealed to a
+    /// [`heal_epoch`] re-rotates if a merge leaves the tip sealed to a
     /// since-removed actor.
     ///
     /// The mint is a **signed [`acl::AclAction::MintEpoch`]** authored as our own
@@ -4072,7 +4093,7 @@ impl Tracker {
     /// this degrades gracefully rather than splitting state. The op commits to
     /// `blake3(new_key)`, binding the sealed envelopes we write next.
     ///
-    /// [`heal_stale_epoch`]: Self::heal_stale_epoch
+    /// [`heal_epoch`]: Self::heal_epoch
     fn rotate_key(&mut self) -> Result<()> {
         let gen = match self.active_epoch() {
             Some(e) => e
@@ -4147,44 +4168,103 @@ impl Tracker {
         Ok(())
     }
 
-    /// Convergent re-seal: if the active epoch's recorded recipient set still
-    /// includes an actor who is no longer a member (a concurrent removal of a
-    /// *different* member left a stale tip), mint a fresh epoch sealed to the
-    /// actual current member set. Deterministic + monotone (the fresh epoch has a
-    /// higher generation and a correct recipient set, so it is not itself stale),
-    /// so all admins converge on a fenced tip. Admin-only; a non-admin waits.
-    fn heal_stale_epoch(&mut self) -> Result<()> {
-        let Some(active) = self.active_epoch() else {
-            return Ok(());
-        };
-        // Only an admin can mint, so only an admin can heal.
+    /// Convergent re-key, covering both reasons a merge can leave the tip unfit.
+    /// Admin-only (only an admin can mint); a non-admin waits — see
+    /// [`rekey_pending_notice`] for what it is told meanwhile.
+    ///
+    /// **Staleness** — the active epoch is compromised or unusable:
+    /// - its *minter* is no longer a member — a departed member controlled its
+    ///   recipient list and knows its key, so it must not linger as the tip;
+    /// - a *declared recipient* is no longer a member (a concurrent removal left
+    ///   a stale tip); or
+    /// - we hold admin standing yet cannot open it — a peer minted an epoch we
+    ///   have no key for, so content is frozen under it (liveness).
+    ///
+    /// **Revoke fences** — replay evicted an actor whose invite was revoked
+    /// concurrently with their redemption ([`acl::RekeyFence`]). They are out of
+    /// the member set but still hold every epoch key sealed to them at
+    /// admission, so only a mint *causally after* the revoke fences them off.
+    /// Replay discharges fences it can see satisfied, so a non-empty list is
+    /// exactly the outstanding work.
+    ///
+    /// Both are evaluated against **one** ACL snapshot and discharged by **one**
+    /// rotation: a fresh mint rides the current frontier, so it descends every
+    /// outstanding fence at once and is itself neither stale nor fenced. Two
+    /// separately effectful heals would let the first rotate and the second
+    /// mint again off a pre-rotation snapshot.
+    ///
+    /// Unstaggered on purpose: each observing admin may mint once, concurrent
+    /// mints share a generation, `(gen, id)` selects deterministically, and the
+    /// next import sees the fences discharged and stops. Bounded and convergent,
+    /// the same shape the staleness heal already relied on.
+    ///
+    /// [`rekey_pending_notice`]: Self::rekey_pending_notice
+    fn heal_epoch(&mut self) -> Result<()> {
+        // Only an admin can mint, so only an admin can heal. Note this is the
+        // *only* gate: `rotate_key` draws a fresh random key and seals it with
+        // public device identities, so it never needs the outgoing key —
+        // gating on possession would strand the admin who cannot open the tip,
+        // which is precisely the `unopenable` case below.
         if !self.am_i_admin() {
             return Ok(());
         }
-        let members: std::collections::BTreeSet<ActorId> = self
-            .acl_state()
-            .members()
-            .into_iter()
-            .map(|(a, _)| a)
-            .collect();
-        // Re-key the active tip if it is compromised or unusable:
-        // - its *minter* is no longer a member — a departed member controlled
-        //   its recipient list and knows its key, so it must not linger as the
-        //   tip (the revocation fence the self-declared `members` list can't give);
-        // - a *declared recipient* is no longer a member (a concurrent removal
-        //   left a stale tip); or
-        // - we hold admin standing yet cannot open it — a peer minted an epoch
-        //   we have no key for, so content is frozen under it (liveness). A fresh
-        //   mint sealed to the true member set supersedes it and every replica
-        //   converges.
-        let minter_gone = !members.contains(&active.minted_by);
-        let recipient_gone = active.members.iter().any(|m| !members.contains(m));
-        let unopenable = !self.keyring.contains_key(&active.id);
-        if minter_gone || recipient_gone || unopenable {
+        let acl = self.acl_state();
+        let stale = match self.active_epoch() {
+            Some(active) => {
+                let members: std::collections::BTreeSet<ActorId> =
+                    acl.members().into_iter().map(|(a, _)| a).collect();
+                let minter_gone = !members.contains(&active.minted_by);
+                let recipient_gone = active.members.iter().any(|m| !members.contains(m));
+                let unopenable = !self.keyring.contains_key(&active.id);
+                minter_gone || recipient_gone || unopenable
+            }
+            // No epoch yet ⇒ nothing to be stale. A fence is still actionable.
+            None => false,
+        };
+        if stale || !acl.rekey_fences().is_empty() {
             self.rotate_key()?;
             self.persist_membership("epoch_heal")?;
         }
         Ok(())
+    }
+
+    /// Outstanding rekey obligations this node cannot discharge itself, for the
+    /// status surface. `Some` only when we are **not** an admin (an admin heals
+    /// on import instead of reporting), so a plain member learns that a revoked
+    /// invite's admittee still holds live keys until an admin syncs.
+    ///
+    /// Callers must not describe this as the invite being undone. Rotation
+    /// fences *future* content only: everything encrypted under the epochs the
+    /// evicted actor was sealed stays readable by them permanently (lazy
+    /// revocation — see [`acl::RekeyFence`]).
+    ///
+    /// The wording says *may* hold *a* key, not *the current* key: which epoch
+    /// is the active tip is decided by `(gen, id)` selection, and a concurrent
+    /// mint the evicted actor was never sealed can win it. What we can state is
+    /// that they hold a workspace key able to encrypt new content until an admin
+    /// rotates past the fence.
+    pub fn rekey_pending_notice(&self) -> Option<String> {
+        if self.am_i_admin() {
+            return None;
+        }
+        let acl = self.acl_state();
+        let fences = acl.rekey_fences();
+        if fences.is_empty() {
+            return None;
+        }
+        let who: Vec<String> = fences.iter().map(|f| f.evicted.short()).collect();
+        let (subject, verb, key) = if who.len() == 1 {
+            ("was", "has", "a workspace key")
+        } else {
+            ("were", "have", "workspace keys")
+        };
+        Some(format!(
+            "revoked invite: {} {subject} admitted concurrently and {verb} been \
+             removed, but may still hold {key} that can encrypt new content. An \
+             admin must sync to rotate the key. Content already shared remains \
+             readable by them.",
+            who.join(", ")
+        ))
     }
 
     /// **Provider side.** Export the catalog ops a puller at `peer_vv` lacks,
@@ -4487,8 +4567,7 @@ mod tests {
     const ME_SEED: [u8; 32] = [7u8; 32];
     fn me() -> UserId {
         // A real ed25519 key (so the founder can seal the workspace key to itself).
-        let pk = ed25519_dalek::SigningKey::from_bytes(&ME_SEED).verifying_key();
-        UserId::from_key_string(data_encoding::HEXLOWER.encode(pk.as_bytes()))
+        crypto::user_from_seed(&ME_SEED)
     }
 
     struct TestNode {
@@ -4506,8 +4585,7 @@ mod tests {
     }
 
     fn user_from_seed(seed: [u8; 32]) -> UserId {
-        let pk = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
-        UserId::from_key_string(data_encoding::HEXLOWER.encode(pk.as_bytes()))
+        crypto::user_from_seed(&seed)
     }
 
     /// A single-device actor inception for `seed` in `t`'s workspace (a joiner's
@@ -4561,7 +4639,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&home).unwrap();
         let store = Store::open(&home).unwrap();
-        join_workspace_store(&store, ws, &proof.0, &proof.1, &proof.2).unwrap();
+        join_workspace_store(&store, &user, ws, &proof.0, &proof.1, &proof.2).unwrap();
         let clock = FakeClock::new(1_000_000 + seed[0] as u64 * 100_000);
         let tracker = Tracker::open(store, user, "tester".into(), seed, Box::new(clock)).unwrap();
         TestNode { tracker, home }
@@ -5498,7 +5576,7 @@ mod tests {
         );
 
         // Heal: A sees the tip was minted by a non-member and re-keys.
-        a.tracker.heal_stale_epoch().unwrap();
+        a.tracker.heal_epoch().unwrap();
         let healed = a.tracker.active_epoch().unwrap();
         assert_eq!(healed.minted_by, a_actor, "A re-keyed the tip away from B");
         assert!(
@@ -5629,7 +5707,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&forged_home).unwrap();
         let forged_store = Store::open(&forged_home).unwrap();
-        let err = join_workspace_store(&forged_store, &a_ws, &a_salt, &a_rr, &b_incept);
+        let err = join_workspace_store(&forged_store, &me(), &a_ws, &a_salt, &a_rr, &b_incept);
         assert!(
             err.is_err(),
             "a ticket rooting on the inviter's inception is rejected, not forked"
@@ -5939,6 +6017,224 @@ mod tests {
             "{resp:?}"
         );
         assert!(a.tracker.is_member_actor(&j_actor));
+    }
+
+    /// Unstaggered repair is bounded: admins that observe the fence independently
+    /// each mint once, the concurrent mints converge by `(gen, id)`, and once a
+    /// discharging epoch is visible no further import mints again.
+    ///
+    /// Only two of the three can race by construction — B has to redeem *before*
+    /// seeing the revoke (`redeem_invite` refuses a revoked nonce outright), so
+    /// B necessarily learns of the fence together with someone's mint. That is
+    /// itself the stop-minting property, asserted at the end.
+    #[test]
+    fn concurrent_fence_repairs_converge_and_then_stop() {
+        let mut a = new_node(); // founder + admin A
+        with_project(&mut a.tracker);
+        new_issue(&mut a.tracker, "secret");
+        let a_ws = a.tracker.workspace_str();
+        let proof = a.tracker.founding_proof().unwrap();
+
+        // B and C join as admins.
+        let b_seed = [21u8; 32];
+        let b_user = user_from_seed(b_seed);
+        let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, &proof);
+        let c_seed = [31u8; 32];
+        let mut c = new_joiner_node_as(user_from_seed(c_seed), c_seed, &a_ws, &proof);
+        for incept in [
+            b.tracker.self_inception().unwrap(),
+            c.tracker.self_inception().unwrap(),
+        ] {
+            let (resp, _) = a
+                .tracker
+                .admit_member(&incept, vec![Grant::Admin, Grant::Write]);
+            assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        }
+        sync_all(&mut a.tracker, &mut b.tracker);
+        sync_all(&mut a.tracker, &mut c.tracker);
+        let gen_before = a.tracker.active_epoch().unwrap().gen;
+
+        // ---- PARTITION: B redeems, A revokes ----
+        let nonce = [7u8; 16];
+        let x_seed = [61u8; 32];
+        let x_user = user_from_seed(x_seed);
+        let x_incept = incept_for(x_seed, &b.tracker);
+        let x_actor = actor_of(&x_incept);
+        let (resp, _) = b.tracker.redeem_invite(&b_user, &x_incept, &nonce, true);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        let (resp, _) = a
+            .tracker
+            .invite_revoke_cmd(data_encoding::HEXLOWER.encode(&nonce));
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+
+        // C sees the redemption first (no fence yet), then the revoke — so C
+        // raises the fence and repairs without having seen anyone else's mint.
+        sync_membership(&mut b.tracker, &mut c.tracker);
+        assert_eq!(
+            c.tracker.active_epoch().unwrap().gen,
+            gen_before,
+            "a redemption alone raises no fence"
+        );
+        sync_membership(&mut a.tracker, &mut c.tracker);
+        // A independently receives the redemption and repairs too.
+        sync_membership(&mut b.tracker, &mut a.tracker);
+
+        let a_epoch = a.tracker.active_epoch().unwrap();
+        let c_epoch = c.tracker.active_epoch().unwrap();
+        assert_eq!(
+            (a_epoch.gen, c_epoch.gen),
+            (gen_before + 1, gen_before + 1),
+            "both admins minted once, at the same generation"
+        );
+        assert_ne!(a_epoch.id, c_epoch.id, "the mints are genuinely concurrent");
+
+        // ---- MERGE: converge on one tip ----
+        sync_membership(&mut a.tracker, &mut c.tracker);
+        sync_membership(&mut c.tracker, &mut a.tracker);
+        let winner = a.tracker.active_epoch().unwrap();
+        assert_eq!(
+            c.tracker.active_epoch().unwrap().id,
+            winner.id,
+            "(gen, id) selects one tip on both replicas"
+        );
+        assert_eq!(
+            winner.gen,
+            gen_before + 1,
+            "converging on a concurrent mint does not escalate the generation"
+        );
+
+        // B learns of the fence and a discharging epoch together: no new mint.
+        sync_membership(&mut a.tracker, &mut b.tracker);
+        assert_eq!(
+            b.tracker.active_epoch().unwrap().id,
+            winner.id,
+            "B adopts the fenced tip rather than minting again"
+        );
+        // And a further round of imports is inert everywhere.
+        sync_membership(&mut b.tracker, &mut a.tracker);
+        sync_membership(&mut a.tracker, &mut c.tracker);
+        assert_eq!(
+            a.tracker.active_epoch().unwrap().id,
+            winner.id,
+            "a satisfied fence never re-raises"
+        );
+        assert_eq!(c.tracker.active_epoch().unwrap().id, winner.id);
+
+        // The security property, on the tip everyone settled on.
+        for node in [&a, &b, &c] {
+            assert!(!node.tracker.is_member_actor(&x_actor), "X is evicted");
+            assert!(
+                node.tracker.acl_state().rekey_fences().is_empty(),
+                "no outstanding obligation"
+            );
+            assert!(
+                !node
+                    .tracker
+                    .membership
+                    .sealed_devices(&winner.id)
+                    .contains(&x_user),
+                "X holds no key for the converged tip"
+            );
+        }
+    }
+
+    /// End-to-end kill switch across a partition: A revokes a leaked invite
+    /// while B concurrently redeems it. After merge the admitted actor must be
+    /// out of the member set *and* fenced off the live key.
+    ///
+    /// The fence has to be **causal**, not a recipient-list comparison, and this
+    /// test pins why: `seal_epochs_to_actor` seals epochs to a joiner by writing
+    /// blobs into the membership store without ever touching `EpochAuth.members`,
+    /// so the admitted actor holds the live key while absent from its declared
+    /// recipient list. The asserts below show every state trigger reading
+    /// "healthy" at the moment the key is compromised.
+    #[test]
+    fn a_concurrently_revoked_invite_is_fenced_by_an_automatic_rekey() {
+        let mut a = new_node(); // founder + admin A
+        with_project(&mut a.tracker);
+        new_issue(&mut a.tracker, "secret");
+        let a_ws = a.tracker.workspace_str();
+
+        // B joins as a second ADMIN and syncs.
+        let b_seed = [21u8; 32];
+        let b_user = user_from_seed(b_seed);
+        let mut b = new_joiner_node_as(
+            b_user.clone(),
+            b_seed,
+            &a_ws,
+            &a.tracker.founding_proof().unwrap(),
+        );
+        let b_incept = b.tracker.self_inception().unwrap();
+        let (resp, _) = a
+            .tracker
+            .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        sync_all(&mut a.tracker, &mut b.tracker);
+        let epoch_before = b.tracker.active_epoch().expect("an epoch exists");
+
+        // ---- PARTITION ----
+        // A revokes the leaked invite.
+        let nonce = [7u8; 16];
+        let (resp, _) = a
+            .tracker
+            .invite_revoke_cmd(data_encoding::HEXLOWER.encode(&nonce));
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+
+        // B, not having seen the revoke, redeems it for X — sealing X the epochs
+        // live at that moment.
+        let x_seed = [61u8; 32];
+        let x_user = user_from_seed(x_seed);
+        let x_incept = incept_for(x_seed, &b.tracker);
+        let x_actor = actor_of(&x_incept);
+        let (resp, _) = b.tracker.redeem_invite(&b_user, &x_incept, &nonce, true);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        assert!(
+            b.tracker
+                .membership
+                .sealed_devices(&epoch_before.id)
+                .contains(&x_user),
+            "X holds the live epoch's key"
+        );
+        assert!(
+            !epoch_before.members.contains(&x_actor),
+            "yet X never appears in that epoch's declared recipient list — the \
+             blind spot a recipient-set trigger cannot see through"
+        );
+
+        // ---- MERGE ----
+        sync_membership(&mut b.tracker, &mut a.tracker);
+        sync_membership(&mut a.tracker, &mut b.tracker);
+
+        // Revoke wins: X is out, and the fence was discharged by a rotation.
+        assert!(
+            !a.tracker.is_member_actor(&x_actor),
+            "revoke wins over the concurrent redemption"
+        );
+        assert!(
+            a.tracker.acl_state().rekey_fences().is_empty(),
+            "the rekey obligation was discharged automatically on import"
+        );
+        let active = a.tracker.active_epoch().unwrap();
+        assert!(
+            active.gen > epoch_before.gen,
+            "an admin rotated past the fence on merge"
+        );
+        assert!(
+            !a.tracker
+                .membership
+                .sealed_devices(&active.id)
+                .contains(&x_user),
+            "the evicted actor holds no key for the fenced epoch"
+        );
+
+        // Convergent: B lands on the same tip and mints nothing further.
+        let gen_after = active.gen;
+        sync_membership(&mut a.tracker, &mut b.tracker);
+        assert_eq!(
+            b.tracker.active_epoch().map(|e| e.gen),
+            Some(gen_after),
+            "B converges on the fenced tip without minting again"
+        );
     }
 
     #[test]
