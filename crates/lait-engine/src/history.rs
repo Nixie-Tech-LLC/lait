@@ -7,6 +7,15 @@
 //! Legacy changes (written before the contract) surface honestly: ts 0, no
 //! kind, no actor, possibly many fields fused into one change.
 //!
+//! **Two identities, deliberately not unified.** Anything this module reads
+//! *out of the document* — comment authors, assignees — is an [`ActorId`]: a
+//! person, stable across their devices. Anything read *off the change itself*
+//! (`DocChange::actor`, `ImportDelta::actors`) is a [`UserId`]: the device that
+//! committed, self-asserted in the commit message. The feed keeps them apart on
+//! purpose — "who wrote this" and "which device landed it" answer different
+//! questions, and collapsing the latter into an actor loses the fact you want
+//! when a single device is misbehaving.
+//!
 //! Collision detection is the DAG fact, not a heuristic: a change whose deps
 //! differ from the walk's running head-set sits on a concurrent branch
 //! (SCHEMA A§9's LWW collision note — the compensating control for LWW
@@ -16,11 +25,10 @@ use std::collections::{HashMap, HashSet};
 
 use loro::{Container, Frontiers, LoroDoc, ID};
 
-use crate::dto::{CommentDto, FieldChange};
-use crate::ids::UserId;
+use crate::dto::{self, CommentDto, CorruptRecord, FieldChange, Projected};
+use crate::ids::{ActorId, UserId};
 
-use crate::issue::IssueDoc;
-use crate::loro_ext as lx;
+use crate::issue::{project_comment, IssueDoc};
 use crate::op::OpMeta;
 
 /// One oplog change of an issue doc, projected for the history feed.
@@ -28,7 +36,9 @@ use crate::op::OpMeta;
 pub struct DocChange {
     /// Request kind from the commit message (`None` for legacy changes).
     pub kind: Option<String>,
-    /// Advisory actor claim from the commit message (non-goal 6).
+    /// The **device** that committed, as claimed in the commit message — a
+    /// `committedBy` stamp, not authorship. Advisory and self-asserted
+    /// (non-goal 6); never resolved to an actor. See the module note.
     pub actor: Option<UserId>,
     /// Unix seconds (0 on legacy changes written before `record_timestamp`).
     pub ts: u64,
@@ -36,7 +46,12 @@ pub struct DocChange {
     pub collision: bool,
     pub changes: Vec<FieldChange>,
     /// Comments introduced by this change (bodies for the feed's text line).
+    /// Valid records only — see [`DocChange::corrupt_records`].
     pub comments: Vec<CommentDto>,
+    /// Records this change introduced that failed to project. Kept beside the
+    /// typed list so the feed can note "this change landed a malformed record"
+    /// without a consumer ever mistaking one for a real comment.
+    pub corrupt_records: Vec<CorruptRecord>,
 }
 
 /// What an import brought in, derived from `diff(before, after)` — positional
@@ -49,12 +64,21 @@ pub struct ImportDelta {
     /// captured if it needs one).
     pub fields: Vec<FieldChange>,
     /// Exactly the comments that are new to this replica, wherever they merged.
+    /// Valid records only — see [`ImportDelta::corrupt_records`].
     pub new_comments: Vec<CommentDto>,
-    pub assignee_added: Vec<UserId>,
-    pub assignee_removed: Vec<UserId>,
+    /// Incoming records that failed to project. A remote peer is the *likeliest*
+    /// source of malformed data, so an import is exactly where dropping it
+    /// silently would be worst: this is the audit trail for a peer writing
+    /// records that don't conform.
+    pub corrupt_records: Vec<CorruptRecord>,
+    /// Assignees are **actors** (S§5.2) — assignment follows the person, not
+    /// the device they happened to be on.
+    pub assignee_added: Vec<ActorId>,
+    pub assignee_removed: Vec<ActorId>,
     /// DAG concurrency: the import created (or extended) a concurrent branch.
     pub collision: bool,
-    /// Distinct advisory actors of the incoming changes (commit messages).
+    /// Distinct committing **devices** of the incoming changes, from their
+    /// commit messages. Advisory (non-goal 6); see [`DocChange::actor`].
     pub actors: Vec<UserId>,
     /// Distinct request kinds of the incoming changes.
     pub kinds: Vec<String>,
@@ -111,14 +135,20 @@ pub fn issue_history(issue: &IssueDoc) -> Vec<DocChange> {
         }
         heads.insert(end);
 
-        let (mut fields, comments, adds, removes) = extract(doc, &deps, &Frontiers::from(end));
+        let Extracted {
+            mut fields,
+            comments,
+            assignee_added,
+            assignee_removed,
+            corrupt_records,
+        } = extract(doc, &deps, &Frontiers::from(end));
         for f in &mut fields {
             f.from = last_seen.get(&f.field).cloned();
             if let Some(to) = &f.to {
                 last_seen.insert(f.field.clone(), to.clone());
             }
         }
-        fields.extend(set_changes(&adds, &removes));
+        fields.extend(set_changes(&assignee_added, &assignee_removed));
         let meta = OpMeta::parse(message.as_deref());
         let actor = meta.actor_id();
         out.push(DocChange {
@@ -128,6 +158,7 @@ pub fn issue_history(issue: &IssueDoc) -> Vec<DocChange> {
             collision,
             changes: fields,
             comments,
+            corrupt_records,
         });
     }
     out
@@ -144,8 +175,13 @@ pub fn import_delta(issue: &IssueDoc, mark: &ImportMark) -> ImportDelta {
     // Two-plus heads after import = the incoming ops were concurrent with a
     // local branch (a fast-forward import keeps a single head — verified).
     let collision = after.len() > 1;
-    let (fields, new_comments, assignee_added, assignee_removed) =
-        extract(doc, &mark.frontiers, &after);
+    let Extracted {
+        fields,
+        comments: new_comments,
+        assignee_added,
+        assignee_removed,
+        corrupt_records,
+    } = extract(doc, &mark.frontiers, &after);
 
     // Attribution of the incoming changes rides in their commit messages.
     let mut actors = Vec::new();
@@ -173,6 +209,7 @@ pub fn import_delta(issue: &IssueDoc, mark: &ImportMark) -> ImportDelta {
     ImportDelta {
         fields,
         new_comments,
+        corrupt_records,
         assignee_added,
         assignee_removed,
         collision,
@@ -182,19 +219,19 @@ pub fn import_delta(issue: &IssueDoc, mark: &ImportMark) -> ImportDelta {
 }
 
 /// Render assignee set membership changes as field transitions.
-fn set_changes(adds: &[UserId], removes: &[UserId]) -> Vec<FieldChange> {
+fn set_changes(adds: &[ActorId], removes: &[ActorId]) -> Vec<FieldChange> {
     let mut out = Vec::new();
-    for u in adds {
+    for a in adds {
         out.push(FieldChange {
             field: "assignees".into(),
             from: None,
-            to: Some(u.short()),
+            to: Some(a.short()),
         });
     }
-    for u in removes {
+    for a in removes {
         out.push(FieldChange {
             field: "assignees".into(),
-            from: Some(u.short()),
+            from: Some(a.short()),
             to: None,
         });
     }
@@ -205,20 +242,35 @@ fn set_changes(adds: &[UserId], removes: &[UserId]) -> Vec<FieldChange> {
 /// presence in a diff is noise.
 const IDENTITY_KEYS: [&str; 4] = ["id", "workspaceId", "createdBy", "createdAt"];
 
-type Extracted = (Vec<FieldChange>, Vec<CommentDto>, Vec<UserId>, Vec<UserId>);
+/// What one `diff(from, to)` batch yielded. A struct rather than a tuple: the
+/// corruption sidecar makes five fields, and positional returns stop being
+/// readable well before that.
+#[derive(Default)]
+struct Extracted {
+    fields: Vec<FieldChange>,
+    comments: Vec<CommentDto>,
+    assignee_added: Vec<ActorId>,
+    assignee_removed: Vec<ActorId>,
+    corrupt_records: Vec<CorruptRecord>,
+}
 
 /// Map a `diff(from, to)` batch onto issue-schema semantics: root-map LWW
 /// fields, the assignees/labels present-key sets, new comments, description
 /// edits. Container identity is resolved via its path from the root, so the
 /// extraction survives any container-id representation.
 fn extract(doc: &LoroDoc, from: &Frontiers, to: &Frontiers) -> Extracted {
-    let mut fields = Vec::new();
-    let mut comments = Vec::new();
-    let mut assignee_added = Vec::new();
-    let mut assignee_removed = Vec::new();
+    let mut out = Extracted::default();
     let Ok(batch) = doc.diff(from, to) else {
-        return (fields, comments, assignee_added, assignee_removed);
+        return out;
     };
+    let Extracted {
+        fields,
+        comments,
+        assignee_added,
+        assignee_removed,
+        corrupt_records,
+    } = &mut out;
+    let mut projected_comments: Vec<Projected<CommentDto>> = Vec::new();
     for (cid, diff) in batch.iter() {
         let field = container_field(doc, cid);
         match (field.as_deref(), diff) {
@@ -241,11 +293,25 @@ fn extract(doc: &LoroDoc, from: &Frontiers, to: &Frontiers) -> Extracted {
             }
             (Some("assignees"), loro::event::Diff::Map(md)) => {
                 for (k, v) in md.updated.iter() {
-                    let user = UserId::from_key_string(k.to_string());
+                    // The set is keyed by `ActorId`, so a key that isn't one is
+                    // corruption. Neither laundered (a wrapped-unvalidated id
+                    // mis-attributes the change downstream) nor dropped (which
+                    // would make an assignment silently not happen, with nothing
+                    // anywhere to say why) — reported, and the caller decides.
+                    let Some(actor) = ActorId::parse(k) else {
+                        corrupt_records.push(
+                            CorruptRecord::new(
+                                format!("assignees[{k}]"),
+                                "assignee key: not an ActorId",
+                            )
+                            .with_raw("key", k.to_string()),
+                        );
+                        continue;
+                    };
                     if v.is_some() {
-                        assignee_added.push(user);
+                        assignee_added.push(actor);
                     } else {
-                        assignee_removed.push(user);
+                        assignee_removed.push(actor);
                     }
                 }
             }
@@ -262,15 +328,17 @@ fn extract(doc: &LoroDoc, from: &Frontiers, to: &Frontiers) -> Extracted {
                 for item in items {
                     if let loro::event::ListDiffItem::Insert { insert, .. } = item {
                         for voc in insert {
-                            if let loro::ValueOrContainer::Container(Container::Map(m)) = voc {
-                                comments.push(CommentDto {
-                                    author: UserId::from_key_string(
-                                        lx::get_str(m, "author").unwrap_or_default(),
-                                    ),
-                                    author_nick: None,
-                                    ts: lx::get_u64(m, "ts").unwrap_or(0),
-                                    body: lx::get_str(m, "body").unwrap_or_default(),
-                                });
+                            // The locus is the position within *this diff*, not
+                            // within the document — a diff doesn't know where
+                            // its inserts landed in the merged list.
+                            let locus = format!("comments+[{}]", projected_comments.len());
+                            match voc {
+                                loro::ValueOrContainer::Container(Container::Map(m)) => {
+                                    projected_comments.push(project_comment(m, locus));
+                                }
+                                _ => projected_comments.push(Projected::Corrupt(
+                                    CorruptRecord::new(locus, "list element is not a map"),
+                                )),
                             }
                         }
                     }
@@ -286,7 +354,10 @@ fn extract(doc: &LoroDoc, from: &Frontiers, to: &Frontiers) -> Extracted {
             _ => {}
         }
     }
-    (fields, comments, assignee_added, assignee_removed)
+    let (valid, corrupt) = dto::partition(projected_comments);
+    comments.extend(valid);
+    corrupt_records.extend(corrupt);
+    out
 }
 
 /// Resolve which issue-schema field a container diff belongs to: the root map

@@ -127,13 +127,8 @@ fn found_home(home: &Path) {
 fn join_home(home: &Path, ticket: &str) {
     let t: lait::proto::WorkspaceTicket = ticket.parse().expect("parse ticket");
     let store = lait::store::Store::open(home).expect("store");
-    // The SAME identity the daemon will boot with — the advisory commit stamp on
-    // the seeded founding inception must name this device, not a placeholder.
-    let key = lait::config::load_or_create_identity(home).expect("identity");
-    let joiner = lait::crypto::user_from_seed(&key);
     lait::tracker::join_workspace_store(
         &store,
-        &joiner,
         &t.workspace,
         &t.salt,
         &t.recovery_root,

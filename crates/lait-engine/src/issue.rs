@@ -20,11 +20,47 @@
 use anyhow::{anyhow, Result};
 use loro::{ExportMode, Frontiers, LoroDoc};
 
-use crate::dto::{CommentDto, Priority, DEFAULT_STATUS};
+use crate::dto::{CommentDto, CorruptRecord, Priority, Projected, DEFAULT_STATUS};
 use crate::ids::{ActorId, DocId, LabelId, ProjectId, UserId, WorkspaceId};
 
 use crate::loro_ext as lx;
 use crate::op::{self, OpCtx};
+
+/// Project one stored comment map into a [`CommentDto`], or say why it isn't
+/// one. The single definition of "is this comment well-formed", shared by the
+/// document read ([`IssueDoc::comments`]) and the oplog diff walk
+/// ([`crate::history`]) so the two can never disagree about the same record.
+///
+/// Only `author` is a corruption trigger. It is the field with no defensible
+/// default: the schema types it [`ActorId`], and any substitute — a sentinel, a
+/// laundered string — is a well-typed lie that mis-attributes authorship
+/// downstream. `ts` and `body` keep their tolerant defaults (0 / empty) because
+/// a comment with a missing timestamp or an empty body is still a comment a
+/// person can read and act on; degrading it to a corruption report would hide
+/// real content behind a diagnostic.
+pub(crate) fn project_comment(m: &loro::LoroMap, locus: String) -> Projected<CommentDto> {
+    let raw_author = lx::get_str(m, "author");
+    let Some(author) = raw_author.as_deref().and_then(ActorId::parse) else {
+        let reason = match &raw_author {
+            Some(_) => "author: not an ActorId",
+            None => "author: absent",
+        };
+        let mut record = CorruptRecord::new(locus, reason);
+        if let Some(a) = raw_author {
+            record = record.with_raw("author", a);
+        }
+        if let Some(b) = lx::get_str(m, "body") {
+            record = record.with_raw("body", b);
+        }
+        return Projected::Corrupt(record);
+    };
+    Projected::Valid(CommentDto {
+        author,
+        author_nick: None,
+        ts: lx::get_u64(m, "ts").unwrap_or(0),
+        body: lx::get_str(m, "body").unwrap_or_default(),
+    })
+}
 
 const ROOT: &str = "issue";
 const K_ID: &str = "id";
@@ -236,24 +272,33 @@ impl IssueDoc {
         out
     }
 
-    /// Comments in insertion order (S§5.3).
-    pub fn comments(&self) -> Vec<CommentDto> {
+    /// Comments in insertion order (S§5.3), each either projected or reported
+    /// corrupt. Nothing is dropped: a malformed element keeps its position in
+    /// the sequence, so the caller's counts stay right and a peer writing bad
+    /// records stays visible instead of silently vanishing.
+    pub fn comments(&self) -> Vec<Projected<CommentDto>> {
         let Some(list) = self.comments_list() else {
             return Vec::new();
         };
         let mut out = Vec::new();
         for i in 0..list.len() {
-            let Some(v) = list.get(i) else { continue };
-            let m = match v {
-                loro::ValueOrContainer::Container(loro::Container::Map(m)) => m,
-                _ => continue,
+            let locus = format!("comments[{i}]");
+            let Some(v) = list.get(i) else {
+                out.push(Projected::Corrupt(CorruptRecord::new(
+                    locus,
+                    "list element is absent",
+                )));
+                continue;
             };
-            out.push(CommentDto {
-                author: UserId::from_key_string(lx::get_str(&m, "author").unwrap_or_default()),
-                author_nick: None,
-                ts: lx::get_u64(&m, "ts").unwrap_or(0),
-                body: lx::get_str(&m, "body").unwrap_or_default(),
-            });
+            match v {
+                loro::ValueOrContainer::Container(loro::Container::Map(m)) => {
+                    out.push(project_comment(&m, locus));
+                }
+                _ => out.push(Projected::Corrupt(CorruptRecord::new(
+                    locus,
+                    "list element is not a map",
+                ))),
+            }
         }
         out
     }
@@ -320,8 +365,13 @@ impl IssueDoc {
         Ok(())
     }
 
-    /// Append an immutable comment (S§5.3).
-    pub fn add_comment(&self, author: &UserId, ts: u64, body: &str) -> Result<()> {
+    /// Append an immutable comment (S§5.3). `author` is the **actor**, not the
+    /// signing device: a comment is authored by a person, so attribution must
+    /// survive that person adding, rotating, or recovering a device. The device
+    /// that committed is still recorded — advisorily, on the change itself, via
+    /// [`OpCtx`] — so "who wrote it" and "which device landed it" stay separate
+    /// facts, exactly as [`NewIssue::created_by`] / [`NewIssue::committed_by`].
+    pub fn add_comment(&self, author: &ActorId, ts: u64, body: &str) -> Result<()> {
         let list = self
             .comments_list()
             .ok_or_else(|| anyhow!("comments container missing"))?;
@@ -432,13 +482,79 @@ mod tests {
     #[test]
     fn comments_append_immutably() {
         let i = sample();
-        i.add_comment(&user(), 10, "first").unwrap();
-        i.add_comment(&user(), 20, "second").unwrap();
+        i.add_comment(&actor('a'), 10, "first").unwrap();
+        i.add_comment(&actor('a'), 20, "second").unwrap();
         i.apply(&ctx("commented"));
-        let cs = i.comments();
+        let (cs, corrupt) = crate::dto::partition(i.comments());
+        assert!(corrupt.is_empty());
         assert_eq!(cs.len(), 2);
         assert_eq!(cs[0].body, "first");
         assert_eq!(cs[1].ts, 20);
+        assert_eq!(cs[0].author, actor('a'));
+    }
+
+    /// The point of actor-authored comments: one person on two devices is one
+    /// author. `add_comment` never sees a device key, so there is no way for
+    /// the authoring device to leak into attribution — and a later revoke of
+    /// that device cannot orphan the comment.
+    #[test]
+    fn comment_author_is_the_actor_not_the_device() {
+        let i = sample();
+        i.add_comment(&actor('b'), 10, "from laptop").unwrap();
+        i.add_comment(&actor('b'), 20, "from phone").unwrap();
+        i.apply(&ctx("commented"));
+        let (cs, _) = crate::dto::partition(i.comments());
+        let authors: Vec<_> = cs.iter().map(|c| c.author.clone()).collect();
+        assert_eq!(
+            authors,
+            vec![actor('b'), actor('b')],
+            "the same actor on two devices is one author"
+        );
+    }
+
+    /// The corruption policy, end to end. A comment whose stored `author` is not
+    /// an `ActorId` must not be dropped (the count would lie and the bad record
+    /// would be invisible), must not be laundered into a well-typed fake, and
+    /// must not degrade `CommentDto` into an optional-author shape. It is lifted
+    /// out as a `CorruptRecord` that names where it sat and what was wrong.
+    #[test]
+    fn malformed_comment_author_is_reported_not_dropped_or_laundered() {
+        let i = sample();
+        i.add_comment(&actor('a'), 10, "well-formed").unwrap();
+        // Write a comment the typed API cannot express: author is a device key,
+        // not an actor id — exactly the pre-cutover shape a stale peer would send.
+        let list = i.comments_list().unwrap();
+        let m = list
+            .insert_container(list.len(), loro::LoroMap::new())
+            .unwrap();
+        m.insert("author", "a".repeat(64).as_str()).unwrap();
+        m.insert("ts", 20i64).unwrap();
+        m.insert("body", "from a stale peer").unwrap();
+        i.apply(&ctx("commented"));
+
+        let projected = i.comments();
+        assert_eq!(projected.len(), 2, "nothing is dropped");
+        let (valid, corrupt) = crate::dto::partition(projected);
+
+        assert_eq!(
+            valid.len(),
+            1,
+            "only the well-formed comment is a CommentDto"
+        );
+        assert_eq!(valid[0].author, actor('a'));
+
+        assert_eq!(corrupt.len(), 1);
+        assert_eq!(corrupt[0].locus, "comments[1]", "position is preserved");
+        assert!(
+            corrupt[0].reason.contains("author"),
+            "names the failing field: {}",
+            corrupt[0].reason
+        );
+        assert_eq!(
+            corrupt[0].raw.get("body").map(String::as_str),
+            Some("from a stale peer"),
+            "the record stays auditable"
+        );
     }
 
     #[test]

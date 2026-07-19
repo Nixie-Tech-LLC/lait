@@ -1647,8 +1647,19 @@ fn print_issue(v: &IssueView, out: Out) {
     if !v.comments.is_empty() {
         println!("\n## Comments ({})", v.comments.len());
         for c in &v.comments {
-            println!("{} · {}  {}", c.author.short(), c.ts, c.body);
+            let who = c.author_nick.clone().unwrap_or_else(|| c.author.short());
+            println!("{} · {}  {}", who, c.ts, c.body);
         }
+    }
+    // Corruption is reported, never rendered as content: a malformed record gets
+    // a diagnostic line under its own heading, so it can't be mistaken for
+    // something a person actually wrote.
+    if !v.corrupt_records.is_empty() {
+        println!("\n## Corrupt records ({})", v.corrupt_records.len());
+        for r in &v.corrupt_records {
+            println!("{} · {}", r.locus, r.reason);
+        }
+        println!("(these are stored records that do not conform to the schema; run with --json for the raw values)");
     }
 }
 

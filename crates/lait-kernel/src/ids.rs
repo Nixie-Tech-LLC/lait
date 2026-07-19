@@ -6,8 +6,11 @@
 //! (SCHEMA §2): a `DocId` is minted once and is forever, while a Loro `PeerId`
 //! is an internal, per-session `u64`.
 //!
-//! `UserId` is an ed25519 public key — a member *is* a key (SCHEMA §2), the same
-//! bytes as the iroh `EndpointId`.
+//! `UserId` is an ed25519 public key — the same bytes as the iroh `EndpointId`.
+//! Since the `lait/actor/1` cutover it identifies a **device**, not a person: a
+//! member is an [`ActorId`] over a set of device keys, so one human holds many
+//! `UserId`s and rotates them under a stable identity. Read a `UserId` as "which
+//! device", an `ActorId` as "who".
 
 use std::fmt;
 
@@ -169,10 +172,14 @@ prefixed_id!(
     LabelId, "lbl_"
 );
 
-/// A member id — an ed25519 public key, hex-encoded (64 lowercase hex chars).
-/// A member *is* a key (SCHEMA §2); this is the same bytes as the iroh
-/// `EndpointId`. We keep it as a validated string so Layer B can carry it
-/// without depending on iroh types.
+/// A **device** id — an ed25519 public key, hex-encoded (64 lowercase hex
+/// chars), the same bytes as the iroh `EndpointId`. Kept as a validated string
+/// so Layer B can carry it without depending on iroh types.
+///
+/// Not a member id: membership is keyed on [`ActorId`], and a device speaks
+/// *for* an actor only while the actor's key-event log binds it. Use this for
+/// transport peers, signature authors, and `committedBy` stamps — never to
+/// answer "who did this".
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct UserId(String);
 
@@ -187,7 +194,15 @@ impl UserId {
         }
     }
 
-    /// Wrap a key string that is already known valid (e.g. from iroh).
+    /// Wrap a key string that is already known valid (e.g. an iroh
+    /// `EndpointId`, 64-hex by construction). **Validates nothing** — the
+    /// caller vouches for the shape.
+    ///
+    /// Only use this where the value's provenance guarantees a device key. It
+    /// is not a parser: reaching for it on a string read back out of a document
+    /// launders whatever is there into a `UserId`, and post-cutover those
+    /// strings are often `ActorId`s — a type lie that then mis-attributes
+    /// silently downstream. Use [`UserId::parse`] there instead.
     pub fn from_key_string(s: String) -> Self {
         Self(s)
     }

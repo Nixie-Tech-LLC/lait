@@ -122,6 +122,7 @@ fn response_dtos_round_trip() {
             created_by: lait::ids::ActorId::from_incept_hash(&"a".repeat(64)),
             created_at: 1000,
             provisional: false,
+            corrupt_records: vec![],
         })),
         Response::Activity {
             events: vec![ActivityEvent {
@@ -179,6 +180,7 @@ fn issue_response_status_field_survives_the_kind_tag() {
         created_by: lait::ids::ActorId::from_incept_hash(&"a".repeat(64)),
         created_at: 0,
         provisional: false,
+        corrupt_records: vec![],
     }));
     let json = serde_json::to_string(&resp).unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();

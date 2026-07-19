@@ -25,8 +25,8 @@ use crate::catalog::{CatalogDoc, RowMeta};
 use crate::control::{BoardPos, CatalogScope, Filter, Request, Response};
 use crate::crypto::{self, WorkspaceKey};
 use crate::dto::{
-    ActivityEvent, BoardColumn, BoardView, CommentDto, FieldChange, GraphView, IssueView, LabelDto,
-    LinkDto, Priority, ProjectDto, Row, StatusCategory, SCHEMA_VERSION,
+    ActivityEvent, BoardColumn, BoardView, FieldChange, GraphView, IssueView, LabelDto, LinkDto,
+    Priority, ProjectDto, Row, StatusCategory, SCHEMA_VERSION,
 };
 use crate::engine::history;
 use crate::engine::op::OpCtx;
@@ -458,7 +458,6 @@ fn persist_space_recovery(store: &Store, secret: &[u8; 32]) -> Result<()> {
 /// Errors if the store already holds a workspace; the CLI guarantees it doesn't.
 pub fn join_workspace_store(
     store: &Store,
-    me: &UserId,
     workspace: &str,
     salt: &[u8; 16],
     recovery_root: &[u8; 32],
@@ -485,13 +484,15 @@ pub fn join_workspace_store(
     store.write_genesis(&genesis)?;
     store.save_catalog(&CatalogDoc::empty(Some(store.peer_id())))?;
     // Seed the verified founding inception so the actor plane roots correctly
-    // from the first replay, before any sync. The `apply` is load-bearing, not
-    // decoration: `save_membership` exports, and an export auto-commits whatever
-    // is staged — so without it the actor plane's trust root lands as an
-    // untagged, unattributed commit in every joiner's oplog, forever.
+    // from the first replay, before any sync. The seed is committed through
+    // `apply` like every other write (contract §5/§6) — `save_membership`
+    // exports, and an export implicitly commits whatever is pending, so a bare
+    // stage here would seal the joiner's trust root into an anonymous,
+    // tier-less change. The actor claim is the inception's own author (the
+    // founder's device): we are landing *their* signed event, not authoring one.
     let membership = MembershipDoc::empty(Some(store.peer_id()));
     membership.add_actor_event(founder_inception)?;
-    membership.apply(&OpCtx::authority("join", me));
+    membership.apply(&OpCtx::authority("join_seed", &founder_inception.author));
     store.save_membership(&membership)?;
     store.commit("join workspace from ticket");
     Ok(ws_id)
@@ -1454,7 +1455,12 @@ impl Tracker {
             Err(resp) => return Ok((resp, None)),
         };
         let ts = self.now_secs();
-        let me = self.me.clone();
+        // The comment is attributed to the *actor* (the person); the device that
+        // landed it rides the change's `OpCtx` as the advisory commit stamp.
+        let me = match self.my_actor() {
+            Some(a) => a,
+            None => return Ok((Response::err("this device has no actor identity"), None)),
+        };
         let ctx = OpCtx::content("commented", &self.me);
         let project_id = {
             let issue = self
@@ -2155,6 +2161,7 @@ impl Tracker {
                     created_by: ActorId::from_incept_hash(&"0".repeat(64)),
                     created_at: row.created_at,
                     provisional: true,
+                    corrupt_records: Vec::new(),
                 })));
             }
         };
@@ -2168,7 +2175,10 @@ impl Tracker {
                     .unwrap_or_else(|| l.short(4))
             })
             .collect();
-        let comments: Vec<CommentDto> = issue.comments();
+        // The projection boundary: corruption leaves the typed path exactly
+        // here, once, and travels to the caller in the sidecar instead of
+        // hiding inside `comments`.
+        let (comments, corrupt_records) = crate::dto::partition(issue.comments());
         let view = IssueView {
             schema_version: SCHEMA_VERSION,
             reff: canonical.clone(),
@@ -2192,6 +2202,7 @@ impl Tracker {
                 .unwrap_or_else(|| ActorId::from_incept_hash(&"0".repeat(64))),
             created_at: issue.created_at(),
             provisional: false,
+            corrupt_records,
         };
         Ok(Response::Issue(Box::new(view)))
     }
@@ -6057,8 +6068,12 @@ impl Tracker {
         self.aliases.reconcile_doc(&self.catalog, &id);
         // a synced doc advances the activity feed (pulled, not streamed, S§7.5).
         let reff = self.aliases.canonical_for(&id);
-        // Attribute the row to the incoming ops' actor when it is unambiguous;
-        // advisory, exactly like `createdBy` (non-goal 6).
+        // Attribute the row to the incoming ops' committing **device** when it
+        // is unambiguous — deliberately not resolved to an actor. This is a
+        // sync/commit stamp (`committedBy`), not authorship (`createdBy`): which
+        // device landed the ops is the fact worth keeping when a peer misbehaves,
+        // and it survives that device later leaving its actor. Advisory either
+        // way — self-asserted in the commit message (non-goal 6).
         let actor = match delta.actors.as_slice() {
             [one] => Some(one.clone()),
             _ => None,
@@ -6141,12 +6156,11 @@ impl Tracker {
                 }
                 let mention = format!("@{}", self.my_nick).to_ascii_lowercase();
                 for c in &delta.new_comments {
-                    // A comment's author is the committing device (advisory); skip
-                    // our own comments regardless of which of our devices wrote it.
-                    if my_actor
-                        .as_ref()
-                        .is_some_and(|a| self.actor_plane().actor_of_device(&c.author) == Some(a))
-                    {
+                    // A comment's author *is* the actor, so this is a direct
+                    // comparison — no device→actor resolution, which used to
+                    // silently fail once the authoring device was revoked and
+                    // start notifying us about our own past comments.
+                    if my_actor.as_ref() == Some(&c.author) {
                         continue;
                     }
                     let mentioned =
@@ -6327,7 +6341,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&home).unwrap();
         let store = Store::open(&home).unwrap();
-        join_workspace_store(&store, &user, ws, &proof.0, &proof.1, &proof.2).unwrap();
+        join_workspace_store(&store, ws, &proof.0, &proof.1, &proof.2).unwrap();
         let clock = FakeClock::new(1_000_000 + seed[0] as u64 * 100_000);
         let tracker = Tracker::open(store, user, "tester".into(), seed, Box::new(clock)).unwrap();
         TestNode { tracker, home }
@@ -7419,7 +7433,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&forged_home).unwrap();
         let forged_store = Store::open(&forged_home).unwrap();
-        let err = join_workspace_store(&forged_store, &me(), &a_ws, &a_salt, &a_rr, &b_incept);
+        let err = join_workspace_store(&forged_store, &a_ws, &a_salt, &a_rr, &b_incept);
         assert!(
             err.is_err(),
             "a ticket rooting on the inviter's inception is rejected, not forked"
@@ -9874,7 +9888,8 @@ mod tests {
         assert_eq!(unread, 1);
 
         // A comments + moves status; B's next import derives both, with the
-        // comment attributed to A's real key (the one honest author field).
+        // comment attributed to A's **actor** — the person, not the device that
+        // happened to type it, so the attribution outlives A rotating devices.
         let (resp, _) = a.tracker.handle(Request::Comment {
             reff: reff.clone(),
             body: "root cause found".into(),
@@ -9893,7 +9908,12 @@ mod tests {
         assert_eq!(entries.len(), 3, "{entries:?}");
         let comment = entries.iter().find(|e| e.kind == "comment").unwrap();
         assert_eq!(comment.detail, "root cause found");
-        assert_eq!(comment.actor.as_deref(), Some(me().as_str()));
+        let a_actor = a.tracker.my_actor().expect("A has an actor identity");
+        assert_eq!(
+            comment.actor.as_deref(),
+            Some(a_actor.as_str()),
+            "a comment is attributed to the authoring actor, not its device key"
+        );
         let status = entries.iter().find(|e| e.kind == "status").unwrap();
         assert!(status.detail.contains("in_progress"), "{status:?}");
 

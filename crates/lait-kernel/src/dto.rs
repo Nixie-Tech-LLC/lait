@@ -10,6 +10,8 @@
 //! plain enum shared across layers is fine; what the three-layer rule forbids is
 //! mirroring the *container layout* automatically.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{ActorId, DocId, LabelId, ProjectId, UserId, WorkspaceId};
@@ -150,6 +152,105 @@ pub fn default_workflow() -> Vec<WorkflowState> {
 pub const DEFAULT_STATUS: &str = "backlog";
 
 // ----------------------------------------------------------------------------
+// Corruption (the projection honesty policy)
+// ----------------------------------------------------------------------------
+
+/// One stored record that could not be projected into its DTO.
+///
+/// The policy this type exists to enforce: **a projection never lies.** Three
+/// states must stay distinct — *known* (stored and parsed), *unknown*
+/// (legitimately not available yet, e.g. a provisional row whose body hasn't
+/// synced), and *corrupt* (a value is stored and does not conform to its type).
+/// Collapsing them is what produced the failure modes this replaces:
+///
+/// - `Option<ActorId>` on a field that is never optional in the schema, which
+///   makes every consumer re-decide what a missing author means;
+/// - a silent `continue`/`filter_map`, which makes the record vanish — counts go
+///   wrong, positions shift, and a peer writing malformed keys becomes invisible;
+/// - a sentinel like `act_0000…`, which is a *well-typed lie* and the worst of
+///   the three, because nothing downstream can tell it from a real id.
+///
+/// A corrupt record is therefore neither dropped nor laundered: it is lifted out
+/// of the typed collection and carried alongside it, so the DTO keeps its true
+/// types and the corruption stays auditable under `--json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorruptRecord {
+    /// Where the record sat, position included: `comments[3]`. This is what
+    /// makes a sidecar list lossless — the index the record occupied in the
+    /// valid collection is recoverable, so "3rd comment is corrupt" survives.
+    pub locus: String,
+    /// Which field failed and how: `author: not an ActorId`. Human-readable;
+    /// diagnostics, not a machine contract.
+    pub reason: String,
+    /// Best-effort raw leaves, for forensics and eventual repair. Never
+    /// interpreted — this is evidence, not data.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub raw: BTreeMap<String, String>,
+}
+
+impl CorruptRecord {
+    /// A corrupt record with no salvaged leaves.
+    pub fn new(locus: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            locus: locus.into(),
+            reason: reason.into(),
+            raw: BTreeMap::new(),
+        }
+    }
+
+    /// Attach a salvaged raw leaf.
+    pub fn with_raw(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.raw.insert(key.into(), value.into());
+        self
+    }
+}
+
+/// The result of projecting one stored record: either the DTO, or the reason it
+/// isn't one. Layer-A readers return these so that **no read site has to choose
+/// between dropping and laundering** — both bad options are off the table
+/// because the type has somewhere honest to put the failure.
+///
+/// Deliberately **not** `Serialize`. A `Projected` cannot reach the wire; it has
+/// to be [`partition`]ed first, which is what guarantees a UI consumer can never
+/// receive a malformed record inside a field typed as a valid one. The invariant
+/// is structural, not a matter of discipline — exactly the argument the data
+/// contract's §6 collar makes about raw kernel handles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Projected<T> {
+    Valid(T),
+    Corrupt(CorruptRecord),
+}
+
+impl<T> Projected<T> {
+    /// The DTO, if this record projected cleanly.
+    pub fn valid(self) -> Option<T> {
+        match self {
+            Projected::Valid(v) => Some(v),
+            Projected::Corrupt(_) => None,
+        }
+    }
+
+    pub fn is_corrupt(&self) -> bool {
+        matches!(self, Projected::Corrupt(_))
+    }
+}
+
+/// Split a projected sequence into the valid DTOs and the corruption sidecar,
+/// preserving the relative order of each. The single point where corruption
+/// leaves the typed path — call it once, at the projection boundary.
+pub fn partition<T>(items: impl IntoIterator<Item = Projected<T>>) -> (Vec<T>, Vec<CorruptRecord>) {
+    let mut valid = Vec::new();
+    let mut corrupt = Vec::new();
+    for item in items {
+        match item {
+            Projected::Valid(v) => valid.push(v),
+            Projected::Corrupt(c) => corrupt.push(c),
+        }
+    }
+    (valid, corrupt)
+}
+
+// ----------------------------------------------------------------------------
 // Projections (read DTOs)
 // ----------------------------------------------------------------------------
 
@@ -217,7 +318,14 @@ pub struct BoardView {
 /// A comment projection (SCHEMA §5.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommentDto {
-    pub author: UserId,
+    /// The authoring **actor** — the person, stable across their devices.
+    ///
+    /// Not optional: the schema has no authorless comment, so an `Option` here
+    /// would encode *storage corruption* in a *domain* type and push the
+    /// decision onto every consumer. A comment whose stored author doesn't parse
+    /// as an [`ActorId`] is not a `CommentDto` with a hole in it — it isn't a
+    /// `CommentDto` at all, and is projected as a [`CorruptRecord`] instead.
+    pub author: ActorId,
     pub author_nick: Option<String>,
     pub ts: u64,
     pub body: String,
@@ -241,10 +349,22 @@ pub struct IssueView {
     pub assignees: Vec<ActorId>,
     pub labels: Vec<LabelId>,
     pub label_names: Vec<String>,
+    /// Valid comments only. Every element satisfies the `CommentDto` schema —
+    /// a consumer may render these as trusted objects without re-validating.
     pub comments: Vec<CommentDto>,
     pub created_by: ActorId,
     pub created_at: u64,
     pub provisional: bool,
+    /// Records under this issue that failed to project (see [`CorruptRecord`]).
+    ///
+    /// Carried beside the typed collections rather than inside them: the
+    /// corruption stays auditable under `--json` for the operator who has to
+    /// diagnose it, while a normal UI consumer iterating `comments` cannot
+    /// accidentally render a malformed record as a trusted one. Absent from the
+    /// JSON entirely when empty, so the healthy shape is unchanged and existing
+    /// readers keep working.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub corrupt_records: Vec<CorruptRecord>,
 }
 
 /// One derived activity transition (SCHEMA §7.4). `changes` is a **list** so one
