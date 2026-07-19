@@ -19,6 +19,11 @@ curve25519-dalek = "4"
 chacha20poly1305 = "0.10"
 sha2 = "0.10"
 blake3 = "1"
+# Password-based key derivation for the passphrase unlock slot on a portable
+# share package. Memory-hard by design: blake3's derive_key is a KDF, not a
+# PASSWORD KDF, and using it here would make an offline guessing attack cheap.
+# Pure Rust (RustCrypto), consistent with the no-C-toolchain rule.
+argon2 = "0.5"
 # threshold recovery ceremony (dealer-free DKG + signing)
 frost-ed25519 = "3"
 rand_core = { version = "0.6", features = ["getrandom"] }

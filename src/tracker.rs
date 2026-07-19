@@ -340,6 +340,64 @@ pub enum RecoveryArtifactFailure {
     Io(String),
 }
 
+/// Argon2 cost for a share package's passphrase slot.
+///
+/// Production always pays the real cost. Tests would otherwise spend minutes in
+/// a debug-build KDF across many exports, and a slow suite is a suite that stops
+/// being run — but the weak parameters must never be reachable from a release
+/// binary, hence `cfg(test)` rather than a caller-supplied value.
+#[cfg(not(test))]
+fn custody_kdf_params() -> crate::custody::Argon2Params {
+    crate::custody::Argon2Params::default()
+}
+#[cfg(test)]
+fn custody_kdf_params() -> crate::custody::Argon2Params {
+    crate::custody::Argon2Params {
+        m_cost_kib: 64,
+        t_cost: 1,
+        p_cost: 1,
+    }
+}
+
+/// What this device can say about recovery readiness.
+///
+/// Deliberately does NOT assert that recovery is possible. This node knows its
+/// own custody and the arrangement's shape; it does not know whether other
+/// holders still have their shares, and claiming they do would be the most
+/// dangerous kind of reassurance — believed, unverifiable, and only disproved
+/// during an actual emergency.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecoveryStatus {
+    /// Short form of the standing authority's key, or `None` when this device
+    /// cannot attribute the standing key to any arrangement it has seen.
+    pub authority: Option<String>,
+    pub scheme: crate::authority::AuthorityScheme,
+    /// Phase B reports the shape. Phase D will report policy branches and
+    /// qualified-set readiness instead.
+    pub k: u16,
+    pub n: u16,
+    pub local_custody: LocalCustodyState,
+}
+
+/// This device's standing as a custodian.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", content = "detail", rename_all = "snake_case")]
+pub enum LocalCustodyState {
+    /// Not a holder — nothing is expected of this device.
+    NotAHolder,
+    /// Holding usable material.
+    Ready,
+    /// Expected to hold a share and does not.
+    Missing,
+    /// The share is present but cannot be produced.
+    Unreadable(RecoveryArtifactFailure),
+    /// Holding a share of an **indispensable** arrangement with no verified
+    /// portable backup. Distinct from `Ready` because the share is usable today
+    /// and unrecoverable tomorrow, and that difference is invisible until it
+    /// matters.
+    BackupUnverified,
+}
+
 /// A holder whose share exists on this device but cannot be used.
 ///
 /// Structured rather than preformatted, so status, diagnosis and the CLI can
@@ -3869,6 +3927,305 @@ impl Tracker {
         })
     }
 
+    /// Whether `dkg`'s arrangement is **indispensable**: every holder is
+    /// required, so no share is redundant and losing one ends the authority.
+    fn is_indispensable(&self, dkg: &crate::dkg::TranscriptId) -> bool {
+        self.dkg_manifest(dkg)
+            .and_then(|m| m.configuration.as_frost_threshold())
+            .is_some_and(|c| c.k as usize == c.participants.len())
+    }
+
+    /// Custodians of `dkg` that have **not** attested portable custody.
+    ///
+    /// Only meaningful for an indispensable arrangement; a redundant one can
+    /// afford to lose a holder, so it does not gate on this.
+    fn custody_outstanding(
+        &self,
+        dkg: &crate::dkg::TranscriptId,
+        t: &crate::dkg::DkgTranscript,
+        participants: &[UserId],
+    ) -> Vec<UserId> {
+        if !self.is_indispensable(dkg) {
+            return Vec::new();
+        }
+        let acked = t.custody_acks();
+        participants
+            .iter()
+            .filter(|p| !acked.contains(p))
+            .cloned()
+            .collect()
+    }
+
+    /// Export this device's share for `dkg` as a portable package, verify it by
+    /// reopening it, and attest that on the board.
+    ///
+    /// The verification is the point. Writing a file proves nothing — the
+    /// failure this guards against is a package that cannot be reopened, which
+    /// is indistinguishable from a good one until the day it is needed. So the
+    /// package is read back from disk and opened through the **portable** slot
+    /// specifically, never the local convenience path, before anything is
+    /// attested.
+    pub fn space_custody_export_cmd(
+        &mut self,
+        path: String,
+        passphrase: String,
+    ) -> (Response, Option<DirtySet>) {
+        if passphrase.chars().count() < 12 {
+            return (
+                Response::err(
+                    "choose a passphrase of at least 12 characters — this is the only thing standing between an attacker with the file and your share",
+                ),
+                None,
+            );
+        }
+        // The ceremony to export for: one we hold a share of. A pending
+        // arrangement takes precedence, since that is the one whose install is
+        // waiting on this attestation.
+        let events = self.membership.ceremony_events();
+        let board = self.ceremony_board(&events);
+        let standing = self.active_dkg_session();
+        let Some(dkg) = board
+            .dkg
+            .keys()
+            .find(|id| self.dkg_read(id, "share").is_some() && Some(**id) != standing)
+            .copied()
+            .or(standing)
+        else {
+            return (Response::err("this device holds no share to export"), None);
+        };
+        let Some(t) = board.dkg.get(&dkg) else {
+            return (Response::err("that ceremony is not on the board"), None);
+        };
+        let Some((_, _, participants)) = self.accepted_proposal(&dkg, t) else {
+            return (Response::err("that ceremony is not accepted here"), None);
+        };
+        let Some(manifest) = self.dkg_manifest(&dkg) else {
+            return (
+                Response::err("no acceptance record for that ceremony"),
+                None,
+            );
+        };
+        let (Some(share), Some(pkp)) = (self.dkg_read(&dkg, "share"), self.dkg_read(&dkg, "pkp"))
+        else {
+            return (
+                Response::err("this device's share for that ceremony is missing or unreadable"),
+                None,
+            );
+        };
+        let Ok(group_key) = crate::dkg::group_key_of_package(&pkp) else {
+            return (Response::err("the public-key package is unusable"), None);
+        };
+        let Some(index) = participants.iter().position(|p| p == &self.me) else {
+            return (Response::err("this device is not a participant"), None);
+        };
+        let principal = crate::authority::PrincipalId::of_device(&self.me);
+        let leaf = crate::authority::LeafId::of_principal(&principal);
+        let authority =
+            crate::authority::AuthorityId::new(group_key.clone(), &manifest.configuration);
+        let payload = crate::custody::SharePayload::Frost(crate::custody::FrostSharePayload {
+            key_share: share,
+            public_package: pkp,
+            index: index as u16 + 1,
+        });
+        let mut salt = [0u8; 16];
+        salt.copy_from_slice(&rand16());
+        let package = match crate::custody::AuthoritySharePackage::seal(
+            &self.workspace_id,
+            &authority,
+            &dkg.to_hex(),
+            &principal,
+            &leaf,
+            &payload,
+            &[crate::custody::SlotSpec::Passphrase {
+                passphrase: passphrase.clone(),
+                salt,
+                params: custody_kdf_params(),
+            }],
+        ) {
+            Ok(p) => p,
+            Err(e) => return (Response::err(format!("{e:#}")), None),
+        };
+        let bytes = match postcard::to_stdvec(&package) {
+            Ok(b) => b,
+            Err(e) => return (Response::err(format!("encode package: {e}")), None),
+        };
+        let out = std::path::PathBuf::from(&path);
+        if let Some(parent) = out.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = crate::secretfs::create_private_dir(parent) {
+                    return (Response::err(format!("{e:#}")), None);
+                }
+            }
+        }
+        // Portable: a share package is meant to be carried off this machine, so
+        // it must not be wrapped to this account.
+        if let Err(e) = crate::secretfs::write_private(
+            &out,
+            &bytes,
+            crate::secretfs::Create::Replace,
+            crate::secretfs::Wrap::Portable,
+        ) {
+            return (Response::err(format!("{e:#}")), None);
+        }
+        // Read back from disk and open through the portable slot. Verifying the
+        // in-memory value would test nothing that could actually fail.
+        let reread = match crate::secretfs::read_private(&out) {
+            Ok(Some(b)) => b,
+            Ok(None) => return (Response::err("the package vanished after writing"), None),
+            Err(e) => {
+                return (
+                    Response::err(format!("re-reading the package failed: {e}")),
+                    None,
+                )
+            }
+        };
+        let restored: crate::custody::AuthoritySharePackage = match postcard::from_bytes(&reread) {
+            Ok(p) => p,
+            Err(e) => {
+                return (
+                    Response::err(format!("the written package does not decode: {e}")),
+                    None,
+                )
+            }
+        };
+        let expect = crate::custody::PackageExpectation {
+            workspace: &self.workspace_id,
+            authority: &authority,
+            ceremony: &dkg.to_hex(),
+            leaf: &leaf,
+            group_key: &group_key,
+        };
+        if let Err(e) =
+            restored.verify_and_open(&crate::custody::UnlockKey::Passphrase(passphrase), &expect)
+        {
+            return (
+                Response::err(format!(
+                    "the exported package could not be reopened, so it was NOT attested: {e:#}"
+                )),
+                None,
+            );
+        }
+        if let Err(e) = self.post_ceremony(crate::dkg::CeremonyOp::CustodyAck { dkg }) {
+            return (Response::err(format!("{e:#}")), None);
+        }
+        // Recompute from the board so the count reflects our own attestation.
+        let events = self.membership.ceremony_events();
+        let board = self.ceremony_board(&events);
+        let outstanding = board
+            .dkg
+            .get(&dkg)
+            .map(|t| self.custody_outstanding(&dkg, t, &participants))
+            .unwrap_or_default();
+        let note = if !self.is_indispensable(&dkg) {
+            "this arrangement tolerates a lost holder, so no attestation is required to install it"
+                .to_string()
+        } else if outstanding.is_empty() {
+            "every custodian has attested — the arrangement can now install".to_string()
+        } else {
+            format!("still waiting on {} custodian(s)", outstanding.len())
+        };
+        (
+            Response::Ok {
+                message: Some(format!(
+                    "exported and verified your share package to {path} — {note}. Keep it somewhere the passphrase alone cannot be found."
+                )),
+            },
+            Some(DirtySet::catalog(CatalogScope::Acl)),
+        )
+    }
+
+    /// What this device can say about recovery right now.
+    pub fn recovery_status(&self) -> RecoveryStatus {
+        let authority = self.current_authority();
+        let scheme = authority
+            .as_ref()
+            .and_then(|_| self.active_dkg_session())
+            .and_then(|id| self.dkg_manifest(&id))
+            .map(|m| m.configuration.scheme)
+            .unwrap_or(crate::authority::AuthorityScheme::Single);
+        let (k, n) = self
+            .active_dkg_session()
+            .and_then(|id| self.dkg_manifest(&id))
+            .and_then(|m| m.configuration.as_frost_threshold())
+            .map(|c| (c.k, c.participants.len() as u16))
+            .unwrap_or((1, 1));
+        // Consider every ceremony this device is a custodian of, not only the
+        // standing one. A PENDING indispensable arrangement is precisely the
+        // case worth reporting: its install is blocked on this device, and
+        // saying "Ready" because some other authority is currently fine would
+        // hide the one thing the operator needs to act on.
+        let events = self.membership.ceremony_events();
+        let board = self.ceremony_board(&events);
+        let mine: Vec<crate::dkg::TranscriptId> = board
+            .dkg
+            .iter()
+            .filter(|(id, t)| {
+                self.accepted_proposal(id, t)
+                    .is_some_and(|(_, _, ps)| ps.contains(&self.me))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        // Worst state wins: an unusable share outranks an unbacked one, which
+        // outranks a healthy one.
+        let mut state =
+            if self.read_space_recovery_key().is_some() && self.active_dkg_session().is_none() {
+                LocalCustodyState::Ready
+            } else {
+                // Anyone else starts as not-a-holder and is upgraded by whatever
+                // shares they turn out to hold.
+                LocalCustodyState::NotAHolder
+            };
+        for id in &mine {
+            match self.dkg_artifact(id, "share") {
+                ArtifactRead::Unreadable(e) => {
+                    return RecoveryStatus {
+                        authority: authority.map(|a| a.public_key.short()),
+                        scheme,
+                        k,
+                        n,
+                        local_custody: LocalCustodyState::Unreadable(match e {
+                            crate::secretfs::SecretError::Undecryptable(m) => {
+                                RecoveryArtifactFailure::Undecryptable(m)
+                            }
+                            crate::secretfs::SecretError::Io(e) => {
+                                RecoveryArtifactFailure::Io(e.to_string())
+                            }
+                        }),
+                    };
+                }
+                ArtifactRead::Present(_) => {
+                    let attested = board
+                        .dkg
+                        .get(id)
+                        .map(|t| t.custody_acks().contains(&self.me))
+                        .unwrap_or(false);
+                    if self.is_indispensable(id) && !attested {
+                        state = LocalCustodyState::BackupUnverified;
+                    } else if state == LocalCustodyState::NotAHolder {
+                        state = LocalCustodyState::Ready;
+                    }
+                }
+                ArtifactRead::Missing => {
+                    // Only a gap in the STANDING authority is a missing share;
+                    // mid-DKG absence is ordinary progress, not a fault.
+                    if Some(*id) == self.active_dkg_session()
+                        && state == LocalCustodyState::NotAHolder
+                    {
+                        state = LocalCustodyState::Missing;
+                    }
+                }
+            }
+        }
+        let local_custody = state;
+        RecoveryStatus {
+            authority: authority.map(|a| a.public_key.short()),
+            scheme,
+            k,
+            n,
+            local_custody,
+        }
+    }
+
     /// The authority standing right now: its public key, and the arrangement
     /// operating it.
     ///
@@ -4539,6 +4896,25 @@ impl Tracker {
         );
         let already = crate::space::recovery_commit(&group_key) == Some(cur.recovery_commit);
         if already {
+            return Ok(false);
+        }
+        // An INDISPENSABLE arrangement must not install until every custodian
+        // has verified a portable backup. Otherwise an N-of-N authority can be
+        // created in a state where one holder's share exists only behind a
+        // Windows profile, and the workspace learns that on the day it needs to
+        // recover — the day it is too late to fix.
+        //
+        // The gate reads signed attestations from the board rather than local
+        // state, so no *other* node can install ahead of the checks. A redundant
+        // arrangement is not gated: it can afford to lose a holder, which is
+        // what redundancy means.
+        let outstanding = self.custody_outstanding(dkg, t, &participants);
+        if !outstanding.is_empty() {
+            tracing::info!(
+                "holding the rotation for {}: {} custodian(s) have not verified a portable backup",
+                dkg.to_hex(),
+                outstanding.len()
+            );
             return Ok(false);
         }
         // Solo authority: sign the rotation directly.
@@ -5613,6 +5989,20 @@ mod tests {
             t.current_authority()
                 .expect("a fresh node knows its solo authority"),
         )
+    }
+
+    /// Perform the custody step an indispensable arrangement requires: export a
+    /// portable package, verify it by reopening, and attest on the board.
+    fn attest_custody(node: &mut TestNode, tag: &str) {
+        let path = node.home.join(format!("custody-{tag}.pkg"));
+        let (resp, _) = node.tracker.space_custody_export_cmd(
+            path.to_string_lossy().to_string(),
+            "a-sufficiently-long-passphrase".into(),
+        );
+        assert!(
+            matches!(resp, Response::Ok { .. }),
+            "custody export: {resp:?}"
+        );
     }
 
     fn me() -> UserId {
@@ -6877,6 +7267,14 @@ mod tests {
             sync_all(&mut a.tracker, &mut b.tracker);
             sync_all(&mut b.tracker, &mut a.tracker);
         }
+        // 2-of-2 is indispensable: both custodians must verify a portable
+        // backup before the arrangement may install.
+        attest_custody(&mut a, "a");
+        attest_custody(&mut b, "b");
+        for _ in 0..6 {
+            sync_all(&mut a.tracker, &mut b.tracker);
+            sync_all(&mut b.tracker, &mut a.tracker);
+        }
 
         // The recovery authority is now the DKG group key, not A's solo key.
         let after = crate::space::replay(
@@ -7042,6 +7440,14 @@ mod tests {
             sync_all(&mut a.tracker, &mut b.tracker);
             sync_all(&mut b.tracker, &mut a.tracker);
         }
+        // 2-of-2 is indispensable: both custodians must verify a portable
+        // backup before the arrangement may install.
+        attest_custody(&mut a, "a");
+        attest_custody(&mut b, "b");
+        for _ in 0..6 {
+            sync_all(&mut a.tracker, &mut b.tracker);
+            sync_all(&mut b.tracker, &mut a.tracker);
+        }
 
         // B opens a break-glass recovery: this commits B's nonces.
         let (resp, _) = b.tracker.space_recover_cmd();
@@ -7124,6 +7530,14 @@ mod tests {
             .tracker
             .space_elevate_cmd(vec![b_user.as_str().to_string()], 2);
         assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        for _ in 0..6 {
+            sync_all(&mut a.tracker, &mut b.tracker);
+            sync_all(&mut b.tracker, &mut a.tracker);
+        }
+        // 2-of-2 is indispensable: both custodians must verify a portable
+        // backup before the arrangement may install.
+        attest_custody(&mut a, "a");
+        attest_custody(&mut b, "b");
         for _ in 0..6 {
             sync_all(&mut a.tracker, &mut b.tracker);
             sync_all(&mut b.tracker, &mut a.tracker);
@@ -7495,6 +7909,14 @@ mod tests {
             sync_all(&mut a.tracker, &mut b.tracker);
             sync_all(&mut b.tracker, &mut a.tracker);
         }
+        // 2-of-2 is indispensable: both custodians must verify a portable
+        // backup before the arrangement may install.
+        attest_custody(&mut a, "a");
+        attest_custody(&mut b, "b");
+        for _ in 0..6 {
+            sync_all(&mut a.tracker, &mut b.tracker);
+            sync_all(&mut b.tracker, &mut a.tracker);
+        }
         let after_first = crate::space::replay(
             &a.tracker.genesis,
             &a.tracker.workspace_id,
@@ -7723,6 +8145,166 @@ mod tests {
         drop(absent);
     }
 
+    /// B7: an indispensable arrangement must not install until every custodian
+    /// has verified a portable backup.
+    ///
+    /// The failure this prevents is silent and delayed: an N-of-N group created
+    /// while one holder's share exists only behind a Windows profile looks
+    /// perfectly healthy, and the workspace finds out on the day it needs to
+    /// recover. So the gate reads signed attestations from the board — local
+    /// state would let another node install ahead of the checks.
+    #[test]
+    fn an_indispensable_arrangement_waits_for_verified_custody() {
+        let mut a = new_node();
+        let a_ws = a.tracker.workspace_str();
+        let b_seed = [21u8; 32];
+        let b_user = user_from_seed(b_seed);
+        let mut b = new_joiner_node_as(
+            b_user.clone(),
+            b_seed,
+            &a_ws,
+            &a.tracker.founding_proof().unwrap(),
+        );
+        let b_incept = b.tracker.self_inception().unwrap();
+        a.tracker
+            .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
+        sync_all(&mut a.tracker, &mut b.tracker);
+
+        let commit0 = crate::space::replay(
+            &a.tracker.genesis,
+            &a.tracker.workspace_id,
+            &a.tracker.membership.space_events(),
+        )
+        .recovery_commit;
+
+        let (resp, _) = a
+            .tracker
+            .space_elevate_cmd(vec![b_user.as_str().to_string()], 2);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        for _ in 0..8 {
+            sync_all(&mut a.tracker, &mut b.tracker);
+            sync_all(&mut b.tracker, &mut a.tracker);
+        }
+
+        // The DKG is complete — both hold shares — but nothing has installed.
+        let dkg = *crate::dkg::parse_board(
+            &a.tracker.membership.ceremony_events(),
+            &a.tracker.workspace_id,
+        )
+        .dkg
+        .keys()
+        .next()
+        .unwrap();
+        assert!(a.tracker.dkg_read(&dkg, "share").is_some());
+        assert!(b.tracker.dkg_read(&dkg, "share").is_some());
+        assert_eq!(
+            crate::space::replay(
+                &a.tracker.genesis,
+                &a.tracker.workspace_id,
+                &a.tracker.membership.space_events(),
+            )
+            .recovery_commit,
+            commit0,
+            "an indispensable arrangement must not install on unverified custody"
+        );
+
+        // Status says exactly why, rather than reporting a healthy holder.
+        assert_eq!(
+            a.tracker.recovery_status().local_custody,
+            LocalCustodyState::BackupUnverified,
+            "holding a share is not the same as being able to keep it"
+        );
+
+        // One custodian attests: still blocked, because ALL are required.
+        attest_custody(&mut a, "a");
+        for _ in 0..4 {
+            sync_all(&mut a.tracker, &mut b.tracker);
+            sync_all(&mut b.tracker, &mut a.tracker);
+        }
+        assert_eq!(
+            crate::space::replay(
+                &a.tracker.genesis,
+                &a.tracker.workspace_id,
+                &a.tracker.membership.space_events(),
+            )
+            .recovery_commit,
+            commit0,
+            "one of two attestations is not enough for an N-of-N arrangement"
+        );
+
+        // Both attest: it installs.
+        attest_custody(&mut b, "b");
+        for _ in 0..6 {
+            sync_all(&mut a.tracker, &mut b.tracker);
+            sync_all(&mut b.tracker, &mut a.tracker);
+        }
+        assert_ne!(
+            crate::space::replay(
+                &a.tracker.genesis,
+                &a.tracker.workspace_id,
+                &a.tracker.membership.space_events(),
+            )
+            .recovery_commit,
+            commit0,
+            "with every custodian verified, the arrangement installs"
+        );
+        assert_eq!(
+            a.tracker.recovery_status().local_custody,
+            LocalCustodyState::Ready
+        );
+        let st = a.tracker.recovery_status();
+        assert_eq!((st.k, st.n), (2, 2));
+        assert_eq!(st.scheme, crate::authority::AuthorityScheme::FrostThreshold);
+    }
+
+    /// A redundant arrangement is NOT gated: tolerating a lost holder is what
+    /// redundancy means, so requiring every custodian to attest would impose a
+    /// cost the shape does not need.
+    #[test]
+    fn a_redundant_arrangement_installs_without_universal_attestation() {
+        let mut a = new_node();
+        let a_ws = a.tracker.workspace_str();
+        let proof = a.tracker.founding_proof().unwrap();
+        let b_seed = [21u8; 32];
+        let b_user = user_from_seed(b_seed);
+        let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, &proof);
+        let c_seed = [31u8; 32];
+        let c_user = user_from_seed(c_seed);
+        let mut c = new_joiner_node_as(c_user.clone(), c_seed, &a_ws, &proof);
+        for incept in [
+            b.tracker.self_inception().unwrap(),
+            c.tracker.self_inception().unwrap(),
+        ] {
+            a.tracker
+                .admit_member(&incept, vec![Grant::Admin, Grant::Write]);
+        }
+        sync_all(&mut a.tracker, &mut b.tracker);
+        sync_all(&mut a.tracker, &mut c.tracker);
+
+        let (resp, _) = a.tracker.space_elevate_cmd(
+            vec![b_user.as_str().to_string(), c_user.as_str().to_string()],
+            2, // 2-of-3: one holder may be lost
+        );
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        let mut nodes = vec![a, b, c];
+        sync_mesh(&mut nodes, 8);
+        assert_eq!(
+            crate::space::replay(
+                &nodes[0].tracker.genesis,
+                &nodes[0].tracker.workspace_id,
+                &nodes[0].tracker.membership.space_events(),
+            )
+            .gen,
+            1,
+            "a redundant arrangement installs without attestation"
+        );
+        assert_eq!(
+            nodes[0].tracker.recovery_status().local_custody,
+            LocalCustodyState::Ready,
+            "and its holders are Ready, not BackupUnverified"
+        );
+    }
+
     /// F1 regression, the headline one. A rogue proposal carries a perfectly
     /// valid *device* signature — authentication was never the missing piece.
     /// Without an authorization from the recovery authority, no honest node may
@@ -7919,6 +8501,14 @@ mod tests {
             sync_all(&mut a.tracker, &mut b.tracker);
             sync_all(&mut b.tracker, &mut a.tracker);
         }
+        // 2-of-2 is indispensable: both custodians must verify a portable
+        // backup before the arrangement may install.
+        attest_custody(&mut a, "a");
+        attest_custody(&mut b, "b");
+        for _ in 0..6 {
+            sync_all(&mut a.tracker, &mut b.tracker);
+            sync_all(&mut b.tracker, &mut a.tracker);
+        }
         let installed = crate::space::replay(
             &a.tracker.genesis,
             &a.tracker.workspace_id,
@@ -7968,6 +8558,14 @@ mod tests {
             .tracker
             .space_elevate_cmd(vec![b_user.as_str().to_string()], 2);
         assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        for _ in 0..6 {
+            sync_all(&mut a.tracker, &mut b.tracker);
+            sync_all(&mut b.tracker, &mut a.tracker);
+        }
+        // 2-of-2 is indispensable: both custodians must verify a portable
+        // backup before the arrangement may install.
+        attest_custody(&mut a, "a");
+        attest_custody(&mut b, "b");
         for _ in 0..6 {
             sync_all(&mut a.tracker, &mut b.tracker);
             sync_all(&mut b.tracker, &mut a.tracker);

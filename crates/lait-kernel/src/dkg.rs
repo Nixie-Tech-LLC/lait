@@ -157,6 +157,17 @@ pub enum CeremonyOp {
         signing: TranscriptId,
         plan: Vec<u8>,
     },
+    /// A custodian's attestation that it has exported its share package for
+    /// `dkg` and reopened it through a **portable** slot.
+    ///
+    /// Required before an indispensable arrangement (every holder needed) may be
+    /// installed. Without it, an N-of-N authority can be created in a state where
+    /// one holder's share exists only behind a Windows profile — and the
+    /// workspace discovers this on the day it needs to recover, which is the day
+    /// it is too late. The attestation is a signed board event rather than local
+    /// state so that no *other* node can install the rotation before every
+    /// custodian has actually made the check.
+    CustodyAck { dkg: TranscriptId },
     /// A broadcast signing round-1 commitment.
     SignRound1 {
         signing: TranscriptId,
@@ -409,6 +420,17 @@ pub struct SignTranscript {
     pub rounds: Vec<Verified>,
 }
 
+impl DkgTranscript {
+    /// Devices that have attested portable custody of their share.
+    pub fn custody_acks(&self) -> Vec<UserId> {
+        self.rounds
+            .iter()
+            .filter(|v| matches!(v.op, CeremonyOp::CustodyAck { .. }))
+            .map(|v| v.author.clone())
+            .collect()
+    }
+}
+
 impl SignTranscript {
     /// The plan for this transcript, if the **named coordinator** published one.
     ///
@@ -498,7 +520,9 @@ pub fn parse_board(events: &[SignedNode], ws: &WorkspaceId) -> CeremonyBoard {
                 }
             }
             // Rounds are keyed by the transcript they name.
-            CeremonyOp::DkgRound1 { dkg, .. } | CeremonyOp::DkgRound2 { dkg, .. } => {
+            CeremonyOp::DkgRound1 { dkg, .. }
+            | CeremonyOp::DkgRound2 { dkg, .. }
+            | CeremonyOp::CustodyAck { dkg } => {
                 let dkg = *dkg;
                 board.dkg.entry(dkg).or_default().rounds.push(entry);
             }
@@ -536,6 +560,7 @@ fn round_key(op: &CeremonyOp) -> Option<(u8, &str)> {
         // the other. Retaining both would not help — it would only move the
         // decision to whoever looks second.
         CeremonyOp::SignPlan { .. } => Some((5, "")),
+        CeremonyOp::CustodyAck { .. } => Some((6, "")),
         _ => None,
     }
 }
@@ -976,18 +1001,21 @@ pub fn aggregate(
     ser(sig.serialize(), "serialize signature")
 }
 
+/// DKG fixtures shared by other modules' tests.
+///
+/// Exposed so custody tests can seal a REAL share rather than random bytes: a
+/// package that round-trips arbitrary bytes proves nothing about whether the
+/// group key derives from what it carries.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests_support {
     use super::*;
 
     /// Per-participant `(key_share, public_key_package)`, keyed by index.
-    type Holders = BTreeMap<u16, (Vec<u8>, Vec<u8>)>;
+    pub type Holders = BTreeMap<u16, (Vec<u8>, Vec<u8>)>;
 
-    /// Run a full dealer-free `k`-of-`n` DKG through the byte API and return each
-    /// participant's `(key_share, public_key_package)` plus the group key.
-    fn run_dkg(n: u16, k: u16) -> (Holders, UserId) {
+    /// Run a full dealer-free `k`-of-`n` DKG through the byte API.
+    pub fn run_dkg(n: u16, k: u16) -> (Holders, UserId) {
         let ids: Vec<u16> = (1..=n).collect();
-        // round 1
         let mut secret1 = BTreeMap::new();
         let mut round1 = BTreeMap::new();
         for &i in &ids {
@@ -1002,7 +1030,6 @@ mod tests {
                 .map(|(k, v)| (*k, v.clone()))
                 .collect()
         };
-        // round 2
         let mut secret2 = BTreeMap::new();
         let mut inbox: BTreeMap<u16, Packages> =
             ids.iter().map(|i| (*i, BTreeMap::new())).collect();
@@ -1013,7 +1040,6 @@ mod tests {
                 inbox.get_mut(&recipient).unwrap().insert(i, pkg);
             }
         }
-        // round 3
         let mut shares = BTreeMap::new();
         let mut group = None;
         for &i in &ids {
@@ -1026,6 +1052,13 @@ mod tests {
         }
         (shares, group.unwrap())
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use super::tests_support::run_dkg;
 
     #[test]
     fn dkg_then_threshold_sign_yields_an_ed25519_group_signature() {

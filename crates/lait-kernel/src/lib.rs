@@ -23,6 +23,7 @@ pub mod actor;
 pub mod authority;
 pub mod authz;
 pub mod crypto;
+pub mod custody;
 pub mod dkg;
 pub mod dto;
 pub mod genesis;
