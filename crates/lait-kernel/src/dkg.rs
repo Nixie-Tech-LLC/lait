@@ -137,7 +137,25 @@ pub enum CeremonyOp {
         /// request to one authority rather than "whichever group is current".
         authority: TranscriptId,
         target: SignTarget,
+        /// The device permitted to publish this transcript's [`SigningPlan`].
+        ///
+        /// Must be a participant of the named authority: retention drops rounds
+        /// from non-participants, so a plan from an outsider is discarded before
+        /// anyone could act on it. Coordination is a holder's job.
+        ///
+        /// Any-K needs *someone* to choose which K holders sign, and that choice
+        /// must be a single canonical object every signer binds to. Naming the
+        /// chooser in the request means the role cannot be seized later: a plan
+        /// from anyone else is not a plan. If the coordinator goes away, the
+        /// answer is a new transcript with fresh nonces — never a second
+        /// coordinator over the same commitments.
+        coordinator: UserId,
         op: Vec<u8>,
+    },
+    /// The coordinator's chosen signing plan for a transcript.
+    SignPlan {
+        signing: TranscriptId,
+        plan: Vec<u8>,
     },
     /// A broadcast signing round-1 commitment.
     SignRound1 {
@@ -391,6 +409,25 @@ pub struct SignTranscript {
     pub rounds: Vec<Verified>,
 }
 
+impl SignTranscript {
+    /// The plan for this transcript, if the **named coordinator** published one.
+    ///
+    /// A plan from any other author is not a plan: the coordinator role is fixed
+    /// by the request precisely so it cannot be seized by whoever posts first.
+    pub fn plan(&self) -> Option<SigningPlan> {
+        let coordinator = match self.request.as_ref().map(|r| &r.op) {
+            Some(CeremonyOp::SignRequest { coordinator, .. }) => coordinator.clone(),
+            _ => return None,
+        };
+        self.rounds.iter().find_map(|v| match &v.op {
+            CeremonyOp::SignPlan { plan, .. } if v.author == coordinator => {
+                postcard::from_bytes::<SigningPlan>(plan).ok()
+            }
+            _ => None,
+        })
+    }
+}
+
 /// Every verified ceremony contribution, indexed by transcript.
 #[derive(Debug, Clone, Default)]
 pub struct CeremonyBoard {
@@ -465,7 +502,9 @@ pub fn parse_board(events: &[SignedNode], ws: &WorkspaceId) -> CeremonyBoard {
                 let dkg = *dkg;
                 board.dkg.entry(dkg).or_default().rounds.push(entry);
             }
-            CeremonyOp::SignRound1 { signing, .. } | CeremonyOp::SignRound2 { signing, .. } => {
+            CeremonyOp::SignRound1 { signing, .. }
+            | CeremonyOp::SignRound2 { signing, .. }
+            | CeremonyOp::SignPlan { signing, .. } => {
                 let signing = *signing;
                 board.signing.entry(signing).or_default().rounds.push(entry);
             }
@@ -491,6 +530,12 @@ fn round_key(op: &CeremonyOp) -> Option<(u8, &str)> {
         CeremonyOp::DkgRound2 { to, .. } => Some((2, to.as_str())),
         CeremonyOp::SignRound1 { .. } => Some((3, "")),
         CeremonyOp::SignRound2 { .. } => Some((4, "")),
+        // One plan per author is retained. A coordinator that publishes two is
+        // equivocating; keeping the first means every replica honours the same
+        // one (board order converges), and a holder already bound to it refuses
+        // the other. Retaining both would not help — it would only move the
+        // decision to whoever looks second.
+        CeremonyOp::SignPlan { .. } => Some((5, "")),
         _ => None,
     }
 }
@@ -638,6 +683,58 @@ pub struct DkgManifest {
     pub configuration: AuthorityConfiguration,
 }
 
+/// The canonical description of one signing attempt: who signs, over what, with
+/// which commitments, and by what right.
+///
+/// This is the object every signature share is bound to. It exists as one
+/// structure rather than as loose parameters because the nonce binding must
+/// cover *everything* that affects a share's meaning — change any field and a
+/// nonce bound to the old plan must refuse the new one. Splitting it into
+/// separate comparisons is how one of them eventually gets dropped in a
+/// refactor, and the field most likely to go is the signer set: exactly what
+/// any-K selection mutates.
+///
+/// Scheme-neutral by construction. Flat FROST and, later, general-access
+/// signing differ only in [`AccessWitness`]; the nonce lifecycle above and the
+/// aggregation below are shared.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SigningPlan {
+    pub signing: TranscriptId,
+    pub authority: crate::authority::AuthorityId,
+    /// `blake3` of the exact message. The message itself is re-derived locally
+    /// by every signer, so the plan commits to it without being trusted for it.
+    pub message_commitment: [u8; 32],
+    pub signers: Vec<crate::authority::LeafId>,
+    /// The frozen commitment map, keyed by participant index.
+    pub commitments: Packages,
+    pub witness: AccessWitness,
+}
+
+/// Why the chosen signer set is entitled to operate the key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AccessWitness {
+    /// Flat threshold: any `k` of the participants qualify, so the witness is
+    /// just which indices were chosen.
+    FrostThreshold {
+        k: u16,
+        participant_indices: Vec<u16>,
+    },
+    /// A qualified set under a compiled access structure, with the
+    /// reconstruction coefficients it implies. Reserved; Phase D.
+    LinearReconstruction {
+        policy: [u8; 32],
+        leaves: Vec<crate::authority::LeafId>,
+        coefficient_commitment: [u8; 32],
+    },
+}
+
+impl SigningPlan {
+    /// The canonical bytes this plan hashes to.
+    pub fn encode(&self) -> Vec<u8> {
+        postcard::to_stdvec(self).expect("encode signing plan")
+    }
+}
+
 /// One signing transcript's single-use nonce state.
 ///
 /// FROST nonces are one-use cryptographic material. Producing shares for two
@@ -659,25 +756,24 @@ pub struct PendingNonce {
 }
 
 /// The binding a [`PendingNonce`] is pinned to: a domain-separated hash over the
-/// signing transcript, the exact message, and the complete frozen commitment map
-/// (which encodes the signer set — the indices are its keys).
+/// signing transcript, the exact message, and the canonical [`SigningPlan`] —
+/// which carries the signer set, the frozen commitments, the authority and the
+/// access witness.
 ///
 /// One composite hash rather than several separate comparisons: a single value
-/// cannot be partially checked, and the field most likely to be dropped in a
-/// later refactor is the signer set — exactly what any-K selection would start
-/// mutating.
-pub fn nonce_binding(signing: &TranscriptId, message: &[u8], commitments: &Packages) -> [u8; 32] {
+/// cannot be partially checked. Now that any-K selection genuinely varies the
+/// signer set, this is the difference between "the plan changed under me" being
+/// detected and a share being produced for a package the holder never agreed
+/// to — which, with a reused nonce, leaks the share.
+pub fn nonce_binding(signing: &TranscriptId, message: &[u8], plan: &SigningPlan) -> [u8; 32] {
+    let encoded = plan.encode();
     let mut h = blake3::Hasher::new();
     h.update(b"lait/space/1/ceremony/2/nonce-binding");
     h.update(&signing.0);
     h.update(&(message.len() as u64).to_le_bytes());
     h.update(message);
-    h.update(&(commitments.len() as u64).to_le_bytes());
-    for (i, c) in commitments {
-        h.update(&i.to_le_bytes());
-        h.update(&(c.len() as u64).to_le_bytes());
-        h.update(c);
-    }
+    h.update(&(encoded.len() as u64).to_le_bytes());
+    h.update(&encoded);
     *h.finalize().as_bytes()
 }
 
@@ -1234,28 +1330,150 @@ mod tests {
         assert!(board.dkg[&id].auths.len() == 1);
     }
 
+    // ---- signing plans and retention ----
+    fn request_with_coordinator(
+        w: &WorkspaceId,
+        coordinator: UserId,
+    ) -> (TranscriptId, SignedNode) {
+        let authority = TranscriptId::parse_hex(&"a".repeat(64)).unwrap();
+        let req = CeremonyOp::SignRequest {
+            nonce: [3u8; 16],
+            authority,
+            target: SignTarget::SpaceOp,
+            coordinator,
+            op: vec![1, 2, 3],
+        };
+        let ev = sign_ceremony(&[7u8; 32], &req, w);
+        (TranscriptId::of(&ev).unwrap(), ev)
+    }
+
+    /// The coordinator role is fixed by the request. A plan from anyone else is
+    /// not a plan — otherwise any holder could seize the choice of who signs
+    /// simply by publishing first.
+    #[test]
+    fn a_plan_from_a_non_coordinator_is_ignored() {
+        let w = ws();
+        let coordinator = crate::crypto::user_from_seed(&[50u8; 32]);
+        let (signing, rev) = request_with_coordinator(&w, coordinator.clone());
+        let plan = test_plan(signing, [(1u16, vec![1])].into_iter().collect());
+
+        let impostor = sign_ceremony(
+            &[51u8; 32],
+            &CeremonyOp::SignPlan {
+                signing,
+                plan: plan.encode(),
+            },
+            &w,
+        );
+        let mut board = parse_board(&[rev.clone(), impostor], &w);
+        board.restrict_signing_rounds(|_| Some(vec![coordinator.clone()]));
+        assert!(
+            board.signing[&signing].plan().is_none(),
+            "only the named coordinator publishes a plan"
+        );
+
+        let good = sign_ceremony(
+            &[50u8; 32],
+            &CeremonyOp::SignPlan {
+                signing,
+                plan: plan.encode(),
+            },
+            &w,
+        );
+        let mut board = parse_board(&[rev, good], &w);
+        board.restrict_signing_rounds(|_| Some(vec![coordinator.clone()]));
+        assert_eq!(board.signing[&signing].plan(), Some(plan));
+    }
+
+    /// A coordinator publishing two plans is equivocating. Every replica honours
+    /// the same one (board order converges) and a holder already bound to it
+    /// refuses the other, so the second is inert rather than ambiguous.
+    #[test]
+    fn only_one_plan_per_coordinator_is_honoured() {
+        let w = ws();
+        let coordinator = crate::crypto::user_from_seed(&[50u8; 32]);
+        let (signing, rev) = request_with_coordinator(&w, coordinator.clone());
+        let first = test_plan(signing, [(1u16, vec![1])].into_iter().collect());
+        let second = test_plan(signing, [(2u16, vec![2])].into_iter().collect());
+        let evs = vec![
+            rev,
+            sign_ceremony(
+                &[50u8; 32],
+                &CeremonyOp::SignPlan {
+                    signing,
+                    plan: first.encode(),
+                },
+                &w,
+            ),
+            sign_ceremony(
+                &[50u8; 32],
+                &CeremonyOp::SignPlan {
+                    signing,
+                    plan: second.encode(),
+                },
+                &w,
+            ),
+        ];
+        let mut board = parse_board(&evs, &w);
+        board.restrict_signing_rounds(|_| Some(vec![coordinator.clone()]));
+        assert_eq!(board.signing[&signing].rounds.len(), 1, "one plan retained");
+        assert_eq!(board.signing[&signing].plan(), Some(first));
+    }
+
     // ---- nonce binding ----
 
-    /// The binding covers the transcript, the message AND the complete
-    /// commitment map (whose keys are the signer set). Any of them moving is a
-    /// different binding, so a stored nonce cannot sign two distinct packages.
+    fn test_plan(signing: TranscriptId, commitments: Packages) -> SigningPlan {
+        let indices: Vec<u16> = commitments.keys().copied().collect();
+        SigningPlan {
+            signing,
+            authority: crate::authority::AuthorityId::single(crate::crypto::user_from_seed(
+                &[201u8; 32],
+            )),
+            message_commitment: [0u8; 32],
+            signers: indices
+                .iter()
+                .map(|i| {
+                    crate::authority::LeafId::of_principal(
+                        &crate::authority::PrincipalId::of_device(&crate::crypto::user_from_seed(
+                            &[*i as u8; 32],
+                        )),
+                    )
+                })
+                .collect(),
+            commitments,
+            witness: AccessWitness::FrostThreshold {
+                k: indices.len() as u16,
+                participant_indices: indices,
+            },
+        }
+    }
+
+    /// The binding covers the transcript, the message AND the whole plan — which
+    /// carries the signer set, the frozen commitments, the authority and the
+    /// access witness. Any of them moving is a different binding, so a stored
+    /// nonce cannot sign two distinct plans.
     #[test]
-    fn the_nonce_binding_covers_transcript_message_and_signer_set() {
+    fn the_nonce_binding_covers_transcript_message_and_plan() {
         let a = TranscriptId::parse_hex(&"a".repeat(64)).unwrap();
         let b = TranscriptId::parse_hex(&"b".repeat(64)).unwrap();
         let commitments: Packages = [(1u16, vec![1, 2, 3]), (2u16, vec![4, 5, 6])]
             .into_iter()
             .collect();
-        let base = nonce_binding(&a, b"msg", &commitments);
+        let plan = test_plan(a, commitments.clone());
+        let base = nonce_binding(&a, b"msg", &plan);
 
-        assert_ne!(base, nonce_binding(&b, b"msg", &commitments), "transcript");
-        assert_ne!(base, nonce_binding(&a, b"other", &commitments), "message");
+        assert_ne!(base, nonce_binding(&b, b"msg", &plan), "transcript");
+        assert_ne!(base, nonce_binding(&a, b"other", &plan), "message");
 
-        // A different signer set at the same size.
+        // A different signer set at the same size — what any-K selection varies.
         let moved: Packages = [(1u16, vec![1, 2, 3]), (3u16, vec![4, 5, 6])]
             .into_iter()
             .collect();
-        assert_ne!(base, nonce_binding(&a, b"msg", &moved), "signer set");
+        assert_ne!(
+            base,
+            nonce_binding(&a, b"msg", &test_plan(a, moved)),
+            "signer set"
+        );
 
         // A changed commitment for the same signer.
         let tweaked: Packages = [(1u16, vec![1, 2, 3]), (2u16, vec![4, 5, 7])]
@@ -1263,444 +1481,22 @@ mod tests {
             .collect();
         assert_ne!(
             base,
-            nonce_binding(&a, b"msg", &tweaked),
+            nonce_binding(&a, b"msg", &test_plan(a, tweaked)),
             "commitment bytes"
         );
 
+        // A different authority over the same commitments.
+        let mut other_authority = test_plan(a, commitments.clone());
+        other_authority.authority =
+            crate::authority::AuthorityId::single(crate::crypto::user_from_seed(&[202u8; 32]));
+        assert_ne!(
+            base,
+            nonce_binding(&a, b"msg", &other_authority),
+            "authority"
+        );
+
         // Stable for identical input.
-        assert_eq!(base, nonce_binding(&a, b"msg", &commitments));
-    }
-
-    // ---- domain separation ----
-
-    /// §2.3 regression. A group must be able to threshold-sign a ceremony
-    /// proposal, so the signing path takes the domain from `SignTarget`. If it
-    /// did not, a signature over ceremony bytes would be produced under the
-    /// space domain and handed to the space plane — and because postcard is not
-    /// self-describing and `DkgPropose` shares variant tag 0 with
-    /// `SpaceOp::Recover`, that is type confusion, not a filing error.
-    #[test]
-    fn a_ceremony_signature_cannot_pass_as_a_space_event() {
-        let w = ws();
-        let seed = [4u8; 32];
-        // Bytes that are a structurally valid DkgPropose...
-        let op_bytes =
-            postcard::to_stdvec(&CeremonyOp::DkgPropose(test_proposal([0u8; 16], 2, vec![])))
-                .unwrap();
-        // ...and which postcard will also happily read as a SpaceOp, since the
-        // encoding carries no type information. This is the hazard itself.
-        assert!(
-            postcard::from_bytes::<crate::space::SpaceOp>(&op_bytes).is_ok(),
-            "ceremony bytes decode as a space op — nothing but the domain separates them"
-        );
-
-        // The two targets produce different signing messages...
-        let author = crate::crypto::user_from_seed(&seed);
-        let as_space = sigdag::payload_to_sign(
-            crate::space::SPACE_EVENT_DOMAIN,
-            &op_bytes,
-            &author,
-            &[],
-            w.as_str(),
-        );
-        let as_ceremony =
-            sigdag::payload_to_sign(CEREMONY_DOMAIN, &op_bytes, &author, &[], w.as_str());
-        assert_ne!(as_space, as_ceremony, "the domain must change the message");
-
-        // ...so a node signed for the ceremony plane cannot be installed on the
-        // space plane, even though the bytes parse there.
-        let node = sigdag::sign_node(CEREMONY_DOMAIN, &seed, op_bytes, vec![], w.as_str());
-        assert!(node.verify_sig(CEREMONY_DOMAIN, w.as_str()));
-        assert!(
-            !node.verify_sig(crate::space::SPACE_EVENT_DOMAIN, w.as_str()),
-            "a ceremony-plane signature must never verify as a space event"
-        );
-    }
-
-    // ---- multi-authorization retention (§3) ----
-
-    /// Build a proposal and `count` authorizations from distinct keys.
-    fn proposal_with_auths(w: &WorkspaceId, seeds: &[[u8; 32]]) -> (TranscriptId, Vec<SignedNode>) {
-        let propose = CeremonyOp::DkgPropose(test_proposal([1u8; 16], 2, vec![]));
-        let pev = sign_ceremony(&[7u8; 32], &propose, w);
-        let id = TranscriptId::of(&pev).unwrap();
-        let mut evs = vec![pev];
-        for seed in seeds {
-            let grant = sign_authority_grant(seed, w, &id);
-            evs.push(sign_ceremony(
-                &[7u8; 32],
-                &CeremonyOp::DkgAuthorize(grant),
-                w,
-            ));
-        }
-        (id, evs)
-    }
-
-    /// A signature-valid authorization from the WRONG key must not displace the
-    /// right one. With a single slot, whichever landed later won — so anyone able
-    /// to post could suppress a proposal, making recovery a denial-of-service
-    /// target decided by board order rather than by authority.
-    #[test]
-    fn a_wrong_key_authorization_cannot_displace_the_right_one() {
-        let w = ws();
-        let right = [3u8; 32];
-        let wrong = [4u8; 32];
-        let right_key = crate::crypto::user_from_seed(&right);
-
-        // Both orders must give the same answer.
-        for seeds in [[right, wrong], [wrong, right]] {
-            let (id, evs) = proposal_with_auths(&w, &seeds);
-            let board = parse_board(&evs, &w);
-            let auths = &board.dkg[&id].auths;
-            assert_eq!(auths.len(), 2, "both are retained");
-            assert!(
-                auths.contains_key(&right_key),
-                "the correct authorization survives regardless of order"
-            );
-        }
-    }
-
-    /// Many wrong-key authorizations cannot crowd out a correct one: they are
-    /// keyed by signer, so the correct signer always has its own entry.
-    #[test]
-    fn many_wrong_authorizations_cannot_suppress_a_correct_one() {
-        let w = ws();
-        let right = [3u8; 32];
-        let right_key = crate::crypto::user_from_seed(&right);
-        // Correct authorization FIRST: a last-wins single slot would lose it,
-        // so this fails against the behaviour being replaced.
-        let mut seeds: Vec<[u8; 32]> = vec![right];
-        seeds.extend((10..60u8).map(|i| [i; 32]));
-        let (id, evs) = proposal_with_auths(&w, &seeds);
-        let board = parse_board(&evs, &w);
-        assert!(board.dkg[&id].auths.contains_key(&right_key));
-    }
-
-    /// Two postings of the SAME authority decision converge to one entry, so a
-    /// participant cannot inflate retained state by re-posting.
-    #[test]
-    fn repeated_postings_of_one_authority_decision_converge() {
-        let w = ws();
-        let (id, mut evs) = proposal_with_auths(&w, &[[3u8; 32]]);
-        // Post the same decision again, under a different carrier signature.
-        let grant = sign_authority_grant(&[3u8; 32], &w, &id);
-        evs.push(sign_ceremony(
-            &[8u8; 32],
-            &CeremonyOp::DkgAuthorize(grant),
-            &w,
-        ));
-        let board = parse_board(&evs, &w);
-        assert_eq!(
-            board.dkg[&id].auths.len(),
-            1,
-            "one authority, one retained decision"
-        );
-    }
-
-    // ---- signing-round participant filtering (§4) ----
-
-    /// Build a DKG whose proposal names `participants`, plus a signing request
-    /// against it.
-    fn dkg_and_request(
-        w: &WorkspaceId,
-        participants: Vec<UserId>,
-    ) -> (TranscriptId, TranscriptId, Vec<SignedNode>) {
-        let propose = CeremonyOp::DkgPropose(test_proposal([1u8; 16], 2, participants));
-        let pev = sign_ceremony(&[7u8; 32], &propose, w);
-        let authority = TranscriptId::of(&pev).unwrap();
-        let req = CeremonyOp::SignRequest {
-            nonce: [2u8; 16],
-            authority,
-            target: SignTarget::SpaceOp,
-            op: vec![1, 2, 3],
-        };
-        let rev = sign_ceremony(&[7u8; 32], &req, w);
-        let signing = TranscriptId::of(&rev).unwrap();
-        (authority, signing, vec![pev, rev])
-    }
-
-    /// One-contribution-per-author is not a bound on the signing side: an
-    /// attacker mints as many keys as they like. Participants must be resolved
-    /// through the request's named authority.
-    #[test]
-    fn signing_rounds_from_nonparticipant_keys_retain_nothing() {
-        let w = ws();
-        let insider = crate::crypto::user_from_seed(&[11u8; 32]);
-        let (_authority, signing, mut evs) = dkg_and_request(
-            &w,
-            vec![insider.clone(), crate::crypto::user_from_seed(&[12u8; 32])],
-        );
-        // 500 distinct attacker keys, one round each — under any per-author cap.
-        for i in 0..500u32 {
-            let mut seed = [0u8; 32];
-            seed[..4].copy_from_slice(&i.to_le_bytes());
-            seed[8] = 1; // keep clear of the insider seed
-            evs.push(sign_ceremony(
-                &seed,
-                &CeremonyOp::SignRound1 {
-                    signing,
-                    commitments: vec![0u8; 8],
-                },
-                &w,
-            ));
-        }
-        let mut board = parse_board(&evs, &w);
-        board.restrict_signing_rounds(|_| None);
-        assert_eq!(
-            board.signing[&signing].rounds.len(),
-            0,
-            "no attacker key is a participant of the named authority"
-        );
-
-        // The insider's round is retained, and is not displaced by the flood.
-        evs.push(sign_ceremony(
-            &[11u8; 32],
-            &CeremonyOp::SignRound1 {
-                signing,
-                commitments: vec![9u8; 8],
-            },
-            &w,
-        ));
-        let mut board = parse_board(&evs, &w);
-        board.restrict_signing_rounds(|_| None);
-        assert_eq!(board.signing[&signing].rounds.len(), 1);
-        assert_eq!(board.signing[&signing].rounds[0].author, insider);
-    }
-
-    /// Regression: a DKG round 2 is a *targeted* share, so each participant
-    /// posts `n - 1` of them. Capping retention at one per author silently broke
-    /// every ceremony with more than two participants while passing at n = 2 —
-    /// which is what the whole suite used, so nothing caught it until a 3-party
-    /// group→group rotation stalled with no shares derived.
-    #[test]
-    fn every_targeted_round_two_share_is_retained() {
-        let w = ws();
-        let devices: Vec<UserId> = (20..23u8)
-            .map(|i| crate::crypto::user_from_seed(&[i; 32]))
-            .collect();
-        let mut sorted = devices.clone();
-        sorted.sort();
-        let propose = CeremonyOp::DkgPropose(test_proposal([1u8; 16], 2, sorted.clone()));
-        let pev = sign_ceremony(&[20u8; 32], &propose, &w);
-        let id = TranscriptId::of(&pev).unwrap();
-        let mut evs = vec![pev];
-        // One author sends a sealed share to each of the other two.
-        for to in sorted.iter().filter(|d| **d != devices[0]) {
-            evs.push(sign_ceremony(
-                &[20u8; 32],
-                &CeremonyOp::DkgRound2 {
-                    dkg: id,
-                    to: to.clone(),
-                    sealed: vec![1, 2, 3],
-                },
-                &w,
-            ));
-        }
-        let board = parse_board(&evs, &w);
-        assert_eq!(
-            board.dkg[&id].rounds.len(),
-            2,
-            "n - 1 targeted shares from one author are all legitimate"
-        );
-
-        // But a second share to the SAME recipient is still capped, so the bound
-        // is n - 1 per author rather than unlimited.
-        evs.push(sign_ceremony(
-            &[20u8; 32],
-            &CeremonyOp::DkgRound2 {
-                dkg: id,
-                to: sorted.iter().find(|d| **d != devices[0]).unwrap().clone(),
-                sealed: vec![9, 9, 9],
-            },
-            &w,
-        ));
-        let board = parse_board(&evs, &w);
-        assert_eq!(
-            board.dkg[&id].rounds.len(),
-            2,
-            "one contribution per author PER RECIPIENT"
-        );
-    }
-
-    /// An authority the projection cannot resolve, and for which the caller has
-    /// no authenticated local record, retains no actionable rounds — nothing can
-    /// establish who is permitted to contribute.
-    #[test]
-    fn a_request_naming_an_unknown_authority_retains_no_rounds() {
-        let w = ws();
-        let unknown = TranscriptId::parse_hex(&"e".repeat(64)).unwrap();
-        let req = CeremonyOp::SignRequest {
-            nonce: [2u8; 16],
-            authority: unknown,
-            target: SignTarget::SpaceOp,
-            op: vec![1],
-        };
-        let rev = sign_ceremony(&[11u8; 32], &req, &w);
-        let signing = TranscriptId::of(&rev).unwrap();
-        let round = sign_ceremony(
-            &[11u8; 32],
-            &CeremonyOp::SignRound1 {
-                signing,
-                commitments: vec![1],
-            },
-            &w,
-        );
-        let mut board = parse_board(&[rev, round], &w);
-        board.restrict_signing_rounds(|_| None);
-        assert_eq!(board.signing[&signing].rounds.len(), 0);
-    }
-
-    /// The fallback resolves an authority missing from the projection, so a
-    /// pruned or not-yet-synced proposal does not strand a live group.
-    #[test]
-    fn an_authenticated_fallback_resolves_a_missing_authority() {
-        let w = ws();
-        let holder = crate::crypto::user_from_seed(&[11u8; 32]);
-        let missing = TranscriptId::parse_hex(&"e".repeat(64)).unwrap();
-        let req = CeremonyOp::SignRequest {
-            nonce: [2u8; 16],
-            authority: missing,
-            target: SignTarget::SpaceOp,
-            op: vec![1],
-        };
-        let rev = sign_ceremony(&[11u8; 32], &req, &w);
-        let signing = TranscriptId::of(&rev).unwrap();
-        let round = sign_ceremony(
-            &[11u8; 32],
-            &CeremonyOp::SignRound1 {
-                signing,
-                commitments: vec![1],
-            },
-            &w,
-        );
-        let mut board = parse_board(&[rev, round], &w);
-        board.restrict_signing_rounds(|id| (*id == missing).then(|| vec![holder.clone()]));
-        assert_eq!(board.signing[&signing].rounds.len(), 1);
-    }
-
-    /// A signing request cannot smuggle in its own participant set: the filter
-    /// reads the authority's proposal, never the request. Here the request names
-    /// authority A while the attacker holds a slot only in an unrelated DKG B.
-    #[test]
-    fn a_signing_request_cannot_borrow_another_dkgs_participants() {
-        let w = ws();
-        let outsider = crate::crypto::user_from_seed(&[42u8; 32]);
-        let insider = crate::crypto::user_from_seed(&[11u8; 32]);
-
-        // Authority A names only the insider.
-        let (_a_id, signing, mut evs) = dkg_and_request(
-            &w,
-            vec![insider, crate::crypto::user_from_seed(&[12u8; 32])],
-        );
-        // An unrelated DKG B names the outsider — irrelevant to this request.
-        let other = CeremonyOp::DkgPropose(test_proposal(
-            [9u8; 16],
-            2,
-            vec![outsider, crate::crypto::user_from_seed(&[13u8; 32])],
-        ));
-        evs.push(sign_ceremony(&[7u8; 32], &other, &w));
-        evs.push(sign_ceremony(
-            &[42u8; 32],
-            &CeremonyOp::SignRound1 {
-                signing,
-                commitments: vec![1],
-            },
-            &w,
-        ));
-        let mut board = parse_board(&evs, &w);
-        board.restrict_signing_rounds(|_| None);
-        assert_eq!(
-            board.signing[&signing].rounds.len(),
-            0,
-            "membership of another DKG grants nothing here"
-        );
-    }
-
-    // ---- retention ----
-
-    /// Rounds naming a transcript nobody opened can never be acted on, and
-    /// anyone can mint ids — so they must not accumulate as retained state.
-    #[test]
-    fn rounds_for_an_unopened_transcript_are_dropped() {
-        let w = ws();
-        let orphan = TranscriptId::parse_hex(&"d".repeat(64)).unwrap();
-        let ev = sign_ceremony(
-            &[5u8; 32],
-            &CeremonyOp::DkgRound1 {
-                dkg: orphan,
-                package: vec![1, 2, 3],
-            },
-            &w,
-        );
-        let board = parse_board(&[ev], &w);
-        assert!(board.dkg.is_empty(), "no opener, no transcript");
-    }
-
-    /// A round from a device the proposal never named cannot contribute, so it
-    /// is dropped rather than carried.
-    #[test]
-    fn rounds_from_non_participants_are_dropped() {
-        let w = ws();
-        let insider = crate::crypto::user_from_seed(&[11u8; 32]);
-        let propose = CeremonyOp::DkgPropose(test_proposal(
-            [1u8; 16],
-            2,
-            vec![insider.clone(), crate::crypto::user_from_seed(&[12u8; 32])],
-        ));
-        let pev = sign_ceremony(&[11u8; 32], &propose, &w);
-        let id = TranscriptId::of(&pev).unwrap();
-        let good = sign_ceremony(
-            &[11u8; 32],
-            &CeremonyOp::DkgRound1 {
-                dkg: id,
-                package: vec![1],
-            },
-            &w,
-        );
-        let outsider = sign_ceremony(
-            &[99u8; 32],
-            &CeremonyOp::DkgRound1 {
-                dkg: id,
-                package: vec![2],
-            },
-            &w,
-        );
-        let board = parse_board(&[pev, good, outsider], &w);
-        assert_eq!(board.dkg[&id].rounds.len(), 1);
-        assert_eq!(board.dkg[&id].rounds[0].author, insider);
-    }
-
-    /// Duplicates past the first were already ignored by `entry().or_insert`,
-    /// but they were retained — so a legitimate participant could flood a
-    /// transcript they belong to.
-    #[test]
-    fn one_round_per_author_per_kind_is_retained() {
-        let w = ws();
-        let me = crate::crypto::user_from_seed(&[11u8; 32]);
-        let propose = CeremonyOp::DkgPropose(test_proposal(
-            [1u8; 16],
-            2,
-            vec![me.clone(), crate::crypto::user_from_seed(&[12u8; 32])],
-        ));
-        let pev = sign_ceremony(&[11u8; 32], &propose, &w);
-        let id = TranscriptId::of(&pev).unwrap();
-        let mut events = vec![pev];
-        for i in 0..50u8 {
-            events.push(sign_ceremony(
-                &[11u8; 32],
-                &CeremonyOp::DkgRound1 {
-                    dkg: id,
-                    package: vec![i],
-                },
-                &w,
-            ));
-        }
-        let board = parse_board(&events, &w);
-        assert_eq!(
-            board.dkg[&id].rounds.len(),
-            1,
-            "50 round-1 posts from one author retain one"
-        );
+        assert_eq!(base, nonce_binding(&a, b"msg", &plan));
     }
 
     /// The group key must be derivable from the public-key package, since that

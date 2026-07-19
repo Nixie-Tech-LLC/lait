@@ -3051,6 +3051,7 @@ impl Tracker {
                     nonce: rand16(),
                     authority,
                     target: crate::dkg::SignTarget::SpaceOp,
+                    coordinator: self.me.clone(),
                     op: op_bytes.clone(),
                 };
                 let ev = crate::dkg::sign_ceremony(&self.seed, &req, &self.workspace_id);
@@ -3596,6 +3597,7 @@ impl Tracker {
                     nonce: rand16(),
                     authority,
                     target: crate::dkg::SignTarget::AuthorityGrant,
+                    coordinator: self.me.clone(),
                     op: op_bytes.clone(),
                 };
                 let ev = crate::dkg::sign_ceremony(&self.seed, &req, &self.workspace_id);
@@ -4073,24 +4075,22 @@ impl Tracker {
         crate::dkg::group_key_of_package(&self.dkg_read(t, "pkp")?).ok()
     }
 
-    /// Advance one FROST threshold-signing transcript over the bulletin board:
-    /// post my commitment, then my signature share once the signer set has
-    /// committed, then (any holder) aggregate and install.
+    /// Advance one FROST threshold-signing transcript over the bulletin board.
     ///
-    /// The signer set is fixed as the `threshold` lowest-index holders, so every
-    /// participant assembles the identical `SigningPackage`. That keeps the
-    /// ceremony convergent without a coordinator, at the cost that recovery needs
-    /// *those* K holders online — for the common K=N case, every holder anyway.
+    /// Any available K holders can sign, not a predetermined K. That needs a
+    /// single canonical answer to "which K", because a signature share binds to
+    /// the whole signing package and two holders signing under different
+    /// packages produce shares that do not aggregate — and a holder signing
+    /// twice under different packages with one nonce leaks its share outright.
     ///
-    /// **The fixed set is load-bearing for safety, not just convergence.** A
-    /// signature share binds to the whole `SigningPackage`; signing twice with
-    /// one nonce under two different packages is textbook nonce reuse and leaks
-    /// the signing share. Loosening this to any-committed-K therefore needs a
-    /// coordinator op to freeze the set, *and* the nonce binding check below to
-    /// stay in force.
+    /// The answer is the [`SigningPlan`], published by the coordinator the
+    /// request names. Holders do not trust it: every selected signer re-derives
+    /// the message, checks each commitment against what its author actually
+    /// posted, confirms its own commitment is unchanged, and only then binds its
+    /// nonce record to the plan. What the coordinator supplies is a *choice*,
+    /// not an input to the cryptography.
     ///
-    /// Contribution is gated on local `intent`: a passive replica never co-signs
-    /// a request it did not itself authorize.
+    /// [`SigningPlan`]: crate::dkg::SigningPlan
     fn sign_advance_session(
         &mut self,
         signing: &crate::dkg::TranscriptId,
@@ -4103,15 +4103,13 @@ impl Tracker {
         let crate::dkg::CeremonyOp::SignRequest {
             authority,
             target,
+            coordinator,
             op: op_bytes,
             ..
         } = &request.op
         else {
             return Ok(false);
         };
-        // The request names the DKG whose group key it asks to sign. Only act if
-        // we hold a share for THAT authority — binding the request to one group
-        // rather than "whichever group happens to be current".
         let Some(dkg_t) = board.dkg.get(authority) else {
             return Ok(false);
         };
@@ -4160,32 +4158,28 @@ impl Tracker {
             &[],
             self.workspace_id.as_str(),
         );
-        // Fixed signer set: the `threshold` lowest-index holders.
-        let in_set = my_index <= threshold;
 
-        // Round-1 commitments from the signer set, keyed by index.
-        let mut r1: crate::dkg::Packages = std::collections::BTreeMap::new();
+        // Every commitment posted so far, keyed by index, taken from the authors
+        // who actually posted them.
+        let mut posted: crate::dkg::Packages = std::collections::BTreeMap::new();
         for v in &t.rounds {
             if let crate::dkg::CeremonyOp::SignRound1 { commitments, .. } = &v.op {
                 if let Some(i) = index_of(&v.author) {
-                    if i <= threshold {
-                        r1.entry(i).or_insert_with(|| commitments.clone());
-                    }
+                    posted.entry(i).or_insert_with(|| commitments.clone());
                 }
             }
         }
-        let i_posted_r1 = t.rounds.iter().any(|v| {
-            v.author == self.me && matches!(v.op, crate::dkg::CeremonyOp::SignRound1 { .. })
-        });
+        let i_posted_r1 = posted.contains_key(&my_index);
 
-        // Step 1 — post my commitment (if I am in the signer set). The nonce
-        // record is created EXCLUSIVELY: single-use material that already exists
-        // must be examined, never overwritten.
-        if in_set && !i_posted_r1 && !self.dkg_has(signing, "nonce") {
+        // Step 1 — commit. EVERY holder commits, not only a predetermined K:
+        // that is what makes any available K able to sign. The nonce record is
+        // created exclusively, since single-use material that already exists
+        // must be examined rather than overwritten.
+        if !i_posted_r1 && !self.dkg_has(signing, "nonce") {
             let (nonces, commitments) = crate::dkg::sign_round1(&share)?;
             let pending = crate::dkg::PendingNonce {
                 signing: *signing,
-                // Filled in at step 2, once the full commitment set is known.
+                // Bound at step 3, once the coordinator has fixed the plan.
                 binding: [0u8; 32],
                 nonces,
             };
@@ -4197,30 +4191,118 @@ impl Tracker {
             return Ok(true);
         }
 
-        // Step 2 — once the whole signer set has committed, post my share.
+        // Step 2 — the coordinator freezes a plan once enough holders have
+        // committed. Only the named coordinator may do this, and only once.
+        let existing_plan = t.plan();
+        if existing_plan.is_none() && &self.me == coordinator && posted.len() >= threshold as usize
+        {
+            // Take the lowest `threshold` indices among those that committed.
+            // Any qualified subset would do; a deterministic rule keeps a
+            // coordinator restarted mid-flight from producing a second plan.
+            let chosen: Vec<u16> = posted.keys().copied().take(threshold as usize).collect();
+            let commitments: crate::dkg::Packages =
+                chosen.iter().map(|i| (*i, posted[i].clone())).collect();
+            let signers: Vec<crate::authority::LeafId> = chosen
+                .iter()
+                .map(|i| {
+                    crate::authority::LeafId::of_principal(
+                        &crate::authority::PrincipalId::of_device(&participants[*i as usize - 1]),
+                    )
+                })
+                .collect();
+            let Some(config) = self.dkg_manifest(authority).map(|m| m.configuration) else {
+                return Ok(false);
+            };
+            let plan = crate::dkg::SigningPlan {
+                signing: *signing,
+                authority: crate::authority::AuthorityId::new(group_key.clone(), &config),
+                message_commitment: *blake3::hash(&message).as_bytes(),
+                signers,
+                commitments,
+                witness: crate::dkg::AccessWitness::FrostThreshold {
+                    k: threshold,
+                    participant_indices: chosen,
+                },
+            };
+            self.post_ceremony(crate::dkg::CeremonyOp::SignPlan {
+                signing: *signing,
+                plan: plan.encode(),
+            })?;
+            return Ok(true);
+        }
+        let Some(plan) = existing_plan else {
+            return Ok(false);
+        };
+
+        // Step 3 — validate the plan, then sign under it.
+        //
+        // Nothing here trusts the coordinator's arithmetic. The message is
+        // re-derived; every commitment is checked against the round-1 event its
+        // author actually posted; our own commitment must be the one we hold a
+        // nonce for. A coordinator can choose WHO signs; it cannot choose WHAT
+        // they sign or forge a commitment on their behalf.
+        let crate::dkg::AccessWitness::FrostThreshold {
+            k,
+            participant_indices,
+        } = &plan.witness
+        else {
+            // A witness this build cannot evaluate is refused rather than
+            // assumed valid.
+            return Ok(false);
+        };
+        let plan_ok = plan.signing == *signing
+            && plan.authority.public_key == group_key
+            && plan.message_commitment == *blake3::hash(&message).as_bytes()
+            && *k == threshold
+            && participant_indices.len() == threshold as usize
+            && plan.commitments.len() == threshold as usize
+            && plan.signers.len() == threshold as usize
+            // Canonical ordering, so two coordinators cannot produce differing
+            // encodings of the same choice.
+            && participant_indices.windows(2).all(|w| w[0] < w[1])
+            && participant_indices
+                .iter()
+                .all(|i| *i >= 1 && (*i as usize) <= participants.len())
+            && plan.commitments.keys().eq(participant_indices.iter())
+            // Authenticity: each commitment must be what that participant
+            // actually posted, not what the coordinator says they posted.
+            && plan
+                .commitments
+                .iter()
+                .all(|(i, c)| posted.get(i) == Some(c));
+        if !plan_ok {
+            anyhow::bail!("refusing to sign: the coordinator's plan does not validate");
+        }
+        let in_plan = participant_indices.contains(&my_index);
         let i_posted_r2 = t.rounds.iter().any(|v| {
             v.author == self.me && matches!(v.op, crate::dkg::CeremonyOp::SignRound2 { .. })
         });
-        if in_set && r1.len() == threshold as usize && !i_posted_r2 {
+        if in_plan && !i_posted_r2 {
             let Some(raw) = self.dkg_read(signing, "nonce") else {
                 return Ok(false);
             };
             let mut pending: crate::dkg::PendingNonce = postcard::from_bytes(&raw)?;
-            let binding = crate::dkg::nonce_binding(signing, &message, &r1);
+            // Our own commitment in the plan must be the one these nonces
+            // produced. This is the check that makes a shifted signer set safe.
+            if plan.commitments.get(&my_index) != posted.get(&my_index) {
+                anyhow::bail!("refusing to sign: the plan carries a commitment we did not post");
+            }
+            let binding = crate::dkg::nonce_binding(signing, &message, &plan);
             // THE nonce-reuse gate. One stored record may produce shares for
-            // exactly one signing package; if the package moved under us, refuse
-            // rather than sign. The comparison — not the deletion — is what
-            // prevents reuse, since a crash between posting and deleting always
-            // leaves the record behind.
+            // exactly one plan; if the plan moved under us, refuse rather than
+            // sign. The comparison — not the deletion — is what prevents reuse,
+            // since a crash between publishing and deleting always leaves the
+            // record behind.
             if pending.binding == [0u8; 32] {
                 pending.binding = binding;
                 self.dkg_write(signing, "nonce", &postcard::to_stdvec(&pending)?)?;
             } else if pending.binding != binding {
                 anyhow::bail!(
-                    "refusing to sign: this transcript's signing package changed after commitment (signing again would reuse the nonce and leak the key share)"
+                    "refusing to sign: this transcript's signing plan changed after commitment (signing again would reuse the nonce and leak the key share)"
                 );
             }
-            let share_sig = crate::dkg::sign_round2(&r1, &message, &pending.nonces, &share)?;
+            let share_sig =
+                crate::dkg::sign_round2(&plan.commitments, &message, &pending.nonces, &share)?;
             self.post_ceremony(crate::dkg::CeremonyOp::SignRound2 {
                 signing: *signing,
                 share: share_sig,
@@ -4231,19 +4313,19 @@ impl Tracker {
             return Ok(true);
         }
 
-        // Step 3 — any holder aggregates the group signature and installs it.
+        // Step 4 — any participant aggregates the plan's shares and installs.
         let mut r2: crate::dkg::Packages = std::collections::BTreeMap::new();
         for v in &t.rounds {
             if let crate::dkg::CeremonyOp::SignRound2 { share, .. } = &v.op {
                 if let Some(i) = index_of(&v.author) {
-                    if i <= threshold {
+                    if participant_indices.contains(&i) {
                         r2.entry(i).or_insert_with(|| share.clone());
                     }
                 }
             }
         }
-        if r1.len() == threshold as usize && r2.len() == threshold as usize {
-            let sig = crate::dkg::aggregate(&r1, &message, &r2, &pkp)?;
+        if r2.len() == threshold as usize {
+            let sig = crate::dkg::aggregate(&plan.commitments, &message, &r2, &pkp)?;
             let node = crate::sigdag::assemble_signed(op_bytes.clone(), group_key, sig, vec![]);
             match target {
                 crate::dkg::SignTarget::SpaceOp => {
@@ -4265,11 +4347,6 @@ impl Tracker {
                     }
                 }
                 crate::dkg::SignTarget::AuthorityGrant => {
-                    // `node` IS the grant: byte-identical in shape to what a solo
-                    // authority produces with `sign_authority_grant`, so one
-                    // verifier serves both. It rides onto the board inside a
-                    // ceremony op signed by this device — outer signature says
-                    // who relayed it, inner says who authorized.
                     if crate::dkg::authority_grant_of(&node, &self.workspace_id).is_some() {
                         let already = self.membership.ceremony_events().iter().any(|e| {
                             matches!(
@@ -4545,6 +4622,7 @@ impl Tracker {
                     nonce: rand16(),
                     authority,
                     target: crate::dkg::SignTarget::SpaceOp,
+                    coordinator: self.me.clone(),
                     op: op_bytes.clone(),
                 };
                 let ev = crate::dkg::sign_ceremony(&self.seed, &req, &self.workspace_id);
@@ -5995,6 +6073,30 @@ mod tests {
             }
         }
     }
+    /// Sync every ordered pair, `rounds` times. Nodes left out of the slice are
+    /// genuinely absent: ceremonies advance on import, so a node that never
+    /// syncs never contributes.
+    fn sync_mesh(nodes: &mut [TestNode], rounds: usize) {
+        let n = nodes.len();
+        for _ in 0..rounds {
+            for i in 0..n {
+                for j in 0..n {
+                    if i == j {
+                        continue;
+                    }
+                    let (from, to) = if i < j {
+                        let (l, r) = nodes.split_at_mut(j);
+                        (&mut l[i], &mut r[0])
+                    } else {
+                        let (l, r) = nodes.split_at_mut(i);
+                        (&mut r[0], &mut l[j])
+                    };
+                    sync_all(&mut from.tracker, &mut to.tracker);
+                }
+            }
+        }
+    }
+
     fn titles(t: &mut Tracker) -> Vec<String> {
         match t
             .handle(Request::List {
@@ -6823,6 +6925,7 @@ mod tests {
             nonce,
             authority,
             target: crate::dkg::SignTarget::SpaceOp,
+            coordinator: a.tracker.me.clone(),
             op: op_bytes.clone(),
         };
         let e1 = crate::dkg::sign_ceremony(&[1u8; 32], &mk([1u8; 16]), &a.tracker.workspace_id);
@@ -6864,6 +6967,7 @@ mod tests {
             nonce,
             authority,
             target: crate::dkg::SignTarget::SpaceOp,
+            coordinator: a.tracker.me.clone(),
             op: op_bytes.clone(),
         };
         let e1 = crate::dkg::sign_ceremony(&[1u8; 32], &mk([1u8; 16]), &a.tracker.workspace_id);
@@ -7512,6 +7616,111 @@ mod tests {
             (2, 3),
             "the new arrangement is the 2-of-3 that was proposed"
         );
+    }
+
+    /// B6: **any** available K can sign, not a predetermined K.
+    ///
+    /// The old rule fixed the signer set to the `threshold` lowest-index
+    /// holders, so a 2-of-3 could not recover without holder #1 — which is not
+    /// threshold availability in any useful sense. This drives a recovery with
+    /// holder #1 deliberately absent: it never syncs, so it never contributes.
+    #[test]
+    fn any_k_of_n_can_sign_without_the_lowest_index_holder() {
+        let mut a = new_node();
+        let a_ws = a.tracker.workspace_str();
+        let proof = a.tracker.founding_proof().unwrap();
+        let b_seed = [21u8; 32];
+        let b_user = user_from_seed(b_seed);
+        let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, &proof);
+        let c_seed = [31u8; 32];
+        let c_user = user_from_seed(c_seed);
+        let mut c = new_joiner_node_as(c_user.clone(), c_seed, &a_ws, &proof);
+        for incept in [
+            b.tracker.self_inception().unwrap(),
+            c.tracker.self_inception().unwrap(),
+        ] {
+            a.tracker
+                .admit_member(&incept, vec![Grant::Admin, Grant::Write]);
+        }
+        sync_all(&mut a.tracker, &mut b.tracker);
+        sync_all(&mut a.tracker, &mut c.tracker);
+
+        // A 2-of-3 group over {A, B, C}.
+        let (resp, _) = a.tracker.space_elevate_cmd(
+            vec![b_user.as_str().to_string(), c_user.as_str().to_string()],
+            2,
+        );
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        let mut nodes = vec![a, b, c];
+        sync_mesh(&mut nodes, 8);
+        assert_eq!(
+            crate::space::replay(
+                &nodes[0].tracker.genesis,
+                &nodes[0].tracker.workspace_id,
+                &nodes[0].tracker.membership.space_events(),
+            )
+            .gen,
+            1,
+            "the 2-of-3 group key is installed"
+        );
+
+        // Participant index is position in the sorted device list, so sorting
+        // the nodes the same way tells us who holder #1 is.
+        nodes.sort_by(|x, y| x.tracker.me.as_str().cmp(y.tracker.me.as_str()));
+        let absent = nodes.remove(0); // index 1 — the one the old rule required
+        assert_eq!(nodes.len(), 2, "two holders remain: exactly the threshold");
+
+        // The remaining two recover, with #1 never syncing again.
+        let recovering = nodes[0].tracker.my_actor().unwrap();
+        let (resp, _) = nodes[0].tracker.space_recover_cmd();
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        sync_mesh(&mut nodes, 3);
+
+        let events = nodes[1].tracker.membership.ceremony_events();
+        let board = crate::dkg::parse_board(&events, &nodes[1].tracker.workspace_id);
+        let session = *board
+            .signing
+            .keys()
+            .next()
+            .expect("a recovery request reached the other holder");
+        let (resp, _) = nodes[1]
+            .tracker
+            .space_recover_approve_cmd(session.to_hex(), vec![recovering.as_str().to_string()]);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        sync_mesh(&mut nodes, 8);
+
+        let after = crate::space::replay(
+            &nodes[0].tracker.genesis,
+            &nodes[0].tracker.workspace_id,
+            &nodes[0].tracker.membership.space_events(),
+        );
+        assert!(
+            after.recovered && after.root == vec![recovering.clone()],
+            "two of three signed a recovery without holder #1"
+        );
+
+        // And the plan says so: the chosen signers are indices 2 and 3.
+        let events = nodes[0].tracker.membership.ceremony_events();
+        let board = crate::dkg::parse_board(&events, &nodes[0].tracker.workspace_id);
+        let plan = board
+            .signing
+            .values()
+            .find_map(|t| t.plan())
+            .expect("the coordinator published a plan");
+        let crate::dkg::AccessWitness::FrostThreshold {
+            k,
+            participant_indices,
+        } = &plan.witness
+        else {
+            panic!("flat FROST witness expected");
+        };
+        assert_eq!(*k, 2);
+        assert_eq!(
+            participant_indices,
+            &vec![2u16, 3u16],
+            "the signer set excludes holder #1 — the point of any-K"
+        );
+        drop(absent);
     }
 
     /// F1 regression, the headline one. A rogue proposal carries a perfectly
