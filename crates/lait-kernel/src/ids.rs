@@ -215,6 +215,25 @@ impl DeviceId {
     pub fn short(&self) -> String {
         self.0.chars().take(8).collect()
     }
+
+    /// The raw 32 bytes of the ed25519 public key this id *is*, or `None` when
+    /// the value is not one. Fallible because [`DeviceId::from_key_string`]
+    /// validates nothing.
+    ///
+    /// This is the compact form: a device key is 32 bytes, and any wire that
+    /// spells it as 64 hex characters pays double for the same identity.
+    pub fn key_bytes(&self) -> Option<[u8; 32]> {
+        let raw = data_encoding::HEXLOWER_PERMISSIVE
+            .decode(self.0.as_bytes())
+            .ok()?;
+        <[u8; 32]>::try_from(raw.as_slice()).ok()
+    }
+
+    /// The device id of an ed25519 public key's raw bytes — the inverse of
+    /// [`DeviceId::key_bytes`].
+    pub fn from_key_bytes(raw: &[u8; 32]) -> Self {
+        Self(data_encoding::HEXLOWER.encode(raw))
+    }
 }
 
 impl fmt::Display for DeviceId {

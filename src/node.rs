@@ -949,7 +949,11 @@ impl Node {
         Ok(())
     }
 
-    async fn join_topic(self: &Arc<Self>, topic: TopicId, peers: Vec<DeviceId>) -> Result<()> {
+    async fn join_topic(
+        self: &Arc<Self>,
+        topic: crate::transport::Topic,
+        peers: Vec<DeviceId>,
+    ) -> Result<()> {
         // Register the bootstrap peers (e.g. a ticket's host) before gossip dials
         // them, so bare-id resolution succeeds under Local.
         let mut ids = Vec::with_capacity(peers.len());
@@ -960,7 +964,8 @@ impl Node {
         }
         let gtopic = tokio::time::timeout(
             Duration::from_secs(15),
-            self.gossip.subscribe_and_join(topic, ids),
+            self.gossip
+                .subscribe_and_join(TopicId::from_bytes(topic.0), ids),
         )
         .await
         .map_err(|_| anyhow!("timed out connecting to the room's peers"))?
@@ -991,8 +996,9 @@ impl Node {
         // Under Isolated the host is reachable only at the addresses the ticket
         // carries — register them so the bare-id dial below resolves. A no-op for
         // Public/Local tickets (which carry none and resolve by relay/discovery).
-        let host = DeviceId::from_key_string(ticket.host.to_string());
-        self.peers.learn_direct(ticket.host, &ticket.host_addrs);
+        let host = ticket.host.clone();
+        self.peers
+            .learn_direct(endpoint_of(&host)?, &ticket.host_addrs);
         self.join_topic(ticket.topic(), vec![host.clone()]).await?;
         // Mint (or recover) our actor inception so an admin can admit our actor.
         let incept = self.replica.lock().unwrap().self_inception().ok();
@@ -1059,7 +1065,7 @@ impl Node {
     async fn seed_add(self: &Arc<Self>, arg: &str) -> Result<Response> {
         // Try the ticket form first; a bare id will not decode as a ticket.
         if let Ok(ticket) = arg.parse::<SpaceTicket>() {
-            let id = DeviceId::from_key_string(ticket.host.to_string());
+            let id = ticket.host.clone();
             if id == self.shared.my_id {
                 return Ok(Response::err("that ticket points at this node's own id"));
             }
@@ -1898,7 +1904,7 @@ impl Node {
                 let ticket = SpaceTicket {
                     space,
                     name,
-                    host: endpoint_of(&self.shared.my_id)?,
+                    host: self.shared.my_id.clone(),
                     host_nick: self.shared.nick(),
                     salt,
                     recovery_root,
@@ -2378,7 +2384,7 @@ pub async fn run_daemon_with(home: PathBuf, seed: bool, identity_dir: PathBuf) -
         bootstrap_ids.push(ep);
     }
     let gtopic = gossip
-        .subscribe(topic, bootstrap_ids)
+        .subscribe(TopicId::from_bytes(topic.0), bootstrap_ids)
         .await
         .map_err(|e| anyhow!("subscribe to room: {e}"))?;
     let (sender, receiver) = gtopic.split();
