@@ -225,7 +225,7 @@ in-band version negotiation on top of it.
   Releases now ship a build-provenance attestation and a CycloneDX SBOM, and the
   build was migrated to a custom-artifacts architecture so binaries can be signed
   in place (macOS notarization + Windows Azure signing land next). See
-  `docs/RELEASE-SIGNING.md`.
+  `docs/RELEASES.md`.
 
 ### The daily-loop DX pass (spaces, start/done/stop, inbox)
 

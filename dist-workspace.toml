@@ -49,7 +49,7 @@ unix-archive = ".tar.gz"
 # in between, and its built-in signers can't do macOS notarization or Azure).
 # cargo-dist replaces its default build job with a call to our reusable workflow
 # `.github/workflows/build-binaries.yml`, then still owns installers, the unified
-# checksum, release creation, and the publishers. See docs/RELEASE-SIGNING.md.
+# checksum, release creation, and the publishers. See docs/RELEASES.md.
 build-local-artifacts = false
 local-artifacts-jobs = ["./build-binaries"]
 # The custom build job attests its own archives, so it needs id-token +

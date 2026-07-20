@@ -4,7 +4,7 @@
 # `build-local-artifacts = false`, `local-artifacts-jobs = ["./build-binaries"]`).
 # We own the build so the binary can be SIGNED before it is archived — cargo-dist
 # builds + archives atomically with no hook in between, and its built-in signers
-# can't do macOS notarization or Azure. See docs/RELEASE-SIGNING.md.
+# can't do macOS notarization or Azure. See docs/RELEASES.md.
 #
 # The contract with cargo-dist is by FILENAME + in-archive layout (its `host` job
 # collects everything matching `artifacts-*`):

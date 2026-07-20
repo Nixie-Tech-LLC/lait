@@ -54,7 +54,7 @@ New references should use filenames and section names. Legacy `A§`, `S§`, and
 | Document | Covers |
 |---|---|
 | [`INSTALL.md`](./INSTALL.md) | Supported installation channels, completions, and verification. |
-| [`RELEASE-SIGNING.md`](./RELEASE-SIGNING.md) | Artifact provenance and the current signing rollout. |
+| [`RELEASES.md`](./RELEASES.md) | Release provenance, current signing status, and consumer verification. |
 
 Per-release changes belong in [`CHANGELOG.md`](../CHANGELOG.md), not in the
 current architecture. Vulnerabilities should be reported privately through the
