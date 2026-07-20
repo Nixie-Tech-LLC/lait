@@ -98,7 +98,9 @@ impl Replica {
             Request::IssueDone { reff } => self.work_state(reff, WorkAction::Done),
             Request::IssueStop { reff } => self.work_state(reff, WorkAction::Stop),
             Request::IssueView { reff } => self.issue_view(reff).map(|r| (r, None)),
-            Request::List { project, filter } => self.list(project, filter).map(|r| (r, None)),
+            Request::List { project, filter } => {
+                return Self::respond(self.list(project, filter), |rows| Response::List { rows })
+            }
             Request::Board {
                 project,
                 project_hint,
@@ -147,10 +149,59 @@ impl Replica {
         }
     }
 
+    // ---- the control adapter ----
+    //
+    // The single door between the domain and the client protocol. Everything
+    // below this line speaks `Response`; everything the replica exposes above it
+    // speaks [`Outcome`] and [`ReplicaError`]. Keeping the conversion in one
+    // place is what lets the domain be lifted out from under the daemon later,
+    // and what keeps error prose from scattering back into the modules that
+    // detect failures.
+
+    /// Turn a domain result into a wire response and a doorbell.
+    ///
+    /// The `Err` arm hard-codes `None`: a failed operation committed nothing, so
+    /// it has nothing to announce. [`Outcome`] makes that unrepresentable on the
+    /// way in, and this makes it unrepresentable on the way out.
+    pub(super) fn respond<T>(
+        result: std::result::Result<Outcome<T>, ReplicaError>,
+        into_response: impl FnOnce(T) -> Response,
+    ) -> (Response, Option<DirtySet>) {
+        match result {
+            Ok(outcome) => {
+                let (value, dirty) = outcome.into_parts();
+                (into_response(value), dirty)
+            }
+            Err(e) => (Self::error_response(e), None),
+        }
+    }
+
+    /// Render a domain failure. `NotFound` is the only family the control plane
+    /// reports as such — scripts read the kind, people read the message.
+    pub(super) fn error_response(e: ReplicaError) -> Response {
+        match e {
+            // A ref that named several issues, or none but with near misses, is
+            // answered with the list rather than a refusal: the useful reply to
+            // a typo is the handle the caller meant.
+            ReplicaError::Ref(RefError::Candidates {
+                candidates,
+                near_miss_for,
+            }) => Response::Candidates {
+                candidates,
+                near_miss_for,
+            },
+            ReplicaError::Ref(ref inner @ RefError::NoMatch { .. }) => {
+                Response::not_found(inner.to_string())
+            }
+            ReplicaError::NotFound(ref inner) => Response::not_found(inner.to_string()),
+            other => Response::err(other.to_string()),
+        }
+    }
+
     // ---- resolution helpers ----
 
-    /// Resolve an issue ref → DocId, or a candidate/zero outcome as a `Response`.
-    pub(super) fn resolve_issue(&self, reff: &str) -> std::result::Result<DocId, Response> {
+    /// Resolve an issue ref → `DocId`, or say how it failed to name exactly one.
+    pub(super) fn resolve_issue(&self, reff: &str) -> std::result::Result<DocId, ReplicaError> {
         match index::resolve_ref(&self.catalog, &self.aliases, reff) {
             RefResolution::One(id) => Ok(id),
             // Nothing matched — offer the closest handles rather than a dead end.
@@ -158,19 +209,21 @@ impl Replica {
             // typo is the more common way to get here.
             RefResolution::Zero => {
                 let near = index::near_misses(&self.catalog, &self.aliases, reff, 5);
-                if near.is_empty() {
-                    Err(Response::not_found(format!("no issue matches '{reff}'")))
+                Err(ReplicaError::Ref(if near.is_empty() {
+                    RefError::NoMatch {
+                        reff: reff.to_string(),
+                    }
                 } else {
-                    Err(Response::Candidates {
+                    RefError::Candidates {
                         candidates: near,
                         near_miss_for: Some(reff.to_string()),
-                    })
-                }
+                    }
+                }))
             }
-            RefResolution::Many(cands) => Err(Response::Candidates {
+            RefResolution::Many(cands) => Err(ReplicaError::Ref(RefError::Candidates {
                 candidates: cands,
                 near_miss_for: None,
-            }),
+            })),
         }
     }
 
@@ -187,11 +240,13 @@ impl Replica {
         &self,
         explicit: Option<&str>,
         hint: Option<&str>,
-    ) -> std::result::Result<ProjectDto, Response> {
+    ) -> std::result::Result<ProjectDto, ReplicaError> {
         if let Some(p) = explicit {
-            return self
-                .resolve_project(p)
-                .ok_or_else(|| Response::not_found(format!("no project matches '{p}'")));
+            return self.resolve_project(p).ok_or_else(|| {
+                ReplicaError::NotFound(NotFound::Project {
+                    named: p.to_string(),
+                })
+            });
         }
         if let Some(h) = hint {
             if let Some(pr) = self.resolve_project(h) {
@@ -203,23 +258,18 @@ impl Replica {
         let settings = crate::config::Settings::load(Some(self.store.home_path()));
         if let Some(dflt) = settings.default_project() {
             return self.resolve_project(&dflt).ok_or_else(|| {
-                Response::err(format!(
-                    "project.default is '{dflt}' but no such project exists — fix it: `lait config set project.default <KEY>`"
-                ))
+                ReplicaError::ProjectChoice(ProjectChoice::StaleDefault { configured: dflt })
             });
         }
         let projects = self.catalog.projects_list();
         match projects.len() {
             1 => Ok(projects.into_iter().next().unwrap()),
-            0 => Err(Response::err(
-                "no projects visible yet — still syncing, or create one: `lait projects new <name> --key <KEY>`",
-            )),
+            0 => Err(ReplicaError::ProjectChoice(ProjectChoice::None)),
             _ => {
-                let keys: Vec<&str> = projects.iter().map(|p| p.key.as_str()).collect();
-                Err(Response::err(format!(
-                    "more than one project ({}) — pass -p <KEY> or set a default: `lait config set project.default <KEY>`",
-                    keys.join(", ")
-                )))
+                let keys: Vec<String> = projects.iter().map(|p| p.key.clone()).collect();
+                Err(ReplicaError::ProjectChoice(ProjectChoice::Ambiguous {
+                    keys,
+                }))
             }
         }
     }

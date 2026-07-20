@@ -58,18 +58,26 @@ impl Replica {
         }
     }
 
-    pub(super) fn list(&self, project: Option<String>, filter: Filter) -> Result<Response> {
+    pub(super) fn list(
+        &self,
+        project: Option<String>,
+        filter: Filter,
+    ) -> std::result::Result<Outcome<Vec<Row>>, ReplicaError> {
         let project_filter = match &project {
             Some(p) => match self.resolve_project(p) {
                 Some(pr) => Some(pr.id),
-                None => return Ok(Response::not_found(format!("no project matches '{p}'"))),
+                None => {
+                    return Err(ReplicaError::NotFound(NotFound::Project {
+                        named: p.clone(),
+                    }))
+                }
             },
             None => None,
         };
         let label_filter = match &filter.label {
             Some(l) => match self.resolve_label(l) {
                 Some(id) => Some(id),
-                None => return Ok(Response::not_found(format!("no label matches '{l}'"))),
+                None => return Err(ReplicaError::NotFound(NotFound::Label { named: l.clone() })),
             },
             None => None,
         };
@@ -106,7 +114,7 @@ impl Replica {
         }
         // stable order: priority desc, then created (ULID) asc via doc_id.
         rows.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.doc_id.cmp(&b.doc_id)));
-        Ok(Response::List { rows })
+        Ok(Outcome::unchanged(rows))
     }
 
     /// Build the board, deduplicating its ordering projection:
@@ -120,7 +128,7 @@ impl Replica {
     ) -> Result<Response> {
         let project_dto = match self.choose_project(project.as_deref(), project_hint.as_deref()) {
             Ok(pr) => pr,
-            Err(resp) => return Ok(resp),
+            Err(e) => return Ok(Self::error_response(e)),
         };
         let pid = &project_dto.id;
         let rows_by_doc: HashMap<String, RowMeta> = self
@@ -190,7 +198,7 @@ impl Replica {
     pub(super) fn issue_view(&mut self, reff: String) -> Result<Response> {
         let doc_id = match self.resolve_issue(&reff) {
             Ok(id) => id,
-            Err(resp) => return Ok(resp),
+            Err(e) => return Ok(Self::error_response(e)),
         };
         // Clone viewer context up front so it doesn't conflict with the issue
         // borrow below.
@@ -287,7 +295,7 @@ impl Replica {
     pub(super) fn history(&mut self, reff: String) -> Result<Response> {
         let doc_id = match self.resolve_issue(&reff) {
             Ok(id) => id,
-            Err(resp) => return Ok(resp),
+            Err(e) => return Ok(Self::error_response(e)),
         };
         let canonical = self.aliases.canonical_for(&doc_id);
         let issue = self

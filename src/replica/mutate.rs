@@ -40,7 +40,7 @@ impl Replica {
         }
         let project = match self.choose_project(project.as_deref(), project_hint.as_deref()) {
             Ok(pr) => pr,
-            Err(resp) => return Ok((resp, None)),
+            Err(e) => return Ok((Self::error_response(e), None)),
         };
         let priority = match priority {
             Some(p) => match Priority::parse(&p) {
@@ -137,7 +137,7 @@ impl Replica {
     ) -> Result<(Response, Option<DirtySet>)> {
         let doc_id = match self.resolve_issue(&reff) {
             Ok(id) => id,
-            Err(resp) => return Ok((resp, None)),
+            Err(e) => return Ok((Self::error_response(e), None)),
         };
         // validate status/priority before touching anything
         if let Some(s) = &status {
@@ -241,7 +241,7 @@ impl Replica {
     ) -> Result<(Response, Option<DirtySet>)> {
         let doc_id = match self.resolve_issue(&reff) {
             Ok(id) => id,
-            Err(resp) => return Ok((resp, None)),
+            Err(e) => return Ok((Self::error_response(e), None)),
         };
         let (cat, kind) = match action {
             WorkAction::Start => (StatusCategory::Active, "started"),
@@ -339,7 +339,7 @@ impl Replica {
     ) -> Result<(Response, Option<DirtySet>)> {
         let doc_id = match self.resolve_issue(&reff) {
             Ok(id) => id,
-            Err(resp) => return Ok((resp, None)),
+            Err(e) => return Ok((Self::error_response(e), None)),
         };
         // validate target project + anchors up front
         let new_project = match &project {
@@ -358,7 +358,7 @@ impl Replica {
             Some(BoardPos::Before { reff }) | Some(BoardPos::After { reff }) => {
                 match self.resolve_issue(reff) {
                     Ok(id) => Some(id),
-                    Err(resp) => return Ok((resp, None)),
+                    Err(e) => return Ok((Self::error_response(e), None)),
                 }
             }
             _ => None,
@@ -435,7 +435,7 @@ impl Replica {
     ) -> Result<(Response, Option<DirtySet>)> {
         let doc_id = match self.resolve_issue(&reff) {
             Ok(id) => id,
-            Err(resp) => return Ok((resp, None)),
+            Err(e) => return Ok((Self::error_response(e), None)),
         };
         let mut actors = Vec::new();
         for w in &who {
@@ -488,7 +488,7 @@ impl Replica {
     ) -> Result<(Response, Option<DirtySet>)> {
         let doc_id = match self.resolve_issue(&reff) {
             Ok(id) => id,
-            Err(resp) => return Ok((resp, None)),
+            Err(e) => return Ok((Self::error_response(e), None)),
         };
         // Adds create the label on first use (labels are vocabulary, not
         // ceremony); removals still error on unknown (removing a
@@ -545,7 +545,7 @@ impl Replica {
         }
         let doc_id = match self.resolve_issue(&reff) {
             Ok(id) => id,
-            Err(resp) => return Ok((resp, None)),
+            Err(e) => return Ok((Self::error_response(e), None)),
         };
         let ts = self.now_secs();
         // The comment is attributed to the *actor* (the person); the device that
@@ -587,7 +587,7 @@ impl Replica {
     fn set_deleted(&mut self, reff: String, on: bool) -> Result<(Response, Option<DirtySet>)> {
         let doc_id = match self.resolve_issue(&reff) {
             Ok(id) => id,
-            Err(resp) => return Ok((resp, None)),
+            Err(e) => return Ok((Self::error_response(e), None)),
         };
         let project_id = self
             .catalog
@@ -720,11 +720,11 @@ impl Replica {
         }
         let from = match self.resolve_issue(&reff) {
             Ok(id) => id,
-            Err(resp) => return Ok((resp, None)),
+            Err(e) => return Ok((Self::error_response(e), None)),
         };
         let to = match self.resolve_issue(&target) {
             Ok(id) => id,
-            Err(resp) => return Ok((resp, None)),
+            Err(e) => return Ok((Self::error_response(e), None)),
         };
         if from == to {
             return Ok((Response::err("an issue cannot link to itself"), None));
@@ -774,12 +774,12 @@ impl Replica {
     ) -> Result<(Response, Option<DirtySet>)> {
         let child = match self.resolve_issue(&reff) {
             Ok(id) => id,
-            Err(resp) => return Ok((resp, None)),
+            Err(e) => return Ok((Self::error_response(e), None)),
         };
         let parent_id = match &parent {
             Some(p) => match self.resolve_issue(p) {
                 Ok(id) => Some(id),
-                Err(resp) => return Ok((resp, None)),
+                Err(e) => return Ok((Self::error_response(e), None)),
             },
             None => None,
         };
@@ -824,7 +824,7 @@ impl Replica {
     pub(super) fn issue_graph(&mut self, reff: String) -> Result<Response> {
         let doc_id = match self.resolve_issue(&reff) {
             Ok(id) => id,
-            Err(resp) => return Ok(resp),
+            Err(e) => return Ok(Self::error_response(e)),
         };
         let canonical = self.aliases.canonical_for(&doc_id);
         let rows: HashMap<DocId, RowMeta> = self

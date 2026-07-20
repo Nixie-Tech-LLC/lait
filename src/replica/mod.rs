@@ -33,17 +33,24 @@ pub const LINK_KINDS: [&str; 3] = ["blocks", "relates", "duplicates"];
 
 mod devices;
 mod dispatch;
+mod error;
 mod keyring;
 mod lifecycle;
 mod membership;
 mod mutate;
+mod outcome;
 mod project;
 mod recovery;
 mod sync;
 #[cfg(test)]
 mod tests;
 
+pub use error::{
+    AdminAction, Ceremony, Conflict, Denied, GraphViolation, Invalid, NotFound, ProjectChoice,
+    RefError, ReplicaError,
+};
 pub use lifecycle::{derive_project_key, found_space, join_space_store};
+pub use outcome::Outcome;
 pub use recovery::{
     ArtifactRead, DegradedRecoveryHolder, LocalCustodyState, RecoveryArtifactFailure,
     RecoveryStatus,
