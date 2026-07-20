@@ -54,7 +54,7 @@ pub mod workspaces;
 // by these aliases.
 pub use lait_kernel::{
     acl, actor, authority, authz, compile, crypto, custody, dkg, dto, expand, genesis, ids, policy,
-    sigdag, space,
+    sigdag, space, transition,
 };
 
 // The **engine** (`lait-engine`) is the only crate that names Loro. Re-exported
