@@ -167,6 +167,23 @@ impl IrohTransport {
     }
 }
 
+/// The production network: a real endpoint under lait's policy.
+pub struct IrohFactory;
+
+#[async_trait]
+impl super::TransportFactory for IrohFactory {
+    async fn build(
+        &self,
+        identity_seed: &[u8; 32],
+        network: &crate::net::Network,
+        alpns: &[Alpn],
+    ) -> Result<std::sync::Arc<dyn Transport>> {
+        Ok(std::sync::Arc::new(
+            IrohTransport::new(identity_seed, network, alpns).await?,
+        ))
+    }
+}
+
 /// Router handler for one lait ALPN: wraps the connection in an accept-side
 /// [`IrohStream`] and forwards it as an [`Incoming`], returning immediately —
 /// the stream's `Connection` clone keeps the connection alive after the handler

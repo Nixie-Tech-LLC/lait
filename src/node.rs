@@ -1,11 +1,12 @@
-//! The lait daemon: owns the iroh endpoint, the gossip room, presence, the
+//! The lait daemon: owns a [`Transport`], the gossip room, presence, the
 //! Loro-CRDT replica core ([`crate::replica`]), and the local control server that
 //! CLI, web, and MCP clients drive.
 //!
-//! The iroh transport (signed-gossip room for announce/presence, a liveness
-//! probe ALPN, and daemon/control plumbing) is the networking substrate. The
-//! replica rides on top: the daemon is the **only** owner of the Loro docs, and
-//! every local interface is a control client.
+//! The daemon is the transport's **consumer**, never its implementation: it
+//! dials, gossips and accepts in lait's own vocabulary, so the network it runs
+//! over is a constructor argument. The replica rides on top: the daemon is the
+//! **only** owner of the Loro docs, and every local interface is a control
+//! client.
 //!
 //! **Doorbells.** A mutation produces a
 //! [`crate::replica::DirtySet`]; the daemon stamps it with a per-boot `epoch` and
@@ -29,17 +30,6 @@ use interprocess::local_socket::{
     tokio::{prelude::*, Stream as LocalStream},
     ListenerOptions,
 };
-use iroh::{
-    endpoint::Connection,
-    protocol::{AcceptError, ProtocolHandler, Router},
-    Endpoint, EndpointId, SecretKey,
-};
-use iroh_gossip::{
-    api::{Event, GossipReceiver, GossipSender},
-    net::{Gossip, GOSSIP_ALPN},
-    proto::TopicId,
-};
-use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -56,33 +46,15 @@ use crate::{
     dto::{Candidate, JoinRequestDto, SeedDto},
     ids::{DeviceId, SystemUlidSource},
     index::{resolve_device_dir, DeviceResolution, KnownDevice},
-    presence::PeerState,
+    presence::{PeerState, PRESENCE_ALPN},
     proto::{InviteGrant, Payload, SignedInvite, SignedMessage, SpaceTicket},
     replica::{DirtySet, Replica},
     store::Store,
+    transport::{
+        iroh::IrohFactory, GossipEvent, GossipSender, Incoming, Topic, Transport, TransportFactory,
+    },
 };
 
-/// The transport id of a device key: the same 32 ed25519 bytes, hex-decoded.
-/// Fallible because a `DeviceId` read back off disk or the wire is only
-/// *asserted* to be a key, never validated on construction.
-fn endpoint_of(device: &DeviceId) -> Result<EndpointId> {
-    let raw = data_encoding::HEXLOWER_PERMISSIVE
-        .decode(device.as_str().as_bytes())
-        .ok()
-        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
-        .context("peer id is not a 32-byte key")?;
-    EndpointId::from_bytes(&raw).context("peer id is not a valid endpoint id")
-}
-
-/// Presence-probe ALPN. Moves in lockstep with [`crate::sync::SYNC_ALPN`] and
-/// the gossip topic tag, so a version skew that partitions sync/gossip also
-/// partitions the liveness probe rather than leaving cross-epoch peers
-/// half-visible. Epoch 1 carried the space-identity rewrite and the sync
-/// `protocol_version` handshake; epoch 2 carries the space-vocabulary flag day.
-///
-/// Public so transport tests negotiate the ALPN the daemon actually uses rather
-/// than a copy of its spelling that an epoch bump would silently strand.
-pub const PRESENCE_ALPN: &[u8] = b"lait/presence/2";
 const HEARTBEAT: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const REAP_INTERVAL: Duration = Duration::from_secs(5);
@@ -97,6 +69,11 @@ const IDLE_SHUTDOWN: Duration = Duration::from_secs(30 * 60);
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// Bound on the doorbell ring: the last ~1000 batches.
 const DOORBELL_RING: usize = 1000;
+/// How many times a pull that ended before the peer's `EndDocs` is retried
+/// promptly. Bounded so a peer that truncates every attempt costs a fixed
+/// number of dials; the announce/heartbeat backstop still carries the rest.
+const PULL_RETRIES: u32 = 1;
+const PULL_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// How long teardown may spend cancelling and draining the daemon's tasks. The
 /// daemon must not return before its tasks have ended — returning releases the
@@ -196,9 +173,9 @@ fn peers_path(home: &Path) -> PathBuf {
     home.join("peers.json")
 }
 
-/// Load the persisted set of previously-seen peer endpoints, to seed the gossip
-/// bootstrap on restart. Iroh discovery resolves a dialable address
-/// from each `EndpointId`, so the ids alone are enough to reconnect — a fresh
+/// Load the persisted set of previously-seen peers, to seed the gossip
+/// bootstrap on restart. The transport resolves a dialable address from each
+/// device key, so the ids alone are enough to reconnect — a fresh
 /// daemon no longer re-enters the mesh with an empty bootstrap set and waits
 /// passively to be re-announced to. Our own id is filtered out.
 fn load_bootstrap_peers(home: &Path, me: &DeviceId) -> Vec<DeviceId> {
@@ -399,48 +376,6 @@ pub struct Peer {
     pub away: bool,
 }
 
-#[derive(Debug, Clone)]
-struct PresencePing;
-
-impl ProtocolHandler for PresencePing {
-    async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
-        connection.closed().await;
-        Ok(())
-    }
-}
-
-/// Accepts the sync ALPN and serves a peer's catalog-first **pull**
-/// ([`crate::sync::serve`]). A pull never mutates our state, so this is
-/// read-only and rings no doorbell.
-#[derive(Clone)]
-struct SyncHandler {
-    replica: Arc<Mutex<Replica>>,
-}
-
-impl std::fmt::Debug for SyncHandler {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SyncHandler")
-    }
-}
-
-impl ProtocolHandler for SyncHandler {
-    async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
-        // `serve` finishes its send stream but `send.finish()` only queues the
-        // FIN — it does NOT wait for the data to be delivered. If we returned
-        // here the `Connection` would drop and send CONNECTION_CLOSE, truncating
-        // the trailing `DocUpdate`/`EndDocs` frames before the puller drains them
-        // (issue-doc bodies would silently never sync). Keep the connection alive
-        // until the puller has read everything and closes it — same as the
-        // presence handler above.
-        let keepalive = connection.clone();
-        if let Err(e) = crate::sync::serve(connection, &self.replica).await {
-            tracing::debug!("sync serve error: {e:#}");
-        }
-        keepalive.closed().await;
-        Ok(())
-    }
-}
-
 /// Seal a pre-authorization to the host and bind it to the joiner's actor, for
 /// `Payload::JoinRequest`. Sealing keeps the invite nonce off the shared gossip
 /// topic; binding the redeemer means a *copied* blob can only ever admit that
@@ -559,18 +494,17 @@ impl Shared {
 
 /// The running node.
 pub struct Node {
-    endpoint: Endpoint,
-    gossip: Gossip,
-    sender: Mutex<GossipSender>,
-    secret_key: SecretKey,
-    /// How to reach peers under lait's network policy (see `crate::net`). Every
-    /// newly-seen peer id is registered here so the endpoint's bare-id dials
-    /// resolve — a no-op under Public (n0 discovery), the mechanism under Local.
-    peers: crate::net::PeerBook,
+    /// The network, in lait's vocabulary. Dialing, gossip, accepting, address
+    /// advertisement and teardown all go through here; no concrete network type
+    /// is reachable from the daemon.
+    transport: Arc<dyn Transport>,
+    sender: Mutex<Arc<dyn GossipSender>>,
+    /// lait's identity: the seed *is* the key, and the transport derives its own
+    /// keypair from the same 32 bytes (checked at construction).
+    identity_seed: [u8; 32],
     /// This daemon's space id (constant). Bound into every signed gossip
     /// message so a message cannot be replayed onto another space's topic.
     space: String,
-    router: Router,
     shared: Shared,
     shutdown: Arc<Notify>,
     /// Teardown signal for every long-lived task (see [`Cancel`]).
@@ -622,9 +556,7 @@ impl Node {
 
     fn touch(&self, id: &DeviceId, nick: Option<String>) -> String {
         // A newly-seen peer must be reachable before we dial it back (Local).
-        if let Ok(ep) = endpoint_of(id) {
-            self.peers.learn(ep);
-        }
+        self.transport.learn(id.clone(), &[]);
         let now = Instant::now();
         let came_online = {
             let mut p = self.shared.presence.lock().unwrap();
@@ -694,13 +626,17 @@ impl Node {
     }
 
     async fn probe_peer(self: Arc<Self>, id: DeviceId) {
-        let alive = match endpoint_of(&id) {
-            Ok(ep) => matches!(
-                tokio::time::timeout(PROBE_TIMEOUT, self.endpoint.connect(ep, PRESENCE_ALPN)).await,
-                Ok(Ok(_))
-            ),
-            Err(_) => false,
-        };
+        // Liveness is whether the dial succeeds; nothing is ever sent. Dropping
+        // the returned stream closes the connection, which is the dialer's
+        // whole side of the presence protocol — the accepter opens no stream.
+        let alive = matches!(
+            tokio::time::timeout(
+                PROBE_TIMEOUT,
+                self.transport.connect(id.clone(), PRESENCE_ALPN)
+            )
+            .await,
+            Ok(Ok(_))
+        );
         let transition = {
             let mut p = self.shared.presence.lock().unwrap();
             p.get_mut(&id)
@@ -850,13 +786,19 @@ impl Node {
     /// per peer; on success (something changed) ring a doorbell and re-announce
     /// so peers that are behind us pull in turn.
     fn trigger_pull(self: Arc<Self>, peer: DeviceId) {
+        self.trigger_pull_within(peer, PULL_RETRIES);
+    }
+
+    /// `retries` bounds the prompt re-pull after an *incomplete* transfer, so a
+    /// peer that truncates every time costs a fixed number of attempts rather
+    /// than an unbounded loop. Convergence still has the announce/heartbeat
+    /// backstop underneath it.
+    fn trigger_pull_within(self: Arc<Self>, peer: DeviceId, retries: u32) {
         if peer == self.shared.my_id {
             return;
         }
         // Ensure the sync dial can resolve the peer under Local.
-        if let Ok(ep) = endpoint_of(&peer) {
-            self.peers.learn(ep);
-        }
+        self.transport.learn(peer.clone(), &[]);
         let cancel = self.cancel.clone();
         let tracker = self.clone();
         tracker.spawn(async move {
@@ -871,32 +813,79 @@ impl Node {
             };
             self.syncing.lock().unwrap().remove(&peer);
             match result {
-                Ok(dirty) => {
-                    if !dirty.is_empty() {
-                        self.ring_doorbell(dirty);
+                Ok(outcome) => {
+                    if !outcome.dirty.is_empty() {
+                        self.ring_doorbell(outcome.dirty);
                         let _ = self.broadcast_announce().await;
                     }
-                    // We successfully reached this peer — persist it immediately so
-                    // even a short-lived daemon (up for less than a heartbeat) can
-                    // bootstrap from it on the next start.
+                    // We reached this peer — persist it immediately so even a
+                    // short-lived daemon (up for less than a heartbeat) can
+                    // bootstrap from it on the next start. True whether or not
+                    // the transfer finished: reachability is what is being
+                    // recorded.
                     self.persist_known_peers();
+                    if !outcome.complete && retries > 0 {
+                        tokio::time::sleep(PULL_RETRY_DELAY).await;
+                        self.clone().trigger_pull_within(peer, retries - 1);
+                    }
                 }
                 Err(e) => tracing::debug!("pull from {peer} failed: {e:#}"),
             }
         });
     }
 
-    async fn do_pull(&self, peer: &DeviceId) -> Result<crate::replica::DirtySet> {
-        let conn = tokio::time::timeout(
+    async fn do_pull(&self, peer: &DeviceId) -> Result<crate::sync::PullOutcome> {
+        let mut stream = tokio::time::timeout(
             Duration::from_secs(20),
-            self.endpoint
-                .connect(endpoint_of(peer)?, crate::sync::SYNC_ALPN),
+            self.transport.connect(peer.clone(), crate::sync::SYNC_ALPN),
         )
         .await
         .map_err(|_| anyhow!("connect to peer for sync timed out"))??;
-        let dirty = crate::sync::pull(&conn, &self.replica).await?;
-        conn.close(0u32.into(), b"sync done");
-        Ok(dirty)
+        let outcome = crate::sync::pull(&mut *stream, &self.replica).await?;
+        // Dropping the dialer's stream closes the connection: the dialer's
+        // "done" signal, and what releases the accepter from `wait_closed`.
+        Ok(outcome)
+    }
+
+    /// The daemon's inbound side: one loop over the transport's accepted
+    /// connections, dispatched by ALPN. It replaces a per-protocol handler
+    /// registry, and it is why the daemon needs no network type of its own.
+    ///
+    /// `accept` yields `None` only after the transport has shut down, so this
+    /// ends on teardown without a cancellation arm of its own.
+    async fn accept_loop(self: Arc<Self>) {
+        while let Some(inc) = self.transport.accept().await {
+            let me = self.clone();
+            self.spawn(async move { me.serve_incoming(inc).await });
+        }
+    }
+
+    async fn serve_incoming(self: Arc<Self>, inc: Incoming) {
+        let mut stream = inc.stream;
+        if inc.alpn == crate::sync::SYNC_ALPN {
+            if let Err(e) = crate::sync::serve(&mut *stream, &self.replica).await {
+                tracing::debug!("sync serve error: {e:#}");
+            }
+            // Unconditional, including on the error path above. `finish` only
+            // queues end-of-stream; dropping the stream tears the connection
+            // down and truncates whatever the puller has not yet drained —
+            // issue-doc bodies that then silently never sync. Bounded by
+            // cancellation so a peer holding its side open cannot park
+            // teardown, but with no timeout of its own: a deadline short
+            // enough to be useful is short enough to cut a large transfer.
+            tokio::select! {
+                _ = stream.wait_closed() => {}
+                _ = self.cancel.cancelled() => {}
+            }
+        } else if inc.alpn == PRESENCE_ALPN {
+            // A probe sends nothing; it is alive iff the dial landed here.
+            tokio::select! {
+                _ = stream.wait_closed() => {}
+                _ = self.cancel.cancelled() => {}
+            }
+        } else {
+            tracing::debug!("inbound connection on an unregistered alpn: {:?}", inc.alpn);
+        }
     }
 
     /// Broadcast our current catalog head so peers that are behind pull from us.
@@ -939,41 +928,28 @@ impl Node {
     }
 
     async fn broadcast(&self, payload: Payload) -> Result<()> {
-        let bytes =
-            SignedMessage::sign_and_encode(&self.space, &self.secret_key.to_bytes(), &payload)?;
+        let bytes = SignedMessage::sign_and_encode(&self.space, &self.identity_seed, &payload)?;
+        // Clone the sender out from under the lock: a std mutex guard must never
+        // cross an await, and the broadcast below is one.
         let sender = self.sender.lock().unwrap().clone();
         sender
-            .broadcast(bytes)
+            .broadcast(bytes.to_vec())
             .await
             .map_err(|e| anyhow!("broadcast failed: {e}"))?;
         Ok(())
     }
 
-    async fn join_topic(
-        self: &Arc<Self>,
-        topic: crate::transport::Topic,
-        peers: Vec<DeviceId>,
-    ) -> Result<()> {
-        // Register the bootstrap peers (e.g. a ticket's host) before gossip dials
-        // them, so bare-id resolution succeeds under Local.
-        let mut ids = Vec::with_capacity(peers.len());
-        for id in &peers {
-            let ep = endpoint_of(id)?;
-            self.peers.learn(ep);
-            ids.push(ep);
-        }
-        let gtopic = tokio::time::timeout(
-            Duration::from_secs(15),
-            self.gossip
-                .subscribe_and_join(TopicId::from_bytes(topic.0), ids),
-        )
-        .await
-        .map_err(|_| anyhow!("timed out connecting to the room's peers"))?
-        .map_err(|e| anyhow!("subscribe_and_join: {e}"))?;
-        let (sender, receiver) = gtopic.split();
-        *self.sender.lock().unwrap() = sender;
+    async fn join_topic(self: &Arc<Self>, topic: Topic, peers: Vec<DeviceId>) -> Result<()> {
+        let (tx, mut rx) = self.transport.subscribe(topic, &peers).await?;
+        // Install nothing until the room is actually reachable: a join that
+        // times out must leave the node in the room it was already in, rather
+        // than swapping in a sender that broadcasts into nowhere.
+        tokio::time::timeout(Duration::from_secs(15), rx.joined())
+            .await
+            .map_err(|_| anyhow!("timed out connecting to the room's peers"))??;
+        *self.sender.lock().unwrap() = Arc::from(tx);
         let gen = self.recv_gen.fetch_add(1, Ordering::SeqCst) + 1;
-        self.spawn(self.clone().recv_loop(receiver, gen));
+        self.spawn(self.clone().recv_loop(rx, gen));
         Ok(())
     }
 
@@ -997,8 +973,7 @@ impl Node {
         // carries — register them so the bare-id dial below resolves. A no-op for
         // Public/Local tickets (which carry none and resolve by relay/discovery).
         let host = ticket.host.clone();
-        self.peers
-            .learn_direct(endpoint_of(&host)?, &ticket.host_addrs);
+        self.transport.learn(host.clone(), &ticket.host_addrs);
         self.join_topic(ticket.topic(), vec![host.clone()]).await?;
         // Mint (or recover) our actor inception so an admin can admit our actor.
         let incept = self.replica.lock().unwrap().self_inception().ok();
@@ -1123,57 +1098,53 @@ impl Node {
         ))
     }
 
-    async fn recv_loop(self: Arc<Self>, mut receiver: GossipReceiver, gen: u64) {
+    async fn recv_loop(
+        self: Arc<Self>,
+        mut receiver: Box<dyn crate::transport::GossipReceiver>,
+        gen: u64,
+    ) {
         loop {
             if self.recv_gen.load(Ordering::SeqCst) != gen {
                 break;
             }
-            let next = tokio::select! {
-                next = receiver.try_next() => next,
+            let event = tokio::select! {
+                event = receiver.next() => event,
                 _ = self.cancel.cancelled() => break,
             };
-            match next {
-                Ok(Some(event)) => match event {
-                    Event::Received(msg) => {
-                        match SignedMessage::verify_and_decode(&self.space, &msg.content) {
-                            Ok((from, payload)) => {
-                                self.handle_payload(
-                                    DeviceId::from_key_string(from.to_string()),
-                                    payload,
-                                )
-                                .await
-                            }
-                            // A decode failure here is almost always a version-skewed
-                            // peer: postcard is not self-describing, so a payload whose
-                            // shape changed across releases fails to deserialize (see
-                            // `docs/PROTOCOL.md` — incompatible wire epochs require
-                            // all nodes to upgrade together).
-                            // Swallowing it silently made mixed-version fleets
-                            // undiagnosable; log at debug with the error so the drop is
-                            // at least visible under `RUST_LOG=lait=debug`.
-                            Err(e) => tracing::debug!(
-                                error = %e,
-                                "dropped an undecodable gossip payload (likely a \
-                                 version-skewed or malformed peer)"
-                            ),
-                        }
+            // `None` means the room is gone; there is nothing left to receive.
+            let Some(event) = event else { break };
+            match event {
+                GossipEvent::Received { bytes, .. } => {
+                    // The delivering neighbor is a routing hint, never the
+                    // author: gossip relays peer to peer, so authorship comes
+                    // from the signature and nowhere else.
+                    match SignedMessage::verify_and_decode(&self.space, &bytes) {
+                        Ok((from, payload)) => self.handle_payload(from, payload).await,
+                        // A decode failure here is almost always a version-skewed
+                        // peer: postcard is not self-describing, so a payload whose
+                        // shape changed across releases fails to deserialize (see
+                        // `docs/PROTOCOL.md` — incompatible wire epochs require
+                        // all nodes to upgrade together).
+                        // Swallowing it silently made mixed-version fleets
+                        // undiagnosable; log at debug with the error so the drop is
+                        // at least visible under `RUST_LOG=lait=debug`.
+                        Err(e) => tracing::debug!(
+                            error = %e,
+                            "dropped an undecodable gossip payload (likely a \
+                             version-skewed or malformed peer)"
+                        ),
                     }
-                    Event::NeighborUp(id) => {
-                        let id = DeviceId::from_key_string(id.to_string());
-                        self.touch(&id, None);
-                        // The mesh formed with this peer: pull to converge and
-                        // persist it immediately for restart bootstrap.
-                        self.clone().trigger_pull(id);
-                        self.persist_known_peers();
-                    }
-                    Event::NeighborDown(id) => {
-                        self.clone()
-                            .on_neighbor_down(DeviceId::from_key_string(id.to_string()));
-                    }
-                    Event::Lagged => {}
-                },
-                Ok(None) => break,
-                Err(_) => break,
+                }
+                GossipEvent::NeighborUp(id) => {
+                    self.touch(&id, None);
+                    // The mesh formed with this peer: pull to converge and
+                    // persist it immediately for restart bootstrap.
+                    self.clone().trigger_pull(id);
+                    self.persist_known_peers();
+                }
+                GossipEvent::NeighborDown(id) => {
+                    self.clone().on_neighbor_down(id);
+                }
             }
         }
     }
@@ -1308,8 +1279,7 @@ impl Node {
         // blob copied off the wire cannot be re-paired with an eavesdropper's
         // inception.
         let me = self.shared.my_id.clone();
-        let Some(invite) = open_bound_invite(&self.secret_key.to_bytes(), &me, &sealed, &incept)
-        else {
+        let Some(invite) = open_bound_invite(&self.identity_seed, &me, &sealed, &incept) else {
             return;
         };
         let (issuer, grant) = match invite.verify() {
@@ -1877,7 +1847,7 @@ impl Node {
                     const DEFAULT_TTL_HOURS: u64 = 24 * 7;
                     let ttl_secs = ttl_hours.unwrap_or(DEFAULT_TTL_HOURS).saturating_mul(3600);
                     let grant = InviteGrant::mint(space.clone(), now_secs(), ttl_secs, !reusable);
-                    SignedInvite::sign(&self.secret_key.to_bytes(), &grant).ok()
+                    SignedInvite::sign(&self.identity_seed, &grant).ok()
                 };
                 // Carry the verifiable founding proof (salt + founder inception),
                 // NOT a bare anchor string. The joiner checks the space id
@@ -1893,14 +1863,11 @@ impl Node {
                             ))
                         }
                     };
-                // Under Isolated (no relay, no discovery) a ticket must carry the
-                // host's direct addresses so a joiner can reach it. Public/Local
-                // tickets stay address-free (iroh/relay resolves the host by id).
-                let host_addrs = if self.peers.is_isolated() {
-                    self.endpoint.addr().ip_addrs().copied().collect()
-                } else {
-                    vec![]
-                };
+                // Under a policy with no relay and no discovery a ticket must
+                // carry the host's direct addresses. Which policies those are is
+                // the transport's business, not the daemon's: it returns the
+                // addresses a ticket needs, empty when bare ids already resolve.
+                let host_addrs = self.transport.advertised_addrs();
                 let ticket = SpaceTicket {
                     space,
                     name,
@@ -2263,7 +2230,7 @@ async fn write_line_half<T: serde::Serialize>(
 pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     // Identity is global by default (DUR-5); store (repo/lock/socket/config) is
     // this per-repo home. `$LAIT_HOME` collapses both back into `home`.
-    run_daemon_with(home, seed, crate::config::identity_dir()?).await?;
+    run_daemon_with(home, seed, crate::config::identity_dir()?, &IrohFactory).await?;
     std::process::exit(0);
 }
 
@@ -2275,7 +2242,12 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
 /// Returning is a stronger contract than exiting: by the time it returns, every
 /// task the daemon spawned has ended or been aborted, because returning drops the
 /// daemon lock and legalizes a restart on the same home.
-pub async fn run_daemon_with(home: PathBuf, seed: bool, identity_dir: PathBuf) -> Result<()> {
+pub async fn run_daemon_with(
+    home: PathBuf,
+    seed: bool,
+    identity_dir: PathBuf,
+    factory: &dyn TransportFactory,
+) -> Result<()> {
     let _daemon_lock = acquire_daemon_lock(&home)?;
 
     let identity_seed = load_or_create_identity(&identity_dir)?;
@@ -2286,10 +2258,7 @@ pub async fn run_daemon_with(home: PathBuf, seed: bool, identity_dir: PathBuf) -
     // initialized (`lait init` / `lait join`) — a daemon never founds a
     // space as a side effect of starting.
     let store = Store::open(&home)?;
-    // The transport keypair is constructed from lait's identity seed here, at the
-    // net edge — the seed itself is the identity (see config::load_or_create_identity).
-    let secret_key = SecretKey::from_bytes(&identity_seed);
-    let me = DeviceId::from_key_string(secret_key.public().to_string());
+    let me = crate::crypto::device_from_seed(&identity_seed);
     let replica = Replica::open(
         store,
         me,
@@ -2314,12 +2283,12 @@ pub async fn run_daemon_with(home: PathBuf, seed: bool, identity_dir: PathBuf) -
     }
     let replica = Arc::new(Mutex::new(replica));
 
-    // lait states its network requirement; iroh executes it (crate::net is the
-    // sole place relay/discovery vocabulary lives). Defaults to Public.
+    // lait states its network requirement; the transport executes it (crate::net
+    // is the sole place relay/discovery vocabulary lives). Defaults to Public.
     let network = crate::net::Network::from_env()?;
-    // Public and Local are both wired: Public resolves bare ids via n0 discovery,
-    // Local via the PeerBook we populate below. Isolated has no relay and needs
-    // addresses to travel in tickets (not yet) — warn rather than fail silently.
+    // Public and Local both resolve bare ids. Isolated has neither relay nor
+    // discovery and reaches peers only by addresses carried in a ticket — say so
+    // rather than fail silently on the first wider dial.
     if matches!(network, crate::net::Network::Isolated) {
         tracing::info!(
             "LAIT_NETWORK=isolated: no relay and no discovery — peers are reached \
@@ -2327,10 +2296,22 @@ pub async fn run_daemon_with(home: PathBuf, seed: bool, identity_dir: PathBuf) -
              beyond the ticket host is not resolved"
         );
     }
-    let (endpoint, peers) = crate::net::build_endpoint(&secret_key, &network).await?;
-    let my_id = DeviceId::from_key_string(endpoint.id().to_string());
-
-    let gossip = Gossip::builder().spawn(endpoint.clone());
+    let transport = factory
+        .build(
+            &identity_seed,
+            &network,
+            &[PRESENCE_ALPN, crate::sync::SYNC_ALPN],
+        )
+        .await?;
+    // The transport's identity MUST be the daemon's. Nothing downstream can
+    // detect a mismatch: signed gossip would carry one key while the peer
+    // dialed back is another, minted tickets would advertise a host nobody can
+    // reach, and every symptom would surface far from the cause.
+    let expected = crate::crypto::device_from_seed(&identity_seed);
+    if transport.my_id() != expected {
+        anyhow::bail!("transport identity does not match daemon identity");
+    }
+    let my_id = transport.my_id();
 
     let shared = Shared {
         nick: Arc::new(Mutex::new(nick)),
@@ -2338,28 +2319,6 @@ pub async fn run_daemon_with(home: PathBuf, seed: bool, identity_dir: PathBuf) -
         presence: Arc::new(Mutex::new(HashMap::new())),
         events: Arc::new(Mutex::new(EventLog::default())),
     };
-
-    let router = Router::builder(endpoint.clone())
-        .accept(GOSSIP_ALPN, gossip.clone())
-        .accept(PRESENCE_ALPN, PresencePing)
-        .accept(
-            crate::sync::SYNC_ALPN,
-            SyncHandler {
-                replica: replica.clone(),
-            },
-        )
-        .spawn();
-
-    // Waiting for a home relay only makes sense when the policy provides one.
-    // Bound so a valid-URL-but-unreachable relay can't hang startup forever
-    // (iroh's `online()` never times out on its own).
-    if network.uses_relay()
-        && tokio::time::timeout(Duration::from_secs(30), endpoint.online())
-            .await
-            .is_err()
-    {
-        tracing::warn!("no home relay after 30s — continuing; peers may be unreachable");
-    }
 
     // The topic is a pure function of the space id — no user-settable
     // network name, so a cold boot can never subscribe to the wrong topic.
@@ -2375,19 +2334,9 @@ pub async fn run_daemon_with(home: PathBuf, seed: bool, identity_dir: PathBuf) -
             bootstrap.push(id.clone());
         }
     }
-    // Teach the endpoint how to reach each bootstrap peer before dialing them
-    // (under Local this registers `{id, relay}`; under Public it is a no-op).
-    let mut bootstrap_ids = Vec::with_capacity(bootstrap.len());
-    for id in &bootstrap {
-        let ep = endpoint_of(id)?;
-        peers.learn(ep);
-        bootstrap_ids.push(ep);
-    }
-    let gtopic = gossip
-        .subscribe(TopicId::from_bytes(topic.0), bootstrap_ids)
-        .await
-        .map_err(|e| anyhow!("subscribe to room: {e}"))?;
-    let (sender, receiver) = gtopic.split();
+    // Subscribing also teaches the transport how to reach each bootstrap peer,
+    // so a later bare-id dial to one of them resolves.
+    let (sender, receiver) = transport.subscribe(topic, &bootstrap).await?;
 
     // A seed never idles out (DUR-4): it must stay reachable to serve sync and
     // backfill history even with no local client and no peer currently online.
@@ -2403,13 +2352,10 @@ pub async fn run_daemon_with(home: PathBuf, seed: bool, identity_dir: PathBuf) -
 
     let space = replica.lock().unwrap().space_str();
     let node = Arc::new(Node {
-        endpoint,
-        gossip,
-        sender: Mutex::new(sender),
-        secret_key,
-        peers,
+        transport,
+        sender: Mutex::new(Arc::from(sender)),
+        identity_seed,
         space,
-        router,
         shared,
         shutdown: Arc::new(Notify::new()),
         cancel: Cancel::new(),
@@ -2426,6 +2372,9 @@ pub async fn run_daemon_with(home: PathBuf, seed: bool, identity_dir: PathBuf) -
         home: home.clone(),
     });
 
+    // The accept loop goes up first: ALPNs were registered when the transport
+    // was built, so inbound connections can already be queued behind it.
+    node.spawn(node.clone().accept_loop());
     node.spawn(node.clone().recv_loop(receiver, 1));
     node.spawn(node.clone().heartbeat_loop());
     node.spawn(node.clone().reaper_loop());
@@ -2508,7 +2457,7 @@ pub async fn run_daemon_with(home: PathBuf, seed: bool, identity_dir: PathBuf) -
     // lock must never be held across one.
     let mut tasks = std::mem::take(&mut *node.tasks.lock().unwrap());
     let _ = tokio::time::timeout(SHUTDOWN_DEADLINE, async {
-        node.router.shutdown().await.ok();
+        node.transport.shutdown().await;
         while tasks.join_next().await.is_some() {}
     })
     .await;

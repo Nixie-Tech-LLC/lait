@@ -12,6 +12,16 @@
 
 use std::time::{Duration, Instant};
 
+/// The ALPN a liveness probe dials. It is a lait protocol name, not transport
+/// mechanism, and it lives beside the probe's semantics.
+///
+/// It moves in lockstep with [`crate::sync::SYNC_ALPN`] and the gossip topic
+/// tag, so a version skew that partitions sync and gossip also partitions the
+/// liveness probe rather than leaving cross-epoch peers half-visible. Epoch 1
+/// carried the space-identity rewrite and the sync `protocol_version`
+/// handshake; epoch 2 carries the space-vocabulary flag day.
+pub const PRESENCE_ALPN: &[u8] = b"lait/presence/2";
+
 /// Grace period after a NeighborDown (with no probe result yet) before a peer is
 /// declared offline. Covers the large-mesh case where NeighborDown means "no
 /// longer my *direct* neighbor" rather than "left the room".

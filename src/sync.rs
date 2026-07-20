@@ -1,15 +1,14 @@
-//! Live peer-to-peer sync over iroh. A **catalog-first pull** over a
-//! direct QUIC bi-stream on a custom ALPN: exchange the one Catalog VV-diff to
+//! Live peer-to-peer sync over the transport seam. A **catalog-first pull** over
+//! one framed [`Stream`] on a custom ALPN: exchange the one Catalog VV-diff to
 //! learn the whole changed-head set, then fetch each changed issue doc by
-//! per-doc VV-diff, multiplexed over the one stream as length-prefixed,
-//! `DocId`-keyed frames.
+//! per-doc VV-diff, multiplexed over the one stream as `DocId`-keyed frames.
 //!
 //! The protocol is a **pull** (the dialer pulls the accepter's state), which is
-//! strictly turn-taking and therefore deadlock-free on one bi-stream. Both
+//! strictly turn-taking and therefore deadlock-free on one stream. Both
 //! directions are covered because each node pulls from a peer whenever it hears
 //! that peer's catalog head moved (gossip announce, [`crate::proto`]). All Loro
-//! work happens under the replica lock in short synchronous sections; all QUIC
-//! IO happens outside the lock.
+//! work happens under the replica lock in short synchronous sections; all
+//! network IO happens outside the lock.
 //!
 //! For forward compatibility, frames are per-document `export(updates)` blobs
 //! keyed by `DocId`, so encrypted space data wraps them in ciphertext chunks
@@ -18,10 +17,12 @@
 use std::sync::Mutex;
 
 use anyhow::{anyhow, Context, Result};
-use iroh::endpoint::{Connection, RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 
-use crate::replica::{DirtySet, Replica};
+use crate::{
+    replica::{DirtySet, Replica},
+    transport::Stream,
+};
 
 /// The ALPN for the pairwise Loro-sync protocol. The trailing number is the
 /// protocol **epoch** — bump it for a change so breaking that peers of the old
@@ -108,48 +109,49 @@ enum Msg {
     EndDocs,
 }
 
-/// Max framed message size (64 MiB) — a guard against a malformed length.
-const MAX_FRAME: u32 = 64 * 1024 * 1024;
-
-async fn write_msg(send: &mut SendStream, msg: &Msg) -> Result<()> {
-    let bytes = postcard::to_stdvec(msg).context("encode sync frame")?;
-    let len = u32::try_from(bytes.len()).map_err(|_| anyhow!("sync frame too large"))?;
-    send.write_all(&len.to_be_bytes())
-        .await
-        .context("write frame length")?;
-    send.write_all(&bytes).await.context("write frame body")?;
-    Ok(())
+/// One `Msg` per frame. Length framing and its cap belong to the transport,
+/// which owns the wire; this protocol only says what a frame *means*.
+async fn send_msg(stream: &mut dyn Stream, msg: &Msg) -> Result<()> {
+    let body = postcard::to_stdvec(msg).context("encode sync frame")?;
+    stream.send(&body).await
 }
 
-async fn read_msg(recv: &mut RecvStream) -> Result<Option<Msg>> {
-    let mut len_buf = [0u8; 4];
-    match recv.read_exact(&mut len_buf).await {
-        Ok(()) => {}
-        Err(_) => return Ok(None), // clean EOF / stream closed
+/// `Ok(None)` is a **clean** end at a frame boundary; a truncated or lost
+/// stream is an `Err`, so a partial transfer can never be mistaken for a
+/// finished one.
+async fn recv_msg(stream: &mut dyn Stream) -> Result<Option<Msg>> {
+    match stream.recv().await? {
+        Some(body) => Ok(Some(
+            postcard::from_bytes(&body).context("decode sync frame")?,
+        )),
+        None => Ok(None),
     }
-    let len = u32::from_be_bytes(len_buf);
-    if len > MAX_FRAME {
-        return Err(anyhow!("sync frame length {len} exceeds cap"));
-    }
-    let mut buf = vec![0u8; len as usize];
-    recv.read_exact(&mut buf).await.context("read frame body")?;
-    let msg: Msg = postcard::from_bytes(&buf).context("decode sync frame")?;
-    Ok(Some(msg))
 }
 
-/// **Dialer side.** Pull a peer's state up to date and return a coalesced
-/// dirty-set describing everything that changed locally (the node rings one
-/// doorbell for it through daemon-side batching.
-pub async fn pull(conn: &Connection, replica: &Mutex<Replica>) -> Result<DirtySet> {
-    let (mut send, mut recv) = conn.open_bi().await.context("open sync stream")?;
+/// What a pull achieved.
+///
+/// `complete` is the distinction the caller cannot make from `dirty` alone: a
+/// doc phase that ended before `EndDocs` still imported real work that must ring
+/// its doorbell, but the peer's state is not yet ours. Reporting that as a
+/// finished sync is how a truncated transfer disappears — re-announced and
+/// persisted exactly as if everything had arrived.
+pub struct PullOutcome {
+    pub dirty: DirtySet,
+    pub complete: bool,
+}
 
+/// **Dialer side.** Pull a peer's state up to date. The returned
+/// [`PullOutcome`] carries a coalesced dirty-set of everything that changed
+/// locally (the node rings one doorbell for it through daemon-side batching)
+/// and whether the transfer actually reached its end.
+pub async fn pull(stream: &mut dyn Stream, replica: &Mutex<Replica>) -> Result<PullOutcome> {
     // 1. send our membership + catalog VVs.
     let (space, membership_vv, catalog_vv) = {
         let t = replica.lock().unwrap();
         (t.space_str(), t.membership_vv_bytes(), t.catalog_vv_bytes())
     };
-    write_msg(
-        &mut send,
+    send_msg(
+        stream,
         &Msg::Pull {
             protocol_version: PROTOCOL_VERSION,
             space,
@@ -162,7 +164,7 @@ pub async fn pull(conn: &Connection, replica: &Mutex<Replica>) -> Result<DirtySe
     // Read and import the plaintext membership diff first; it may provide the
     // have just been added and can now decrypt the catalog/docs below.
     let mut dirty = DirtySet::default();
-    match read_msg(&mut recv).await? {
+    match recv_msg(stream).await? {
         Some(Msg::Membership { update }) => {
             if !update.is_empty() {
                 let mut t = replica.lock().unwrap();
@@ -170,11 +172,12 @@ pub async fn pull(conn: &Connection, replica: &Mutex<Replica>) -> Result<DirtySe
                 dirty.merge(DirtySet::catalog_structure());
             }
         }
+        None => return Err(anyhow!("peer closed before sending Membership")),
         other => return Err(anyhow!("expected Membership, got {other:?}")),
     }
 
     // 2b. read the encrypted catalog diff, decrypt+import, compute needed docs.
-    let needs = match read_msg(&mut recv).await? {
+    let needs = match recv_msg(stream).await? {
         Some(Msg::Catalog { update }) => {
             let changed = !update.is_empty();
             let needs = {
@@ -188,13 +191,14 @@ pub async fn pull(conn: &Connection, replica: &Mutex<Replica>) -> Result<DirtySe
             }
             needs
         }
+        None => return Err(anyhow!("peer closed before sending Catalog")),
         other => return Err(anyhow!("expected Catalog, got {other:?}")),
     };
 
     // 3. request each needed doc, then signal end.
     for need in &needs {
-        write_msg(
-            &mut send,
+        send_msg(
+            stream,
             &Msg::DocRequest {
                 doc_id: need.doc_id.clone(),
                 vv: need.vv.clone(),
@@ -202,35 +206,52 @@ pub async fn pull(conn: &Connection, replica: &Mutex<Replica>) -> Result<DirtySe
         )
         .await?;
     }
-    write_msg(&mut send, &Msg::EndRequests).await?;
+    send_msg(stream, &Msg::EndRequests).await?;
 
     // 4. read doc updates until EndDocs, importing each; coalesce dirty-sets.
+    // A truncation here is NOT fatal: whatever imported is real and keeps its
+    // doorbell, so the loop breaks with what it has instead of unwinding. What
+    // it must not do is claim the pull finished — convergence then rests on the
+    // caller's retry and on the next announce or heartbeat.
+    let mut complete = false;
     loop {
-        match read_msg(&mut recv).await? {
-            Some(Msg::DocUpdate { doc_id, bytes }) => {
+        match recv_msg(stream).await {
+            Ok(Some(Msg::DocUpdate { doc_id, bytes })) => {
                 let mut t = replica.lock().unwrap();
                 if let Some(d) = t.import_doc(&doc_id, &bytes)? {
                     dirty.merge(d);
                 }
             }
-            Some(Msg::DocMissing { .. }) => {}
-            Some(Msg::EndDocs) | None => break,
-            other => return Err(anyhow!("unexpected frame during doc phase: {other:?}")),
+            Ok(Some(Msg::DocMissing { .. })) => {}
+            Ok(Some(Msg::EndDocs)) => {
+                complete = true;
+                break;
+            }
+            Ok(Some(other)) => return Err(anyhow!("unexpected frame during doc phase: {other:?}")),
+            Ok(None) => {
+                tracing::debug!("peer ended the doc phase before EndDocs");
+                break;
+            }
+            Err(e) => {
+                tracing::warn!("sync pull truncated: {e:#}");
+                break;
+            }
         }
     }
 
-    send.finish().ok();
-    Ok(dirty)
+    stream.finish().await.ok();
+    Ok(PullOutcome { dirty, complete })
 }
 
 /// **Accepter side.** Serve a pull: answer the dialer's catalog + doc requests.
 /// Read-only with respect to our own state (a pull never mutates the provider),
 /// so it never rings a doorbell here.
-pub async fn serve(conn: Connection, replica: &Mutex<Replica>) -> Result<()> {
-    let (mut send, mut recv) = conn.accept_bi().await.context("accept sync stream")?;
-
+/// The stream is **borrowed**: connection lifecycle belongs to the accept loop,
+/// which parks on `wait_closed` after this returns — including on the error
+/// paths a `?` in here would skip.
+pub async fn serve(stream: &mut dyn Stream, replica: &Mutex<Replica>) -> Result<()> {
     // 1. read the Pull; guard the space.
-    let (membership_vv, catalog_vv) = match read_msg(&mut recv).await? {
+    let (membership_vv, catalog_vv) = match recv_msg(stream).await? {
         Some(Msg::Pull {
             protocol_version,
             space,
@@ -246,6 +267,7 @@ pub async fn serve(conn: Connection, replica: &Mutex<Replica>) -> Result<()> {
             }
             (membership_vv, catalog_vv)
         }
+        None => return Err(anyhow!("dialer closed before sending Pull")),
         other => return Err(anyhow!("expected Pull, got {other:?}")),
     };
 
@@ -258,25 +280,26 @@ pub async fn serve(conn: Connection, replica: &Mutex<Replica>) -> Result<()> {
             t.export_catalog_from(&catalog_vv)?,
         )
     };
-    write_msg(&mut send, &Msg::Membership { update: membership }).await?;
-    write_msg(&mut send, &Msg::Catalog { update: catalog }).await?;
+    send_msg(stream, &Msg::Membership { update: membership }).await?;
+    send_msg(stream, &Msg::Catalog { update: catalog }).await?;
 
-    // 3. answer doc requests until EndRequests.
+    // 3. answer doc requests until EndRequests. A vanished dialer propagates:
+    // a pull never mutates the provider, so nothing of ours is at risk.
     loop {
-        match read_msg(&mut recv).await? {
+        match recv_msg(stream).await? {
             Some(Msg::DocRequest { doc_id, vv }) => {
                 let exported = replica.lock().unwrap().export_doc_from(&doc_id, &vv)?;
                 match exported {
-                    Some(bytes) => write_msg(&mut send, &Msg::DocUpdate { doc_id, bytes }).await?,
-                    None => write_msg(&mut send, &Msg::DocMissing { doc_id }).await?,
+                    Some(bytes) => send_msg(stream, &Msg::DocUpdate { doc_id, bytes }).await?,
+                    None => send_msg(stream, &Msg::DocMissing { doc_id }).await?,
                 }
             }
             Some(Msg::EndRequests) | None => break,
             other => return Err(anyhow!("unexpected frame during request phase: {other:?}")),
         }
     }
-    write_msg(&mut send, &Msg::EndDocs).await?;
-    send.finish().ok();
+    send_msg(stream, &Msg::EndDocs).await?;
+    stream.finish().await.ok();
     Ok(())
 }
 

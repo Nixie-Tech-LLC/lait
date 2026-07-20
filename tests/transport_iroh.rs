@@ -20,7 +20,7 @@ use lait::transport::{Alpn, GossipEvent, Transport};
 // transport test that pins its own spelling of one stops exercising the ALPN
 // the daemon will actually negotiate.
 const SYNC_ALPN: Alpn = lait::sync::SYNC_ALPN;
-const PRESENCE_ALPN: Alpn = lait::node::PRESENCE_ALPN;
+const PRESENCE_ALPN: Alpn = lait::presence::PRESENCE_ALPN;
 
 fn device(seed: u8) -> lait::ids::DeviceId {
     lait::crypto::device_from_seed(&[seed; 32])
