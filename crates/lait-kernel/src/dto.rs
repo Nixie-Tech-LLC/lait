@@ -22,7 +22,21 @@ use crate::ids::{ActorId, DeviceId, DocId, LabelId, ProjectId, SpaceId};
 /// v2: the actor-identity cutover (`lait/actor/1`) — members, assignees, and
 /// attribution are keyed by `ActorId` over a self-managed device set, replacing
 /// the `person ≡ key ≡ device` model.
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// v3: the space-vocabulary flag day — `genesis.json` keys the space id under
+/// `space_id`, and every Loro document stamps it under `spaceId`. A v2 store
+/// spells both the old way, so a v3 reader would open it and then project an
+/// absent space id; see [`MIN_SUPPORTED_SCHEMA`].
+pub const SCHEMA_VERSION: u32 = 3;
+
+/// The oldest on-disk schema this build will open.
+///
+/// A lower bound exists because "older is fine" is only true while every older
+/// shape is still *readable*. v2 stores are not: their space id sits under keys
+/// v3 does not look at, so opening one succeeds and then silently projects a
+/// store with no space. Refusing is the honest outcome — there is no migration,
+/// and a store that opens wrong is worse than a store that will not open.
+pub const MIN_SUPPORTED_SCHEMA: u32 = 3;
 
 /// Issue priority. Stored inside the issue document as a lowercase
 /// string leaf and projected here.

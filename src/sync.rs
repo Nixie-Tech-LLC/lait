@@ -26,10 +26,13 @@ use crate::replica::{DirtySet, Replica};
 /// The ALPN for the pairwise Loro-sync protocol. The trailing number is the
 /// protocol **epoch** — bump it for a change so breaking that peers of the old
 /// epoch must not even connect (QUIC's ALPN negotiation refuses them at the
-/// transport, before any frame is exchanged). Epoch 1 covers the
-/// space-identity rewrite (topic-from-space-id, SpaceTicket) AND the
-/// in-band `protocol_version` handshake below; epoch 0 had neither.
-pub const SYNC_ALPN: &[u8] = b"lait/sync/1";
+/// transport, before any frame is exchanged). Epoch 1 covered the
+/// space-identity rewrite (topic-from-space-id, SpaceTicket) AND the in-band
+/// `protocol_version` handshake below; epoch 0 had neither. Epoch 2 fences the
+/// space-vocabulary flag day: the persisted and control shapes both changed
+/// field names, so a skewed peer must fail at ALPN rather than reach a
+/// confusing decode error.
+pub const SYNC_ALPN: &[u8] = b"lait/sync/2";
 
 /// The sync protocol version this build **speaks**, exchanged in the `Pull`
 /// handshake. Within one ALPN epoch, bump this for a backward-compatible change
@@ -44,11 +47,15 @@ pub const SYNC_ALPN: &[u8] = b"lait/sync/1";
 /// So v2 refuses v1 outright (`MIN_SUPPORTED_PROTOCOL = 2`): the flag day the
 /// versioning contract exists for, taken while the mesh is small. Going
 /// forward, replay keeps signature-valid-but-undecodable ops as opaque DAG
-/// nodes (`acl`/`authz`), so this is the LAST divergence-class flag day.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// nodes (`acl`/`authz`), so that was the last divergence-class flag day.
+///
+/// **v3:** the space-vocabulary rename. No divergence class — a v2 peer simply
+/// spells the persisted and control shapes differently, and there is no
+/// migration, so `MIN_SUPPORTED_PROTOCOL = 3` retires v2 alongside it.
+pub const PROTOCOL_VERSION: u32 = 3;
 /// The oldest sync protocol version we still accept from a peer. Raising this is
 /// how a retired version is dropped — it defines the mixed-version support window.
-pub const MIN_SUPPORTED_PROTOCOL: u32 = 2;
+pub const MIN_SUPPORTED_PROTOCOL: u32 = 3;
 
 /// Whether we can sync with a peer advertising protocol version `peer`. Accepts
 /// peers inside the supported window; outside it, returns a human-facing reason
@@ -291,16 +298,18 @@ mod tests {
     }
 
     #[test]
-    fn v1_peers_are_refused_after_authorization_protocol_change() {
-        // The encrypted `authz` DAG and `AddAgent` operation changed membership
-        // ancestry and therefore the key-sealing recipient set. A v1 node drops
-        // operation kinds it cannot decode and would split E2EE, so v2 refuses
-        // v1 outright.
-        // v1 is out of the window (MIN_SUPPORTED_PROTOCOL == 2) — the flag day.
-        let err = check_sync_protocol(1).unwrap_err().to_string();
-        assert!(
-            err.contains("upgrade"),
-            "the refusal must name the way out: {err}"
-        );
+    fn pre_v3_peers_are_refused_after_the_space_flag_day() {
+        // Two closed flag days, both still enforced. v1 lost to the encrypted
+        // `authz` DAG and `AddAgent`, which changed membership ancestry and so
+        // the key-sealing recipient set. v2 loses to the space-vocabulary
+        // rename, which moved field names across the whole persisted shape.
+        // Neither is decodable here, so both are refused rather than tolerated.
+        for old in [1, 2] {
+            let err = check_sync_protocol(old).unwrap_err().to_string();
+            assert!(
+                err.contains("upgrade"),
+                "the refusal must name the way out: {err}"
+            );
+        }
     }
 }

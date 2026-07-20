@@ -2840,7 +2840,7 @@ dependencies = [
 
 [[package]]
 name = "lait"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2891,7 +2891,7 @@ dependencies = [
 
 [[package]]
 name = "lait-fabric"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2907,7 +2907,7 @@ dependencies = [
 
 [[package]]
 name = "lait-kernel"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "argon2",

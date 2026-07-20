@@ -81,7 +81,7 @@ pub enum AclAction {
     /// continued read access, and a replica adopts an epoch only when a valid mint
     /// authorizes it, never because it merely appeared in the synced doc. `gen` is
     /// bounded at replay to `max(ancestor mint gen) + 1` (no generation jump can
-    /// pin the tip or overflow). `key_commit = blake3(workspace_key)` binds the
+    /// pin the tip or overflow). `key_commit = blake3(space_key)` binds the
     /// (unsigned, per-device) sealed envelopes — a device accepts an unsealed key
     /// only if its hash matches, so a forged envelope is inert. Grow-only and
     /// orthogonal to the member set (no subject actor); concurrent mints coexist

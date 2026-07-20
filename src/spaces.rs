@@ -9,6 +9,11 @@
 //! every op); it is pure navigation state: the `name` and `projects` fields are
 //! advisory snapshots refreshed on open, a corrupt/absent file degrades to "no
 //! known spaces", and nothing here is ever a source of truth.
+//!
+//! A v0.5.x `workspaces.json` beside this file is simply not read, and is not
+//! migrated. That is the right outcome precisely because this is navigation
+//! state: the registry rebuilds itself on the next `init`, `join`, or daemon
+//! open, so a migration would buy nothing that opening a store once does not.
 
 use std::path::{Path, PathBuf};
 

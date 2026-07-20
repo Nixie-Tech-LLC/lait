@@ -200,7 +200,7 @@ impl Replica {
         let genesis = store.genesis()?.ok_or_else(|| {
             anyhow!("store missing genesis.json — corrupt or pre-rewrite store; re-init or re-join")
         })?;
-        // A joiner's catalog is empty (no workspaceId) until the founder's ops
+        // A joiner's catalog is empty (no spaceId) until the founder's ops
         // arrive over sync; the genesis is the local root of truth. A catalog
         // that DOES carry an id must agree with it.
         let space_id = match catalog.space_id() {

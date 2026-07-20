@@ -38,11 +38,20 @@ use crate::dto::{
 ///
 /// Version 1 is the first: a daemon that does not answer `hello` at all predates
 /// the handshake (v0.4.8 and earlier) and is reported as such.
-pub const CONTROL_PROTOCOL_VERSION: u32 = 1;
+///
+/// **v2:** the space-vocabulary flag day renamed fields carried on this plane —
+/// `Diagnose.expected_space`, `StatusInfo.space`, `IssueView.space_id`. A v1
+/// daemon cannot answer them, so v1 is retired rather than tolerated: a client
+/// that decoded a v1 answer would read absent fields as absent state.
+pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
 
 /// The oldest control protocol a client still talks to. Raising this retires a
 /// version; the gap to [`CONTROL_PROTOCOL_VERSION`] is the mixed-version window.
-pub const MIN_SUPPORTED_CONTROL_PROTOCOL: u32 = 1;
+///
+/// At 2 the window is a single version, so a v0.5.x daemon still holding the
+/// lock reads as *behind us* and is therefore replaceable — it is killed and
+/// respawned on the first client contact rather than being talked to.
+pub const MIN_SUPPORTED_CONTROL_PROTOCOL: u32 = 2;
 
 /// Whether this build can talk to a daemon advertising control protocol `peer`.
 ///

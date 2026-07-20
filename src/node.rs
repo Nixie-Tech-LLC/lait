@@ -61,11 +61,15 @@ use crate::{
     store::Store,
 };
 
-// Presence-probe ALPN. Bumped to /1 in lockstep with the epoch-1 wire changes
-// (the space-identity rewrite + the sync `protocol_version` handshake) and
-// the gossip topic tag, so a version skew that partitions sync/gossip also
-// partitions the liveness probe rather than leaving cross-epoch peers half-visible.
-const PRESENCE_ALPN: &[u8] = b"lait/presence/1";
+/// Presence-probe ALPN. Moves in lockstep with [`crate::sync::SYNC_ALPN`] and
+/// the gossip topic tag, so a version skew that partitions sync/gossip also
+/// partitions the liveness probe rather than leaving cross-epoch peers
+/// half-visible. Epoch 1 carried the space-identity rewrite and the sync
+/// `protocol_version` handshake; epoch 2 carries the space-vocabulary flag day.
+///
+/// Public so transport tests negotiate the ALPN the daemon actually uses rather
+/// than a copy of its spelling that an epoch bump would silently strand.
+pub const PRESENCE_ALPN: &[u8] = b"lait/presence/2";
 const HEARTBEAT: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const REAP_INTERVAL: Duration = Duration::from_secs(5);

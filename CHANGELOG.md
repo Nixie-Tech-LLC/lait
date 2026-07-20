@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.6.0 — one word for one thing
+
+> **A naming flag day, and a clean break.** The thing lait organises work in is a
+> **space** — the CLI has said so since v0.5.0, and now the code, the on-disk state,
+> and the wire say it too. `lait-engine` is now **`lait-fabric`**, and `UserId` is now
+> **`DeviceId`**. Nothing is migrated: **founders must re-init, everyone else must
+> re-join from a fresh invite.** Your `ws_…` ids and the `--workspace` / `workspaces`
+> aliases still work — the ids in the wild keep working, and your fingers keep working.
+>
+> ```
+> lait update            # everywhere
+> lait init              # founders — nothing from v0.5.x is migrated
+> lait join <link>       # everyone else, from a fresh invite
+> ```
+
+### One word for one thing
+
+- **`lait-engine` is `lait-fabric`.** The kernel determines **legitimacy** — identity,
+  authority, custody, recovery, and which transitions are valid given signed history.
+  The fabric maintains the **shared world** — documents, persistence, history,
+  convergence, projection. They are separate crates because the dependency edge is a
+  correctness boundary: convergence cannot confer legitimacy. They ship, test, and
+  version together as lait's substrate. "Engine" also collided with the CRDT engine
+  the crate seals; prose that said "the engine" now says Loro, the fabric, or the
+  daemon, whichever it meant.
+- **"Workspace" is gone from the code.** `WorkspaceId` → `SpaceId`, `WorkspaceTicket`
+  → `SpaceTicket`, `WorkspaceKey` → `SpaceKey`, `workspaces.json` → `spaces.json`, and
+  the Loro identity key `workspaceId` → `spaceId`. v0.5.0's note that "internal
+  identifiers and architecture docs keep 'workspace'" is superseded. **The `ws_` id
+  prefix is unchanged**, and `--workspace` / `lait workspaces` / `recover-workspace`
+  remain as aliases.
+- **`UserId` is `DeviceId`.** A peer *is* its ed25519 key; `ActorId` is the person.
+  This changes no bytes — the type is a newtype over a string in every encoding — only
+  what the code calls itself. `PeerId` stays as the transport-layer alias. The CLI and
+  MCP noun `<userref>` is now `<who>`, matching the control-plane field it feeds.
+
+### The break
+
+- **Schema v3, sync protocol v3, control protocol v2**, plus `lait/sync/2`,
+  `lait/presence/2`, and gossip topic epoch `v3`. Old and new nodes cannot see each
+  other at all: ALPN negotiation fails before a frame is exchanged, and the gossip
+  topic differs.
+- **v0.5.x stores are refused, not migrated.** The schema gate now has a lower bound
+  as well as an upper one; opening an older store names the version and points at
+  `lait init` / `lait join` rather than opening it and projecting it as spaceless.
+- **A running v0.5.x daemon is replaced, not talked to.** It reads as behind the
+  control-protocol window, so the first client contact kills and respawns it.
+- **`workspaces.json` is not read.** The space registry is `spaces.json`; it is
+  navigation state and rebuilds itself on the next `init`, `join`, or daemon open.
+
 ## v0.5.2 — the board works, history is durable, and issues have a shape
 
 v0.5.0 put a board in the browser but left it read-rich and write-poor: you could

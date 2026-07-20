@@ -16,8 +16,11 @@ use lait::net::Network;
 use lait::transport::iroh::IrohTransport;
 use lait::transport::{Alpn, GossipEvent, Topic, Transport};
 
-const SYNC_ALPN: Alpn = b"lait/sync/1";
-const PRESENCE_ALPN: Alpn = b"lait/presence/1";
+// The real ALPNs, not copies: an epoch bump is a production concern, and a
+// transport test that pins its own spelling of one stops exercising the ALPN
+// the daemon will actually negotiate.
+const SYNC_ALPN: Alpn = lait::sync::SYNC_ALPN;
+const PRESENCE_ALPN: Alpn = lait::node::PRESENCE_ALPN;
 
 fn device(seed: u8) -> lait::ids::DeviceId {
     lait::crypto::device_from_seed(&[seed; 32])
@@ -175,7 +178,7 @@ async fn framing_interops_with_legacy_read_msg_bytes() {
 /// CONNECTION_CLOSE and truncate the trailer — the silent-partial-sync bug.
 #[tokio::test]
 async fn r1_trailing_frames_survive_accepter_finishing_first() {
-    const ALPN: Alpn = b"lait/sync/1";
+    const ALPN: Alpn = SYNC_ALPN;
     let (a, b) = isolated_pair(3, 4, &[ALPN]).await;
     let big = vec![0xC3u8; 8 * 1024 * 1024];
     let big_for_check = big.clone();
@@ -215,7 +218,7 @@ async fn r1_trailing_frames_survive_accepter_finishing_first() {
 /// resolve while the dialer still holds its stream, resolves promptly after.
 #[tokio::test]
 async fn wait_closed_parks_until_dialer_drops() {
-    const ALPN: Alpn = b"lait/sync/1";
+    const ALPN: Alpn = SYNC_ALPN;
     let (a, b) = isolated_pair(5, 6, &[ALPN]).await;
 
     let b_task = tokio::spawn(async move {
@@ -363,7 +366,7 @@ async fn local_policy_relay_resolution() {
             .await
             .expect("run in-process relay");
 
-    const ALPN: Alpn = b"lait/sync/1";
+    const ALPN: Alpn = SYNC_ALPN;
 
     async fn local_endpoint(
         seed: u8,

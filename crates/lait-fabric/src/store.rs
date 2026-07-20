@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! <home>/repo/
-//!   genesis.json        // workspaceId + founding admin keys (public only)
+//!   genesis.json        // spaceId + founding admin keys (public only)
 //!   catalog.loro        // export(Snapshot) of the Catalog doc
 //!   membership.loro     // signed authority inputs and sealed envelopes
 //!   docs/<DocId>.loro   // per-issue snapshot, lazily loaded
@@ -143,7 +143,7 @@ impl Store {
         }
         let bytes = fs::read(&p).context("read catalog.loro")?;
         let catalog = CatalogDoc::from_snapshot(&bytes, Some(self.peer_id))?;
-        // Reject a store written by a newer lait before exposing its contents.
+        // Gate the on-disk schema window before exposing any contents.
         check_schema_version(catalog.schema_version())?;
         Ok(Some(catalog))
     }
@@ -354,18 +354,37 @@ fn run_git(repo: &Path, args: &[&str]) -> Option<String> {
     }
 }
 
-/// Gate a loaded store's on-disk schema version against what this build supports
-/// (`dto::SCHEMA_VERSION`). Refuses a store written by a **newer** lait — opening
-/// it with an older binary risks dropping or misreading unknown fields. An
-/// older-or-equal store is accepted; migrations for older
-/// versions would run at the call site (none yet — only v1 exists). Pure, so the
-/// policy is unit-tested without touching the filesystem.
+/// Gate a loaded store's on-disk schema version against the window this build
+/// supports (`[dto::MIN_SUPPORTED_SCHEMA, dto::SCHEMA_VERSION]`).
+///
+/// Both bounds are closed. A **newer** store is refused because an older binary
+/// would drop or misread fields it does not know. An **older** store is refused
+/// because there is no migration: a v2 store's space id lives under keys a v3
+/// reader never consults, so accepting it would open a store that then projects
+/// as spaceless. A refusal that names the version is recoverable; a store that
+/// opens wrong is not.
+///
+/// `0` is **not** an old version — it is the absence of the key, which is what a
+/// joiner's catalog reads until the founder's ops arrive over sync
+/// ([`CatalogDoc::empty`] stamps nothing). Refusing it would make `lait join`
+/// impossible. An unstamped store carries no shape to be wrong about; the
+/// genesis is the root of truth at that point, and a v0.5.x genesis fails to
+/// parse on its own. Pure, so the window policy is unit-testable without
+/// touching the filesystem.
 fn check_schema_version(found: u32) -> Result<()> {
     let supported = crate::dto::SCHEMA_VERSION;
+    let min = crate::dto::MIN_SUPPORTED_SCHEMA;
     if found > supported {
         return Err(anyhow!(
             "this space store was written by a newer lait (schema v{found}); \
              this build supports up to schema v{supported} — upgrade lait to open it"
+        ));
+    }
+    if found != 0 && found < min {
+        return Err(anyhow!(
+            "this space store was written by lait v0.5.x or earlier (schema v{found}); \
+             v0.6 changed the on-disk shape and does not migrate — re-found it with \
+             `lait init`, or re-join from a fresh invite"
         ));
     }
     Ok(())
@@ -374,13 +393,17 @@ fn check_schema_version(found: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dto::{Priority, SCHEMA_VERSION};
+    use crate::dto::{Priority, MIN_SUPPORTED_SCHEMA, SCHEMA_VERSION};
     use crate::ids::SpaceId;
 
     #[test]
-    fn schema_gate_accepts_supported_and_refuses_newer() {
-        // Current and older schemas load; a newer store is refused (upgrade path).
+    fn schema_gate_accepts_supported_and_refuses_outside_the_window() {
+        // The window is closed at both ends: a newer store and a retired older
+        // one are both refused, so a v0.5.x store cannot open and mis-project.
         assert!(check_schema_version(SCHEMA_VERSION).is_ok());
+        assert!(check_schema_version(MIN_SUPPORTED_SCHEMA - 1).is_err());
+        // `0` is the key's absence, not a version: a joiner's catalog reads it
+        // until the founder's ops land, and refusing it would break `lait join`.
         assert!(check_schema_version(0).is_ok());
         assert!(check_schema_version(SCHEMA_VERSION + 1).is_err());
     }

@@ -1,6 +1,6 @@
 [package]
 name = "lait-kernel"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.91"
 description = "The lait kernel: identity, trust regimes, and derivation rules — the roots lait grows from, depending on no scaffold (no Loro, no iroh)."

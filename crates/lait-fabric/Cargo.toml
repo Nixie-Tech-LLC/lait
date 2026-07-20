@@ -1,6 +1,6 @@
 [package]
 name = "lait-fabric"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.91"
 description = "The lait fabric: the shared world — documents, persistence, history, convergence, and projection, with the Loro scaffold sealed behind typed wrappers. The ONLY crate that names loro."

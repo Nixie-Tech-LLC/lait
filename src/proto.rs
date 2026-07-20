@@ -47,15 +47,17 @@ fn endpoint_of(device: &DeviceId) -> Result<EndpointId> {
 /// function of the genesis identity — there is no user-settable network name,
 /// so it can never drift, be renamed apart, or collide across spaces the
 /// way the old folder-seeded "room" string could. Domain-separated so the topic
-/// space is disjoint from any other blake3 use; the `lait/topic/v2` tag also
+/// space is disjoint from any other blake3 use; the `lait/topic/v3` tag also
 /// serves as the gossip protocol **epoch** — bump it on any breaking change to
 /// [`Payload`] *or the message-signing preimage* so old and new nodes partition
 /// onto different topics instead of silently failing to decode/verify each
 /// other's frames (postcard is not self-describing; that drop is logged in
-/// node.rs). It was bumped to v2 with the domain/space-bound signatures.
+/// node.rs). v2 carried the domain/space-bound signatures; v3 carries the
+/// space-vocabulary flag day, partitioning v0.5.x nodes onto a topic no v0.6
+/// node subscribes to.
 pub fn topic_for_space(space: &str) -> TopicId {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"lait/topic/v2");
+    hasher.update(b"lait/topic/v3");
     hasher.update(space.as_bytes());
     TopicId::from_bytes(*hasher.finalize().as_bytes())
 }

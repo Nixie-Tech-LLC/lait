@@ -4,7 +4,7 @@
 //! is a single key in the root `LoroMap` resolved by Lamport order (LWW).
 //!
 //! Stored fields:
-//! - `id`, `workspaceId`, `projectId`, `createdBy`, `createdAt` — value leaves.
+//! - `id`, `spaceId`, `projectId`, `createdBy`, `createdAt` — value leaves.
 //! - `title`, `status`, `priority` — LWW value leaves.
 //! - `description` — `LoroText` (RGA char-merge, co-editable; writes are a
 //!   **splice**, never a full-buffer replace — see [`IssueDoc::set_description`]).

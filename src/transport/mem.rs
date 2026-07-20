@@ -302,12 +302,12 @@ mod tests {
         let b_accept = tokio::spawn(async move {
             let inc = b.accept().await.expect("incoming");
             assert_eq!(inc.from, id(1));
-            assert_eq!(inc.alpn, b"lait/sync/1");
+            assert_eq!(inc.alpn, crate::sync::SYNC_ALPN);
             let mut s = inc.stream;
             assert_eq!(s.recv().await.unwrap().as_deref(), Some(&b"ping"[..]));
             s.send(b"pong").await.unwrap();
         });
-        let mut s = a.connect(id(2), b"lait/sync/1").await.unwrap();
+        let mut s = a.connect(id(2), crate::sync::SYNC_ALPN).await.unwrap();
         s.send(b"ping").await.unwrap();
         assert_eq!(s.recv().await.unwrap().as_deref(), Some(&b"pong"[..]));
         b_accept.await.unwrap();
@@ -327,7 +327,7 @@ mod tests {
             assert_eq!(s.recv().await.unwrap().as_deref(), Some(&b"two"[..]));
             assert_eq!(s.recv().await.unwrap(), None, "clean end after drain");
         });
-        let mut s = a.connect(id(2), b"lait/sync/1").await.unwrap();
+        let mut s = a.connect(id(2), crate::sync::SYNC_ALPN).await.unwrap();
         s.send(b"one").await.unwrap();
         s.send(b"two").await.unwrap();
         s.finish().await.unwrap();
@@ -359,7 +359,7 @@ mod tests {
                 .expect("wait_closed must resolve after the dialer drops");
         });
 
-        let mut s = a.connect(id(2), b"lait/sync/1").await.unwrap();
+        let mut s = a.connect(id(2), crate::sync::SYNC_ALPN).await.unwrap();
         assert_eq!(s.recv().await.unwrap().as_deref(), Some(&b"payload"[..]));
         tokio::time::sleep(Duration::from_millis(200)).await;
         drop(s); // the dialer's "done" signal
@@ -373,6 +373,6 @@ mod tests {
         let a = net.peer(id(1));
         let b = net.peer(id(2));
         b.shutdown().await;
-        assert!(a.connect(id(2), b"lait/sync/1").await.is_err());
+        assert!(a.connect(id(2), crate::sync::SYNC_ALPN).await.is_err());
     }
 }
