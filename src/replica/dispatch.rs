@@ -254,13 +254,21 @@ impl Replica {
                 )
             }
             Request::SpaceCustodyExport { path, passphrase } => {
-                Ok(self.space_custody_export_cmd(path, passphrase))
+                return Self::respond(
+                    self.space_custody_export_cmd(path, passphrase),
+                    Self::custody_export_response,
+                )
             }
             Request::SpaceCustodyImport {
                 path,
                 passphrase,
                 force,
-            } => Ok(self.space_custody_import_cmd(path, passphrase, force)),
+            } => {
+                return Self::respond(
+                    self.space_custody_import_cmd(path, passphrase, force),
+                    Self::custody_import_response,
+                )
+            }
             Request::SpaceRecoverApprove { session, expect } => {
                 return Self::respond(
                     self.space_recover_approve_cmd(session, expect),
@@ -398,6 +406,41 @@ impl Replica {
                 proposal.to_hex(),
                 signing.to_hex(),
                 proposal.to_hex(),
+            ),
+        };
+        Response::Ok {
+            message: Some(message),
+        }
+    }
+
+    /// Whether a custodian still owes an attestation is derived here from what
+    /// the export reported, so the domain never carries one of three sentences.
+    fn custody_export_response(e: CustodyExport) -> Response {
+        let note = if !e.indispensable {
+            "this arrangement tolerates a lost holder, so no attestation is required to install it"
+                .to_string()
+        } else if e.outstanding == 0 {
+            "every custodian has attested — the arrangement can now install".to_string()
+        } else {
+            format!("still waiting on {} custodian(s)", e.outstanding)
+        };
+        Response::Ok {
+            message: Some(format!(
+                "exported and verified your share package to {} — {note}. Keep it somewhere the passphrase alone cannot be found.",
+                e.path
+            )),
+        }
+    }
+
+    fn custody_import_response(i: CustodyImport) -> Response {
+        let head = format!(
+            "restored and verified your share for ceremony {} — this device can take part in recovery again",
+            i.ceremony.to_hex()
+        );
+        let message = match i.incomplete {
+            None => head,
+            Some(e) => format!(
+                "{head}. The ceremony did not advance here ({e:#}); it will retry on the next sync"
             ),
         };
         Response::Ok {

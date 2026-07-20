@@ -54,8 +54,9 @@ pub use error::{
 pub use lifecycle::{derive_project_key, found_space, join_space_store};
 pub use membership::{Admission, InviteRevocation, KeyRotated, MemberRemoved};
 pub use recovery::{
-    ArtifactRead, DegradedRecoveryHolder, Elevation, ElevationApproved, LocalCustodyState,
-    RecoveryApproved, RecoveryArtifactFailure, RecoveryStatus, SpaceRecovered, SpaceRecovery,
+    ArtifactRead, CustodyExport, CustodyImport, DegradedRecoveryHolder, Elevation,
+    ElevationApproved, LocalCustodyState, RecoveryApproved, RecoveryArtifactFailure,
+    RecoveryStatus, SpaceRecovered, SpaceRecovery,
 };
 // private re-imports so `use super::*` in children keeps unqualified helper names working:
 use lifecycle::mint_recovery;

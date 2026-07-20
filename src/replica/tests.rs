@@ -78,14 +78,10 @@ fn test_proposal(
 /// portable package, verify it by reopening, and attest on the board.
 fn attest_custody(node: &mut TestNode, tag: &str) {
     let path = node.home.join(format!("custody-{tag}.pkg"));
-    let (resp, _) = node.replica.space_custody_export_cmd(
+    ok(node.replica.space_custody_export_cmd(
         path.to_string_lossy().to_string(),
         "a-sufficiently-long-passphrase".into(),
-    );
-    assert!(
-        matches!(resp, Response::Ok { .. }),
-        "custody export: {resp:?}"
-    );
+    ));
 }
 
 fn me() -> DeviceId {
@@ -2549,11 +2545,10 @@ fn a_lost_share_is_restored_from_its_portable_package() {
 
     // B exports a portable package, then loses its local material.
     let pkg_path = b.home.join("rescue.pkg");
-    let (resp, _) = b.replica.space_custody_export_cmd(
+    ok(b.replica.space_custody_export_cmd(
         pkg_path.to_string_lossy().to_string(),
         "a-sufficiently-long-passphrase".into(),
-    );
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ));
     // Only the SHARE goes. The public-key package is stored portable exactly
     // so it survives an account change — which is what lets this device still
     // say which group it belongs to after losing the ability to sign for it.
@@ -2578,12 +2573,11 @@ fn a_lost_share_is_restored_from_its_portable_package() {
     );
 
     // The package brings it back.
-    let (resp, _) = b.replica.space_custody_import_cmd(
+    ok(b.replica.space_custody_import_cmd(
         pkg_path.to_string_lossy().to_string(),
         "a-sufficiently-long-passphrase".into(),
         false,
-    );
-    assert!(matches!(resp, Response::Ok { .. }), "restore: {resp:?}");
+    ));
     assert_eq!(
         b.replica.recovery_status().local_custody,
         LocalCustodyState::Ready
@@ -2596,29 +2590,28 @@ fn a_lost_share_is_restored_from_its_portable_package() {
 
     // Re-importing over usable material is refused unless forced, so a
     // mistaken run cannot turn a working device into the loss it prevents.
-    let (resp, _) = b.replica.space_custody_import_cmd(
+    let refusal = refused(b.replica.space_custody_import_cmd(
         pkg_path.to_string_lossy().to_string(),
         "a-sufficiently-long-passphrase".into(),
         false,
-    );
+    ));
     assert!(
-        matches!(resp, Response::Error { .. }),
-        "must not clobber a readable share: {resp:?}"
+        refusal.to_string().contains("--force"),
+        "must not clobber a readable share, and must say how to mean it: {refusal}"
     );
-    let (resp, _) = b.replica.space_custody_import_cmd(
+    ok(b.replica.space_custody_import_cmd(
         pkg_path.to_string_lossy().to_string(),
         "a-sufficiently-long-passphrase".into(),
         true,
-    );
-    assert!(matches!(resp, Response::Ok { .. }), "forced: {resp:?}");
+    ));
 
     // A wrong passphrase restores nothing.
-    let (resp, _) = b.replica.space_custody_import_cmd(
+    // A wrong passphrase restores nothing, even with --force.
+    refused(b.replica.space_custody_import_cmd(
         pkg_path.to_string_lossy().to_string(),
         "not-the-right-passphrase".into(),
         true,
-    );
-    assert!(matches!(resp, Response::Error { .. }), "{resp:?}");
+    ));
 
     // Losing the public package too is a harder case, and the honest answer
     // is that this device can no longer tell which group it belonged to —
@@ -2631,12 +2624,11 @@ fn a_lost_share_is_restored_from_its_portable_package() {
         LocalCustodyState::NotAHolder,
         "with no public package there is nothing to attribute the device to"
     );
-    let (resp, _) = b.replica.space_custody_import_cmd(
+    ok(b.replica.space_custody_import_cmd(
         pkg_path.to_string_lossy().to_string(),
         "a-sufficiently-long-passphrase".into(),
         true,
-    );
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ));
     assert_eq!(
         b.replica.active_dkg_session(),
         Some(dkg),

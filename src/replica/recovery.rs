@@ -59,6 +59,26 @@ pub struct ElevationApproved {
     pub n: usize,
 }
 
+/// A share package written to disk and verified by reopening it.
+///
+/// `indispensable` and `outstanding` are the facts; which of the three notes a
+/// custodian reads is derived from them at the adapter.
+#[derive(Debug)]
+pub struct CustodyExport {
+    pub path: String,
+    pub indispensable: bool,
+    pub outstanding: usize,
+}
+
+/// A share restored from a portable package.
+#[derive(Debug)]
+pub struct CustodyImport {
+    pub ceremony: crate::dkg::TranscriptId,
+    /// The share is durable by the time this exists; this carries a follow-on
+    /// step that did not complete.
+    pub incomplete: Option<anyhow::Error>,
+}
+
 /// A holder co-signed a pending recovery.
 #[derive(Debug)]
 pub struct RecoveryApproved {
@@ -1220,14 +1240,11 @@ impl Replica {
         &mut self,
         path: String,
         passphrase: String,
-    ) -> (Response, Option<DirtySet>) {
+    ) -> ChangeResult<CustodyExport> {
         if passphrase.chars().count() < 12 {
-            return (
-                Response::err(
-                    "choose a passphrase of at least 12 characters — this is the only thing standing between an attacker with the file and your share",
-                ),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "choose a passphrase of at least 12 characters — this is the only thing standing between an attacker with the file and your share",
+            ));
         }
         // The ceremony to export for: one we hold a share of. A pending
         // arrangement takes precedence, since that is the one whose install is
@@ -1242,32 +1259,32 @@ impl Replica {
             .copied()
             .or(standing)
         else {
-            return (Response::err("this device holds no share to export"), None);
+            return Err(ReplicaError::ceremony(
+                "this device holds no share to export",
+            ));
         };
         let Some(t) = board.dkg.get(&dkg) else {
-            return (Response::err("that ceremony is not on the board"), None);
+            return Err(ReplicaError::ceremony("that ceremony is not on the board"));
         };
         let Some((_, _, participants)) = self.accepted_proposal(&dkg, t) else {
-            return (Response::err("that ceremony is not accepted here"), None);
+            return Err(ReplicaError::ceremony("that ceremony is not accepted here"));
         };
         let Some(manifest) = self.dkg_manifest(&dkg) else {
-            return (
-                Response::err("no acceptance record for that ceremony"),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "no acceptance record for that ceremony",
+            ));
         };
         let (Some(share), Some(pkp)) = (self.dkg_read(&dkg, "share"), self.dkg_read(&dkg, "pkp"))
         else {
-            return (
-                Response::err("this device's share for that ceremony is missing or unreadable"),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "this device's share for that ceremony is missing or unreadable",
+            ));
         };
         let Ok(group_key) = crate::dkg::group_key_of_package(&pkp) else {
-            return (Response::err("the public-key package is unusable"), None);
+            return Err(ReplicaError::ceremony("the public-key package is unusable"));
         };
         let Some(index) = participants.iter().position(|p| p == &self.me) else {
-            return (Response::err("this device is not a participant"), None);
+            return Err(ReplicaError::ceremony("this device is not a participant"));
         };
         let principal = crate::authority::PrincipalId::of_device(&self.me);
         let leaf = crate::authority::LeafId::of_principal(&principal);
@@ -1294,17 +1311,17 @@ impl Replica {
             }],
         ) {
             Ok(p) => p,
-            Err(e) => return (Response::err(format!("{e:#}")), None),
+            Err(e) => return Err(ReplicaError::from(e)),
         };
         let bytes = match postcard::to_stdvec(&package) {
             Ok(b) => b,
-            Err(e) => return (Response::err(format!("encode package: {e}")), None),
+            Err(e) => return Err(ReplicaError::ceremony(format!("encode package: {e}"))),
         };
         let out = std::path::PathBuf::from(&path);
         if let Some(parent) = out.parent() {
             if !parent.as_os_str().is_empty() {
                 if let Err(e) = crate::secretfs::create_private_dir(parent) {
-                    return (Response::err(format!("{e:#}")), None);
+                    return Err(ReplicaError::from(e));
                 }
             }
         }
@@ -1316,27 +1333,25 @@ impl Replica {
             crate::secretfs::Create::Replace,
             crate::secretfs::Wrap::Portable,
         ) {
-            return (Response::err(format!("{e:#}")), None);
+            return Err(ReplicaError::from(e));
         }
         // Read back from disk and open through the portable slot. Verifying the
         // in-memory value would test nothing that could actually fail.
         let reread = match crate::secretfs::read_private(&out) {
             Ok(Some(b)) => b,
-            Ok(None) => return (Response::err("the package vanished after writing"), None),
+            Ok(None) => return Err(ReplicaError::ceremony("the package vanished after writing")),
             Err(e) => {
-                return (
-                    Response::err(format!("re-reading the package failed: {e}")),
-                    None,
-                )
+                return Err(ReplicaError::ceremony(format!(
+                    "re-reading the package failed: {e}"
+                )))
             }
         };
         let restored: crate::custody::AuthoritySharePackage = match postcard::from_bytes(&reread) {
             Ok(p) => p,
             Err(e) => {
-                return (
-                    Response::err(format!("the written package does not decode: {e}")),
-                    None,
-                )
+                return Err(ReplicaError::ceremony(format!(
+                    "the written package does not decode: {e}"
+                )))
             }
         };
         let expect = crate::custody::PackageExpectation {
@@ -1350,15 +1365,12 @@ impl Replica {
         if let Err(e) =
             restored.verify_and_open(&crate::custody::UnlockKey::Passphrase(passphrase), &expect)
         {
-            return (
-                Response::err(format!(
-                    "the exported package could not be reopened, so it was NOT attested: {e:#}"
-                )),
-                None,
-            );
+            return Err(ReplicaError::ceremony(format!(
+                "the exported package could not be reopened, so it was NOT attested: {e:#}"
+            )));
         }
         if let Err(e) = self.post_ceremony(crate::dkg::CeremonyOp::CustodyAck { dkg }) {
-            return (Response::err(format!("{e:#}")), None);
+            return Err(ReplicaError::from(e));
         }
         // Recompute from the board so the count reflects our own attestation.
         let events = self.membership.ceremony_events();
@@ -1368,22 +1380,14 @@ impl Replica {
             .get(&dkg)
             .map(|t| self.custody_outstanding(&dkg, t, &participants))
             .unwrap_or_default();
-        let note = if !self.is_indispensable(&dkg) {
-            "this arrangement tolerates a lost holder, so no attestation is required to install it"
-                .to_string()
-        } else if outstanding.is_empty() {
-            "every custodian has attested — the arrangement can now install".to_string()
-        } else {
-            format!("still waiting on {} custodian(s)", outstanding.len())
-        };
-        (
-            Response::Ok {
-                message: Some(format!(
-                    "exported and verified your share package to {path} — {note}. Keep it somewhere the passphrase alone cannot be found."
-                )),
+        Ok(Change::committed(
+            CustodyExport {
+                indispensable: self.is_indispensable(&dkg),
+                outstanding: outstanding.len(),
+                path,
             },
-            Some(DirtySet::catalog(CatalogScope::Acl)),
-        )
+            DirtySet::catalog(CatalogScope::Acl),
+        ))
     }
 
     /// Restore a share from a portable package written by
@@ -1403,67 +1407,64 @@ impl Replica {
         path: String,
         passphrase: String,
         force: bool,
-    ) -> (Response, Option<DirtySet>) {
+    ) -> ChangeResult<CustodyImport> {
         let bytes = match crate::secretfs::read_private(std::path::Path::new(&path)) {
             Ok(Some(b)) => b,
-            Ok(None) => return (Response::not_found(format!("no package at {path}")), None),
-            Err(e) => return (Response::err(format!("reading {path}: {e}")), None),
+            Ok(None) => {
+                return Err(ReplicaError::NotFound(NotFound::CustodyPackage {
+                    path: path.clone(),
+                }))
+            }
+            Err(e) => return Err(ReplicaError::ceremony(format!("reading {path}: {e}"))),
         };
         let package: crate::custody::AuthoritySharePackage = match postcard::from_bytes(&bytes) {
             Ok(p) => p,
             Err(e) => {
-                return (
-                    Response::err(format!("that file is not a share package: {e}")),
-                    None,
-                )
+                return Err(ReplicaError::ceremony(format!(
+                    "that file is not a share package: {e}"
+                )))
             }
         };
         if package.space != self.space_id {
-            return (
-                Response::err("that package belongs to a different space"),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "that package belongs to a different space",
+            ));
         }
         // Resolve the ceremony it claims, from the board — never from the
         // package. A package names its own ceremony; that is a claim, not proof.
         let Some(dkg) = crate::dkg::TranscriptId::parse_hex(&package.ceremony) else {
-            return (Response::err("that package names no valid ceremony"), None);
+            return Err(ReplicaError::ceremony(
+                "that package names no valid ceremony",
+            ));
         };
         let events = self.membership.ceremony_events();
         let board = self.ceremony_board(&events);
         let Some(t) = board.dkg.get(&dkg) else {
-            return (
-                Response::err("that ceremony is not on this device's board — sync the space first"),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "that ceremony is not on this device's board — sync the space first",
+            ));
         };
         let Some((_, _, participants)) = self.accepted_proposal(&dkg, t) else {
-            return (
-                Response::err("that ceremony is not accepted here — it may not be authorized"),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "that ceremony is not accepted here — it may not be authorized",
+            ));
         };
         let Some(index) = participants.iter().position(|p| p == &self.me) else {
-            return (
-                Response::err("this device is not a participant of that ceremony"),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "this device is not a participant of that ceremony",
+            ));
         };
         let index = index as u16 + 1;
         let Some(manifest) = self.dkg_manifest(&dkg) else {
-            return (
-                Response::err("no acceptance record for that ceremony"),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "no acceptance record for that ceremony",
+            ));
         };
         // Refuse to clobber usable material.
         if !force && matches!(self.dkg_artifact(&dkg, "share"), ArtifactRead::Present(_)) {
-            return (
-                Response::err(
-                    "this device already holds a readable share for that ceremony — pass --force only if you mean to replace it",
-                ),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "this device already holds a readable share for that ceremony — pass --force only if you mean to replace it",
+            ));
         }
         // The expected group key comes from the board's ceremony where possible,
         // so a package cannot introduce a group this device never accepted. When
@@ -1474,10 +1475,9 @@ impl Replica {
             ArtifactRead::Present(pkp) => match crate::dkg::group_key_of_package(&pkp) {
                 Ok(k) => k,
                 Err(e) => {
-                    return (
-                        Response::err(format!("local public package unusable: {e}")),
-                        None,
-                    )
+                    return Err(ReplicaError::ceremony(format!(
+                        "local public package unusable: {e}"
+                    )))
                 }
             },
             _ => package.authority.public_key.clone(),
@@ -1500,23 +1500,22 @@ impl Replica {
             .verify_and_open(&crate::custody::UnlockKey::Passphrase(passphrase), &expect)
         {
             Ok(p) => p,
-            Err(e) => return (Response::err(format!("{e:#}")), None),
+            Err(e) => return Err(ReplicaError::from(e)),
         };
         let crate::custody::SharePayload::Frost(f) = payload else {
-            return (
-                Response::err("that package carries a share this build cannot use"),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "that package carries a share this build cannot use",
+            ));
         };
         // Write the public package first: if the process dies between the two,
         // a share without its package is unusable and looks broken, whereas a
         // package without a share is simply an absent share — the recoverable
         // side of the failure.
         if let Err(e) = self.dkg_write_portable(&dkg, "pkp", &f.public_package) {
-            return (Response::err(format!("{e:#}")), None);
+            return Err(ReplicaError::from(e));
         }
         if let Err(e) = self.dkg_write(&dkg, "share", &f.key_share) {
-            return (Response::err(format!("{e:#}")), None);
+            return Err(ReplicaError::from(e));
         }
         // Prove the restore actually worked by reading back what was stored,
         // rather than trusting the write. This is the same discipline as export:
@@ -1527,28 +1526,26 @@ impl Replica {
         ) {
             (ArtifactRead::Present(s), ArtifactRead::Present(p)) => (s, p),
             _ => {
-                return (
-                    Response::err("the restored share could not be read back"),
-                    None,
-                )
+                return Err(ReplicaError::ceremony(
+                    "the restored share could not be read back",
+                ))
             }
         };
         if let Err(e) = crate::dkg::validate_share(&restored.0, &restored.1, index) {
-            return (
-                Response::err(format!("the restored share does not validate: {e:#}")),
-                None,
-            );
+            return Err(ReplicaError::ceremony(format!(
+                "the restored share does not validate: {e:#}"
+            )));
         }
-        let _ = self.dkg_advance();
-        (
-            Response::Ok {
-                message: Some(format!(
-                    "restored and verified your share for ceremony {} — this device can take part in recovery again",
-                    dkg.to_hex()
-                )),
+        // The share is on disk and validated by now, so a failure to drive the
+        // ceremony is worth reporting but must not deny the restore.
+        let incomplete = self.dkg_advance().err();
+        Ok(Change::committed(
+            CustodyImport {
+                ceremony: dkg,
+                incomplete,
             },
-            Some(DirtySet::catalog(CatalogScope::Acl)),
-        )
+            DirtySet::catalog(CatalogScope::Acl),
+        ))
     }
 
     /// What this device can say about recovery right now.

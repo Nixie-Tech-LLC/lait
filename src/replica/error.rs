@@ -87,6 +87,10 @@ pub enum NotFound {
     /// is the widest failure in this family, and every `Result` in the replica
     /// would otherwise carry its three strings by value.
     Link(Box<LinkRef>),
+    /// No share package at that path.
+    CustodyPackage {
+        path: String,
+    },
     /// No actor answers to that `<who>`, when co-signing a recovery. The fix is
     /// to sync the recovering device's identity, not to invite anyone.
     RecoveryActor {
@@ -337,6 +341,7 @@ impl fmt::Display for NotFound {
             Self::Project { named } => write!(f, "no project matches '{named}'"),
             Self::Label { named } => write!(f, "no label matches '{named}'"),
             Self::Member { named } => write!(f, "no known member matches '{named}'"),
+            Self::CustodyPackage { path } => write!(f, "no package at {path}"),
             Self::RecoveryActor { named } => write!(
                 f,
                 "no known actor matches '{named}' — sync the recovering device's identity first"
