@@ -1,9 +1,9 @@
-//! DUR-1 end-to-end: a daemon that is killed and restarted must actively rejoin
+//! Restart durability: a daemon that is killed and restarted must actively rejoin
 //! the gossip mesh from its persisted peer set (`peers.json`) instead of sitting
 //! idle waiting to be re-announced to, and reconverge with a peer that kept
 //! running the whole time.
 //!
-//! Before DUR-1, `run_daemon` re-subscribed to the room topic with an EMPTY
+//! Previously, `run_daemon` re-subscribed to the room topic with an empty
 //! bootstrap list and presence was in-memory only, so a restarted node could
 //! only rejoin if a still-live peer happened to redial it. This test kills B,
 //! files a new issue on A while B is down, restarts B on the SAME home, and
@@ -152,7 +152,7 @@ fn poll_title(home: &Path, needle: &str, timeout: Duration) -> bool {
 }
 
 /// Poll until `peers.json` under `home` records `id` (written when the mesh forms
-/// / on the first successful pull — DUR-1).
+/// or on the first successful pull).
 fn poll_peer_persisted(home: &Path, id: &str, timeout: Duration) -> bool {
     poll_until(timeout, || {
         std::fs::read_to_string(home.join("peers.json"))
@@ -169,9 +169,9 @@ fn poll_peer_persisted(home: &Path, id: &str, timeout: Duration) -> bool {
 /// uninitialized store — so every founder home goes through this first.
 fn found_home(home: &Path) {
     let key = lait::config::load_or_create_identity(home).expect("identity");
-    let me = lait::ids::UserId::from_key_string(key.public().to_string());
+    let me = lait::crypto::user_from_seed(&key);
     let store = lait::store::Store::open(home).expect("store");
-    lait::tracker::found_workspace(&store, &me, "test", &lait::ids::SystemUlidSource)
+    lait::tracker::found_workspace(&store, &me, &key, "test", &lait::ids::SystemUlidSource)
         .expect("found workspace");
 }
 
@@ -182,8 +182,16 @@ fn found_home(home: &Path) {
 fn join_home(home: &Path, ticket: &str) {
     let t: lait::proto::WorkspaceTicket = ticket.parse().expect("parse ticket");
     let store = lait::store::Store::open(home).expect("store");
-    lait::tracker::join_workspace_store(&store, &t.workspace, &t.host.to_string())
-        .expect("bootstrap joiner store");
+    lait::tracker::join_workspace_store(
+        &store,
+        &t.workspace,
+        &t.salt,
+        &t.recovery_root,
+        t.founder_inception
+            .as_ref()
+            .expect("ticket carries a founding proof"),
+    )
+    .expect("bootstrap joiner store");
 }
 
 fn new_issue(home: &Path, title: &str) -> Response {
@@ -271,7 +279,7 @@ fn restarted_daemon_rejoins_from_persisted_peers() {
         "pre-restart: B did not converge to A's first issue"
     );
 
-    // DUR-1 precondition: B persisted A's endpoint as a bootstrap peer.
+    // Restart precondition: B persisted A's endpoint as a bootstrap peer.
     let a_id = id_of(&a_home);
     assert!(
         poll_peer_persisted(&b_home, &a_id, Duration::from_secs(20)),
@@ -287,7 +295,7 @@ fn restarted_daemon_rejoins_from_persisted_peers() {
         "A: post-restart issue"
     );
 
-    // Restart B on the SAME home. With DUR-1 it bootstraps gossip from peers.json
+    // Restart B on the same home. It bootstraps gossip from peers.json
     // (A's id) and actively redials A; without it, B would wait to be re-announced
     // to and never converge here.
     b = spawn(&b_home);

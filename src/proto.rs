@@ -1,37 +1,61 @@
 //! Wire protocol: signed gossip messages, the workspace ticket, and topic derivation.
 //!
 //! Messages broadcast on the gossip topic are postcard-encoded `SignedMessage`s
-//! carrying an ed25519 signature over a `Payload`. This mirrors the canonical
-//! iroh-gossip `chat.rs` example.
+//! carrying a **lait** ed25519 signature over a `Payload` — authored, signed, and
+//! verified by [`crate::sigdag`], lait's own signing plane. (This once mirrored
+//! iroh-gossip's `chat.rs` example and signed with the transport's key type; the
+//! authenticity is now lait's, so a message's author is a lait [`UserId`], not an
+//! iroh key, and the primitive is the same one the trust planes use.)
 //!
-//! This is the transport skeleton kept from the chat app: signed announce +
-//! presence over gossip. The issue-tracker data model (Loro docs, the catalog,
-//! per-doc sync) is layered on top of it — see `docs/ARCHITECTURE.md`.
+//! iroh's own types appear here only where they *are* the transport: the gossip
+//! `TopicId` and the host `EndpointId` in a ticket. Identity and authenticity are
+//! lait's.
 
 use std::{fmt, str::FromStr};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use iroh::{EndpointId, PublicKey, SecretKey};
+use iroh::EndpointId;
 use iroh_gossip::proto::TopicId;
 use serde::{Deserialize, Serialize};
 use serde_byte_array::ByteArray;
 
-const SIGNATURE_LENGTH: usize = iroh::Signature::LENGTH;
+use crate::ids::UserId;
+
+/// An ed25519 signature is 64 bytes.
+const SIGNATURE_LENGTH: usize = 64;
 type SignatureBytes = ByteArray<SIGNATURE_LENGTH>;
+
+/// Signing domains (see [`crate::sigdag::sign_message`]). Distinct per use-site so
+/// a signature from one context can never verify in another — a gossip message is
+/// not liftable into an invite, and vice-versa.
+const GOSSIP_DOMAIN: &[u8] = b"lait/gossip/1";
+const INVITE_DOMAIN: &[u8] = b"lait/invite/1";
+
+/// The `EndpointId` (transport id) of a lait `UserId` — the same 32 bytes, so a
+/// gossip message's lait-signed author resolves to the peer to dial back.
+fn endpoint_of(user: &UserId) -> Result<EndpointId> {
+    let raw = data_encoding::HEXLOWER_PERMISSIVE
+        .decode(user.as_str().as_bytes())
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+        .context("author is not a 32-byte key")?;
+    EndpointId::from_bytes(&raw).context("author is not a valid endpoint id")
+}
 
 /// Derive the gossip topic id from the workspace id. The topic is a pure
 /// function of the genesis identity — there is no user-settable network name,
 /// so it can never drift, be renamed apart, or collide across workspaces the
 /// way the old folder-seeded "room" string could. Domain-separated so the topic
-/// space is disjoint from any other blake3 use; the `lait/topic/v1` tag also
+/// space is disjoint from any other blake3 use; the `lait/topic/v2` tag also
 /// serves as the gossip protocol **epoch** — bump it on any breaking change to
-/// [`Payload`] so old and new nodes partition onto different topics instead of
-/// silently failing to decode each other's frames (postcard is not
-/// self-describing; that drop is also logged in node.rs).
+/// [`Payload`] *or the message-signing preimage* so old and new nodes partition
+/// onto different topics instead of silently failing to decode/verify each
+/// other's frames (postcard is not self-describing; that drop is logged in
+/// node.rs). It was bumped to v2 with the domain/workspace-bound signatures.
 pub fn topic_for_workspace(workspace: &str) -> TopicId {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"lait/topic/v1");
+    hasher.update(b"lait/topic/v2");
     hasher.update(workspace.as_bytes());
     TopicId::from_bytes(*hasher.finalize().as_bytes())
 }
@@ -84,39 +108,50 @@ impl InviteGrant {
 /// *single-use* checks are enforced by the redeeming node against live state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedInvite {
-    issuer: PublicKey,
+    issuer: UserId,
     grant: Bytes,
     signature: SignatureBytes,
 }
 
 impl SignedInvite {
-    /// Sign `grant` with the issuer's secret key.
-    pub fn sign(secret_key: &SecretKey, grant: &InviteGrant) -> Result<Self> {
+    /// Sign `grant` with the issuer's identity seed (lait's own signing plane).
+    /// Bound to the invite domain and the grant's own workspace.
+    pub fn sign(seed: &[u8; 32], grant: &InviteGrant) -> Result<Self> {
         let data: Bytes = postcard::to_stdvec(grant)
             .context("encode invite grant")?
             .into();
-        let signature = secret_key.sign(&data);
+        let (issuer, sig) =
+            crate::sigdag::sign_message(INVITE_DOMAIN, &grant.workspace, seed, &data);
         Ok(Self {
-            issuer: secret_key.public(),
+            issuer,
             grant: data,
-            signature: ByteArray::new(signature.to_bytes()),
+            signature: ByteArray::new(sig),
         })
     }
 
-    /// Verify the issuer signature and decode the grant.
-    pub fn verify(&self) -> Result<(PublicKey, InviteGrant)> {
-        self.issuer
-            .verify(&self.grant, &iroh::Signature::from_bytes(&self.signature))
-            .map_err(|e| anyhow::anyhow!("invalid invite signature: {e}"))?;
+    /// Verify the issuer signature and decode the grant. Returns the issuer's
+    /// lait `UserId` (what membership is keyed on). The signature is bound to the
+    /// invite domain and the grant's workspace, so it cannot be a lifted gossip
+    /// signature nor replayed for a different workspace.
+    pub fn verify(&self) -> Result<(UserId, InviteGrant)> {
         let grant: InviteGrant =
             postcard::from_bytes(&self.grant).context("decode invite grant")?;
-        Ok((self.issuer, grant))
+        if !crate::sigdag::verify_message(
+            INVITE_DOMAIN,
+            &grant.workspace,
+            &self.issuer,
+            &self.grant,
+            &self.signature,
+        ) {
+            anyhow::bail!("invalid invite signature");
+        }
+        Ok((self.issuer.clone(), grant))
     }
 }
 
 /// The application-level payload carried inside a signed gossip message. Scoped
-/// to announce + presence; the tracker's data sync rides its own per-doc streams
-/// (see `docs/ARCHITECTURE.md` §8), not this gossip payload.
+/// to announcements and presence; document synchronization uses separate
+/// per-document streams rather than this gossip payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Payload {
     /// Announce/refresh our nickname.
@@ -126,18 +161,31 @@ pub enum Payload {
     /// valid, an admin receiver auto-seals the workspace key with no manual step.
     JoinRequest {
         nick: String,
+        /// The pre-authorization, **sealed to the host** (`ticket.host`) and bound
+        /// to the joiner's actor: `seal_to(host, postcard((SignedInvite, redeemer)))`.
+        /// Sealing keeps the nonce off the shared gossip topic — a removed member
+        /// on the topic sees only ciphertext, so it cannot lift the invite to
+        /// hijack the seat. Binding the redeemer means a *copied* blob only ever
+        /// admits the original joiner (an eavesdropper cannot re-pair it with its
+        /// own inception). Only the host can open it, so the host auto-admits;
+        /// other admins fall back to the manual approve of the stashed request.
         #[serde(default)]
-        invite: Option<SignedInvite>,
+        invite: Option<Vec<u8>>,
+        /// The joiner's self-certifying actor inception (lait/actor/1), so an
+        /// admin can admit its *actor* before doc-sync delivers it. Absent only
+        /// from a pre-actor peer (which a v2 daemon will not admit).
+        #[serde(default)]
+        incept: Option<crate::actor::SignedEvent>,
     },
     /// Periodic liveness heartbeat for presence tracking. `state` carries the
-    /// three-state input-driven presence (online/away, UI.md §4.5).
+    /// three-state input-driven presence (online or away).
     ///
     /// NOTE: postcard is not self-describing, so `#[serde(default)]` does NOT make
     /// this field forward-compatible on the wire — a pre-`state` peer sends a
     /// shorter frame and a newer peer fails to decode it with
     /// `DeserializeUnexpectedEnd` (the drop is now logged in node.rs). Adding
     /// `state` was a coordinated format bump; the `#[serde(default)]` only helps
-    /// the JSON/DTO paths, not the postcard wire. See docs/HARDENING.md.
+    /// the JSON/DTO paths, not the postcard wire. See `docs/PROTOCOL.md`.
     Presence {
         nick: String,
         #[serde(default)]
@@ -146,7 +194,7 @@ pub enum Payload {
     /// Graceful "going offline" notice, broadcast on shutdown so peers can mark
     /// us offline immediately instead of waiting for the heartbeat to lapse.
     Bye { nick: String },
-    /// "My catalog head moved" — the P1 sync trigger (A§8). A peer that sees a
+    /// "My catalog head moved": the peer-sync trigger. A peer that sees a
     /// head different from what it holds pulls from us over the sync ALPN.
     Announce {
         workspace: String,
@@ -154,7 +202,7 @@ pub enum Payload {
     },
 }
 
-/// Three-state presence carried on the wire (UI.md §4.5). Offline is conveyed by
+/// Three-state presence carried on the wire. Offline is conveyed by
 /// `Bye`/heartbeat lapse, not this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -166,38 +214,48 @@ pub enum PresenceState {
     Away,
 }
 
-/// A signed, postcard-encoded envelope broadcast over gossip.
+/// A signed, postcard-encoded envelope broadcast over gossip. The author is a
+/// lait [`UserId`], signed by [`crate::sigdag`] — the transport never sees a
+/// key type of its own here.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SignedMessage {
-    from: PublicKey,
+    from: UserId,
     data: Bytes,
     signature: SignatureBytes,
 }
 
 impl SignedMessage {
-    /// Verify the signature and decode the inner payload.
-    pub fn verify_and_decode(bytes: &[u8]) -> Result<(PublicKey, Payload)> {
+    /// Verify the signature and decode the inner payload. `workspace` is the
+    /// receiver's own workspace: the signature is bound to it, so a message signed
+    /// for a different topic fails here — closing cross-workspace replay of
+    /// presence/join gossip. Returns the sender's transport id (the same 32 bytes
+    /// as its lait author) so the caller can dial it back over gossip.
+    pub fn verify_and_decode(workspace: &str, bytes: &[u8]) -> Result<(EndpointId, Payload)> {
         let signed: Self = postcard::from_bytes(bytes).context("decode signed message")?;
-        let key = signed.from;
-        key.verify(
+        if !crate::sigdag::verify_message(
+            GOSSIP_DOMAIN,
+            workspace,
+            &signed.from,
             &signed.data,
-            &iroh::Signature::from_bytes(&signed.signature),
-        )
-        .map_err(|e| anyhow::anyhow!("invalid signature: {e}"))?;
+            &signed.signature,
+        ) {
+            anyhow::bail!("invalid signature");
+        }
         let payload: Payload = postcard::from_bytes(&signed.data).context("decode payload")?;
-        Ok((signed.from, payload))
+        Ok((endpoint_of(&signed.from)?, payload))
     }
 
-    /// Sign and encode a payload for broadcast.
-    pub fn sign_and_encode(secret_key: &SecretKey, payload: &Payload) -> Result<Bytes> {
+    /// Sign and encode a payload for broadcast on `workspace`'s topic, using the
+    /// sender's identity seed. The signature binds the gossip domain and workspace.
+    pub fn sign_and_encode(workspace: &str, seed: &[u8; 32], payload: &Payload) -> Result<Bytes> {
         let data: Bytes = postcard::to_stdvec(payload)
             .context("encode payload")?
             .into();
-        let signature = secret_key.sign(&data);
+        let (from, sig) = crate::sigdag::sign_message(GOSSIP_DOMAIN, workspace, seed, &data);
         let signed = Self {
-            from: secret_key.public(),
+            from,
             data,
-            signature: ByteArray::new(signature.to_bytes()),
+            signature: ByteArray::new(sig),
         };
         let encoded = postcard::to_stdvec(&signed).context("encode signed message")?;
         Ok(encoded.into())
@@ -206,7 +264,7 @@ impl SignedMessage {
 
 /// A compact, base32-encoded invite to join a workspace. It carries only what a
 /// joiner cannot derive on its own: the workspace id (the topic is
-/// `topic_for_workspace(workspace)` and the genesis trust anchor, A§6/A§10),
+/// `topic_for_workspace(workspace)` and the genesis trust anchor),
 /// the workspace's display name (so the joiner sees what they're joining before
 /// the catalog arrives), the host's endpoint id, and the host's nick (for
 /// one-step `connect`). We deliberately do NOT ship relay/socket addresses —
@@ -224,12 +282,36 @@ pub struct WorkspaceTicket {
     pub host: EndpointId,
     /// Nick of the host who minted this ticket (for one-step `connect`).
     pub host_nick: String,
+    /// The salt that, with the founding device, derives `workspace`
+    /// (`lait/space/1`). Ships so the joiner can verify the id commits to the
+    /// founder rather than trusting a bare anchor string.
+    #[serde(default)]
+    pub salt: [u8; 16],
+    /// The break-glass recovery commitment folded into `workspace`. The joiner
+    /// checks the id commits to it too, so the recovery authority is pinned at
+    /// verification, not trusted from a mutable field.
+    #[serde(default)]
+    pub recovery_root: [u8; 32],
+    /// The founder's signed inception. Together with `salt` it makes the trust
+    /// root **verifiable offline**: the joiner checks `workspace` commits to this
+    /// inception's device, that the inception validly incepts for `workspace`,
+    /// and roots genesis on its `ActorId` — so a tampered anchor is detected, not
+    /// silently forked (see [`crate::space::verify_founding`]).
+    #[serde(default)]
+    pub founder_inception: Option<crate::actor::SignedEvent>,
     /// An optional pre-authorization capability (Pattern A). Present ⇒ a joiner is
     /// auto-admitted on `join` (the seal happens without a manual `members
     /// approve`). Absent ⇒ the classic request→approve flow. The joiner echoes it
     /// in its signed `JoinRequest`.
     #[serde(default)]
     pub invite: Option<SignedInvite>,
+    /// The host's direct socket addresses, for the **Isolated** network policy
+    /// only (no relay, no discovery). Empty in a normal `Public`/`Local` ticket —
+    /// there the ticket stays address-free and iroh/relay resolves the host from
+    /// its id. Present, the joiner registers `{host, these addrs}` and dials the
+    /// host directly on a LAN with no infrastructure.
+    #[serde(default)]
+    pub host_addrs: Vec<std::net::SocketAddr>,
 }
 
 impl WorkspaceTicket {
@@ -309,7 +391,7 @@ mod tests {
     use super::*;
 
     fn host_key() -> EndpointId {
-        SecretKey::from_bytes(&[7u8; 32]).public()
+        endpoint_of(&crate::crypto::user_from_seed(&[7u8; 32])).unwrap()
     }
 
     /// A bad invite is the most likely thing to go wrong on a new joiner's very
@@ -355,7 +437,11 @@ mod tests {
             name: "demo".into(),
             host: host_key(),
             host_nick: "alice".into(),
+            salt: [0u8; 16],
+            recovery_root: [0u8; 32],
+            founder_inception: None,
             invite: None,
+            host_addrs: vec![],
         }
     }
 
@@ -399,8 +485,12 @@ mod tests {
     #[test]
     fn ticket_is_a_short_one_liner() {
         let s = sample().to_string();
+        // Since the lait/actor/1 cutover the ticket also carries the founding
+        // *actor* id (a self-certifying identity, ~68 chars) so a joiner roots
+        // its genesis on the founder's identity rather than a device key. That
+        // is a real size cost, but the ticket stays a single copy-paste line.
         assert!(
-            s.len() < 120,
+            s.len() < 260,
             "ticket should be a short one-liner, got {} chars",
             s.len()
         );
@@ -426,11 +516,11 @@ mod tests {
 
     #[test]
     fn signed_invite_roundtrips_and_detects_tampering() {
-        let sk = SecretKey::from_bytes(&[9u8; 32]);
+        let seed = [9u8; 32];
         let grant = InviteGrant::mint("ws_1".into(), 1_000, 3_600, true);
-        let signed = SignedInvite::sign(&sk, &grant).unwrap();
+        let signed = SignedInvite::sign(&seed, &grant).unwrap();
         let (issuer, back) = signed.verify().expect("valid signature verifies");
-        assert_eq!(issuer, sk.public());
+        assert_eq!(issuer, crate::crypto::user_from_seed(&seed));
         assert_eq!(back, grant);
         assert!(!back.is_expired(4_599) && back.is_expired(4_600));
         // Flip a byte of the signed grant ⇒ verification must fail.
@@ -443,17 +533,17 @@ mod tests {
 
     #[test]
     fn ticket_carries_an_invite_through_base32() {
-        let sk = SecretKey::from_bytes(&[3u8; 32]);
+        let seed = [3u8; 32];
         let grant = InviteGrant::mint("ws_00000000000000000000000000".into(), 0, 604_800, true);
         let mut t = sample();
-        t.invite = Some(SignedInvite::sign(&sk, &grant).unwrap());
+        t.invite = Some(SignedInvite::sign(&seed, &grant).unwrap());
         let back: WorkspaceTicket = t.to_string().parse().unwrap();
         let (issuer, g) = back
             .invite
             .expect("invite survives roundtrip")
             .verify()
             .unwrap();
-        assert_eq!(issuer, sk.public());
+        assert_eq!(issuer, crate::crypto::user_from_seed(&seed));
         assert_eq!(g, grant);
     }
 }

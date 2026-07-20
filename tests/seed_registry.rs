@@ -1,4 +1,4 @@
-//! Seed registry end-to-end (ARCHITECTURE §10, client half): a node already
+//! Seed-registry end-to-end: a node already
 //! bound to a workspace that pins an always-on seed with `seed add <ticket>`
 //! must (1) connect and backfill the workspace's history via the pin, and
 //! (2) on a later cold restart — with the opportunistic `peers.json` bootstrap
@@ -7,9 +7,9 @@
 //! is bootstrapped via `lait join` first, and a foreign-workspace ticket is an
 //! error, covered below.)
 //!
-//! This is the property that distinguishes an explicit seed pin from the DUR-1
+//! This distinguishes an explicit seed pin from the learned restart
 //! opportunistic peer cache: deleting `peers.json` before the restart removes the
-//! DUR-1 path, so if B still converges it can only be via its seed pin.
+//! restart path, so if B still converges it can only be through its seed pin.
 //!
 //! Like `restart_reconnect.rs` this drives the real iroh stack over the Layer-B
 //! control channel; convergence timing over discovery/relay is variable, so the
@@ -171,9 +171,9 @@ fn poll_seed_persisted(home: &Path, id: &str, timeout: Duration) -> bool {
 /// uninitialized store — so every founder home goes through this first.
 fn found_home(home: &Path) {
     let key = lait::config::load_or_create_identity(home).expect("identity");
-    let me = lait::ids::UserId::from_key_string(key.public().to_string());
+    let me = lait::crypto::user_from_seed(&key);
     let store = lait::store::Store::open(home).expect("store");
-    lait::tracker::found_workspace(&store, &me, "test", &lait::ids::SystemUlidSource)
+    lait::tracker::found_workspace(&store, &me, &key, "test", &lait::ids::SystemUlidSource)
         .expect("found workspace");
 }
 
@@ -183,8 +183,16 @@ fn found_home(home: &Path) {
 fn join_home(home: &Path, ticket: &str) {
     let t: lait::proto::WorkspaceTicket = ticket.parse().expect("parse ticket");
     let store = lait::store::Store::open(home).expect("store");
-    lait::tracker::join_workspace_store(&store, &t.workspace, &t.host.to_string())
-        .expect("bootstrap joiner store");
+    lait::tracker::join_workspace_store(
+        &store,
+        &t.workspace,
+        &t.salt,
+        &t.recovery_root,
+        t.founder_inception
+            .as_ref()
+            .expect("ticket carries a founding proof"),
+    )
+    .expect("bootstrap joiner store");
 }
 
 fn new_issue(home: &Path, title: &str) -> Response {
@@ -253,7 +261,7 @@ fn seed_pin_backfills_then_survives_restart() {
         "B: seed add"
     );
 
-    // Grant B membership (mirrors the P1 sync path in restart_reconnect).
+    // Grant B membership, mirroring the peer-sync path in restart_reconnect.
     let b_id = id_of(&b_home);
     assert!(
         matches!(

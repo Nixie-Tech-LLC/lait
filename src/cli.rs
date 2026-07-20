@@ -1,8 +1,9 @@
 //! CLI client: builds control requests, auto-spawns the daemon, prints results.
 //!
-//! All three surfaces (CLI, TUI, MCP) are Layer-B clients of the daemon (UI.md
-//! §1); this one renders `Response` snapshots for a human shell, or the versioned
-//! `--json` DTO for scripts/agents (UI.md §2.3). Exit codes: `0` ok · `1`
+//! CLI and MCP are Layer-B clients of the daemon (`docs/UI.md`); the web
+//! application uses the same contract through its loopback adapter. This module
+//! renders `Response` snapshots for a human shell, or the versioned
+//! `--json` DTO for scripts/agents. Exit codes: `0` ok · `1`
 //! usage/error · `2` ref not found / ambiguous · `3` daemon unreachable.
 
 use std::{
@@ -51,7 +52,7 @@ impl Default for Out {
 /// so classifying is opt-in and nothing has to be reclassified at once.
 #[derive(Debug)]
 pub struct CliError {
-    /// The documented exit code (UI.md §2.3) this failure means.
+    /// The documented exit code for this failure.
     pub code: i32,
     pub message: String,
 }
@@ -84,7 +85,7 @@ impl std::fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
-/// The exit code a client-side error means (UI.md §2.3). Split from
+/// The exit code represented by a client-side error. Split from
 /// [`report_error`] so the mapping is testable without a process to exit —
 /// `ExitCode` is deliberately opaque and can't be read back.
 ///
@@ -648,7 +649,7 @@ pub async fn client(home: &Path, req: Request) -> Result<Response> {
         .map_err(|e| CliError::unreachable(format!("{e:#}")).into())
 }
 
-/// Run a request, print the response, and exit with the right code (UI.md §2.3).
+/// Run a request, print the response, and exit with the corresponding code.
 pub async fn run(home: &Path, req: Request, out: Out) -> Result<()> {
     match client(home, req).await {
         Ok(resp) => {
@@ -667,7 +668,7 @@ pub async fn run(home: &Path, req: Request, out: Out) -> Result<()> {
     }
 }
 
-/// Emit a bare text value honouring the `--json` contract (UI.md §2.3): the
+/// Emit a bare text value while honoring the `--json` contract: the
 /// `Response::Text` DTO under `--json`, else the raw string. For client-side
 /// commands (`id`, `invite`) that don't round-trip a daemon `Response` but must
 /// still emit a parseable DTO under `--json` instead of leaking plain text.
@@ -710,6 +711,7 @@ fn print_diagnosis(v: &DiagnosisView, out: Out) {
         let code = match g.state {
             GateState::Pass => ansi::GREEN,
             GateState::Wait => ansi::YELLOW,
+            GateState::Warn => ansi::YELLOW,
             GateState::Fail => ansi::RED,
             GateState::Skip => ansi::DIM,
         };
@@ -824,7 +826,7 @@ fn workstate_line(v: &crate::dto::IssueView) -> String {
 
 /// A git branch name for an issue: lowercased `KEY-n` + a hyphenated title slug
 /// (≤40 chars of slug). Predictable by design — `done`/`show` infer the issue
-/// back out of it, and so do agents (UI.md §2.2).
+/// back out of it, and so do agents.
 fn branch_name_for(v: &crate::dto::IssueView) -> String {
     let handle = v
         .key_alias
@@ -1341,7 +1343,8 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
                     .as_deref()
                     .map(|s| format!("  via {}", s.chars().take(8).collect::<String>()))
                     .unwrap_or_default();
-                println!("{:<7} {}{}{}{}", m.role, m.key.short(), name, sponsor, you);
+                let short: String = m.key.chars().take(12).collect();
+                println!("{:<7} {}{}{}{}", m.role, short, name, sponsor, you);
             }
             0
         }
@@ -1467,6 +1470,33 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
                 );
                 println!("   review: `lait members requests`   approve: `lait members approve <id> --as <name>`");
             }
+            // A degraded recovery holder is reported on every status, not only
+            // when break-glass is attempted: by then it is too late to fix.
+            for h in &s.degraded_recovery {
+                let why = match &h.reason {
+                    crate::tracker::RecoveryArtifactFailure::Undecryptable(_) => {
+                        "it was protected under another Windows account or machine"
+                    }
+                    crate::tracker::RecoveryArtifactFailure::Io(_) => {
+                        "it is present but could not be read"
+                    }
+                };
+                let scope = match h.is_current_authority {
+                    Some(true) => "the workspace recovery key",
+                    _ => "a recovery key (group unidentified)",
+                };
+                println!();
+                println!(
+                    "{}",
+                    paint(
+                        out.color,
+                        ansi::YELLOW,
+                        &format!("⚠ your share of {scope} is unusable — {why}.")
+                    )
+                );
+                println!("   transcript: {}", h.transcript);
+                println!("   you cannot take part in recovery from this device; other threshold holders still can.");
+            }
             0
         }
         Response::Diagnosis(v) => {
@@ -1512,7 +1542,7 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
     }
 }
 
-/// Exit code from the typed error kind (UI.md §2.3), not from the message text.
+/// Exit code from the typed error kind, not from the message text.
 fn exit_code_for_kind(kind: ErrorKind) -> i32 {
     match kind {
         ErrorKind::NotFound => 2,
@@ -1618,8 +1648,19 @@ fn print_issue(v: &IssueView, out: Out) {
     if !v.comments.is_empty() {
         println!("\n## Comments ({})", v.comments.len());
         for c in &v.comments {
-            println!("{} · {}  {}", c.author.short(), c.ts, c.body);
+            let who = c.author_nick.clone().unwrap_or_else(|| c.author.short());
+            println!("{} · {}  {}", who, c.ts, c.body);
         }
+    }
+    // Corruption is reported, never rendered as content: a malformed record gets
+    // a diagnostic line under its own heading, so it can't be mistaken for
+    // something a person actually wrote.
+    if !v.corrupt_records.is_empty() {
+        println!("\n## Corrupt records ({})", v.corrupt_records.len());
+        for r in &v.corrupt_records {
+            println!("{} · {}", r.locus, r.reason);
+        }
+        println!("(these are stored records that do not conform to the schema; run with --json for the raw values)");
     }
 }
 
@@ -1748,7 +1789,7 @@ pub(crate) fn copy_to_clipboard(s: &str) -> bool {
 /// Render a scannable QR of the invite link as terminal half-block glyphs. Uses
 /// the lowest error-correction level (`L`) so a long invite ticket yields the
 /// smallest module count — the QR still scans, but takes far fewer lines than the
-/// default level. `pub(crate)`: the TUI invite panel renders the same QR.
+/// default level. `pub(crate)` so other local presentation code can reuse it.
 pub(crate) fn render_qr(data: &str) -> Result<String> {
     use qrcode::{render::unicode, EcLevel, QrCode};
     let code = QrCode::with_error_correction_level(data.as_bytes(), EcLevel::L)
@@ -1944,16 +1985,16 @@ fn desktop_notify(e: &Event) {
 /// Parks on a streaming [`Request::Subscribe`] and treats the doorbell purely as
 /// a **wake signal**: a frame carries a dirty *flag*, never the events, so each
 /// `presence_advanced` ring is followed by a `Log{since}` re-read for the
-/// authoritative rows (UI.md §4.2).
+/// authoritative rows.
 ///
 /// Two cursors are in play and they are **not** interchangeable: `cursor` is an
 /// `EventLog` seq (what `Log{since}` filters on), while the doorbell carries its
 /// own per-session `seq`. We never compare them. The doorbell's `epoch` is the
 /// one field that matters here — a change means the daemon restarted, which
-/// resets the `EventLog` seq to 0 (S§2), voiding our cursor. Rebaselining to 0
+/// resets the `EventLog` sequence to 0, voiding our cursor. Rebaselining to 0
 /// on an epoch change is what keeps `watch` from going deaf across a restart:
 /// the old `Wait` poll loop held its stale high-water and silently matched
-/// nothing forever (S§7.5).
+/// nothing forever.
 pub async fn watch(
     home: &Path,
     since: Option<u64>,
@@ -2036,7 +2077,7 @@ mod tests {
 
     #[test]
     fn client_side_exit_codes_come_from_the_type_not_the_prose() {
-        // Classified errors carry their documented code (UI.md §2.3)...
+        // Classified errors carry their documented code.
         assert_eq!(
             exit_code_for_error(&CliError::not_found("no space matches 'x'").into()),
             2,

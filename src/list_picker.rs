@@ -1,10 +1,8 @@
 //! List-rendering machinery for the inline `lait members` picker: windowing
 //! (keep the selection visible) plus row styling.
 //!
-//! Originally extracted *from* `members_ui` so it could be shared with the TUI's
-//! pickers and list screens. The TUI is gone; `members_ui` is the only caller
-//! again, and this stays a separate module purely because its windowing is worth
-//! testing on its own — not because anything else needs it.
+//! `members_ui` is the current caller. The windowing remains separate from
+//! member actions because it is independently testable and reusable.
 
 use ratatui::style::Style;
 use ratatui::text::Line;

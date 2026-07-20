@@ -1,5 +1,5 @@
-//! End-to-end control-plane tests for the doorbell / `Reset` invariants
-//! (UI.md §4.1, §4.3, SCHEMA §7.5).
+//! End-to-end tests for control-plane dirty notifications and `Reset`
+//! recovery. See `docs/PROTOCOL.md`.
 //!
 //! These drive the **real** daemon binary (`CARGO_BIN_EXE_lait daemon`)
 //! over the actual local IPC control channel — a Unix-domain socket on unix, a
@@ -110,9 +110,9 @@ impl Drop for Daemon {
 /// uninitialized store — so every home is founded before its daemon spawns.
 fn found_home(home: &Path) {
     let key = lait::config::load_or_create_identity(home).expect("identity");
-    let me = lait::ids::UserId::from_key_string(key.public().to_string());
+    let me = lait::crypto::user_from_seed(&key);
     let store = lait::store::Store::open(home).expect("store");
-    lait::tracker::found_workspace(&store, &me, "test", &lait::ids::SystemUlidSource)
+    lait::tracker::found_workspace(&store, &me, &key, "test", &lait::ids::SystemUlidSource)
         .expect("found workspace");
 }
 
@@ -155,7 +155,7 @@ async fn seed_project_and_issue(home: &Path) -> String {
 
 /// A deliberately-stale `since` must not cause silent deafness: the daemon
 /// always rebaselines a new Subscribe with a `Reset` first frame at the current
-/// seq (UI.md §4.1), and a subsequent live edit then rings a real, non-reset
+/// sequence, and a subsequent live edit then rings a real, non-reset
 /// doorbell whose dirty-set names the touched project.
 #[tokio::test]
 async fn stale_since_after_restart_yields_reset() {
@@ -219,7 +219,7 @@ async fn stale_since_after_restart_yields_reset() {
     let _ = request(home.path(), &Request::Stop).await;
 }
 
-/// A rejected write rings nothing: validate-then-commit (UI.md §4.3) means an
+/// A rejected write rings nothing: validate-then-commit means an
 /// invalid `IssueEdit` returns an `Error` having touched nothing and produced no
 /// dirty-set, so no doorbell arrives. We drain the initial Reset, send a bad
 /// status, and assert the stream stays silent for a grace window.

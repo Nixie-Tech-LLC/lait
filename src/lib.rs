@@ -6,52 +6,60 @@
 //!   * `lait <cmd>` is the CLI client, driving the daemon over a local IPC
 //!     control channel.
 //!   * `lait serve` binds that same façade to loopback HTTP + SSE so a browser
-//!     can be a client too ([`serve`], `docs/SERVE.md`). The only surface global
+//!     can be a client too ([`serve`], `docs/UI.md`). The only surface global
 //!     to the machine: it supervises one daemon per space.
 //!   * `lait mcp` exposes the same Layer-B façade as MCP tools for an agent.
 //!
 //! The crate is split lib + bin so integration tests, doctests, and the MCP/DTO
 //! parity check can exercise the same code the binary runs. See `docs/`.
 //!
-//! Layering (see `docs/ARCHITECTURE.md` §4, `docs/SCHEMA.md` §1):
+//! Layering (see `docs/ARCHITECTURE.md` and `docs/DATA-CONTRACT.md`):
 //!   * **Layer A — storage/CRDT** ([`catalog`], [`issue`], [`store`], [`ids`]):
 //!     Loro documents are the single source of truth for all merge semantics.
 //!   * **Layer B — control protocol** ([`control`], [`dto`]): a stable, versioned,
 //!     hand-maintained projection of Layer A over the local socket. Never a dump.
-//!   * **Layer C — wire/sync** ([`proto`], and P1 `sync`): opaque Loro bytes plus
+//!   * **Peer wire and sync** ([`proto`] and `sync`): opaque Loro bytes plus
 //!     the minimum framing to route them over iroh.
 
-pub mod acl;
 pub mod app;
-pub mod authz;
 pub mod cli;
 pub mod cmdspec;
 pub mod config;
 pub mod control;
-pub mod crypto;
 pub mod daemon_spawn;
 pub mod diagnose;
-pub mod dto;
-pub mod engine;
-pub mod ids;
 pub mod inbox;
 pub mod index;
 pub mod install;
 pub mod list_picker;
 pub mod mcp;
 pub mod members_ui;
+pub mod net;
 pub mod node;
 pub mod presence;
 pub mod proto;
 pub mod registry;
+pub mod secretfs;
 pub mod serve;
-pub mod sigdag;
-pub mod store;
 pub mod sync;
 pub mod tracker;
+pub mod transport;
 pub mod workspaces;
 
-// Path compatibility: the engine wrappers keep their historical crate-root
-// paths (`crate::issue::IssueDoc`, …) while living behind the sealed
-// `engine` module boundary.
-pub use engine::{catalog, issue, membership};
+// The **kernel** (`lait-kernel`) holds lait's roots — identity, the trust
+// planes, derivation rules — in a crate that lists no scaffold, so a `loro::`
+// or `iroh::` reference there cannot compile. Re-exported here so the app layer
+// keeps reaching them by their historical crate-root paths (`crate::acl`,
+// `lait::ids`, …); the boundary is enforced by the kernel crate's manifest, not
+// by these aliases.
+pub use lait_kernel::{
+    acl, actor, authority, authz, compile, crypto, custody, dkg, dto, expand, genesis, ids, policy,
+    sigdag, space, transition,
+};
+
+// The **engine** (`lait-engine`) is the only crate that names Loro. Re-exported
+// here — as the `engine` module and its wrappers — so the app layer keeps its
+// historical paths (`crate::engine::op`, `crate::catalog`, `crate::store`, …)
+// while the app crate's manifest lists no `loro`, so `loro::*` is unnameable
+// outside the engine.
+pub use lait_engine::{self as engine, catalog, issue, membership, store};

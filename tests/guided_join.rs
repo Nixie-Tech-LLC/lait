@@ -1,5 +1,5 @@
 //! Guided-join verifier + directory-trap fix, end-to-end (see
-//! `docs/GUIDED-JOIN.md`). Two real nodes exercise the `Diagnose` control verb
+//! `docs/UI.md`, joining). Two real nodes exercise the `Diagnose` control verb
 //! across the onboarding lifecycle, and a CLI-level test proves the read-command
 //! decoy-store guard. Drives daemons over the Layer-B control channel like
 //! `invite_ergonomics.rs`; the CLI guard test shells the binary because it is
@@ -125,9 +125,9 @@ fn gate_state(v: &lait::diagnose::DiagnosisView, id: &str) -> GateState {
 /// uninitialized store — so every founder home goes through this first.
 fn found_home(home: &Path) {
     let key = lait::config::load_or_create_identity(home).expect("identity");
-    let me = lait::ids::UserId::from_key_string(key.public().to_string());
+    let me = lait::crypto::user_from_seed(&key);
     let store = lait::store::Store::open(home).expect("store");
-    lait::tracker::found_workspace(&store, &me, "test", &lait::ids::SystemUlidSource)
+    lait::tracker::found_workspace(&store, &me, &key, "test", &lait::ids::SystemUlidSource)
         .expect("found workspace");
 }
 
@@ -137,8 +137,16 @@ fn found_home(home: &Path) {
 fn join_home(home: &Path, ticket: &str) {
     let t: lait::proto::WorkspaceTicket = ticket.parse().expect("parse ticket");
     let store = lait::store::Store::open(home).expect("store");
-    lait::tracker::join_workspace_store(&store, &t.workspace, &t.host.to_string())
-        .expect("bootstrap joiner store");
+    lait::tracker::join_workspace_store(
+        &store,
+        &t.workspace,
+        &t.salt,
+        &t.recovery_root,
+        t.founder_inception
+            .as_ref()
+            .expect("ticket carries a founding proof"),
+    )
+    .expect("bootstrap joiner store");
 }
 
 fn ticket_for(home: &Path, require_approval: bool) -> String {

@@ -118,9 +118,9 @@ fn membership(home: &Path) -> Option<String> {
 /// uninitialized store — so every founder home goes through this first.
 fn found_home(home: &Path) {
     let key = lait::config::load_or_create_identity(home).expect("identity");
-    let me = lait::ids::UserId::from_key_string(key.public().to_string());
+    let me = lait::crypto::user_from_seed(&key);
     let store = lait::store::Store::open(home).expect("store");
-    lait::tracker::found_workspace(&store, &me, "test", &lait::ids::SystemUlidSource)
+    lait::tracker::found_workspace(&store, &me, &key, "test", &lait::ids::SystemUlidSource)
         .expect("found workspace");
 }
 
@@ -130,8 +130,16 @@ fn found_home(home: &Path) {
 fn join_home(home: &Path, ticket: &str) {
     let t: lait::proto::WorkspaceTicket = ticket.parse().expect("parse ticket");
     let store = lait::store::Store::open(home).expect("store");
-    lait::tracker::join_workspace_store(&store, &t.workspace, &t.host.to_string())
-        .expect("bootstrap joiner store");
+    lait::tracker::join_workspace_store(
+        &store,
+        &t.workspace,
+        &t.salt,
+        &t.recovery_root,
+        t.founder_inception
+            .as_ref()
+            .expect("ticket carries a founding proof"),
+    )
+    .expect("bootstrap joiner store");
 }
 
 #[test]

@@ -1,8 +1,8 @@
-//! MCP server (stdio) exposing the lait tracker as agent tools (A§12).
+//! MCP server over stdio exposing the lait tracker as agent tools.
 //!
 //! Each tool is a thin wrapper over the **same** Layer-B `Request`/`Response`
-//! the CLI uses (UI.md §1), so an agent drives the local daemon natively and
-//! gets back the **same versioned DTO** the CLI `--json` emits (S§7.3). The tool
+//! the CLI uses, so an agent drives the local daemon natively and gets back the
+//! **same versioned DTO** emitted by CLI `--json`. The tool
 //! set is checked against the tracker command surface by `tests/mcp_parity.rs`
 //! so the agent and human surfaces never drift.
 
@@ -27,7 +27,7 @@ use crate::{
 
 /// The tracker command tags (`Request` serde `cmd` values) an agent must be able
 /// to drive. `tests/mcp_parity.rs` asserts every one has a tool below, so adding
-/// a `Request` without an MCP tool fails the build gate (S§1/§7.3 parity).
+/// a `Request` without an MCP tool fails the interface-parity build gate.
 pub const REQUIRED_TRACKER_COMMANDS: &[&str] = &[
     "issue_new",
     "issue_edit",
@@ -156,7 +156,7 @@ pub struct IssueEditArgs {
     pub status: Option<String>,
     #[serde(default)]
     pub priority: Option<String>,
-    /// Replace the whole description (full-buffer, S§5.1/U§5.3).
+    /// Replace the whole description buffer.
     #[serde(default)]
     pub description: Option<String>,
 }
@@ -164,10 +164,10 @@ pub struct IssueEditArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct IssueMoveArgs {
     pub reff: String,
-    /// New project (writes membership truth, S§5.5).
+    /// New project, written as the issue's authoritative membership.
     #[serde(default)]
     pub project: Option<String>,
-    /// Board position: top | bottom | before:<ref> | after:<ref>.
+    /// Board position: `top` | `bottom` | `before:<ref>` | `after:<ref>`.
     #[serde(default)]
     pub position: Option<String>,
 }
@@ -649,7 +649,7 @@ impl LaitMcp {
         self.run(Request::Activity { since: a.since }).await
     }
 
-    // ---- membership / ACL (P3) ----
+    // ---- membership and authorization ----
 
     #[tool(description = "Add a workspace member (admin-only); seals them the workspace key.")]
     async fn member_add(

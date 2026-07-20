@@ -2,11 +2,10 @@
 //! `main.rs`) so integration tests and doctests can drive the same command
 //! surface the binary exposes. `main.rs` is a thin shim over [`run`].
 //!
-//! The command surface follows UI.md §2: flat verbs act on **issues**, plural
+//! Flat verbs act on **issues**, while plural
 //! nouns manage **registries** (`label <ref> +bug` vs `labels new`), and every
-//! `<ref>` is resolved daemon-side (UI.md §3). Each verb maps to exactly one
-//! Layer-B `Request` (S§7), which keeps one command = one commit = one activity
-//! row (S§7.1).
+//! `<ref>` is resolved daemon-side. Each verb maps to exactly one control
+//! `Request`, preserving one command = one commit = one activity row.
 //!
 //! The surface is defined as **data** in [`crate::cmdspec`] — a `Vec<Spec>` turned
 //! into a `clap::Command` at runtime — not a `#[derive(Parser)]` enum. This module
@@ -23,7 +22,7 @@ use crate::{
     cmdspec::{self, Dispatch, Special},
     config::{self, load_or_create_identity},
     control::Request,
-    ids::{SystemUlidSource, UserId},
+    ids::SystemUlidSource,
     install::{self, Client, Scope},
     mcp, node,
     store::Store,
@@ -127,7 +126,7 @@ pub async fn run() -> std::process::ExitCode {
     let specs = cmdspec::specs();
     let cli = cmdspec::build_cli(&specs);
     // `try_get_matches` (not `get_matches`) so a usage/parse error exits `1` — the
-    // documented code (UI.md §2.3) — instead of clap's default `2`, which collides
+    // documented code — instead of clap's default `2`, which collides
     // with `2 = ref not found / ambiguous`. `--help`/`--version` still exit `0`.
     let matches = match cli.try_get_matches() {
         Ok(m) => m,
@@ -189,7 +188,7 @@ pub async fn run() -> std::process::ExitCode {
 async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Result<()> {
     let resolved = cmdspec::resolve(specs, matches);
 
-    // Bare `lait` = the FOCUS view (inbox + your active issues, UI.md §2): the
+    // Bare `lait` = the FOCUS view (inbox + your active issues): the
     // most valuable keystroke answers "what's addressed to me / what am I on",
     // not help. Global flags (--home/-w/--json) still apply.
     let Some((leaf, m)) = resolved else {
@@ -350,6 +349,7 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
     match &leaf.dispatch {
         Dispatch::Special(Special::Init) => return run_init(m, out).await,
         Dispatch::Special(Special::Join) => return run_join_cli(m, out).await,
+        Dispatch::Special(Special::DeviceAccept) => return run_device_accept(m, out),
         _ => {}
     }
     // Everything else binds an existing store or gets the guided error —
@@ -376,7 +376,7 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
                 std::process::exit(1);
             }
             // `new --start` chains the create into the work loop: file it, then
-            // claim it (two honest commits = two activity rows, S§7.1).
+            // claim it (two honest commits produce two activity rows).
             //
             // Ask for `start` in a way that can answer "there is no such arg".
             // `leaf.name` is only the *last* path segment, so `labels new` answers
@@ -414,8 +414,8 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
                 crate::cli::run_workstate(&home, Request::IssueStop { reff }, out).await?
             }
             Special::Id => {
-                let key = load_or_create_identity(&config::identity_dir()?)?;
-                crate::cli::emit_text(&key.public().to_string(), out);
+                let seed = load_or_create_identity(&config::identity_dir()?)?;
+                crate::cli::emit_text(crate::crypto::user_from_seed(&seed).as_str(), out);
             }
             Special::Daemon => {
                 tracing_subscriber::fmt()
@@ -487,6 +487,7 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
             | Special::ConfigList
             | Special::Init
             | Special::Join
+            | Special::DeviceAccept
             | Special::Serve
             | Special::Update => {
                 unreachable!("handled before home resolution")
@@ -527,10 +528,11 @@ async fn run_init(m: &ArgMatches, out: Out) -> Result<()> {
         cfg.set("user.nick", n);
         cfg.save(&p)?;
     }
-    let key = load_or_create_identity(&config::identity_dir()?)?;
-    let me = UserId::from_key_string(key.public().to_string());
+    let seed = load_or_create_identity(&config::identity_dir()?)?;
+    let me = crate::crypto::user_from_seed(&seed);
     let store = Store::open(&home)?;
-    let (ws, project) = crate::tracker::found_workspace(&store, &me, &name, &SystemUlidSource)?;
+    let (ws, project) =
+        crate::tracker::found_workspace(&store, &me, &seed, &name, &SystemUlidSource)?;
     // Register the founder — this is what makes `lait workspaces` complete.
     if let Err(e) = workspaces::upsert(workspaces::WorkspaceEntry {
         workspace: ws.to_string(),
@@ -557,7 +559,7 @@ async fn run_init(m: &ArgMatches, out: Out) -> Result<()> {
         );
     } else {
         println!("founded space '{name}' ({ws})");
-        println!("id:      {}", key.public());
+        println!("id:      {}", me);
         println!(
             "project: {} ({}) — `lait new \"...\"` files into it",
             project.name, project.key
@@ -565,6 +567,40 @@ async fn run_init(m: &ArgMatches, out: Out) -> Result<()> {
         println!("home:    {}", home.display());
         println!();
         println!("invite someone: `lait invite`");
+    }
+    Ok(())
+}
+
+/// New-machine side of device enrollment (no daemon, no store): consume a
+/// `device invite` token (`<actor_id> <workspace_id>`), sign this identity's
+/// consent to join that actor, and print the blob to hand back to `device add`.
+fn run_device_accept(m: &ArgMatches, out: Out) -> Result<()> {
+    let token = m.get_one::<String>("token").cloned().unwrap_or_default();
+    let mut parts = token.split_whitespace();
+    let actor = parts
+        .next()
+        .and_then(crate::ids::ActorId::parse)
+        .ok_or_else(|| anyhow!("invalid device token (expected `<actor_id> <workspace_id>`)"))?;
+    let workspace = parts
+        .next()
+        .filter(|w| w.starts_with("ws_"))
+        .ok_or_else(|| anyhow!("invalid device token (missing workspace id)"))?
+        .to_string();
+    let seed = load_or_create_identity(&config::identity_dir()?)?;
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce).map_err(|e| anyhow!("getrandom: {e}"))?;
+    let binding = crate::actor::consent_sign(
+        &seed,
+        &workspace,
+        nonce,
+        &crate::actor::ConsentCtx::Member { actor: &actor },
+    );
+    let blob = data_encoding::HEXLOWER.encode(&postcard::to_stdvec(&binding)?);
+    if out.json {
+        crate::cli::emit_ok(&blob, out);
+    } else {
+        println!("{blob}");
+        eprintln!("hand this to `lait device add <blob>` on a device already in the actor.");
     }
     Ok(())
 }
@@ -634,12 +670,23 @@ async fn run_join_cli(m: &ArgMatches, out: Out) -> Result<()> {
         }
     } else {
         let store = Store::open(&target)?;
-        crate::tracker::join_workspace_store(&store, &ticket.workspace, &ticket.host.to_string())?;
+        let founder_inception = ticket.founder_inception.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "this invite carries no founding proof — it may be from an older lait; ask for a fresh one"
+            )
+        })?;
+        crate::tracker::join_workspace_store(
+            &store,
+            &ticket.workspace,
+            &ticket.salt,
+            &ticket.recovery_root,
+            founder_inception,
+        )?;
     }
 
     // Set the display name before the daemon is auto-spawned so a cold joiner
     // announces the right name on its join request. It stays a self-asserted
-    // claim — the admin approves by key, never by this nick (UI.md §8).
+    // claim — the admin approves by key, never by this nickname.
     if let Some(n) = m.get_one::<String>("nick") {
         let p = config::store_config_path(&target);
         let mut cfg = config::ConfigMap::load(&p);

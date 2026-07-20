@@ -286,7 +286,7 @@ fn a_client_side_error_keeps_the_cli_contract() {
         !stderr.contains("Caused by:"),
         "the cause chain is anyhow's Debug output, not a CLI contract; got: {stderr}",
     );
-    // UI.md §2.3: 2 = not found / ambiguous. Termination made this a flat 1.
+    // Not-found and ambiguous selectors exit 2; generic termination flattened this to 1.
     assert_eq!(
         out.status.code(),
         Some(2),

@@ -1,18 +1,18 @@
 //! The lait daemon: owns the iroh endpoint, the gossip room, presence, the
 //! Loro-CRDT tracker core ([`crate::tracker`]), and the local control server that
-//! CLI/TUI/MCP clients drive.
+//! CLI, web, and MCP clients drive.
 //!
 //! The iroh transport (signed-gossip room for announce/presence, a liveness
-//! probe ALPN, the daemon/control plumbing) is the P1 networking substrate. The
-//! P0 tracker rides on top: the daemon is the **only** owner of the Loro docs
-//! (UI.md §1), and every surface is a thin Layer-B client of it.
+//! probe ALPN, and daemon/control plumbing) is the networking substrate. The
+//! tracker rides on top: the daemon is the **only** owner of the Loro docs, and
+//! every local interface is a control client.
 //!
-//! **Doorbells (S§7.5, UI.md §4.1–§4.2).** A mutation produces a
+//! **Doorbells.** A mutation produces a
 //! [`crate::tracker::DirtySet`]; the daemon stamps it with a per-boot `epoch` and
 //! a per-session `seq`, pushes it onto a bounded ring, and wakes every parked
 //! [`Request::Subscribe`] stream. `seq` is never persisted; the first frame of
 //! every Subscribe is a `Reset`, which unifies first-connect / reconnect /
-//! restart / ring-overrun into one rebaseline path (UI.md §4.1).
+//! restart or ring overrun into one rebaseline path.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -30,8 +30,7 @@ use interprocess::local_socket::{
     ListenerOptions,
 };
 use iroh::{
-    address_lookup::memory::MemoryLookup,
-    endpoint::{presets, Connection},
+    endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler, Router},
     Endpoint, EndpointId, SecretKey,
 };
@@ -72,14 +71,14 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const REAP_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How often the daemon coalesces pending durable-store mutations into a single
-/// git commit (A§6). git is inspectability, not durability (every write is
+/// git commit. Git provides inspectability, not durability (every write is
 /// fsync'd), so a slow cadence keeps `git add -A` off the edit hot path while
 /// still snapshotting history within a few seconds.
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 const PRUNE_WINDOW: Duration = Duration::from_secs(600);
 const IDLE_SHUTDOWN: Duration = Duration::from_secs(30 * 60);
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
-/// Bound on the doorbell ring — holds the last ~1000 *batches* (UI.md §4.2).
+/// Bound on the doorbell ring: the last ~1000 batches.
 const DOORBELL_RING: usize = 1000;
 
 fn now_secs() -> u64 {
@@ -137,7 +136,7 @@ fn peers_path(home: &Path) -> PathBuf {
 }
 
 /// Load the persisted set of previously-seen peer endpoints, to seed the gossip
-/// bootstrap on (re)start (DUR-1). iroh discovery resolves a dialable address
+/// bootstrap on restart. Iroh discovery resolves a dialable address
 /// from each `EndpointId`, so the ids alone are enough to reconnect — a fresh
 /// daemon no longer re-enters the mesh with an empty bootstrap set and waits
 /// passively to be re-announced to. Our own id is filtered out.
@@ -158,12 +157,12 @@ fn save_known_peers(home: &Path, peers: &[EndpointId]) {
 }
 
 /// A pinned always-on **seed** peer — the client-side half of the seed role
-/// (ARCHITECTURE §10). Unlike the opportunistic `peers.json` bootstrap set
-/// (DUR-1), these pins are **explicit and sticky**: they always seed the gossip
+/// Unlike the opportunistic `peers.json` bootstrap set
+/// these learned peers, pins are **explicit and sticky**: they always seed the gossip
 /// bootstrap and are eagerly pulled on startup, so a client converges through
 /// its seed even when no other peer is online. A pin grants **no trust** — the
 /// seed is a bootstrap/backfill anchor only; every signed op is still validated
-/// against the genesis keys carried in the ticket (A§6/A§10).
+/// against the genesis keys carried in the ticket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeedRecord {
     pub id: EndpointId,
@@ -282,7 +281,7 @@ fn upsert_alias(home: &Path, key: &str, name: &str) {
 
 /// Map ambiguous user matches into the shared [`Candidate`] shape so the CLI and
 /// `--json` render them through the same disambiguation path as issue refs
-/// (UI.md §3.2): `reff` = short key, `key_alias` = nick (if any), `title` = full
+/// `reff` is the short key, `key_alias` the optional nickname, and `title` the full
 /// key so the caller can copy an unambiguous value.
 fn user_candidates(cands: &[KnownUser]) -> Vec<Candidate> {
     cands
@@ -301,7 +300,7 @@ pub struct Peer {
     pub nick: String,
     pub last_seen: Instant,
     pub presence: PeerState,
-    /// Advertised three-state presence: `true` ⇒ up but AFK (UI.md §4.5). Only
+    /// Advertised three-state presence: `true` means reachable but away. Only
     /// meaningful while `presence.is_online()`.
     pub away: bool,
 }
@@ -316,7 +315,7 @@ impl ProtocolHandler for PresencePing {
     }
 }
 
-/// Accepts the P1 sync ALPN and serves a peer's catalog-first **pull**
+/// Accepts the sync ALPN and serves a peer's catalog-first **pull**
 /// ([`crate::sync::serve`]). A pull never mutates our state, so this is
 /// read-only and rings no doorbell.
 #[derive(Clone)]
@@ -348,7 +347,39 @@ impl ProtocolHandler for SyncHandler {
     }
 }
 
-/// Append-only-ish ring buffer of presence/system events (P1 transport surface).
+/// Seal a pre-authorization to the host and bind it to the joiner's actor, for
+/// `Payload::JoinRequest`. Sealing keeps the invite nonce off the shared gossip
+/// topic; binding the redeemer means a *copied* blob can only ever admit that
+/// actor, not an eavesdropper re-pairing it with its own inception.
+fn seal_bound_invite(
+    host: &UserId,
+    invite: &SignedInvite,
+    redeemer: &crate::ids::ActorId,
+) -> Option<Vec<u8>> {
+    let payload = postcard::to_stdvec(&(invite.clone(), redeemer.clone())).ok()?;
+    crate::crypto::seal_to(host, &payload)
+}
+
+/// Open a sealed, redeemer-bound pre-authorization. Returns the invite only if it
+/// was sealed to `me` (the host) AND the request's `incept` is the actor the seal
+/// names — so a blob copied off the topic and re-paired with a different
+/// inception is refused. `my_seed` is the host's identity seed.
+fn open_bound_invite(
+    my_seed: &[u8; 32],
+    me: &UserId,
+    sealed: &[u8],
+    incept: &crate::actor::SignedEvent,
+) -> Option<SignedInvite> {
+    let raw = crate::crypto::open_sealed(my_seed, me, sealed)?;
+    let (invite, redeemer): (SignedInvite, crate::ids::ActorId) =
+        postcard::from_bytes(&raw).ok()?;
+    if crate::ids::ActorId::from_incept_hash(&incept.hash()) != redeemer {
+        return None;
+    }
+    Some(invite)
+}
+
+/// Bounded ring buffer of presence and transport events.
 #[derive(Debug, Default)]
 pub struct EventLog {
     seq: u64,
@@ -408,7 +439,7 @@ impl DoorbellRing {
 /// `cursor` has fallen off the back of the ring, so the next frame it needs
 /// (`cursor + 1`) is older than the oldest one still retained. When
 /// `cursor + 1 == oldest` the ring still holds the exact next frame, so no reset
-/// (S§7.5, UI.md §4.1). Pure and side-effect-free so the ring-overrun invariant
+/// Pure and side-effect-free so the ring-overrun invariant
 /// is unit-testable without driving the async socket loop.
 fn subscribe_should_reset(cursor: u64, oldest: u64) -> bool {
     cursor + 1 < oldest
@@ -438,6 +469,13 @@ pub struct Node {
     gossip: Gossip,
     sender: Mutex<GossipSender>,
     secret_key: SecretKey,
+    /// How to reach peers under lait's network policy (see `crate::net`). Every
+    /// newly-seen peer id is registered here so the endpoint's bare-id dials
+    /// resolve — a no-op under Public (n0 discovery), the mechanism under Local.
+    peers: crate::net::PeerBook,
+    /// This daemon's workspace id (constant). Bound into every signed gossip
+    /// message so a message cannot be replayed onto another workspace's topic.
+    workspace: String,
     router: Router,
     shared: Shared,
     shutdown: Arc<Notify>,
@@ -445,19 +483,26 @@ pub struct Node {
     active_conns: AtomicU64,
     last_active: Mutex<Instant>,
     idle_window: Duration,
-    /// The Loro-CRDT tracker core (P0). The daemon is its only owner.
+    /// The Loro-CRDT tracker core. The daemon is its only owner.
     tracker: Arc<Mutex<Tracker>>,
-    /// The doorbell ring + its wake source (S§7.5).
+    /// The doorbell ring and its wake source.
     doorbell: Arc<Mutex<DoorbellRing>>,
     doorbell_notify: Arc<Notify>,
     /// Peers we currently have an in-flight sync pull to (dedupes announce storms).
     syncing: Arc<Mutex<HashSet<EndpointId>>>,
-    /// This node's home dir — used to persist the bootstrap peer set (DUR-1).
+    /// Ephemeral join-request actor inceptions, keyed by the requesting device.
+    /// Bounded and NEVER persisted here — an inception only enters the synced
+    /// membership doc when an admin actually admits (redeem/approve), so an
+    /// unauthenticated peer cannot grow the shared container (amplification DoS).
+    pending_incepts: Arc<Mutex<HashMap<UserId, crate::actor::SignedEvent>>>,
+    /// This node's home dir, used to persist the bootstrap peer set across restarts.
     home: PathBuf,
 }
 
 impl Node {
     fn touch(&self, id: EndpointId, nick: Option<String>) -> String {
+        // A newly-seen peer must be reachable before we dial it back (Local).
+        self.peers.learn(id);
         let now = Instant::now();
         let came_online = {
             let mut p = self.shared.presence.lock().unwrap();
@@ -615,7 +660,7 @@ impl Node {
         match payload {
             Payload::Hello { nick } => {
                 self.touch(from, Some(nick));
-                // a peer just showed up — pull to backfill from it (A§10 bootstrap).
+                // A newly visible peer may have state we missed; pull to backfill.
                 self.clone().trigger_pull(from);
             }
             Payload::Presence { nick, state } => {
@@ -628,7 +673,11 @@ impl Node {
                 self.touch(from, Some(nick));
                 self.mark_offline(from, true);
             }
-            Payload::JoinRequest { nick, invite } => {
+            Payload::JoinRequest {
+                nick,
+                invite,
+                incept,
+            } => {
                 let display = self.touch(from, Some(nick.clone()));
                 self.shared.events.lock().unwrap().push(
                     EventKind::Join,
@@ -637,12 +686,24 @@ impl Node {
                     format!("{display} joined the room"),
                 );
                 self.ring_presence_doorbell();
+                // Stash the joiner's inception EPHEMERALLY (bounded, never synced)
+                // so a manual `member add` can admit it later. It only enters the
+                // shared membership doc when an admin admits — so an
+                // unauthenticated peer cannot grow the container.
+                if let Some(incept) = &incept {
+                    const MAX_PENDING_INCEPTS: usize = 256;
+                    let dev = UserId::from_key_string(from.to_string());
+                    let mut pend = self.pending_incepts.lock().unwrap();
+                    if pend.contains_key(&dev) || pend.len() < MAX_PENDING_INCEPTS {
+                        pend.insert(dev, incept.clone());
+                    }
+                }
                 // Pattern A: if the joiner presented a valid pre-authorization and
                 // we're an admin who can seal, admit them now — no manual approve.
                 // On any failure we simply leave the request pending (the event
                 // above already surfaces it to `members requests`).
                 if let Some(invite) = invite {
-                    self.clone().try_auto_approve(from, invite);
+                    self.clone().try_auto_approve(from, invite, incept);
                 }
                 // a joiner wants our state — and may have state we lack; pull.
                 self.clone().trigger_pull(from);
@@ -657,7 +718,7 @@ impl Node {
                     (t.workspace_str(), t.sync_head_bytes())
                 };
                 // Only pull when the peer's catalog head differs from ours — the
-                // A§8 trigger. Same head ⇒ nothing to do (storm suppression).
+                // An unchanged catalog head suppresses redundant pull storms.
                 if workspace == our_ws && catalog_head != our_head {
                     self.clone().trigger_pull(from);
                 }
@@ -665,13 +726,15 @@ impl Node {
         }
     }
 
-    /// Spawn a deduped sync pull from a peer (A§8). At most one in-flight pull
+    /// Spawn a deduplicated sync pull from a peer. At most one in-flight pull
     /// per peer; on success (something changed) ring a doorbell and re-announce
     /// so peers that are behind us pull in turn.
     fn trigger_pull(self: Arc<Self>, peer: EndpointId) {
         if peer == self.shared.my_id {
             return;
         }
+        // Ensure the sync dial can resolve the peer under Local.
+        self.peers.learn(peer);
         tokio::spawn(async move {
             if !self.syncing.lock().unwrap().insert(peer) {
                 return; // already syncing this peer
@@ -686,7 +749,7 @@ impl Node {
                     }
                     // We successfully reached this peer — persist it immediately so
                     // even a short-lived daemon (up for less than a heartbeat) can
-                    // bootstrap from it on the next start (DUR-1).
+                    // bootstrap from it on the next start.
                     self.persist_known_peers();
                 }
                 Err(e) => tracing::debug!("pull from {peer} failed: {e:#}"),
@@ -720,7 +783,7 @@ impl Node {
     }
 
     /// Snapshot the peers we currently know (excluding ourselves) and persist
-    /// them as the next start's gossip bootstrap set (DUR-1). Best-effort.
+    /// them as the next start's gossip bootstrap set. Best-effort.
     fn persist_known_peers(&self) {
         let peers: Vec<EndpointId> = {
             let p = self.shared.presence.lock().unwrap();
@@ -734,7 +797,7 @@ impl Node {
         }
     }
 
-    /// Our own presence state (UI.md §4.5): `away` when no client input within
+    /// Our presence state: `away` when no client input arrives within
     /// the engagement window, else `online`. Input is tracked via `last_active`.
     fn my_presence_state(&self) -> crate::proto::PresenceState {
         const ENGAGED: Duration = Duration::from_secs(60);
@@ -746,7 +809,8 @@ impl Node {
     }
 
     async fn broadcast(&self, payload: Payload) -> Result<()> {
-        let bytes = SignedMessage::sign_and_encode(&self.secret_key, &payload)?;
+        let bytes =
+            SignedMessage::sign_and_encode(&self.workspace, &self.secret_key.to_bytes(), &payload)?;
         let sender = self.sender.lock().unwrap().clone();
         sender
             .broadcast(bytes)
@@ -756,6 +820,11 @@ impl Node {
     }
 
     async fn join_topic(self: &Arc<Self>, topic: TopicId, peers: Vec<EndpointId>) -> Result<()> {
+        // Register the bootstrap peers (e.g. a ticket's host) before gossip dials
+        // them, so bare-id resolution succeeds under Local.
+        for id in &peers {
+            self.peers.learn(*id);
+        }
         let gtopic = tokio::time::timeout(
             Duration::from_secs(15),
             self.gossip.subscribe_and_join(topic, peers),
@@ -786,12 +855,29 @@ impl Node {
                 ticket.workspace
             );
         }
+        // Under Isolated the host is reachable only at the addresses the ticket
+        // carries — register them so the bare-id dial below resolves. A no-op for
+        // Public/Local tickets (which carry none and resolve by relay/discovery).
+        self.peers.learn_direct(ticket.host, &ticket.host_addrs);
         self.join_topic(ticket.topic(), vec![ticket.host]).await?;
+        // Mint (or recover) our actor inception so an admin can admit our actor.
+        let incept = self.tracker.lock().unwrap().self_inception().ok();
+        // Seal the pre-authorization to the HOST and bind it to our actor, so the
+        // invite nonce never rides the shared topic in the clear (a removed member
+        // subscribed to the topic can't lift it), and a copied blob can only ever
+        // admit us — not an eavesdropper re-pairing it with their own inception.
+        let sealed_invite = match (&ticket.invite, &incept) {
+            (Some(inv), Some(ic)) => {
+                let redeemer = crate::ids::ActorId::from_incept_hash(&ic.hash());
+                let host_user = UserId::from_key_string(ticket.host.to_string());
+                seal_bound_invite(&host_user, inv, &redeemer)
+            }
+            _ => None,
+        };
         self.broadcast(Payload::JoinRequest {
             nick: self.shared.nick(),
-            // Echo the ticket's pre-authorization (if any) so an admin receiver can
-            // auto-seal us the key without a manual approve (Pattern A).
-            invite: ticket.invite.clone(),
+            invite: sealed_invite,
+            incept,
         })
         .await
         .ok();
@@ -801,7 +887,7 @@ impl Node {
     }
 
     /// The honest post-`join` message. A join only *requests* access: until an
-    /// admin approves us we hold ciphertext and aren't on the board (UI.md §8).
+    /// an admin approves us, we hold ciphertext and cannot read the board.
     /// So we tell the joiner the truth and point at the one next step, instead of
     /// implying success. If we resolved to an already-member (a re-join), say so.
     fn join_message(&self, ticket: &WorkspaceTicket) -> String {
@@ -810,7 +896,7 @@ impl Node {
         } else {
             ticket.host_nick.clone()
         };
-        let already_member = self.tracker.lock().unwrap().is_member(&self.my_userid());
+        let already_member = self.tracker.lock().unwrap().am_i_member();
         if already_member {
             "joined \u{2014} you're on the board and syncing.".to_string()
         } else if ticket.invite.is_some() {
@@ -832,7 +918,7 @@ impl Node {
         }
     }
 
-    /// Pin a seed (A§10). Accepts two forms: a full `WorkspaceTicket` for the
+    /// Pin a seed. Accepts two forms: a full `WorkspaceTicket` for the
     /// workspace this store is bound to (connect + backfill — the primary path),
     /// or a bare endpoint id (pin only, for a peer we already share a workspace
     /// with). A ticket for a *foreign* workspace is an error — join it first.
@@ -906,12 +992,13 @@ impl Node {
             match receiver.try_next().await {
                 Ok(Some(event)) => match event {
                     Event::Received(msg) => {
-                        match SignedMessage::verify_and_decode(&msg.content) {
+                        match SignedMessage::verify_and_decode(&self.workspace, &msg.content) {
                             Ok((from, payload)) => self.handle_payload(from, payload).await,
                             // A decode failure here is almost always a version-skewed
                             // peer: postcard is not self-describing, so a payload whose
                             // shape changed across releases fails to deserialize (see
-                            // docs/HARDENING.md — "all nodes must upgrade together").
+                            // `docs/PROTOCOL.md` — incompatible wire epochs require
+                            // all nodes to upgrade together).
                             // Swallowing it silently made mixed-version fleets
                             // undiagnosable; log at debug with the error so the drop is
                             // at least visible under `RUST_LOG=lait=debug`.
@@ -924,8 +1011,8 @@ impl Node {
                     }
                     Event::NeighborUp(id) => {
                         self.touch(id, None);
-                        // mesh formed with this peer — pull to converge (A§8) and
-                        // persist it right away for restart bootstrap (DUR-1).
+                        // The mesh formed with this peer: pull to converge and
+                        // persist it immediately for restart bootstrap.
                         self.clone().trigger_pull(id);
                         self.persist_known_peers();
                     }
@@ -954,17 +1041,17 @@ impl Node {
                 tracing::debug!("heartbeat broadcast failed: {e}");
             }
             // Piggyback a catalog-head announce on the heartbeat so a peer that
-            // missed a live announce still converges within a heartbeat (A§8).
+            // A peer that missed a live announcement still converges within a heartbeat.
             let _ = self.broadcast_announce().await;
             // Persist the peers we currently know so the next start bootstraps
-            // from them instead of waiting to be re-announced to (DUR-1).
+            // from them instead of waiting to be re-announced.
             self.persist_known_peers();
         }
     }
 
     /// Periodically coalesce pending durable-store mutations into a single git
     /// commit, keeping `git add -A` (a subprocess whose cost grows with the
-    /// tree) off every edit's hot path (A§6). git is inspectability only —
+    /// tree) off every edit's hot path. Git is inspectability only:
     /// durability is the per-write fsync — so a late or missed checkpoint never
     /// risks data; at worst the working tree is briefly uncommitted and the next
     /// tick tidies it.
@@ -1044,7 +1131,7 @@ impl Node {
         }
     }
 
-    /// Our own key as a [`UserId`] (the endpoint id is the ed25519 key, S§2).
+    /// Our key as a [`UserId`]; the endpoint ID is the Ed25519 key.
     fn my_userid(&self) -> UserId {
         UserId::from_key_string(self.shared.my_id.to_string())
     }
@@ -1056,8 +1143,24 @@ impl Node {
     /// classic pending-request flow, so a bad/expired/foreign invite never blocks
     /// a manual approve. On success we ring the doorbell and re-announce so the
     /// freshly-sealed joiner pulls and decrypts.
-    fn try_auto_approve(self: Arc<Self>, joiner_id: EndpointId, invite: SignedInvite) {
-        let (issuer_pk, grant) = match invite.verify() {
+    fn try_auto_approve(
+        self: Arc<Self>,
+        _joiner_id: EndpointId,
+        sealed: Vec<u8>,
+        incept: Option<crate::actor::SignedEvent>,
+    ) {
+        // A pre-actor peer carries no inception — a v2 daemon cannot admit it.
+        let Some(incept) = incept else { return };
+        // Only we (the host) can open the sealed pre-authorization — that is what
+        // kept the nonce off the topic — and only for the actor it names, so a
+        // blob copied off the wire cannot be re-paired with an eavesdropper's
+        // inception.
+        let me = UserId::from_key_string(self.shared.my_id.to_string());
+        let Some(invite) = open_bound_invite(&self.secret_key.to_bytes(), &me, &sealed, &incept)
+        else {
+            return;
+        };
+        let (issuer, grant) = match invite.verify() {
             Ok(v) => v,
             Err(_) => return,
         };
@@ -1065,15 +1168,13 @@ impl Node {
         if grant.is_expired(now) {
             return;
         }
-        let joiner = UserId::from_key_string(joiner_id.to_string());
-        let issuer = UserId::from_key_string(issuer_pk.to_string());
         let (changed, dirty) = {
             let mut t = self.tracker.lock().unwrap();
             // Bind the grant to *our* workspace before doing anything.
             if grant.workspace != t.workspace_str() {
                 return;
             }
-            let (_resp, dirty) = t.redeem_invite(&issuer, &joiner, &grant.nonce, grant.single_use);
+            let (_resp, dirty) = t.redeem_invite(&issuer, &incept, &grant.nonce, grant.single_use);
             (dirty.is_some(), dirty)
         };
         if let Some(dirty) = dirty {
@@ -1087,7 +1188,7 @@ impl Node {
         }
     }
 
-    /// Assemble the user-ref resolution directory (UI.md §3.1). Keys are gathered
+    /// Assemble the user-reference resolution directory. Keys are gathered
     /// from every place we've seen one — our own id, the live presence map, recent
     /// join requests, and the signed ACL members — so any of them resolves by
     /// `@me` / full key / id-prefix. **Names come only from the local alias store**
@@ -1113,7 +1214,7 @@ impl Node {
             }
         }
         {
-            for (key, _role, _me) in self.tracker.lock().unwrap().members() {
+            for key in self.tracker.lock().unwrap().member_device_keys() {
                 keys.insert(key);
             }
         }
@@ -1132,15 +1233,17 @@ impl Node {
 
     /// Pending join requests: announced joiners (`EventKind::Join`) who are not
     /// yet ACL members. Newest-first, deduped by key. Ephemeral — bounded by the
-    /// event ring, never persisted (UI.md §8).
+    /// event ring and is never persisted.
     fn pending_join_requests(&self) -> Vec<JoinRequestDto> {
+        // A joiner's announced id is a *device* key; it is "already a member" if
+        // that device speaks for a member actor.
         let members: HashSet<String> = self
             .tracker
             .lock()
             .unwrap()
-            .members()
+            .member_device_keys()
             .into_iter()
-            .map(|(k, _r, _me)| k.as_str().to_string())
+            .map(|k| k.as_str().to_string())
             .collect();
         let (events, _) = self.shared.events.lock().unwrap().since(0);
         let mut seen: HashSet<String> = HashSet::new();
@@ -1173,6 +1276,7 @@ impl Node {
                 | Request::MemberRemove { .. }
                 | Request::Assign { .. }
                 | Request::IssueNew { .. }
+                | Request::SpaceElevate { .. }
         ) {
             return Ok(req);
         }
@@ -1203,6 +1307,13 @@ impl Node {
             Request::MemberRemove { who } => Request::MemberRemove {
                 who: resolve(&who)?,
             },
+            Request::SpaceElevate { cofounders, k } => {
+                let mut out = Vec::with_capacity(cofounders.len());
+                for w in &cofounders {
+                    out.push(resolve(w)?);
+                }
+                Request::SpaceElevate { cofounders: out, k }
+            }
             Request::Assign { reff, who, add } => {
                 let mut out = Vec::with_capacity(who.len());
                 for w in &who {
@@ -1246,7 +1357,7 @@ impl Node {
     /// (never across an await).
     /// Dispatch a tracker request; ring a local doorbell for any dirty-set and
     /// return `(response, did_change)`. A change means our catalog head moved, so
-    /// the caller announces it for P2P propagation (A§8).
+    /// the caller announces it for peer propagation.
     fn dispatch_tracker(&self, req: Request) -> (Response, bool) {
         let (resp, dirty) = {
             let mut t = self.tracker.lock().unwrap();
@@ -1267,7 +1378,7 @@ impl Node {
             Err(resp) => return Ok(resp),
         };
         match req {
-            // ---- tracker (P0) ----
+            // ---- tracker ----
             Request::IssueNew { .. }
             | Request::IssueEdit { .. }
             | Request::IssueMove { .. }
@@ -1293,12 +1404,23 @@ impl Node {
             | Request::LabelList
             | Request::Activity { .. }
             | Request::MemberRemove { .. }
-            | Request::AgentAdd { .. }
             | Request::MemberLog
-            | Request::KeyRotate => {
+            | Request::KeyRotate
+            | Request::InviteRevoke { .. }
+            | Request::DeviceInvite
+            | Request::DeviceAdd { .. }
+            | Request::DeviceRevoke { .. }
+            | Request::DeviceList
+            | Request::Recover
+            | Request::SpaceElevate { .. }
+            | Request::SpaceRecoverApprove { .. }
+            | Request::SpaceElevateApprove { .. }
+            | Request::SpaceCustodyExport { .. }
+            | Request::SpaceCustodyImport { .. }
+            | Request::SpaceRecover => {
                 let (resp, changed) = self.dispatch_tracker(req);
                 if changed {
-                    // our catalog head moved — announce so peers pull (A§8).
+                    // Announce a changed catalog head so peers pull.
                     let me = self.clone();
                     tokio::spawn(async move { me.broadcast_announce().await.ok() });
                 }
@@ -1313,6 +1435,15 @@ impl Node {
                 admin,
                 as_name,
             } => {
+                // If this device's inception was stashed from a join request,
+                // make it known now — admin-gated persistence, only on this
+                // explicit approve action (not on the raw request).
+                if let Some(dev) = UserId::parse(&who) {
+                    let pending = self.pending_incepts.lock().unwrap().get(&dev).cloned();
+                    if let Some(incept) = pending {
+                        let _ = self.tracker.lock().unwrap().import_inception(&incept);
+                    }
+                }
                 let (resp, changed) = self.dispatch_tracker(Request::MemberAdd {
                     who: who.clone(),
                     admin,
@@ -1328,15 +1459,45 @@ impl Node {
                 Ok(resp)
             }
 
+            // Sponsor an agent: import its stashed inception (from the agent's
+            // join) so the tracker can resolve its actor, then dispatch.
+            Request::AgentAdd { key } => {
+                if let Some(dev) = UserId::parse(&key) {
+                    let pending = self.pending_incepts.lock().unwrap().get(&dev).cloned();
+                    if let Some(incept) = pending {
+                        let _ = self.tracker.lock().unwrap().import_inception(&incept);
+                    }
+                }
+                let (resp, changed) = self.dispatch_tracker(Request::AgentAdd { key });
+                if changed {
+                    let me = self.clone();
+                    tokio::spawn(async move { me.broadcast_announce().await.ok() });
+                }
+                Ok(resp)
+            }
+
             // Members list, with local petnames overlaid onto the projection.
             Request::Members => {
                 let (resp, _) = self.dispatch_tracker(Request::Members);
                 Ok(match resp {
                     Response::Members { mut members } => {
                         let aliases = load_aliases(&self.home);
+                        // A member's `key` is now an actor id; a local petname may
+                        // have been set on the actor id OR on any of its device
+                        // keys (e.g. the device seen in the join request). Resolve
+                        // through the actor's device set.
+                        let plane = self.tracker.lock().unwrap().actor_plane();
                         for m in &mut members {
-                            if let Some(a) = aliases.iter().find(|a| a.key == m.key.as_str()) {
+                            if let Some(a) = aliases.iter().find(|a| a.key == m.key) {
                                 m.alias = a.name.clone();
+                            } else if let Some(actor) = crate::ids::ActorId::parse(&m.key) {
+                                let devs = plane.devices_of(&actor);
+                                if let Some(a) = aliases
+                                    .iter()
+                                    .find(|a| devs.iter().any(|d| d.as_str() == a.key))
+                                {
+                                    m.alias = a.name.clone();
+                                }
                             }
                         }
                         Response::Members { members }
@@ -1395,6 +1556,13 @@ impl Node {
                 match resolve_user_dir(who.trim(), &self.my_userid(), &dir) {
                     UserResolution::One(u) => {
                         let key = u.as_str().to_string();
+                        // Import the joiner's stashed inception (from its join
+                        // request) so the tracker can resolve its actor — admin-
+                        // gated persistence, only on this explicit approve.
+                        if let Some(incept) = self.pending_incepts.lock().unwrap().get(&u).cloned()
+                        {
+                            let _ = self.tracker.lock().unwrap().import_inception(&incept);
+                        }
                         let (resp, changed) = self.dispatch_tracker(Request::MemberAdd {
                             who: key.clone(),
                             admin: false,
@@ -1433,13 +1601,11 @@ impl Node {
                     .values()
                     .filter(|p| p.presence.is_online())
                     .count();
-                let me = self.my_userid();
                 let (workspace, name, issues, projects, membership) = {
                     let t = self.tracker.lock().unwrap();
-                    let acl = t.acl_state();
-                    let membership = if acl.is_admin(&me) {
+                    let membership = if t.am_i_admin() {
                         "admin"
-                    } else if acl.is_member(&me) {
+                    } else if t.am_i_member() {
                         "member"
                     } else {
                         "pending"
@@ -1453,6 +1619,10 @@ impl Node {
                     )
                 };
                 let pending_requests = self.pending_join_requests().len();
+                let (degraded_recovery, recovery) = {
+                    let t = self.tracker.lock().unwrap();
+                    (t.degraded_recovery_holders(), Some(t.recovery_status()))
+                };
                 Ok(Response::Status(Box::new(StatusInfo {
                     id: self.shared.my_id.to_string(),
                     nick: self.shared.nick(),
@@ -1463,6 +1633,8 @@ impl Node {
                     projects,
                     membership,
                     pending_requests,
+                    degraded_recovery,
+                    recovery,
                 })))
             }
             Request::Diagnose { expected_workspace } => {
@@ -1476,13 +1648,11 @@ impl Node {
                     .values()
                     .filter(|p| p.presence.is_online())
                     .count();
-                let me = self.my_userid();
                 let (workspace, name, issues, projects, membership) = {
                     let t = self.tracker.lock().unwrap();
-                    let acl = t.acl_state();
-                    let membership = if acl.is_admin(&me) {
+                    let membership = if t.am_i_admin() {
                         "admin"
-                    } else if acl.is_member(&me) {
+                    } else if t.am_i_member() {
                         "member"
                     } else {
                         "pending"
@@ -1495,6 +1665,14 @@ impl Node {
                         membership.to_string(),
                     )
                 };
+                let (degraded_recovery, rekey_pending, local_custody) = {
+                    let t = self.tracker.lock().unwrap();
+                    (
+                        t.degraded_recovery_holders(),
+                        t.rekey_pending_notice(),
+                        t.recovery_status().local_custody,
+                    )
+                };
                 let view = crate::diagnose::diagnose(crate::diagnose::DiagnoseInput {
                     workspace: Some(workspace.as_str()),
                     name: name.as_str(),
@@ -1503,6 +1681,9 @@ impl Node {
                     projects,
                     issues,
                     expected_workspace: expected_workspace.as_deref(),
+                    degraded_recovery: &degraded_recovery,
+                    rekey_pending: rekey_pending.as_deref(),
+                    local_custody: Some(&local_custody),
                 });
                 Ok(Response::Diagnosis(Box::new(view)))
             }
@@ -1516,6 +1697,15 @@ impl Node {
             } => {
                 let (workspace, name) = {
                     let t = self.tracker.lock().unwrap();
+                    // Only an admin can meaningfully onboard: `redeem_invite`
+                    // honors a pre-authorization only from an admin device, and a
+                    // manual approve is admin-gated too. Refuse up front rather
+                    // than hand back a ticket that can never admit anyone.
+                    if !t.am_i_admin() {
+                        return Ok(Response::err(
+                            "only an admin can mint an invite — ask a workspace admin",
+                        ));
+                    }
                     (t.workspace_str(), t.workspace_name())
                 };
                 // Default: embed a signed, single-use pre-authorization so the
@@ -1528,14 +1718,40 @@ impl Node {
                     let ttl_secs = ttl_hours.unwrap_or(DEFAULT_TTL_HOURS).saturating_mul(3600);
                     let grant =
                         InviteGrant::mint(workspace.clone(), now_secs(), ttl_secs, !reusable);
-                    SignedInvite::sign(&self.secret_key, &grant).ok()
+                    SignedInvite::sign(&self.secret_key.to_bytes(), &grant).ok()
+                };
+                // Carry the verifiable founding proof (salt + founder inception),
+                // NOT a bare anchor string. The joiner checks the workspace id
+                // commits to it, so a non-founder's invite still roots the joiner
+                // on the TRUE founder and a tampered anchor is rejected — every
+                // correctly-joined node holds the same proof (lait/space/1).
+                let (salt, recovery_root, founder_inception) =
+                    match self.tracker.lock().unwrap().founding_proof() {
+                        Some(p) => p,
+                        None => {
+                            return Ok(Response::err(
+                                "this workspace has no founding proof — cannot mint an invite",
+                            ))
+                        }
+                    };
+                // Under Isolated (no relay, no discovery) a ticket must carry the
+                // host's direct addresses so a joiner can reach it. Public/Local
+                // tickets stay address-free (iroh/relay resolves the host by id).
+                let host_addrs = if self.peers.is_isolated() {
+                    self.endpoint.addr().ip_addrs().copied().collect()
+                } else {
+                    vec![]
                 };
                 let ticket = WorkspaceTicket {
                     workspace,
                     name,
                     host: self.shared.my_id,
                     host_nick: self.shared.nick(),
+                    salt,
+                    recovery_root,
+                    founder_inception: Some(founder_inception),
                     invite,
+                    host_addrs,
                 };
                 Ok(Response::Text {
                     text: ticket.to_string(),
@@ -1599,7 +1815,7 @@ impl Node {
                     .iter()
                     .map(|(id, p)| {
                         let online = p.presence.is_online();
-                        // three-state (UI.md §4.5): reachable-and-engaged =
+                        // Three-state presence: reachable and engaged means
                         // online; reachable-but-AFK = away; unreachable = offline.
                         let state = if !online {
                             "offline"
@@ -1722,7 +1938,7 @@ impl Node {
 
     /// Whether this node belongs to a shared workspace it should stay online to
     /// serve (DUR-3). True if it currently tracks any peer, or has ever persisted
-    /// one (DUR-1 `peers.json`) — i.e. it has meshed with someone at least once.
+    /// one in `peers.json`, meaning it has meshed with someone at least once.
     /// A node that has never met a peer is solo/ephemeral and may idle out.
     fn is_mesh_member(&self) -> bool {
         if self
@@ -1782,7 +1998,7 @@ impl Node {
         let _ = write_line(write_half, &resp).await;
     }
 
-    /// The streaming Subscribe loop (S§7.5, UI.md §4.1): emit a `Reset` first
+    /// The streaming subscription loop: emit a `Reset` first
     /// frame that rebaselines the client to the current `seq`, then push every
     /// new doorbell until the client hangs up or the daemon stops. Because the
     /// first frame is always `Reset`, first-connect / reconnect / restart /
@@ -1876,16 +2092,18 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
 
     // Identity is global by default (DUR-5); store (repo/lock/socket/config) is
     // this per-repo home. `$LAIT_HOME` collapses both back into `home`.
-    let secret_key = load_or_create_identity(&crate::config::identity_dir()?)?;
+    let identity_seed = load_or_create_identity(&crate::config::identity_dir()?)?;
     let settings = Settings::load(Some(&home));
     let nick = settings.nick();
 
-    // Tracker core (P0): open the git-backed store. The store must already be
+    // Tracker core: open the git-backed store. The store must already be
     // initialized (`lait init` / `lait join`) — a daemon never founds a
     // workspace as a side effect of starting.
     let store = Store::open(&home)?;
+    // The transport keypair is constructed from lait's identity seed here, at the
+    // net edge — the seed itself is the identity (see config::load_or_create_identity).
+    let secret_key = SecretKey::from_bytes(&identity_seed);
     let me = UserId::from_key_string(secret_key.public().to_string());
-    let identity_seed = secret_key.to_bytes();
     let tracker = Tracker::open(
         store,
         me,
@@ -1910,12 +2128,20 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     }
     let tracker = Arc::new(Mutex::new(tracker));
 
-    let memory_lookup = MemoryLookup::new();
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(secret_key.clone())
-        .address_lookup(memory_lookup.clone())
-        .bind()
-        .await?;
+    // lait states its network requirement; iroh executes it (crate::net is the
+    // sole place relay/discovery vocabulary lives). Defaults to Public.
+    let network = crate::net::Network::from_env()?;
+    // Public and Local are both wired: Public resolves bare ids via n0 discovery,
+    // Local via the PeerBook we populate below. Isolated has no relay and needs
+    // addresses to travel in tickets (not yet) — warn rather than fail silently.
+    if matches!(network, crate::net::Network::Isolated) {
+        tracing::info!(
+            "LAIT_NETWORK=isolated: no relay and no discovery — peers are reached \
+             by addresses carried in the ticket (host-star on a LAN); a wider mesh \
+             beyond the ticket host is not resolved"
+        );
+    }
+    let (endpoint, peers) = crate::net::build_endpoint(&secret_key, &network).await?;
     let my_id = endpoint.id();
 
     let gossip = Gossip::builder().spawn(endpoint.clone());
@@ -1938,14 +2164,23 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         )
         .spawn();
 
-    endpoint.online().await;
+    // Waiting for a home relay only makes sense when the policy provides one.
+    // Bound so a valid-URL-but-unreachable relay can't hang startup forever
+    // (iroh's `online()` never times out on its own).
+    if network.uses_relay()
+        && tokio::time::timeout(Duration::from_secs(30), endpoint.online())
+            .await
+            .is_err()
+    {
+        tracing::warn!("no home relay after 30s — continuing; peers may be unreachable");
+    }
 
     // The topic is a pure function of the workspace id — no user-settable
     // network name, so a cold boot can never subscribe to the wrong topic.
     let topic = crate::proto::topic_for_workspace(&tracker.lock().unwrap().workspace_str());
     // Seed gossip bootstrap from previously-seen peers so a restart actively
-    // rejoins the mesh instead of waiting to be re-announced to (DUR-1), unioned
-    // with the explicit, sticky seed pins (A§10) so a restart always dials its
+    // rejoins the mesh instead of waiting to be re-announced, unioned with the
+    // explicit, sticky seed pins so a restart always dials its
     // always-on seeds even when no ordinary peer was seen last run.
     let pinned_seeds = seed_ids(&home, my_id);
     let mut bootstrap = load_bootstrap_peers(&home, my_id);
@@ -1953,6 +2188,11 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         if !bootstrap.contains(id) {
             bootstrap.push(*id);
         }
+    }
+    // Teach the endpoint how to reach each bootstrap peer before dialing them
+    // (under Local this registers `{id, relay}`; under Public it is a no-op).
+    for id in &bootstrap {
+        peers.learn(*id);
     }
     let gtopic = gossip
         .subscribe(topic, bootstrap)
@@ -1972,11 +2212,14 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         tracing::info!("running as an always-on seed — idle-shutdown disabled");
     }
 
+    let workspace = tracker.lock().unwrap().workspace_str();
     let node = Arc::new(Node {
         endpoint,
         gossip,
         sender: Mutex::new(sender),
         secret_key,
+        peers,
+        workspace,
         router,
         shared,
         shutdown: Arc::new(Notify::new()),
@@ -1988,6 +2231,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         doorbell: Arc::new(Mutex::new(DoorbellRing::new(now_secs()))),
         doorbell_notify: Arc::new(Notify::new()),
         syncing: Arc::new(Mutex::new(HashSet::new())),
+        pending_incepts: Arc::new(Mutex::new(HashMap::new())),
         home: home.clone(),
     });
 
@@ -2004,7 +2248,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     .ok();
 
     // Eagerly backfill from every pinned seed on startup — don't wait for a
-    // gossip NeighborUp. This is what makes a seed a cold-start anchor (A§10): a
+    // gossip NeighborUp. This makes a seed a cold-start anchor: a
     // fresh or long-offline client converges through its seed immediately.
     for id in pinned_seeds {
         node.clone().trigger_pull(id);
@@ -2081,6 +2325,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_sealed_invite_binds_to_its_redeemer_and_hides_from_the_topic() {
+        use crate::actor::incept_single;
+        use crate::ids::{SystemUlidSource, WorkspaceId};
+        use crate::proto::{InviteGrant, SignedInvite};
+
+        let ws = WorkspaceId::mint(&SystemUlidSource);
+        let host_seed = [10u8; 32];
+        let host_sk = SecretKey::from_bytes(&host_seed);
+        let host = UserId::from_key_string(host_sk.public().to_string());
+
+        // The legit joiner and an eavesdropper, each with their own actor.
+        let (j_incept, j_actor) = incept_single(&[11u8; 32], &ws, [1u8; 16], [2u8; 16], None);
+        let (atk_incept, _atk_actor) = incept_single(&[12u8; 32], &ws, [3u8; 16], [4u8; 16], None);
+
+        // An admin mints + signs an invite; the joiner seals it bound to itself.
+        let grant = InviteGrant::mint(ws.to_string(), 0, 3600, true);
+        let invite = SignedInvite::sign(&host_seed, &grant).unwrap();
+        let sealed = seal_bound_invite(&host, &invite, &j_actor).unwrap();
+
+        // The host opens it for the bound joiner.
+        assert!(
+            open_bound_invite(&host_seed, &host, &sealed, &j_incept).is_some(),
+            "the host admits the bound joiner"
+        );
+        // Hijack attempt: an eavesdropper COPIES the opaque blob and re-pairs it
+        // with its OWN inception — the redeemer binding refuses it.
+        assert!(
+            open_bound_invite(&host_seed, &host, &sealed, &atk_incept).is_none(),
+            "a copied blob cannot admit a different actor"
+        );
+        // And a non-host cannot even read the blob — the nonce stays off the topic.
+        let atk_user =
+            UserId::from_key_string(SecretKey::from_bytes(&[12u8; 32]).public().to_string());
+        assert!(
+            open_bound_invite(&[12u8; 32], &atk_user, &sealed, &j_incept).is_none(),
+            "only the host can open the sealed invite"
+        );
+    }
+
+    #[test]
     fn idle_shutdown_only_when_unused_and_past_window() {
         let w = Duration::from_secs(60);
         // A solo node (never meshed) idles out only when unused past the window.
@@ -2098,7 +2382,7 @@ mod tests {
         assert!(!should_idle_shutdown(0, Duration::from_secs(600), w, true));
     }
 
-    // Doorbell/Reset control-plane invariant (S§7.5, UI.md §4.1): a Subscribe
+    // Doorbell/reset invariant: a subscription
     // stream rebaselines with a `Reset` exactly when its cursor has fallen off
     // the back of the ring, and never otherwise.
     #[test]
@@ -2123,7 +2407,7 @@ mod tests {
         assert!(subscribe_should_reset(oldest - 2, oldest));
     }
 
-    // DUR-1: the bootstrap peer set round-trips through disk and never seeds the
+    // The bootstrap peer set round-trips through disk and never seeds the
     // node with itself (dialing your own id is pointless and could self-loop).
     #[test]
     fn bootstrap_peers_persist_and_filter_self() {
@@ -2145,7 +2429,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // The pinned-seed registry (A§10 client half): upsert is id-keyed (no
+    // The pinned-seed registry is ID-keyed (no
     // duplicates), bootstrap ids drop self, and removal matches id or nick.
     #[test]
     fn seeds_upsert_dedup_and_remove() {

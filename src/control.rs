@@ -1,12 +1,12 @@
-//! Layer B — the local control protocol (SCHEMA §7). Newline-delimited JSON over
+//! Layer B — the local control protocol. Newline-delimited JSON over
 //! the cross-platform local IPC channel (a Unix-domain socket on unix, a named
 //! pipe on Windows; see [`control_name`]). One request → one response, plus the
 //! streaming [`Request::Subscribe`] mode that writes [`Doorbell`] frames until
-//! the client disconnects (S§7.5, UI.md §4.1).
+//! the client disconnects.
 //!
 //! This is an **imperative façade over a declarative CRDT**: a stable, versioned,
-//! hand-maintained projection of Layer A (S§1), never an auto-dump. `Ref`s and
-//! `UserRef`s arrive as plain strings and are resolved **daemon-side** (UI.md §3).
+//! hand-maintained projection of durable state, never an automatic dump. `Ref`s
+//! and `UserRef`s arrive as plain strings and are resolved **daemon-side**.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -25,7 +25,7 @@ use crate::dto::{
     LabelDto, MemberDto, MemberLogEntry, ProjectDto, Row, SeedDto,
 };
 
-/// The control-plane protocol version this build **speaks** — the CLI/TUI/MCP
+/// The control-plane protocol version this build **speaks** — CLI, web, and MCP
 /// ↔ daemon channel, exchanged in the [`Request::Hello`] handshake.
 ///
 /// The third plane to get one. The sync plane has [`crate::sync::PROTOCOL_VERSION`]
@@ -85,7 +85,7 @@ pub fn control_name(home: &Path) -> Result<Name<'static>> {
     }
 }
 
-/// A board position for `IssueMove` (UI.md §5.1 `--top/--bottom/--before/--after`).
+/// A board position for `IssueMove` (`--top`, `--bottom`, `--before`, or `--after`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "at", rename_all = "snake_case")]
 pub enum BoardPos {
@@ -95,7 +95,7 @@ pub enum BoardPos {
     After { reff: String },
 }
 
-/// List/board filter (UI.md §2.1).
+/// List and board filter.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Filter {
     #[serde(default)]
@@ -104,12 +104,12 @@ pub struct Filter {
     pub status: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
-    /// Include done + tombstoned rows (UI.md §2.2).
+    /// Include done and tombstoned rows.
     #[serde(default)]
     pub all: bool,
 }
 
-/// A request from a client to the daemon (SCHEMA §7).
+/// A request from a client to the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
@@ -141,7 +141,7 @@ pub enum Request {
         status: Option<String>,
         #[serde(default)]
         priority: Option<String>,
-        /// Full-buffer description replace (P0, UI.md §5.3 — the client holds
+        /// Full-buffer description replacement; the client holds
         /// no `LoroText` cursor; the daemon applies it as a text update).
         #[serde(default)]
         description: Option<String>,
@@ -174,12 +174,12 @@ pub enum Request {
         reff: String,
     },
     /// Restore a deleted issue — a signed content-authority op that clears the
-    /// tombstone (contract §3.4). Restore-wins over a concurrent delete.
+    /// tombstone. Restore wins over a concurrent delete.
     IssueRestore {
         reff: String,
     },
     /// Link two issues (`blocks` | `relates` | `duplicates`) — an add-wins edge
-    /// in the catalog structure doc (contract §3.2).
+    /// in the catalog structure document.
     IssueLink {
         reff: String,
         kind: String,
@@ -192,7 +192,7 @@ pub enum Request {
     },
     /// Set (or clear, with `parent: None`) an issue's parent in the sub-issue
     /// hierarchy — a tree-move CRDT, so concurrent conflicting parents can
-    /// never converge to a cycle (contract §3.2).
+    /// never converge to a cycle.
     IssueParent {
         reff: String,
         #[serde(default)]
@@ -202,7 +202,7 @@ pub enum Request {
     IssueGraph {
         reff: String,
     },
-    /// Work-state verbs (UI.md §2): each is ONE commit = one activity row,
+    /// Work-state verbs: each is one commit and one activity row,
     /// bundling the fields a single human intent moves. Targets are picked by
     /// workflow *category* (first Active / Done / Backlog state), so they track
     /// whatever the workspace's column set is. They return `Response::Issue`
@@ -252,14 +252,14 @@ pub enum Request {
         #[serde(default)]
         since: u64,
     },
-    /// The durable, addressed-to-you inbox (S§8.1 `inbox.json`): remote
+    /// The durable, addressed-to-you inbox (`inbox.json`): remote
     /// assignments/comments/status moves on your work, derived at import time.
     /// `clear` stamps the read watermark after listing.
     Inbox {
         #[serde(default)]
         clear: bool,
     },
-    // ---- membership / ACL (P3, S§6) ----
+    // ---- membership and authorization ----
     MemberAdd {
         who: String,
         #[serde(default)]
@@ -271,7 +271,7 @@ pub enum Request {
     MemberRemove {
         who: String,
     },
-    /// Sponsor an agent keypair (contract §3.4). Any human member may sponsor;
+    /// Sponsor an agent keypair. Any human member may sponsor;
     /// the agent is sealed the workspace key but holds no membership or content
     /// authority, and its standing dies with the sponsor.
     AgentAdd {
@@ -279,11 +279,80 @@ pub enum Request {
         key: String,
     },
     KeyRotate,
+    /// Revoke an outstanding invite so it can no longer admit anyone (admin-
+    /// only). Accepts the invite ticket or its 32-hex nonce.
+    InviteRevoke {
+        /// The invite ticket, or its raw 32-hex nonce.
+        invite: String,
+    },
+    /// Print a device-enrollment token for adding another device to *this*
+    /// actor (lait/actor/1). The new machine consumes it with `device accept`.
+    DeviceInvite,
+    /// Add a device to our actor from its consent blob (produced by
+    /// `device accept`), sealing it the workspace key.
+    DeviceAdd {
+        /// Hex-encoded consent binding from the joining device.
+        consent: String,
+    },
+    /// Revoke a device from our actor and rotate the key to fence it.
+    DeviceRevoke {
+        device: String,
+    },
+    /// List the device keys currently bound to our actor.
+    DeviceList,
+    /// Break-glass **workspace** recovery (lait/space/1 W5): re-root the workspace
+    /// to this device using the offline workspace recovery keys, as threshold
+    /// `Recover` events. Distinct from [`Recover`](Self::Recover), which resets a
+    /// single actor's devices.
+    SpaceRecover,
+    /// Elevate the workspace recovery authority from a solo bootstrap key to a
+    /// `k`-of-N FROST group key over `cofounders` (device keys) + this device,
+    /// via a dealer-free DKG that rides the synced ceremony bulletin board.
+    SpaceElevate {
+        cofounders: Vec<String>,
+        k: u16,
+    },
+    /// Co-sign a pending break-glass recovery request as a holder of the current
+    /// K-of-N group recovery key. Explicit per-request consent: the holder has
+    /// checked out-of-band that `session` re-roots to the agreed party.
+    SpaceRecoverApprove {
+        session: String,
+        /// The actor(s) the holder expects this recovery to re-root to — consent
+        /// binds to the roots, so an injected request that re-roots elsewhere is
+        /// refused before any share is contributed.
+        expect: Vec<String>,
+    },
+    /// Co-sign a pending authority grant as a holder of the current group key,
+    /// authorizing a replacement ceremony. Consent binds to the PROPOSAL, not to
+    /// the session id: a request for a different proposal is refused.
+    SpaceElevateApprove {
+        session: String,
+        proposal: String,
+    },
+    /// Export this device's recovery share as a portable, passphrase-protected
+    /// package, verify it by reopening, and attest that on the board. An
+    /// all-holders arrangement will not install until every custodian has done
+    /// this.
+    SpaceCustodyExport {
+        path: String,
+        passphrase: String,
+    },
+    /// Restore a recovery share from a portable package written by
+    /// `SpaceCustodyExport`. Refuses to replace a readable share unless `force`.
+    SpaceCustodyImport {
+        path: String,
+        passphrase: String,
+        force: bool,
+    },
+    /// Recover our actor with the offline recovery key: reset the device set to
+    /// this device (identity is restored; content-key access is re-sealed lazily
+    /// by an admin/peer).
+    Recover,
     Members,
     /// The membership audit log: the signed ACL DAG replayed in causal order
     /// with each op's authorization verdict (cryptographic provenance).
     MemberLog,
-    /// List pending join requests (announced joiners not yet members, UI.md §8).
+    /// List announced joiners that are not yet members.
     MemberRequests,
     /// Approve a pending join request **by id-prefix / key** — sugar over
     /// `MemberAdd` scoped to the pending set. The joiner's self-asserted nick is
@@ -300,16 +369,16 @@ pub enum Request {
         who: String,
         name: String,
     },
-    /// Streaming doorbells for the TUI (S§7.5). Turns the one-shot handler into a
+    /// Streaming dirty notifications for live clients. Turns the one-shot handler into a
     /// stream of [`Doorbell`] frames until the client disconnects.
     Subscribe {
         #[serde(default)]
         since: u64,
     },
 
-    // ---- transport / presence (kept from the skeleton; the P1 surface) ----
+    // ---- transport / presence ----
     Status,
-    /// Guided-join verifier (UI onboarding, `docs/GUIDED-JOIN.md`): project live
+    /// Guided-join verifier (`docs/UI.md`, joining): project live
     /// node state into an ordered list of onboarding gates so a stalled joiner
     /// gets one legible blocker instead of a blank board. `expected_workspace`
     /// (supplied by the `join` tail from the invite ticket) lets it catch a
@@ -340,7 +409,7 @@ pub enum Request {
     Connect {
         ticket: String,
     },
-    /// Pin an always-on seed peer (A§10). `arg` is a room ticket (adopt the
+    /// Pin an always-on seed peer. `arg` is a room ticket (adopt the
     /// workspace + backfill) or a bare endpoint id (pin only). Sticky across
     /// restarts; grants no trust.
     SeedAdd {
@@ -352,7 +421,7 @@ pub enum Request {
     SeedRemove {
         who: String,
     },
-    /// Presence/system event log (P1 transport surface).
+    /// Presence and transport event log.
     Log {
         since: u64,
     },
@@ -380,8 +449,8 @@ fn default_true() -> bool {
     true
 }
 
-/// A response from the daemon (SCHEMA §7). A snapshot at a version — there is
-/// **no CAS token** (S§7.2). Internally tagged by `kind` (not `status`, which
+/// A response from the daemon. A snapshot at a version — there is
+/// **no CAS token**. Internally tagged by `kind` (not `status`, which
 /// would collide with `IssueView.status` when the `Issue` variant is flattened).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -399,7 +468,7 @@ pub enum Response {
     Ok {
         message: Option<String>,
     },
-    /// A write echoes the resolved canonical handle (UI.md §2.2).
+    /// A write echoes the resolved canonical handle.
     Ref {
         reff: String,
     },
@@ -433,15 +502,15 @@ pub enum Response {
     MemberLog {
         entries: Vec<MemberLogEntry>,
     },
-    /// Pending join requests (announced joiners not yet members, UI.md §8).
+    /// Pending join requests: announced joiners that are not yet members.
     JoinRequests {
         requests: Vec<JoinRequestDto>,
     },
-    /// Pinned seeds ("remotes") and their reachability (A§10).
+    /// Pinned seeds ("remotes") and their reachability.
     Seeds {
         seeds: Vec<SeedDto>,
     },
-    /// A ref resolved to many candidates — a first-class outcome (UI.md §3.2) —
+    /// A ref resolved to many candidates, represented as a first-class outcome,
     /// or, when `near_miss_for` is set, matched **nothing** and these are the
     /// closest handles to what was typed.
     Candidates {
@@ -481,7 +550,7 @@ pub enum Response {
     },
 }
 
-/// Classifies a [`Response::Error`] so the process exit code (UI.md §2.3) is
+/// Classifies a [`Response::Error`] so the process exit code is
 /// derived from a **typed kind**, never by string-matching the human message.
 /// `NotFound` (a ref / registry entry didn't resolve) maps to exit `2` alongside
 /// the ambiguous [`Response::Candidates`] outcome; everything else is a plain
@@ -504,7 +573,7 @@ impl Response {
             error_kind: ErrorKind::Error,
         }
     }
-    /// A ref / registry lookup that resolved to **nothing** (exit `2`, UI.md §3.2).
+    /// A ref or registry lookup that resolved to **nothing** (exit `2`).
     pub fn not_found(msg: impl Into<String>) -> Self {
         Response::Error {
             message: msg.into(),
@@ -513,35 +582,35 @@ impl Response {
     }
 }
 
-/// The streamed frame — the repeated reply to [`Request::Subscribe`] (S§7.5).
-/// A **batched, project-keyed dirty-set**, never state (UI.md §4.2). The client
+/// The streamed frame: the repeated reply to [`Request::Subscribe`].
+/// A **batched, project-keyed dirty-set**, never state. The client
 /// re-reads the authoritative projection for each dirty scope; it never patches
 /// from a doorbell.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Doorbell {
-    /// Per-daemon-boot nonce; a change ⇒ restart ⇒ treat as `Reset` (UI.md §4.1).
+    /// Per-daemon-boot nonce; a change means restart and requires a `Reset`.
     pub epoch: u64,
-    /// Per-session cursor (S§2). Never persisted.
+    /// Per-session cursor. Never persisted.
     pub seq: u64,
-    /// `true` ⇒ ignore the rest and rebaseline from a fresh snapshot (S§7.5).
+    /// `true` means ignore the rest and rebaseline from a fresh snapshot.
     pub reset: bool,
     /// Issue-row plane: which docs (by project) moved. Re-read these rows.
     pub dirty_by_project: HashMap<String, Vec<String>>,
-    /// Catalog-structure plane (UI.md §4.2).
+    /// Catalog-structure changes.
     pub dirty_catalog: Vec<CatalogScope>,
-    /// New feed rows exist — pull via `Activity{since}` (S§7.5). Never streamed.
+    /// New feed rows exist; pull via `Activity{since}`. Rows are never streamed.
     pub activity_advanced: bool,
-    /// New presence/join rows exist — pull via `Log{since}` (S§7.5). Never
+    /// New presence or join rows exist; pull via `Log{since}`. Rows are never
     /// streamed: like every other plane this is a dirty *flag*, not the events.
     /// The presence plane rings independently of the tracker dirty-set, so a
     /// peer coming online wakes a subscriber even when no doc moved.
     /// `default` so a frame from a pre-plane daemon (stale across `lait update`)
-    /// still decodes (S§9 rule 1: fields are add-only, absent ⇒ default).
+    /// still decodes because fields are add-only and absence means default.
     #[serde(default)]
     pub presence_advanced: bool,
 }
 
-/// A catalog-structure dirty scope (SCHEMA §7, UI.md §4.2).
+/// Identifies which catalog structure became dirty.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "scope", rename_all = "snake_case")]
 pub enum CatalogScope {
@@ -552,7 +621,7 @@ pub enum CatalogScope {
     Boards { project: String },
 }
 
-/// A presence/system log entry kept in the daemon's ring buffer (P1 transport).
+/// A presence or transport log entry kept in the daemon's ring buffer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub seq: u64,
@@ -575,7 +644,7 @@ pub enum EventKind {
 pub struct PresenceEntry {
     pub id: String,
     pub nick: String,
-    /// Three-state presence (UI.md §4.5): `online` | `away` | `offline`.
+    /// Three-state presence: `online`, `away`, or `offline`.
     pub state: String,
     pub online: bool,
     pub last_seen_secs: u64,
@@ -594,7 +663,7 @@ pub struct StatusInfo {
     pub projects: usize,
     /// This node's standing in the workspace ACL: `admin` | `member` | `pending`.
     /// `pending` means we joined from an invite but an admin hasn't approved us
-    /// yet — we can't decrypt the board (UI.md §8). Lets `status` tell a joiner
+    /// yet, so we cannot decrypt the board. Lets `status` tell a joiner
     /// the truth instead of implying the join already succeeded.
     #[serde(default)]
     pub membership: String,
@@ -602,6 +671,20 @@ pub struct StatusInfo {
     /// host-side nudge to run `members approve`. Only meaningful for an admin.
     #[serde(default)]
     pub pending_requests: usize,
+    /// Recovery shares this device holds that exist but cannot be used.
+    ///
+    /// Structured, not preformatted: the CLI and web layers render it
+    /// differently, and a rendered string would force one of them to parse
+    /// prose. Persistent rather than recovery-only — an operator must be able to
+    /// learn their founder share is unusable *before* the day they need it,
+    /// which is exactly the day it is too late to fix.
+    #[serde(default)]
+    pub degraded_recovery: Vec<crate::tracker::DegradedRecoveryHolder>,
+    /// This device's recovery readiness: the standing authority's shape and our
+    /// own custody standing. Reports what THIS node knows; it deliberately makes
+    /// no claim about whether other holders still have their shares.
+    #[serde(default)]
+    pub recovery: Option<crate::tracker::RecoveryStatus>,
 }
 
 /// What probing a home's control channel found. These three must be told apart
@@ -768,8 +851,8 @@ async fn exchange_raw(stream: Stream, req: &Request) -> Result<String> {
     Ok(resp_line)
 }
 
-/// A live doorbell subscription — the TUI's read side of a [`Request::Subscribe`]
-/// stream (UI.md §4.1). Holds the whole duplex stream (never split, so nothing
+/// A live dirty-notification subscription — the client side of [`Request::Subscribe`]
+/// stream. Holds the whole duplex stream (never split, so nothing
 /// leaks); the subscribe verb is write-once, then read-many.
 pub struct Subscription {
     reader: BufReader<Stream>,
@@ -792,7 +875,7 @@ impl Subscription {
     }
 }
 
-/// Open a streaming [`Request::Subscribe`] connection (UI.md §4.1).
+/// Open a streaming [`Request::Subscribe`] connection.
 pub async fn subscribe(home: &Path, since: u64) -> Result<Subscription> {
     let name = control_name(home)?;
     let mut stream = Stream::connect(name).await.context("connect to daemon")?;

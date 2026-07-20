@@ -25,7 +25,6 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
-use iroh::SecretKey;
 use serde::{Deserialize, Serialize};
 
 use crate::registry::{agents_base, Registry, SessionMap};
@@ -519,21 +518,28 @@ fn secret_key_path(home: &Path) -> PathBuf {
     home.join("secret.key")
 }
 
-/// Load the persistent identity, creating one on first run.
-pub fn load_or_create_identity(home: &Path) -> Result<SecretKey> {
+/// Load the persistent identity **seed** (32 bytes), creating one on first run.
+///
+/// lait's identity is the seed, not a transport keypair: it is stored as hex in
+/// `secret.key` and the transport layer constructs its `iroh::SecretKey` from
+/// these bytes ([`crate::crypto::user_from_seed`] maps the same seed to the
+/// `UserId`). The on-disk format is unchanged — 64 hex chars of the 32-byte
+/// seed — so existing keys load as-is.
+pub fn load_or_create_identity(home: &Path) -> Result<[u8; 32]> {
     let path = secret_key_path(home);
     if path.exists() {
         let hex = fs::read_to_string(&path).context("read secret key")?;
-        let key: SecretKey = hex
-            .trim()
-            .parse()
+        let raw = data_encoding::HEXLOWER_PERMISSIVE
+            .decode(hex.trim().as_bytes())
             .map_err(|e| anyhow::anyhow!("parse secret key: {e}"))?;
-        Ok(key)
+        raw.as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("secret key must be 32 bytes"))
     } else {
-        let key = SecretKey::generate();
-        let hex = data_encoding::HEXLOWER.encode(&key.to_bytes());
+        let seed = crate::crypto::random_seed();
+        let hex = data_encoding::HEXLOWER.encode(&seed);
         fs::write(&path, hex).context("write secret key")?;
-        Ok(key)
+        Ok(seed)
     }
 }
 
@@ -588,7 +594,7 @@ pub const KEYS: &[KeySpec] = &[
 /// The `tui.*` namespace (theme, saved tabs, and the open `tui.key.<action-id>`
 /// override prefix) went with the TUI. The web client keeps the same *shape* of
 /// idea — rebind by stable action id, warn rather than gate — but its overrides
-/// live client-side for now; see docs/SERVE.md. If they ever want a home on disk,
+/// live client-side for now; see `docs/UI.md`. If they ever want a home on disk,
 /// this table is where a `web.key.*` prefix would go.
 pub fn key_spec(name: &str) -> Result<&'static KeySpec> {
     if name.starts_with("workspace.") {

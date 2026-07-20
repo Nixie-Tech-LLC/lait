@@ -1,17 +1,17 @@
-//! Property-based CRDT convergence tests (SCHEMA §1: "all merge semantics live
-//! in Loro"). Each test drives a proptest-generated sequence of operations
+//! Property-based tests for the invariant that all merge semantics live in
+//! Loro. Each test drives a proptest-generated sequence of operations
 //! across 2–3 independent replicas of one document, exchanges updates all-pairs
 //! until quiescence, and asserts every replica reaches identical state
 //! (deep-value equality via `state_json()`) plus the schema-level invariant
 //! that the merge rule promises:
 //!
-//!   * `issue_lww_converges`               — S§5.1 last-writer-wins registers
-//!   * `assignees_labels_map_union_converges` — S§5.2 present-key set (map-union)
-//!   * `board_movable_list_converges`      — S§5.5 board ordering (movable list)
-//!   * `catalog_docs_grow_set_converges`   — S§4  the `docs` grow-only key set
+//!   * `issue_lww_converges` — last-writer-wins registers
+//!   * `assignees_labels_map_union_converges` — present-key set (map-union)
+//!   * `board_movable_list_converges` — board ordering (movable list)
+//!   * `catalog_docs_grow_set_converges` — the `docs` grow-only key set
 //!
 //! Post-contract note: these tests exercise the sealed engine surface only
-//! (LAIT-DATA-CONTRACT §6) — replicas fork via `from_snapshot`, mutate through
+//! (`docs/DATA-CONTRACT.md`) — replicas fork via `from_snapshot`, mutate through
 //! the typed writers, land ops with `apply(OpCtx)`, and exchange bytes through
 //! `oplog_vv_bytes`/`export_from_bytes`/`import`. No raw kernel handle exists
 //! out here, which is itself part of what is under test.
@@ -27,7 +27,7 @@ use proptest::prelude::*;
 use lait::catalog::CatalogDoc;
 use lait::dto::Priority;
 use lait::engine::op::OpCtx;
-use lait::ids::{DocId, LabelId, ProjectId, SystemUlidSource, UserId, WorkspaceId};
+use lait::ids::{ActorId, DocId, LabelId, ProjectId, SystemUlidSource, UserId, WorkspaceId};
 use lait::issue::{IssueDoc, NewIssue};
 
 /// A fixed creation timestamp — never varied, so it can never be the reason two
@@ -79,8 +79,8 @@ impl Replica for CatalogDoc {
     }
 }
 
-/// The core sync primitive (SCHEMA §8): all-pairs exchange of version-vector
-/// deltas. For every ordered pair (i, j) we ship i's ops that j is missing into
+/// Exchanges version-vector deltas between every pair of replicas. For every
+/// ordered pair (i, j), this ships i's ops that j is missing into
 /// j. Running the full all-pairs loop three times drives the mesh to quiescence
 /// even when an update produced in an earlier round only becomes relevant to a
 /// third replica after a later import.
@@ -134,7 +134,8 @@ fn base_issue() -> IssueDoc {
         project_id: ProjectId::mint(&SystemUlidSource),
         title: "base title".into(),
         priority: Priority::None,
-        created_by: tester(),
+        created_by: ActorId::from_incept_hash(&"a".repeat(64)),
+        committed_by: tester(),
         created_at: CREATED_AT,
         body: None,
         peer: None,
@@ -143,7 +144,7 @@ fn base_issue() -> IssueDoc {
 }
 
 // ---------------------------------------------------------------------------
-// Test 1 — LWW registers (S§5.1): title / status / priority.
+// LWW registers: title, status, and priority.
 // ---------------------------------------------------------------------------
 
 /// The four workflow statuses an issue LWW register may hold.
@@ -178,7 +179,7 @@ fn lww_op_strategy() -> impl Strategy<Value = LwwOp> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
-    /// S§5.1: title/status/priority are single-key LWW registers. Under any
+    /// Title, status, and priority are single-key LWW registers. Under any
     /// interleaving of concurrent writes across replicas, after sync every
     /// replica must not only converge byte-for-byte but expose ONE coherent
     /// winner per register — never a value spliced from two writers.
@@ -218,7 +219,7 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
-// Test 2 — present-key sets (S§5.2): assignees & labels as map-union.
+// Present-key sets: assignees and labels as map-union.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -241,7 +242,7 @@ fn set_op_strategy() -> impl Strategy<Value = SetOp> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
-    /// S§5.2: assignees/labels are `LoroMap<Id, true>` present-key sets. Adds of
+    /// Assignees and labels are `LoroMap<Id, true>` present-key sets. Adds of
     /// DIFFERENT keys on different replicas union; concurrent add-vs-remove of
     /// the SAME key resolves to a single per-key LWW winner (deterministic, no
     /// panic). After sync the resolved key SET must be identical everywhere.
@@ -252,8 +253,8 @@ proptest! {
     ) {
         // Fixed pools of 4 users and 4 labels, minted once and shared by every
         // replica (so add/remove target the same keys across replicas).
-        let users: Vec<UserId> =
-            (0..4).map(|i| UserId::from_key_string(format!("{:064x}", i + 1))).collect();
+        let users: Vec<ActorId> =
+            (0..4).map(|i| ActorId::from_incept_hash(&format!("{:064x}", i + 1))).collect();
         let labels: Vec<LabelId> = (0..4).map(|_| LabelId::mint(&SystemUlidSource)).collect();
 
         let snap = base_issue().snapshot().unwrap();
@@ -286,7 +287,7 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
-// Test 3 — board ordering (S§5.5): a movable list reorders without duplication.
+// Board ordering: a movable list reorders without duplication.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -315,9 +316,9 @@ fn board_op_strategy() -> impl Strategy<Value = BoardOp> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
-    /// S§5.5: the board is a `LoroMovableList` used for ordering only. Starting
+    /// The board is a `LoroMovableList` used for ordering only. Starting
     /// from a shared board of K issues, concurrent reorders across replicas must
-    /// converge to ONE identical raw order, whose S§5.5 projection (dedup) is a
+    /// converge to one identical raw order, whose deduplicated projection is a
     /// permutation of the same K docs. (The raw list may hold a duplicate after
     /// concurrent insert paths; dedup is a projection-time rule.)
     #[test]
@@ -340,7 +341,8 @@ proptest! {
                 project_id: project.clone(),
                 title: format!("issue {n}"),
                 priority: Priority::None,
-                created_by: tester(),
+                created_by: ActorId::from_incept_hash(&"a".repeat(64)),
+                committed_by: tester(),
                 created_at: CREATED_AT,
                 body: None,
                 peer: None,
@@ -381,12 +383,12 @@ proptest! {
         // native `mov` (no duplicate under concurrent same-doc moves); the
         // insert paths can still contribute a surviving insert each, and Loro
         // totally-orders those, so all replicas land on the identical raw list;
-        // S§5.5 makes dedup a *projection-time* render rule.
+        // Deduplication is a projection-time render rule.
         for (i, c) in replicas.iter().enumerate() {
             prop_assert_eq!(c.board_order(&project), order0.clone(), "board order diverged at replica {}", i);
         }
 
-        // The S§5.5 projection (dedup) is well-formed: exactly the K seeded docs,
+        // The deduplicated projection is well-formed: exactly the K seeded docs,
         // no phantom ids, none dropped — a permutation of the doc set.
         let mut deduped = order0.clone();
         deduped.sort();
@@ -398,13 +400,13 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
-// Test 4 — the docs grow-only key set (S§4): concurrently registered docs union.
+// The docs grow-only key set: concurrently registered docs form a union.
 // ---------------------------------------------------------------------------
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
-    /// S§4: `Catalog.docs` is a keyed set that only grows (registering an issue
+    /// `Catalog.docs` is a keyed set that only grows (registering an issue
     /// adds its `DocId` key). When replicas register DIFFERENT issues, after
     /// sync every replica's `doc_ids()` must equal the identical union set.
     #[test]
@@ -433,7 +435,8 @@ proptest! {
                 project_id: project.clone(),
                 title: "grow".into(),
                 priority: Priority::None,
-                created_by: tester(),
+                created_by: ActorId::from_incept_hash(&"a".repeat(64)),
+                committed_by: tester(),
                 created_at: CREATED_AT,
                 body: None,
                 peer: None,
@@ -459,14 +462,14 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
-// Test 5 — sub-issue hierarchy (contract §3.2): the tree-move CRDT converges,
+// Sub-issue hierarchy: the tree-move CRDT converges,
 // concurrent cross-replica cycles never survive the merge.
 // ---------------------------------------------------------------------------
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
 
-    /// Contract §3.2 / Kleppmann et al. TPDS 2022: arbitrary concurrent
+    /// Following the Kleppmann et al. TPDS 2022 tree model, arbitrary concurrent
     /// `set_parent` operations across replicas converge to ONE identical
     /// hierarchy that is always a valid forest — every doc has at most one
     /// parent and no doc is its own ancestor — even when replicas concurrently
@@ -532,13 +535,13 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
-// Test 6 — issue links (contract §3.2): the edge set is an add-wins union.
+// Issue links: the edge set is an add-wins union.
 // ---------------------------------------------------------------------------
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
 
-    /// Contract §3.2: `edges` is an add-wins set keyed by the whole edge triple.
+    /// `edges` is an add-wins set keyed by the whole edge triple.
     /// Concurrent adds union; concurrent add/remove of the same edge resolves
     /// deterministically; the converged edge set is identical everywhere.
     #[test]

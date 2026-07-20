@@ -42,7 +42,7 @@ below.
 > durable local copy. The long version — architecture, data shapes, protocol,
 > decision log — lives in [`docs/`](docs/README.md), starting with
 > [`ARCHITECTURE.md`](docs/ARCHITECTURE.md); phase status is in
-> [`docs/ROADMAP.md`](docs/ROADMAP.md).
+> [`docs/README.md`](docs/README.md).
 
 ## Install
 

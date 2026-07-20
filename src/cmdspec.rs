@@ -1,6 +1,6 @@
 //! Programmatic clap command registry.
 //!
-//! The CLI surface (UI.md §2) is defined as **data** — a `Vec<Spec>` built by
+//! The CLI command set is defined as **data** — a `Vec<Spec>` built by
 //! [`specs`] — instead of a `#[derive(Parser)]` enum. [`build_cli`] turns that
 //! data into a `clap::Command` at runtime, so completions (`clap_complete`) and
 //! the man page (`clap_mangen`) still generate from the live tree exactly as
@@ -59,6 +59,9 @@ pub enum Special {
     ConfigUnset,
     ConfigList,
     Update,
+    /// New-machine side of device enrollment: consume a `device invite` token
+    /// and print a consent blob (no daemon, no store — just this identity).
+    DeviceAccept,
 }
 
 /// One command (or nested group) in the tree.
@@ -292,7 +295,7 @@ pub fn build_cli(specs: &[Spec]) -> Command {
         .version(env!("LAIT_VERSION_LONG"))
         .about("A local-first, peer-to-peer issue tracker")
         // No subcommand required: bare `lait` is the FOCUS view (inbox + your
-        // active issues, UI.md §2) — the most valuable keystroke goes to the
+        // active issues) — the most valuable keystroke goes to the
         // most-asked question, not to help. `lait help` / `-h` still work.
         .arg(
             Arg::new("home")
@@ -323,7 +326,7 @@ pub fn build_cli(specs: &[Spec]) -> Command {
                 .global(true)
                 .action(ArgAction::SetTrue)
                 .help_heading(GLOBAL_HEADING)
-                .help("Emit the versioned JSON DTO instead of human output (UI.md §2.3)."),
+                .help("Emit the versioned JSON DTO instead of human output."),
         )
         .arg(
             Arg::new("yes")
@@ -395,8 +398,8 @@ pub fn parse_to_request(argv: &[&str]) -> Result<Request> {
 }
 
 /// A parsed command line, surfacing `Special` leaves instead of erroring on
-/// them — the seam the TUI command palette dispatches through (one grammar,
-/// two entry points, UI.md tenet 4). The palette decides per-`Special` whether
+/// them — the seam interactive clients dispatch through. The caller decides per
+/// `Special` whether
 /// it has a native equivalent (start/done/stop, config, spaces, …) or rejects
 /// with "CLI-only".
 pub enum ParsedCommand {
@@ -1084,11 +1087,184 @@ pub fn specs() -> Vec<Spec> {
             ],
             ..Spec::req(
                 "members",
-                "Manage space membership (the signed ACL, P3). `members` lists.",
+                "Manage space membership through the signed ACL. `members` lists.",
                 vec![],
                 |_| Ok(Request::Members),
             )
         },
+        Spec {
+            subs: vec![
+                Spec::req(
+                    "invite",
+                    "Print a token to enroll another device into your actor.",
+                    vec![],
+                    |_| Ok(Request::DeviceInvite),
+                ),
+                Spec::special(
+                    "accept",
+                    "On a new machine: consume a `device invite` token and print a \
+                     consent blob to hand back for `device add`.",
+                    vec![A::pos("token", "The token from `lait device invite`.")],
+                    Special::DeviceAccept,
+                ),
+                Spec::req(
+                    "add",
+                    "Add a device to your actor from its consent blob, sealing it \
+                     the space key.",
+                    vec![A::pos("consent", "The blob from `device accept`.")],
+                    |m| {
+                        Ok(Request::DeviceAdd {
+                            consent: req_str(m, "consent"),
+                        })
+                    },
+                ),
+                Spec::req(
+                    "revoke",
+                    "Revoke a device from your actor and rotate the key to fence it.",
+                    vec![A::pos("device", "The device's 64-hex key.")],
+                    |m| {
+                        Ok(Request::DeviceRevoke {
+                            device: req_str(m, "device"),
+                        })
+                    },
+                ),
+                Spec::req("ls", "List your actor's devices.", vec![], |_| {
+                    Ok(Request::DeviceList)
+                }),
+            ],
+            ..Spec::req(
+                "device",
+                "Manage the devices of your actor (multi-device identity).",
+                vec![],
+                |_| Ok(Request::DeviceList),
+            )
+        },
+        Spec::req(
+            "recover",
+            "Recover your actor with the offline recovery key: reset the device \
+             set to this device (content access re-seals once a peer syncs).",
+            vec![],
+            |_| Ok(Request::Recover),
+        ),
+        Spec::req(
+            "recover-workspace",
+            "Break-glass: re-root the WHOLE workspace to this device using the \
+             offline workspace recovery keys (threshold K-of-N), when the admins \
+             are lost or compromised. Sync from a surviving peer first. Under a \
+             group key, repeat on each holder until the threshold co-signs.",
+            vec![],
+            |_| Ok(Request::SpaceRecover),
+        ),
+        Spec::req(
+            "recover-approve",
+            "Co-sign a pending break-glass recovery as a holder of the group \
+             recovery key. You must name who you expect it to re-root to (`--to`); \
+             a request that re-roots elsewhere is refused before your share is used.",
+            vec![
+                A::pos(
+                    "session",
+                    "The recovery session id (from the initiator's `recover-workspace`).",
+                ),
+                A::multi(
+                    "to",
+                    "The actor id you expect the workspace to re-root to (repeatable).",
+                )
+                .required(),
+            ],
+            |m| {
+                Ok(Request::SpaceRecoverApprove {
+                    session: req_str(m, "session"),
+                    expect: multi(m, "to"),
+                })
+            },
+        ),
+        Spec::req(
+            "elevate-approve",
+            "Co-sign a proposed change to the recovery arrangement, as a holder \
+             of the current group key. You must name the proposal you expect \
+             (`--proposal`); a request authorizing a different one is refused \
+             before your share is used.",
+            vec![
+                A::pos(
+                    "session",
+                    "The request id (from the proposer's `elevate-recovery`).",
+                ),
+                A::val(
+                    "proposal",
+                    "The proposal id you expect this to authorize.",
+                )
+                .required(),
+            ],
+            |m| {
+                Ok(Request::SpaceElevateApprove {
+                    session: req_str(m, "session"),
+                    proposal: req_str(m, "proposal"),
+                })
+            },
+        ),
+        Spec::req(
+            "custody-export",
+            "Export your share of the group recovery key as a portable, \
+             passphrase-protected package, and verify it by reopening it. An \
+             all-holders arrangement will NOT install until every custodian has \
+             done this — a share that only your Windows account can open is one \
+             profile loss from gone. Store the file where the passphrase cannot \
+             also be found.",
+            vec![
+                A::pos("path", "Where to write the package."),
+                A::val("passphrase", "Passphrase protecting the package (min 12 chars).")
+                    .required(),
+            ],
+            |m| {
+                Ok(Request::SpaceCustodyExport {
+                    path: req_str(m, "path"),
+                    passphrase: req_str(m, "passphrase"),
+                })
+            },
+        ),
+        Spec::req(
+            "custody-import",
+            "Restore your share of the group recovery key from a package written \
+             by `custody-export` — after losing the account or machine that held \
+             it. Refuses to overwrite a share this device can already read unless \
+             you pass `--force`.",
+            vec![
+                A::pos("path", "The package to restore from."),
+                A::val("passphrase", "The passphrase the package was written with.").required(),
+                A::flag("force", "Replace a share this device can already read."),
+            ],
+            |m| {
+                Ok(Request::SpaceCustodyImport {
+                    path: req_str(m, "path"),
+                    passphrase: req_str(m, "passphrase"),
+                    force: flag(m, "force"),
+                })
+            },
+        ),
+        Spec::req(
+            "elevate-recovery",
+            "Elevate the workspace recovery authority from your solo bootstrap key \
+             to a K-of-N group key (dealer-free FROST DKG), sharing the recovery \
+             burden with co-founders. Run where space-recovery.key lives; the \
+             co-founders must already be admitted members.",
+            vec![
+                A::pos_multi(
+                    "cofounders",
+                    "Co-founder device keys to share the recovery authority with.",
+                ),
+                A::val(
+                    "threshold",
+                    "Signatures required to recover (K). Defaults to all holders (N-of-N).",
+                )
+                .default("0"),
+            ],
+            |m| {
+                Ok(Request::SpaceElevate {
+                    cofounders: multi(m, "cofounders"),
+                    k: u64_arg(m, "threshold")? as u16,
+                })
+            },
+        ),
         Spec::req(
             "activity",
             "Workspace-wide recent transitions.",
@@ -1241,33 +1417,48 @@ pub fn specs() -> Vec<Spec> {
         Spec::req("status", "Show node and space status.", vec![], |_| {
             Ok(Request::Status)
         }),
-        Spec::special(
-            "invite",
-            "Print a base32 ticket (+ QR) others use to join your space.",
-            vec![
-                A::val(
-                    "email",
-                    "Open your mail client with a prefilled invite to this address.",
-                ),
-                A::flag(
-                    "require_approval",
-                    "Mint a pass-less ticket: the joiner lands as a pending request.",
-                )
-                .long("require-approval")
-                .conflicts(&["reusable", "ttl_hours"]),
-                A::flag(
-                    "reusable",
-                    "Let one ticket admit your whole team until it expires.",
-                ),
-                A::val(
-                    "ttl_hours",
-                    "Hours until the pass expires (default 168 = 7 days).",
-                )
-                .long("ttl-hours")
-                .value_name("HOURS"),
-            ],
-            Special::Invite,
-        ),
+        Spec {
+            subs: vec![Spec::req(
+                "revoke",
+                "Revoke an invite so it can no longer admit anyone (admin only).",
+                vec![A::pos(
+                    "invite",
+                    "The invite ticket, or its 32-hex nonce.",
+                )],
+                |m| {
+                    Ok(Request::InviteRevoke {
+                        invite: req_str(m, "invite"),
+                    })
+                },
+            )],
+            ..Spec::special(
+                "invite",
+                "Print a base32 ticket (+ QR) others use to join your space.",
+                vec![
+                    A::val(
+                        "email",
+                        "Open your mail client with a prefilled invite to this address.",
+                    ),
+                    A::flag(
+                        "require_approval",
+                        "Mint a pass-less ticket: the joiner lands as a pending request.",
+                    )
+                    .long("require-approval")
+                    .conflicts(&["reusable", "ttl_hours"]),
+                    A::flag(
+                        "reusable",
+                        "Let one ticket admit your whole team until it expires.",
+                    ),
+                    A::val(
+                        "ttl_hours",
+                        "Hours until the pass expires (default 168 = 7 days).",
+                    )
+                    .long("ttl-hours")
+                    .value_name("HOURS"),
+                ],
+                Special::Invite,
+            )
+        },
         Spec::special(
             "join",
             "Join a space from an invite link (creates the store here, or at --dir).",

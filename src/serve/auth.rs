@@ -3,9 +3,8 @@
 //!
 //! [`crate::control`] has never carried authentication, and correctly so: a Unix
 //! socket is gated by filesystem permissions and a Windows named pipe by its
-//! DACL, so *being able to open the channel* *is* the credential. Every Layer-B
-//! client to date (CLI, TUI, MCP) inherited that for free by being a local
-//! process.
+//! DACL, so *being able to open the channel* *is* the credential. Native clients
+//! inherit that protection by being local processes.
 //!
 //! An HTTP port inherits none of it. Two distinct callers appear the moment the
 //! same façade is bound to a socket the network stack will route:

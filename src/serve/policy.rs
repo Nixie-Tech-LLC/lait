@@ -9,7 +9,7 @@ use crate::control::Request;
 
 /// Whether `req` only reads.
 ///
-/// An **allowlist**, and the direction matters. `Request` is add-only (S§9 rule 1),
+/// An **allowlist**, and the direction matters. `Request` fields are add-only,
 /// so a verb added after this was written must default to "not a read" — refused
 /// for an identity that isn't ours — rather than quietly inherit permission. The
 /// match is exhaustive rather than `_ => false` for the same reason: a new variant
@@ -32,6 +32,8 @@ pub fn is_read(req: &Request) -> bool {
         | Request::Members
         | Request::MemberLog
         | Request::MemberRequests
+        | Request::DeviceInvite
+        | Request::DeviceList
         | Request::Status
         | Request::Diagnose { .. }
         | Request::Id
@@ -68,6 +70,19 @@ pub fn is_read(req: &Request) -> bool {
         | Request::MemberApprove { .. }
         | Request::MemberAlias { .. }
         | Request::KeyRotate
+        | Request::InviteRevoke { .. }
+        | Request::DeviceAdd { .. }
+        | Request::DeviceRevoke { .. }
+        | Request::Recover
+        | Request::SpaceRecover
+        | Request::SpaceElevate { .. }
+        | Request::SpaceRecoverApprove { .. }
+        | Request::SpaceElevateApprove { .. }
+        // …and custody, which handles a holder's own key material and a
+        // passphrase, so it belongs to the operator at the machine and not to a
+        // browser session…
+        | Request::SpaceCustodyExport { .. }
+        | Request::SpaceCustodyImport { .. }
         // …joining and inviting, which act *as* an identity on the wire…
         | Request::Invite { .. }
         | Request::Join { .. }

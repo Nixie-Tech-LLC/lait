@@ -1,4 +1,4 @@
-//! P1 end-to-end: two real nodes converge live over iroh P2P (A§8), no central
+//! End-to-end peer sync: two real nodes converge live over iroh P2P, with no central
 //! server. Pre-spawns two `lait` daemons on distinct `LAIT_HOME`s and
 //! drives them **directly over the Layer-B control channel** (`control::request`)
 //! — never shelling out to the CLI, so a captured child process can't inherit a
@@ -124,9 +124,9 @@ fn req(home: &Path, r: Request) -> Response {
 /// uninitialized store — so every founder home goes through this first.
 fn found_home(home: &Path) {
     let key = lait::config::load_or_create_identity(home).expect("identity");
-    let me = lait::ids::UserId::from_key_string(key.public().to_string());
+    let me = lait::crypto::user_from_seed(&key);
     let store = lait::store::Store::open(home).expect("store");
-    lait::tracker::found_workspace(&store, &me, "test", &lait::ids::SystemUlidSource)
+    lait::tracker::found_workspace(&store, &me, &key, "test", &lait::ids::SystemUlidSource)
         .expect("found workspace");
 }
 
@@ -136,8 +136,16 @@ fn found_home(home: &Path) {
 fn join_home(home: &Path, ticket: &str) {
     let t: lait::proto::WorkspaceTicket = ticket.parse().expect("parse ticket");
     let store = lait::store::Store::open(home).expect("store");
-    lait::tracker::join_workspace_store(&store, &t.workspace, &t.host.to_string())
-        .expect("bootstrap joiner store");
+    lait::tracker::join_workspace_store(
+        &store,
+        &t.workspace,
+        &t.salt,
+        &t.recovery_root,
+        t.founder_inception
+            .as_ref()
+            .expect("ticket carries a founding proof"),
+    )
+    .expect("bootstrap joiner store");
 }
 
 fn list_titles(home: &Path) -> Vec<String> {
@@ -261,7 +269,7 @@ fn two_nodes_converge_over_iroh() {
         "B: connect"
     );
 
-    // Workspace data is E2EE (P3): B can't read until A adds it to the ACL and
+    // Workspace data is end-to-end encrypted: B cannot read until A authorizes it and
     // seals it the workspace key. Rather than blind-sleep, wait until B has
     // actually connected to A (a real sync opportunity) — a positive proxy that's
     // both faster and more rigorous than a fixed pause — plus a small settling
@@ -343,7 +351,7 @@ fn two_nodes_converge_over_iroh() {
         "B→A: A did not converge to B's issue over P2P sync"
     );
 
-    // Lazy revocation (P3): A removes B (rotating the key), then files new
+    // Lazy revocation: A removes B (rotating the key), then files new
     // content. B keeps what it already synced but must NOT be able to read the
     // post-removal issue (encrypted under an epoch key B never receives).
     let b_id2 = match req(&b.home, Request::Id) {

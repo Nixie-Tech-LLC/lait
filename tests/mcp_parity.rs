@@ -1,6 +1,6 @@
-//! DTO / MCP parity guard (SCHEMA §1, §7.3; UI.md §8 P4).
+//! Guards parity between the versioned DTO contract and the MCP surface.
 //!
-//! The MCP tools (A§12) return the **same** versioned Layer-B `Response` DTO the
+//! The MCP tools return the **same** versioned control `Response` DTO the
 //! CLI `--json` emits, so agent and human surfaces never drift. These tests are
 //! the "check" half of "generate/check, don't hand-maintain twice": they fail
 //! the build gate if a tracker `Request` is added without a corresponding MCP
@@ -23,7 +23,7 @@ fn every_tracker_command_has_an_mcp_tool() {
         assert!(
             MCP_TOOL_NAMES.contains(cmd),
             "tracker command `{cmd}` has no MCP tool — the agent surface drifted \
-             from the Layer-B command surface (SCHEMA §7.3)"
+             from the Layer-B command surface"
         );
     }
 }
@@ -73,8 +73,8 @@ fn response_dtos_round_trip() {
         priority: Priority::High,
         assignee_summary: "you +1".into(),
         assignees: vec![
-            lait::ids::UserId::from_key_string("a".repeat(64)),
-            lait::ids::UserId::from_key_string("b".repeat(64)),
+            lait::ids::ActorId::from_incept_hash(&"a".repeat(64)),
+            lait::ids::ActorId::from_incept_hash(&"b".repeat(64)),
         ],
         tombstone: false,
         provisional: false,
@@ -119,9 +119,10 @@ fn response_dtos_round_trip() {
             labels: vec![],
             label_names: vec!["bug".into()],
             comments: vec![],
-            created_by: lait::ids::UserId::from_key_string("a".repeat(64)),
+            created_by: lait::ids::ActorId::from_incept_hash(&"a".repeat(64)),
             created_at: 1000,
             provisional: false,
+            corrupt_records: vec![],
         })),
         Response::Activity {
             events: vec![ActivityEvent {
@@ -176,9 +177,10 @@ fn issue_response_status_field_survives_the_kind_tag() {
         labels: vec![],
         label_names: vec![],
         comments: vec![],
-        created_by: lait::ids::UserId::from_key_string("a".repeat(64)),
+        created_by: lait::ids::ActorId::from_incept_hash(&"a".repeat(64)),
         created_at: 0,
         provisional: false,
+        corrupt_records: vec![],
     }));
     let json = serde_json::to_string(&resp).unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();

@@ -1,13 +1,13 @@
-//! Local materialized index (SCHEMA §3 "local cache"): the `KEY-n` alias table
-//! and ref resolution. Never synced — rebuilt from the Catalog on load. All
-//! three surfaces share this one grammar, resolved **daemon-side** (UI.md §3).
+//! Local materialized index for `KEY-n` aliases and reference resolution.
+//! It is never synced and is rebuilt from the catalog on load. Every client
+//! uses this grammar, which the daemon resolves.
 //!
 //! - The **canonical** handle is a short `DocId` prefix (`iss_3f9`), collision-
-//!   free by construction (S§5.4).
+//!   free by construction.
 //! - `KEY-n` (`ENG-142`) is an advisory alias that **may collide**; colliding
-//!   docs disambiguate by a deterministic suffix (`ENG-142b`) (S§5.4).
+//!   documents disambiguate with a deterministic suffix (`ENG-142b`).
 //! - Resolution can return **zero, one, or many** — ambiguity is a first-class
-//!   outcome with a candidate list (UI.md §3.2), never a crash.
+//!   outcome with a candidate list, never a crash.
 
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Bound::{Excluded, Unbounded};
@@ -30,9 +30,9 @@ pub fn canonical_reff(doc_id: &DocId) -> String {
 
 /// The `KEY-n` alias table + canonical-handle table, built from the Catalog.
 /// Handles `KEY-n` collisions with a deterministic suffix, and computes each
-/// doc's **shortest-unique** canonical `iss_` prefix (S§5.4, git-style).
+/// document's **shortest-unique** canonical `iss_` prefix, Git-style.
 ///
-/// **Incremental (A§9 "Linear-grade devex").** The externally-observed outputs
+/// **Incremental.** The externally observed outputs
 /// (`by_doc`/`by_alias`/`canonical`) are a pure function of `{DocId set, each
 /// doc's projectId, each doc's seq}` — nothing an *edit* changes. So the table
 /// is maintained per changed doc via [`reconcile_doc`](Self::reconcile_doc) /
@@ -191,7 +191,7 @@ impl AliasTable {
     }
 
     /// Rewrite every alias in a `(project, seq)` group: sorted-first keeps the
-    /// bare `KEY-n`, the rest get deterministic suffixes `b`, `c`, … (S§5.4).
+    /// bare `KEY-n`; the rest get deterministic suffixes `b`, `c`, and so on.
     fn reassign_group(&mut self, gk: &(String, u32), key: &str) {
         let seq = gk.1;
         let mut docs = self.groups.get(gk).cloned().unwrap_or_default();
@@ -246,7 +246,7 @@ fn project_key(catalog: &CatalogDoc, project_id: &str) -> Option<String> {
         .map(|p| p.key)
 }
 
-/// `1 -> "b", 2 -> "c", …, 25 -> "z", 26 -> "aa"` (collision suffix, S§5.4).
+/// `1 -> "b", 2 -> "c", …, 25 -> "z", 26 -> "aa"` collision suffix.
 fn suffix(i: usize) -> String {
     // i starts at 1 for the first collision (the 0th keeps the bare alias).
     let mut n = i; // 1-based: i==1 is the first collision → "b"
@@ -264,7 +264,7 @@ fn suffix(i: usize) -> String {
     s
 }
 
-/// Outcome of resolving a `<ref>` (UI.md §3.2).
+/// Outcome of resolving a `<ref>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefResolution {
     One(DocId),
@@ -390,7 +390,7 @@ fn finalize(catalog: &CatalogDoc, aliases: &AliasTable, mut matches: Vec<DocId>)
         1 => RefResolution::One(matches.remove(0)),
         // Many: present each candidate with its canonical handle (already 7
         // chars — astronomically unique; a genuine Many only arises from
-        // too-short manual input, UI.md §3.2) plus its alias + title.
+        // too-short manual input) plus its alias and title.
         _ => RefResolution::Many(
             matches
                 .iter()
@@ -442,7 +442,7 @@ pub struct KnownUser {
 }
 
 /// Outcome of resolving a `<userref>` against the directory — the user-plane twin
-/// of [`RefResolution`]. Ambiguity is first-class (UI.md §3.2).
+/// of [`RefResolution`]. Ambiguity is a first-class outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserResolution {
     One(UserId),
@@ -454,13 +454,13 @@ pub enum UserResolution {
 /// enough to rarely collide across a workspace's handful of members).
 const USER_PREFIX_MIN: usize = 4;
 
-/// Resolve a `<userref>` (UI.md §3.1) against a directory: `@me`/`me`; a full
+/// Resolve a `<userref>` against a directory: `@me` or `me`; a full
 /// 64-hex ed25519 key; a locally-set **alias** (case-insensitive, exact); or a
-/// **key id-prefix** (≥ [`USER_PREFIX_MIN`] hex chars). Alias and prefix are
+/// **key id-prefix** (at least `USER_PREFIX_MIN` hex chars). Alias and prefix are
 /// matched against `dir`, whose names come only from the local alias store — a
 /// self-asserted wire nick is never a resolution input. A full key always
 /// resolves even when absent from `dir`. Multiple distinct hits return `Many` so
-/// the caller can show a candidate list (UI.md §3.2). Alias is tried before
+/// the caller can show a candidate list. Alias is tried before
 /// prefix; the first stage to hit wins.
 pub fn resolve_user_dir(input: &str, me: &UserId, dir: &[KnownUser]) -> UserResolution {
     let input = input.trim();
@@ -515,7 +515,7 @@ pub fn resolve_user_dir(input: &str, me: &UserId, dir: &[KnownUser]) -> UserReso
 }
 
 /// A `Row`-ready view: whether a row should be hidden by default (done or
-/// tombstoned) — used by `ls`/`board` filtering (UI.md §2.2).
+/// tombstoned), used by `ls` and `board` filtering.
 pub fn is_hidden_by_default(catalog: &CatalogDoc, row: &RowMeta) -> bool {
     if row.tombstone {
         return true;
@@ -562,7 +562,8 @@ mod tests {
             project_id: p.clone(),
             title: title.into(),
             priority: Priority::Medium,
-            created_by: test_user(),
+            created_by: crate::ids::ActorId::from_incept_hash(&"a".repeat(64)),
+            committed_by: test_user(),
             created_at: 1,
             body: None,
             peer: None,

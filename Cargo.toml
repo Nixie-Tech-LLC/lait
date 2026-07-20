@@ -1,3 +1,11 @@
+[workspace]
+members = ["crates/lait-kernel", "crates/lait-engine"]
+# Pin resolver 2 explicitly: the release binary's non-linkage of the dev-only
+# `test-utils` feature (which would flip presets::N0 from prod to staging relays)
+# depends on it, and must not silently regress to v1 if this ever becomes a
+# virtual workspace.
+resolver = "2"
+
 [package]
 name = "lait"
 version = "0.5.2"
@@ -58,27 +66,32 @@ name = "lait"
 path = "src/main.rs"
 
 [dependencies]
-# Loro CRDT — the storage/truth layer (Layer A). Issue docs + the catalog doc.
-loro = "=1.13.6"
+# lait's roots — identity, trust regimes, derivation rules. Depends on no
+# scaffold; re-exported at this crate's root so the app layer reaches it by its
+# historical paths (`crate::acl`, `lait::ids`, …).
+lait-kernel = { path = "crates/lait-kernel" }
+# The engine — Loro sealed behind typed wrappers. The app depends on this, not on
+# Loro: `loro` is intentionally absent from THIS manifest, so `loro::*` cannot be
+# named in the app layer. The seal is the dependency edge.
+lait-engine = { path = "crates/lait-engine" }
+# object-safe async trait methods for the lait-owned transport seam (crate::transport).
+async-trait = "0.1"
 # randomness for ULID minting (app-minted DocId/ProjectId/… ids).
 getrandom = "0.3"
 
 # Terminal rendering for the inline `lait members` picker (`members_ui`), and the
 # width probe the invite QR uses. The full-screen TUI these were introduced for is
-# gone — the browser is the interactive surface now (docs/SERVE.md) — but the
+# gone — the browser is the interactive surface now (`docs/UI.md`) — but the
 # members picker is a CLI ergonomic in its own right, so both stay.
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 
-# E2EE (P3) — all pure-Rust (RustCrypto/dalek), no C toolchain, no aws-lc:
-# ed25519 signing for the ACL op-graph, X25519 sealed boxes for workspace-key
-# distribution (ed25519→x25519 conversion), ChaCha20-Poly1305 AEAD for the
-# encrypted sync payloads (the blind-relay envelope).
-ed25519-dalek = "2"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-curve25519-dalek = "4"
-chacha20poly1305 = "0.10"
-sha2 = "0.10"
+# E2EE (P3) is the KERNEL's job now: ed25519 signing, X25519 sealed boxes, and
+# the ChaCha20-Poly1305 envelope all live in `lait-kernel::crypto`, which is the
+# only crate that names those primitives. The app deliberately lists NONE of
+# them, so reaching around the kernel to hand-roll a key derivation does not
+# compile — the same manifest-edge enforcement that seals Loro into lait-engine.
+# (`ed25519-dalek` remains a dev-dependency: interop tests forge raw keys.)
 # iroh core + gossip (the room/announce transport). iroh-blobs returns at P2 for
 # snapshots/attachments. All pin iroh =1.0.0-rc.1.
 iroh = "=1.0.0-rc.1"
@@ -133,7 +146,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 # at compile time, which is why the built bundle is COMMITTED and lives under
 # `src/` rather than in the excluded `viewer/`: `cargo install lait` must not need
 # npm (same reproducibility bar `build.rs` holds by never shelling out to git),
-# and the published crate drops `viewer/` entirely. See docs/SERVE.md.
+# and the published crate drops `viewer/` entirely. See `docs/UI.md`.
 include_dir = "0.7"
 
 # mcp server (stdio)
@@ -166,9 +179,31 @@ libc = "0.2"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
+    # `secretfs`: secrets are created with an explicit owner-only DACL rather
+    # than inheriting the parent's. std gives us no way to do that — there is no
+    # `DirBuilderExt` on Windows, and `OpenOptionsExt` exposes only CreateFileW's
+    # access/share/flags bits (`lpSecurityAttributes` is hardcoded null) — so the
+    # secret paths call CreateFileW/CreateDirectoryW directly.
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Memory",
+    # DPAPI wrap for device-bound secrets (never for portable recovery keys).
+    "Win32_Security_Cryptography",
 ] }
 
 [dev-dependencies]
+# Raw crypto primitives are TEST-ONLY at this layer: `identity_interop.rs` and
+# `frost_interop.rs` forge keys and drive ceremony rounds against the kernel's
+# public surface, which is exactly the kind of adversarial construction that has
+# to reach past `lait-kernel::crypto`. Production code goes through the kernel.
+ed25519-dalek = "2"
+frost-ed25519 = "3"
+rand_core = { version = "0.6", features = ["getrandom"] }
+# in-process relay + DNS/pkarr servers for hermetic multi-node tests (crate::net).
+# The `test-utils` feature is dev-only, so the shipped binary never links it.
+iroh = { version = "=1.0.0-rc.1", features = ["test-utils"] }
+# insecure-cert TLS for the in-process test relay (self-signed) — test-only.
+iroh-relay = { version = "=1.0.0-rc.1", features = ["test-utils"] }
 # property-based convergence testing (random op sequences across N peers).
 proptest = "1"
 # `ServiceExt::oneshot` — drive `serve`'s real router in-process, so the gate's
@@ -190,6 +225,16 @@ tar = "0.4"
 zip = { version = "6", default-features = false, features = ["deflate"] }
 
 # The profile that 'dist' will build with
+# Tests build with the `test` profile, which inherits `dev` — i.e. unoptimized.
+# That is fine for our own code (fast rebuilds, real debug info) but brutal for
+# the crypto: curve25519-dalek/frost-ed25519 run 10–50x slower unoptimized, and
+# the ceremony tests drive real DKG + threshold-signing rounds. Optimizing only
+# *dependencies* keeps workspace compile times and debuggability intact while
+# making those tests finish in seconds instead of minutes — the difference
+# between fitting nextest's terminate-after budget and being killed by it.
+[profile.dev.package."*"]
+opt-level = 3
+
 [profile.dist]
 inherits = "release"
 lto = "thin"

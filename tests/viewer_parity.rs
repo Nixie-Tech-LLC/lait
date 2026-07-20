@@ -8,7 +8,7 @@
 //! routes into one hand-written type file.
 //!
 //! What makes that a correctness problem rather than a tidiness one: nothing in
-//! `src/` uses `deny_unknown_fields`, and it shouldn't — S§9's add-only rule is what
+//! `src/` uses `deny_unknown_fields`, and it should not: add-only fields are what
 //! lets a newer client talk to a daemon that is stale across `lait update`. So a
 //! field the TS invents is **silently dropped**, and the daemon does something
 //! plausible with the rest.
@@ -131,7 +131,7 @@ fn types_ts() -> Option<String> {
 /// silently discarded.
 ///
 /// The reverse is *not* asserted: `types.ts` deliberately omits fields (and whole
-/// verbs) the browser has no surface for, and S§9's add-only rule means a Rust
+/// verbs) the browser does not expose, and the add-only field rule means a Rust
 /// field the client never sends is exactly what forward compatibility looks like.
 #[test]
 fn the_ts_client_invents_no_fields() {
@@ -159,7 +159,7 @@ fn the_ts_client_invents_no_fields() {
             assert!(
                 rust_fields.contains(field),
                 "types.ts declares `{field}` on `{cmd}`, but control::Request does not.\n\
-                 serde ignores unknown fields (deliberately — S§9 add-only), so this \
+                 serde ignores unknown fields deliberately for forward compatibility, so this \
                  would be dropped in flight and the command would run without it.\n\
                  Rust has: {rust_fields:?}",
             );

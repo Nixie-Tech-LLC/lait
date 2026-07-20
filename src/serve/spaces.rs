@@ -8,7 +8,7 @@
 //!
 //! Two invariants shape it.
 //!
-//! **Never spawn what you were not asked for.** [`list`] answers the picker by
+//! **Never spawn what you were not asked for.** `SpaceDirectory::list` answers the picker by
 //! probing (a short-timeout [`Request::Status`] that fails closed to `idle`),
 //! never by starting anything: opening the browser must not wake every daemon a
 //! user has ever registered. A space's daemon starts only when that space is
@@ -34,7 +34,7 @@ use crate::workspaces::{self, StorePresence, WorkspaceEntry};
 /// The tab holds one `EventSource` over N attached spaces, so the space id is the
 /// demultiplexing key. Flattened so the wire shape is a [`Doorbell`] plus one
 /// field — the browser re-reads the authoritative projection for each dirty
-/// scope exactly as the TUI does (UI.md §4.2); this is still a dirty *flag*, not
+/// scope according to the shared subscription contract; this is still a dirty *flag*, not
 /// state.
 #[derive(Debug, Clone, Serialize)]
 pub struct SpaceDoorbell {
@@ -271,7 +271,7 @@ impl Supervisor {
         // Bounded: a lagging tab must not let the daemon's dirty-set pin memory.
         // A dropped frame is recoverable by construction — the receiver sees
         // `Lagged`, and the contract for that is the same `reset` rebaseline the
-        // TUI already performs on an epoch change (UI.md §4.1).
+        // Every subscription consumer rebaselines after an epoch change.
         let (doorbells, _) = broadcast::channel(256);
         Self {
             identity,
@@ -464,7 +464,7 @@ impl Supervisor {
             // notices a dead pump when something asks it to attach, and the thing
             // that would ask is a re-read triggered by a doorbell that is never
             // coming. A `reset` is precisely "your position is invalid, rebaseline
-            // from a fresh snapshot" (UI.md §4.1) — so the client re-reads, the
+            // from a fresh snapshot, so the client re-reads while the
             // re-read attaches, and attaching revives the stream. The loop closes
             // itself without this task knowing anything about repair.
             let _ = tx.send(SpaceDoorbell {

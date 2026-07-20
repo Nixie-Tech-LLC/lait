@@ -10,8 +10,8 @@
 //!
 //! Storage: `home/inbox.json`, the `seeds.json` local-state pattern — a small
 //! whole-file atomic rewrite beside the store, never synced, corrupt/missing
-//! degrades to empty. Bounded to the newest [`INBOX_CAP`] entries; the read
-//! watermark is a wall-clock ts (advisory ordering, S§2 — fine for display).
+//! degrades to empty. Bounded to the newest `INBOX_CAP` entries; the read
+//! watermark is a wall-clock timestamp used only for advisory display ordering.
 
 use std::path::{Path, PathBuf};
 
