@@ -68,20 +68,33 @@ pub struct Dealing {
     shares: BTreeMap<LeafId, Scalar>,
 }
 
+/// What signing needs from a key: the group public key and the caller's own
+/// share of each leaf it operates. Deliberately does **not** expose the secret —
+/// dealer-free generation (D2) produces a value with no secret to expose, and
+/// signing must work identically whether the shares came from a test dealer or a
+/// real DKG.
+pub trait KeyShares {
+    /// The group public key `Y = xG`, compressed.
+    fn public_key(&self) -> [u8; 32];
+    /// This holder's share for `leaf`, if it operates it.
+    fn share(&self, leaf: &LeafId) -> Option<Scalar>;
+}
+
 impl Dealing {
-    /// The public key `Y = xG`, compressed.
-    pub fn public_key(&self) -> [u8; 32] {
-        self.public.compress().to_bytes()
-    }
-    /// A leaf's share, for a signer that holds it.
-    pub fn share(&self, leaf: &LeafId) -> Option<Scalar> {
-        self.shares.get(leaf).copied()
-    }
     /// The dealt secret `x`. A real deployment never materializes this — it is
     /// the very thing D2's dealer-free generation exists to avoid. Exposed here
     /// only so tests can check that qualified reconstruction recovers it.
     pub fn secret_for_test(&self) -> Scalar {
         self.secret
+    }
+}
+
+impl KeyShares for Dealing {
+    fn public_key(&self) -> [u8; 32] {
+        self.public.compress().to_bytes()
+    }
+    fn share(&self, leaf: &LeafId) -> Option<Scalar> {
+        self.shares.get(leaf).copied()
     }
 }
 
@@ -221,19 +234,19 @@ fn sign_share(
 ///
 /// A real session distributes these rounds over the ceremony board with the
 /// nonce lifecycle of [`crate::dkg::PendingNonce`]; this is the local algebra.
-pub fn sign_qualified(
+pub fn sign_qualified<K: KeyShares>(
     witness: &ReconstructionWitness,
-    dealing: &Dealing,
+    key: &K,
     nonces: &BTreeMap<LeafId, Nonce>,
     commitments: &[(LeafId, Commitment)],
     msg: &[u8],
 ) -> Option<Signature> {
-    let y = dealing.public_key();
+    let y = key.public_key();
     let (r, _) = group_nonce(msg, commitments);
     let mut z = Scalar::ZERO;
     for (leaf, coeff) in witness.leaves.iter().zip(&witness.coefficients) {
         let nonce = nonces.get(leaf)?;
-        let share = dealing.share(leaf)?;
+        let share = key.share(leaf)?;
         z += sign_share(
             leaf,
             nonce,
