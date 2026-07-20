@@ -14,13 +14,13 @@ use iroh::{endpoint::presets, Endpoint, RelayMap, RelayMode, RelayUrl, SecretKey
 use iroh_relay::tls::CaRootsConfig;
 use lait::net::Network;
 use lait::transport::iroh::IrohTransport;
-use lait::transport::{Alpn, GossipEvent, Topic, Transport};
+use lait::transport::{Alpn, GossipEvent, Transport};
 
 // The real ALPNs, not copies: an epoch bump is a production concern, and a
 // transport test that pins its own spelling of one stops exercising the ALPN
 // the daemon will actually negotiate.
 const SYNC_ALPN: Alpn = lait::sync::SYNC_ALPN;
-const PRESENCE_ALPN: Alpn = lait::node::PRESENCE_ALPN;
+const PRESENCE_ALPN: Alpn = lait::presence::PRESENCE_ALPN;
 
 fn device(seed: u8) -> lait::ids::DeviceId {
     lait::crypto::device_from_seed(&[seed; 32])
@@ -255,7 +255,7 @@ async fn wait_closed_parks_until_dialer_drops() {
 #[tokio::test]
 async fn gossip_room_roundtrip() {
     let (a, b) = isolated_pair(7, 8, &[]).await;
-    let topic = Topic(*lait::proto::topic_for_space("gossip-test").as_bytes());
+    let topic = lait::proto::topic_for_space("gossip-test");
     let a_id = a.my_id();
 
     let (_b_send, mut b_recv) = b.subscribe(topic, &[]).await.expect("B subscribes");

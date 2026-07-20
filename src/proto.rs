@@ -7,20 +7,19 @@
 //! authenticity is now lait's, so a message's author is a lait [`DeviceId`], not an
 //! iroh key, and the primitive is the same one the trust planes use.)
 //!
-//! iroh's own types appear here only where they *are* the transport: the gossip
-//! `TopicId` and the host `EndpointId` in a ticket. Identity and authenticity are
-//! lait's.
+//! No concrete transport type is named here. A room selector is the transport
+//! seam's opaque [`Topic`]; this module owns only the rule that derives one from
+//! a space id, and a ticket's host is a lait [`DeviceId`] like every other
+//! identity.
 
 use std::{fmt, str::FromStr};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use iroh::EndpointId;
-use iroh_gossip::proto::TopicId;
 use serde::{Deserialize, Serialize};
 use serde_byte_array::ByteArray;
 
-use crate::ids::DeviceId;
+use crate::{ids::DeviceId, transport::Topic};
 
 /// An ed25519 signature is 64 bytes.
 const SIGNATURE_LENGTH: usize = 64;
@@ -31,17 +30,6 @@ type SignatureBytes = ByteArray<SIGNATURE_LENGTH>;
 /// not liftable into an invite, and vice-versa.
 const GOSSIP_DOMAIN: &[u8] = b"lait/gossip/1";
 const INVITE_DOMAIN: &[u8] = b"lait/invite/1";
-
-/// The `EndpointId` (transport id) of a lait `DeviceId` — the same 32 bytes, so a
-/// gossip message's lait-signed author resolves to the peer to dial back.
-fn endpoint_of(device: &DeviceId) -> Result<EndpointId> {
-    let raw = data_encoding::HEXLOWER_PERMISSIVE
-        .decode(device.as_str().as_bytes())
-        .ok()
-        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
-        .context("author is not a 32-byte key")?;
-    EndpointId::from_bytes(&raw).context("author is not a valid endpoint id")
-}
 
 /// Derive the gossip topic id from the space id. The topic is a pure
 /// function of the genesis identity — there is no user-settable network name,
@@ -55,11 +43,33 @@ fn endpoint_of(device: &DeviceId) -> Result<EndpointId> {
 /// node.rs). v2 carried the domain/space-bound signatures; v3 carries the
 /// space-vocabulary flag day, partitioning v0.5.x nodes onto a topic no v0.6
 /// node subscribes to.
-pub fn topic_for_space(space: &str) -> TopicId {
+pub fn topic_for_space(space: &str) -> Topic {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"lait/topic/v3");
     hasher.update(space.as_bytes());
-    TopicId::from_bytes(*hasher.finalize().as_bytes())
+    Topic(*hasher.finalize().as_bytes())
+}
+
+/// Serde for a [`DeviceId`] as the raw 32 bytes of the ed25519 key it *is*.
+///
+/// A ticket is a single copy-paste line, and its host field is the largest fixed
+/// cost in it. Spelling the key as its 64 hex characters would double that field
+/// and lengthen every invite link ever sent, for an identity that has not
+/// changed by one bit.
+mod device_id_bytes {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use crate::ids::DeviceId;
+
+    pub fn serialize<S: Serializer>(id: &DeviceId, s: S) -> Result<S::Ok, S::Error> {
+        id.key_bytes()
+            .ok_or_else(|| serde::ser::Error::custom("host is not a 32-byte device key"))?
+            .serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<DeviceId, D::Error> {
+        Ok(DeviceId::from_key_bytes(&<[u8; 32]>::deserialize(d)?))
+    }
 }
 
 /// Length of an invite nonce — a random single-use id (128 bits).
@@ -229,9 +239,9 @@ impl SignedMessage {
     /// Verify the signature and decode the inner payload. `space` is the
     /// receiver's own space: the signature is bound to it, so a message signed
     /// for a different topic fails here — closing cross-space replay of
-    /// presence/join gossip. Returns the sender's transport id (the same 32 bytes
-    /// as its lait author) so the caller can dial it back over gossip.
-    pub fn verify_and_decode(space: &str, bytes: &[u8]) -> Result<(EndpointId, Payload)> {
+    /// presence/join gossip. Returns the author's device id, which is also the
+    /// peer to dial back — a device *is* its key.
+    pub fn verify_and_decode(space: &str, bytes: &[u8]) -> Result<(DeviceId, Payload)> {
         let signed: Self = postcard::from_bytes(bytes).context("decode signed message")?;
         if !crate::sigdag::verify_message(
             GOSSIP_DOMAIN,
@@ -243,7 +253,7 @@ impl SignedMessage {
             anyhow::bail!("invalid signature");
         }
         let payload: Payload = postcard::from_bytes(&signed.data).context("decode payload")?;
-        Ok((endpoint_of(&signed.from)?, payload))
+        Ok((signed.from, payload))
     }
 
     /// Sign and encode a payload for broadcast on `space`'s topic, using the
@@ -263,6 +273,12 @@ impl SignedMessage {
     }
 }
 
+/// The [`SpaceTicket`] wire format this build mints and accepts. It is the
+/// ticket's first byte, checked before any field is decoded, so an invite from a
+/// different epoch is refused by name instead of decoding into plausible
+/// nonsense. Bump it for any change to the ticket's shape or field meanings.
+pub const TICKET_VERSION: u8 = 1;
+
 /// A compact, base32-encoded invite to join a space. It carries only what a
 /// joiner cannot derive on its own: the space id (the topic is
 /// `topic_for_space(space)` and the genesis trust anchor),
@@ -280,7 +296,10 @@ pub struct SpaceTicket {
     /// The space's display name at mint time (cosmetic; the synced catalog
     /// value is authoritative once it arrives).
     pub name: String,
-    pub host: EndpointId,
+    /// The host to dial, and the recipient a pre-authorization is sealed to.
+    /// Carried as the key's raw 32 bytes; see [`device_id_bytes`].
+    #[serde(with = "device_id_bytes")]
+    pub host: DeviceId,
     /// Nick of the host who minted this ticket (for one-step `connect`).
     pub host_nick: String,
     /// The salt that, with the founding device, derives `space`
@@ -317,7 +336,7 @@ pub struct SpaceTicket {
 
 impl SpaceTicket {
     /// The gossip topic this ticket joins (derived from the space id).
-    pub fn topic(&self) -> TopicId {
+    pub fn topic(&self) -> Topic {
         topic_for_space(&self.space)
     }
 
@@ -327,9 +346,22 @@ impl SpaceTicket {
     }
 
     fn to_bytes(&self) -> Vec<u8> {
-        postcard::to_stdvec(self).expect("postcard::to_stdvec is infallible")
+        let mut out = vec![TICKET_VERSION];
+        out.extend_from_slice(&postcard::to_stdvec(self).expect("a ticket always encodes"));
+        out
     }
     fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        // The version is read and checked before one other byte is trusted.
+        // Postcard is not self-describing, so a ticket from another epoch does
+        // not fail to decode — it decodes into fields that look plausible and
+        // are wrong. Refusing by version turns that into one legible sentence.
+        let (&version, bytes) = bytes.split_first().context("that invite is empty")?;
+        if version != TICKET_VERSION {
+            anyhow::bail!(
+                "that invite is from an older lait and this one cannot read it.\n\
+                 ask whoever sent it for a fresh one with `lait invite`."
+            );
+        }
         // Same reason as the base32 step: postcard's own words ("Hit the end of
         // buffer, expected more data") describe our wire format, not the user's
         // mistake, and used to be printed under the good advice instead of it.
@@ -340,8 +372,8 @@ impl SpaceTicket {
                  ask for a fresh one with `lait invite`."
             )
         })?;
-        // Postcard has no schema: an old-format ticket can decode "successfully"
-        // into garbage fields. The space id shape is the cheap integrity check.
+        // A matching version byte is not proof on its own — one byte in 256
+        // agrees by accident — so the space id shape stays as the second check.
         if !t.space.starts_with("ws_") {
             anyhow::bail!(
                 "decode space ticket: not a valid space id (this invite may be from an older lait — ask for a fresh one)"
@@ -391,8 +423,33 @@ impl FromStr for SpaceTicket {
 mod tests {
     use super::*;
 
-    fn host_key() -> EndpointId {
-        endpoint_of(&crate::crypto::device_from_seed(&[7u8; 32])).unwrap()
+    fn host_key() -> DeviceId {
+        crate::crypto::device_from_seed(&[7u8; 32])
+    }
+
+    /// A `SpaceTicket` exactly as the build before the transport cutover minted
+    /// it: the sample below, postcard-encoded, with the host spelled in the
+    /// network's own key type. Two obligations ride on it.
+    ///
+    /// The host was 32 raw bytes at offset 35 and must stay 32 raw bytes there:
+    /// the identity did not change, so the wire must not grow. And the whole
+    /// blob must now be *refused* — it carries no version byte, and the byte it
+    /// starts with instead is the space id's length.
+    const PRE_CUTOVER_TICKET: &str = concat!(
+        "1d77735f3030303030303030303030303030303030303030303030303030",
+        "0464656d6f",
+        "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+        "05616c696365",
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    );
+    /// Where the host key starts in that encoding: the space id and the display
+    /// name, each with its length prefix.
+    const HOST_OFFSET: usize = 35;
+
+    fn pre_cutover_bytes() -> Vec<u8> {
+        data_encoding::HEXLOWER
+            .decode(PRE_CUTOVER_TICKET.as_bytes())
+            .unwrap()
     }
 
     /// A bad invite is the most likely thing to go wrong on a new joiner's very
@@ -480,6 +537,48 @@ mod tests {
         assert!(
             format!("{err:#}").contains("older lait"),
             "error should carry the stale-invite hint, got: {err:#}"
+        );
+    }
+
+    /// The host field is 32 raw bytes and stays exactly where it was. A round
+    /// trip through the current code cannot show this — it would agree with
+    /// itself about any encoding — so the comparison is against bytes an
+    /// earlier build produced.
+    #[test]
+    fn the_ticket_host_is_still_thirty_two_raw_bytes() {
+        let legacy = pre_cutover_bytes();
+        let legacy_host = &legacy[HOST_OFFSET..HOST_OFFSET + 32];
+        assert_eq!(
+            legacy_host,
+            host_key().key_bytes().unwrap(),
+            "the fixture's host must be the key the sample names"
+        );
+
+        let minted = sample().to_bytes();
+        // One version byte ahead of where it used to sit, and not a byte wider.
+        assert_eq!(&minted[1 + HOST_OFFSET..1 + HOST_OFFSET + 32], legacy_host);
+        assert_eq!(
+            minted.len(),
+            legacy.len() + 1,
+            "the only growth in the ticket is its version byte"
+        );
+    }
+
+    /// An invite minted before the flag day is refused by version, and says so
+    /// in a sentence its holder can act on — never decoded into fields that
+    /// happen to parse.
+    #[test]
+    fn a_pre_flag_day_invite_is_refused_by_version() {
+        let mut text = data_encoding::BASE32_NOPAD.encode(&pre_cutover_bytes());
+        text.make_ascii_lowercase();
+        let err = format!("{:#}", text.parse::<SpaceTicket>().unwrap_err());
+        assert!(
+            err.contains("older lait"),
+            "the refusal must name the cause: {err}"
+        );
+        assert!(
+            err.contains("lait invite"),
+            "the refusal must name the way out: {err}"
         );
     }
 

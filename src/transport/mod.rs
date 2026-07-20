@@ -40,10 +40,28 @@ pub struct Topic(pub [u8; 32]);
 
 /// Max framed message size (64 MiB) — a guard against a malformed length.
 /// Framing policy belongs to the transport (the seam that owns the wire), so the
-/// constant lives here; `sync.rs` holds a private duplicate until PR-2 re-points
-/// it. Enforced read-side by every implementation; send-side only the
-/// `u32::try_from` overflow guard applies.
+/// constant lives here and the protocols above it send whole messages. Enforced
+/// read-side by every implementation; send-side only the `u32::try_from`
+/// overflow guard applies.
 pub const MAX_FRAME: u32 = 64 * 1024 * 1024;
+
+/// How a daemon obtains its network.
+///
+/// A factory rather than a ready-made [`Transport`], because the transport's
+/// identity must *be* the daemon's identity, and the daemon only learns its seed
+/// after opening its identity file. Handing the seed to the builder is what makes
+/// the two agree by construction; the daemon's check afterwards is what makes a
+/// factory that disagrees fail loudly instead of running with signed gossip under
+/// one key and a dialable peer under another.
+#[async_trait]
+pub trait TransportFactory: Send + Sync {
+    async fn build(
+        &self,
+        identity_seed: &[u8; 32],
+        network: &crate::net::Network,
+        alpns: &[Alpn],
+    ) -> Result<std::sync::Arc<dyn Transport>>;
+}
 
 /// What a gossip subscription yields. The daemon's `recv_loop` is written against
 /// exactly this — decode/verify a `Received`, `touch` on `NeighborUp`, mark

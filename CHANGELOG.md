@@ -49,6 +49,12 @@
   control-protocol window, so the first client contact kills and respawns it.
 - **`workspaces.json` is not read.** The space registry is `spaces.json`; it is
   navigation state and rebuilds itself on the next `init`, `join`, or daemon open.
+- **Invite links carry a version, and pre-v0.6 links are refused by it.** An older
+  invite now fails with "that invite is from an older lait" and a pointer at `lait
+  invite`, instead of decoding into plausible-looking fields — postcard is not
+  self-describing, so a stale link had no way to announce itself. The link is
+  otherwise the same length it always was: a host is still 32 raw bytes on the wire,
+  because the identity did not change even though its name did.
 
 ## v0.5.2 — the board works, history is durable, and issues have a shape
 

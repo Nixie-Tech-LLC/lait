@@ -1,11 +1,12 @@
-//! The lait daemon: owns the iroh endpoint, the gossip room, presence, the
+//! The lait daemon: owns a [`Transport`], the gossip room, presence, the
 //! Loro-CRDT replica core ([`crate::replica`]), and the local control server that
 //! CLI, web, and MCP clients drive.
 //!
-//! The iroh transport (signed-gossip room for announce/presence, a liveness
-//! probe ALPN, and daemon/control plumbing) is the networking substrate. The
-//! replica rides on top: the daemon is the **only** owner of the Loro docs, and
-//! every local interface is a control client.
+//! The daemon is the transport's **consumer**, never its implementation: it
+//! dials, gossips and accepts in lait's own vocabulary, so the network it runs
+//! over is a constructor argument. The replica rides on top: the daemon is the
+//! **only** owner of the Loro docs, and every local interface is a control
+//! client.
 //!
 //! **Doorbells.** A mutation produces a
 //! [`crate::replica::DirtySet`]; the daemon stamps it with a per-boot `epoch` and
@@ -29,21 +30,11 @@ use interprocess::local_socket::{
     tokio::{prelude::*, Stream as LocalStream},
     ListenerOptions,
 };
-use iroh::{
-    endpoint::Connection,
-    protocol::{AcceptError, ProtocolHandler, Router},
-    Endpoint, EndpointId, SecretKey,
-};
-use iroh_gossip::{
-    api::{Event, GossipReceiver, GossipSender},
-    net::{Gossip, GOSSIP_ALPN},
-    proto::TopicId,
-};
-use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    sync::Notify,
+    sync::{watch, Notify},
+    task::JoinSet,
 };
 
 use crate::{
@@ -55,21 +46,15 @@ use crate::{
     dto::{Candidate, JoinRequestDto, SeedDto},
     ids::{DeviceId, SystemUlidSource},
     index::{resolve_device_dir, DeviceResolution, KnownDevice},
-    presence::PeerState,
+    presence::{PeerState, PRESENCE_ALPN},
     proto::{InviteGrant, Payload, SignedInvite, SignedMessage, SpaceTicket},
     replica::{DirtySet, Replica},
     store::Store,
+    transport::{
+        iroh::IrohFactory, GossipEvent, GossipSender, Incoming, Topic, Transport, TransportFactory,
+    },
 };
 
-/// Presence-probe ALPN. Moves in lockstep with [`crate::sync::SYNC_ALPN`] and
-/// the gossip topic tag, so a version skew that partitions sync/gossip also
-/// partitions the liveness probe rather than leaving cross-epoch peers
-/// half-visible. Epoch 1 carried the space-identity rewrite and the sync
-/// `protocol_version` handshake; epoch 2 carries the space-vocabulary flag day.
-///
-/// Public so transport tests negotiate the ALPN the daemon actually uses rather
-/// than a copy of its spelling that an epoch bump would silently strand.
-pub const PRESENCE_ALPN: &[u8] = b"lait/presence/2";
 const HEARTBEAT: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const REAP_INTERVAL: Duration = Duration::from_secs(5);
@@ -84,6 +69,55 @@ const IDLE_SHUTDOWN: Duration = Duration::from_secs(30 * 60);
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// Bound on the doorbell ring: the last ~1000 batches.
 const DOORBELL_RING: usize = 1000;
+/// How many times a pull that ended before the peer's `EndDocs` is retried
+/// promptly. Bounded so a peer that truncates every attempt costs a fixed
+/// number of dials; the announce/heartbeat backstop still carries the rest.
+const PULL_RETRIES: u32 = 1;
+const PULL_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// How long teardown may spend cancelling and draining the daemon's tasks. The
+/// daemon must not return before its tasks have ended — returning releases the
+/// daemon lock and legalizes a same-home restart — but a wedged task must not
+/// hold the lock forever either, so anything still running past this deadline is
+/// aborted. All state is already durable by the time the deadline starts.
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(3);
+/// Grace for a `Bye` to reach the room before the transport closes under it.
+const BYE_GRACE: Duration = Duration::from_millis(500);
+
+/// Daemon-wide cancellation. Every long-lived task selects on
+/// [`Cancel::cancelled`], so teardown ends them deterministically: the daemon
+/// spawns loops (gossip receive, heartbeat, reaper, checkpoint, idle, accept)
+/// and per-connection tasks that each hold an `Arc<Node>`, and a detached one
+/// would keep broadcasting and checkpointing after the home directory it writes
+/// to is gone and another daemon owns the lock.
+#[derive(Clone)]
+pub struct Cancel(Arc<watch::Sender<bool>>);
+
+impl Cancel {
+    fn new() -> Self {
+        Self(Arc::new(watch::Sender::new(false)))
+    }
+
+    /// Signal every task to wind down. Idempotent.
+    fn cancel(&self) {
+        let _ = self.0.send(true);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    /// Resolve once cancellation has been signalled (immediately if it already
+    /// has). Holding the sender in the daemon keeps this from ever resolving by
+    /// channel closure instead of by an actual cancel.
+    async fn cancelled(&self) {
+        let mut rx = self.0.subscribe();
+        if *rx.borrow() {
+            return;
+        }
+        let _ = rx.wait_for(|c| *c).await;
+    }
+}
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -139,22 +173,22 @@ fn peers_path(home: &Path) -> PathBuf {
     home.join("peers.json")
 }
 
-/// Load the persisted set of previously-seen peer endpoints, to seed the gossip
-/// bootstrap on restart. Iroh discovery resolves a dialable address
-/// from each `EndpointId`, so the ids alone are enough to reconnect — a fresh
+/// Load the persisted set of previously-seen peers, to seed the gossip
+/// bootstrap on restart. The transport resolves a dialable address from each
+/// device key, so the ids alone are enough to reconnect — a fresh
 /// daemon no longer re-enters the mesh with an empty bootstrap set and waits
 /// passively to be re-announced to. Our own id is filtered out.
-fn load_bootstrap_peers(home: &Path, me: EndpointId) -> Vec<EndpointId> {
+fn load_bootstrap_peers(home: &Path, me: &DeviceId) -> Vec<DeviceId> {
     let Ok(data) = std::fs::read_to_string(peers_path(home)) else {
         return Vec::new();
     };
-    let ids: Vec<EndpointId> = serde_json::from_str(&data).unwrap_or_default();
-    ids.into_iter().filter(|id| *id != me).collect()
+    let ids: Vec<DeviceId> = serde_json::from_str(&data).unwrap_or_default();
+    ids.into_iter().filter(|id| id != me).collect()
 }
 
 /// Persist the set of currently-known peer endpoints (best-effort) so the next
 /// daemon start can bootstrap from them.
-fn save_known_peers(home: &Path, peers: &[EndpointId]) {
+fn save_known_peers(home: &Path, peers: &[DeviceId]) {
     if let Ok(data) = serde_json::to_string(peers) {
         let _ = std::fs::write(peers_path(home), data);
     }
@@ -169,7 +203,7 @@ fn save_known_peers(home: &Path, peers: &[EndpointId]) {
 /// against the genesis keys carried in the ticket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeedRecord {
-    pub id: EndpointId,
+    pub id: DeviceId,
     #[serde(default)]
     pub nick: String,
     #[serde(default)]
@@ -180,12 +214,45 @@ fn seeds_path(home: &Path) -> PathBuf {
     home.join("seeds.json")
 }
 
-/// Load the pinned seed registry (best-effort; empty when absent or corrupt).
+/// Load the pinned seed registry, entry at a time. A pin is deliberately-placed
+/// infrastructure — the anchor a cold client converges through — so one
+/// unreadable record must not unpin the rest, and a dropped pin must never be
+/// silent: every reject is named at warn and the survivors are kept.
+///
+/// An id that is not a device key is rejected rather than pinned: it would be
+/// carried as far as the dial and fail there, with nothing pointing back at the
+/// registry entry that caused it.
 fn load_seeds(home: &Path) -> Vec<SeedRecord> {
     let Ok(data) = std::fs::read_to_string(seeds_path(home)) else {
         return Vec::new();
     };
-    serde_json::from_str(&data).unwrap_or_default()
+    let rows: Vec<serde_json::Value> = match serde_json::from_str(&data) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("seeds.json is not a list of pinned seeds ({e}); pinning none");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let rec: SeedRecord = match serde_json::from_value(row.clone()) {
+            Ok(rec) => rec,
+            Err(e) => {
+                tracing::warn!("skipping an unreadable pinned seed ({e}): {row}");
+                continue;
+            }
+        };
+        match DeviceId::parse(rec.id.as_str()) {
+            // Normalize on the way in so the pin compares equal to the same key
+            // seen over the wire.
+            Some(id) => out.push(SeedRecord { id, ..rec }),
+            None => tracing::warn!(
+                "skipping a pinned seed whose id is not a device key: {:?}",
+                rec.id.as_str()
+            ),
+        }
+    }
+    out
 }
 
 /// Persist the pinned seed registry (best-effort).
@@ -197,11 +264,11 @@ fn save_seeds(home: &Path, seeds: &[SeedRecord]) {
 
 /// The pinned seeds' endpoint ids, minus our own — the sticky half of the gossip
 /// bootstrap set. Our own id is filtered out (dialing ourselves is pointless).
-fn seed_ids(home: &Path, me: EndpointId) -> Vec<EndpointId> {
+fn seed_ids(home: &Path, me: &DeviceId) -> Vec<DeviceId> {
     load_seeds(home)
         .into_iter()
         .map(|s| s.id)
-        .filter(|id| *id != me)
+        .filter(|id| id != me)
         .collect()
 }
 
@@ -227,7 +294,7 @@ fn remove_seed(home: &Path, needle: &str) -> usize {
     let mut seeds = load_seeds(home);
     let before = seeds.len();
     seeds.retain(|s| {
-        let id = s.id.to_string();
+        let id = s.id.as_str();
         !(id == needle || (needle.len() >= 6 && id.starts_with(needle)) || s.nick == needle)
     });
     let removed = before - seeds.len();
@@ -307,48 +374,6 @@ pub struct Peer {
     /// Advertised three-state presence: `true` means reachable but away. Only
     /// meaningful while `presence.is_online()`.
     pub away: bool,
-}
-
-#[derive(Debug, Clone)]
-struct PresencePing;
-
-impl ProtocolHandler for PresencePing {
-    async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
-        connection.closed().await;
-        Ok(())
-    }
-}
-
-/// Accepts the sync ALPN and serves a peer's catalog-first **pull**
-/// ([`crate::sync::serve`]). A pull never mutates our state, so this is
-/// read-only and rings no doorbell.
-#[derive(Clone)]
-struct SyncHandler {
-    replica: Arc<Mutex<Replica>>,
-}
-
-impl std::fmt::Debug for SyncHandler {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SyncHandler")
-    }
-}
-
-impl ProtocolHandler for SyncHandler {
-    async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
-        // `serve` finishes its send stream but `send.finish()` only queues the
-        // FIN — it does NOT wait for the data to be delivered. If we returned
-        // here the `Connection` would drop and send CONNECTION_CLOSE, truncating
-        // the trailing `DocUpdate`/`EndDocs` frames before the puller drains them
-        // (issue-doc bodies would silently never sync). Keep the connection alive
-        // until the puller has read everything and closes it — same as the
-        // presence handler above.
-        let keepalive = connection.clone();
-        if let Err(e) = crate::sync::serve(connection, &self.replica).await {
-            tracing::debug!("sync serve error: {e:#}");
-        }
-        keepalive.closed().await;
-        Ok(())
-    }
 }
 
 /// Seal a pre-authorization to the host and bind it to the joiner's actor, for
@@ -456,8 +481,8 @@ pub struct Shared {
     /// user.nick`) applies live instead of waiting for a restart. There is no
     /// room here: the gossip topic is a pure function of the space id.
     pub nick: Arc<Mutex<String>>,
-    pub my_id: EndpointId,
-    pub presence: Arc<Mutex<HashMap<EndpointId, Peer>>>,
+    pub my_id: DeviceId,
+    pub presence: Arc<Mutex<HashMap<DeviceId, Peer>>>,
     pub events: Arc<Mutex<EventLog>>,
 }
 
@@ -469,20 +494,25 @@ impl Shared {
 
 /// The running node.
 pub struct Node {
-    endpoint: Endpoint,
-    gossip: Gossip,
-    sender: Mutex<GossipSender>,
-    secret_key: SecretKey,
-    /// How to reach peers under lait's network policy (see `crate::net`). Every
-    /// newly-seen peer id is registered here so the endpoint's bare-id dials
-    /// resolve — a no-op under Public (n0 discovery), the mechanism under Local.
-    peers: crate::net::PeerBook,
+    /// The network, in lait's vocabulary. Dialing, gossip, accepting, address
+    /// advertisement and teardown all go through here; no concrete network type
+    /// is reachable from the daemon.
+    transport: Arc<dyn Transport>,
+    sender: Mutex<Arc<dyn GossipSender>>,
+    /// lait's identity: the seed *is* the key, and the transport derives its own
+    /// keypair from the same 32 bytes (checked at construction).
+    identity_seed: [u8; 32],
     /// This daemon's space id (constant). Bound into every signed gossip
     /// message so a message cannot be replayed onto another space's topic.
     space: String,
-    router: Router,
     shared: Shared,
     shutdown: Arc<Notify>,
+    /// Teardown signal for every long-lived task (see [`Cancel`]).
+    cancel: Cancel,
+    /// Every task the daemon spawns, so teardown can join them before the
+    /// injectable entry returns and releases the daemon lock. Held behind a
+    /// `std::sync::Mutex` that is never locked across an `.await`.
+    tasks: Arc<Mutex<JoinSet<()>>>,
     recv_gen: AtomicU64,
     active_conns: AtomicU64,
     last_active: Mutex<Instant>,
@@ -493,7 +523,7 @@ pub struct Node {
     doorbell: Arc<Mutex<DoorbellRing>>,
     doorbell_notify: Arc<Notify>,
     /// Peers we currently have an in-flight sync pull to (dedupes announce storms).
-    syncing: Arc<Mutex<HashSet<EndpointId>>>,
+    syncing: Arc<Mutex<HashSet<DeviceId>>>,
     /// Ephemeral join-request actor inceptions, keyed by the requesting device.
     /// Bounded and NEVER persisted here — an inception only enters the synced
     /// membership doc when an admin actually admits (redeem/approve), so an
@@ -504,13 +534,33 @@ pub struct Node {
 }
 
 impl Node {
-    fn touch(&self, id: EndpointId, nick: Option<String>) -> String {
+    /// Spawn a daemon-owned task. Every `tokio::spawn` in the daemon goes
+    /// through here: an untracked task outlives teardown holding an `Arc<Node>`,
+    /// which is only invisible in production because the process exits. Finished
+    /// tasks are reaped on the way in so the set does not grow with the number
+    /// of control connections served.
+    fn spawn<F>(&self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        // Past cancellation the set has already been drained for joining, so a
+        // task admitted here would be exactly the untracked straggler this
+        // exists to prevent. Teardown is under way; drop the work.
+        if self.cancel.is_cancelled() {
+            return;
+        }
+        let mut tasks = self.tasks.lock().unwrap();
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(fut);
+    }
+
+    fn touch(&self, id: &DeviceId, nick: Option<String>) -> String {
         // A newly-seen peer must be reachable before we dial it back (Local).
-        self.peers.learn(id);
+        self.transport.learn(id.clone(), &[]);
         let now = Instant::now();
         let came_online = {
             let mut p = self.shared.presence.lock().unwrap();
-            match p.get_mut(&id) {
+            match p.get_mut(id) {
                 Some(entry) => {
                     entry.last_seen = now;
                     let came = entry.presence.seen(now);
@@ -522,11 +572,9 @@ impl Node {
                     came
                 }
                 None => {
-                    let nm = nick
-                        .filter(|n| !n.is_empty())
-                        .unwrap_or_else(|| id.fmt_short().to_string());
+                    let nm = nick.filter(|n| !n.is_empty()).unwrap_or_else(|| id.short());
                     p.insert(
-                        id,
+                        id.clone(),
                         Peer {
                             nick: nm,
                             last_seen: now,
@@ -538,11 +586,11 @@ impl Node {
                 }
             }
         };
-        let display = self.display_nick(&id);
-        if came_online && id != self.shared.my_id {
+        let display = self.display_nick(id);
+        if came_online && *id != self.shared.my_id {
             self.shared.events.lock().unwrap().push(
                 EventKind::Presence,
-                id.to_string(),
+                id.as_str().to_string(),
                 display.clone(),
                 format!("{display} is online"),
             );
@@ -551,10 +599,10 @@ impl Node {
         display
     }
 
-    fn mark_offline(&self, id: EndpointId, left: bool) {
+    fn mark_offline(&self, id: &DeviceId, left: bool) {
         let visible = {
             let mut p = self.shared.presence.lock().unwrap();
-            match p.get_mut(&id) {
+            match p.get_mut(id) {
                 Some(peer) => peer.presence.force_offline(),
                 None => false,
             }
@@ -564,7 +612,7 @@ impl Node {
         }
     }
 
-    fn on_neighbor_down(self: Arc<Self>, id: EndpointId) {
+    fn on_neighbor_down(self: Arc<Self>, id: DeviceId) {
         let became_suspect = {
             let mut p = self.shared.presence.lock().unwrap();
             match p.get_mut(&id) {
@@ -573,76 +621,81 @@ impl Node {
             }
         };
         if became_suspect {
-            tokio::spawn(self.probe_peer(id));
+            self.spawn(self.clone().probe_peer(id));
         }
     }
 
-    async fn probe_peer(self: Arc<Self>, id: EndpointId) {
-        let alive =
-            match tokio::time::timeout(PROBE_TIMEOUT, self.endpoint.connect(id, PRESENCE_ALPN))
-                .await
-            {
-                Ok(Ok(conn)) => {
-                    conn.close(0u32.into(), b"probe");
-                    true
-                }
-                _ => false,
-            };
+    async fn probe_peer(self: Arc<Self>, id: DeviceId) {
+        // Liveness is whether the dial succeeds; nothing is ever sent. Dropping
+        // the returned stream closes the connection, which is the dialer's
+        // whole side of the presence protocol — the accepter opens no stream.
+        let alive = matches!(
+            tokio::time::timeout(
+                PROBE_TIMEOUT,
+                self.transport.connect(id.clone(), PRESENCE_ALPN)
+            )
+            .await,
+            Ok(Ok(_))
+        );
         let transition = {
             let mut p = self.shared.presence.lock().unwrap();
             p.get_mut(&id)
                 .and_then(|peer| peer.presence.probe_result(alive, Instant::now()))
         };
         match transition {
-            Some(true) => self.announce_online(id),
-            Some(false) => self.announce_offline(id, false),
+            Some(true) => self.announce_online(&id),
+            Some(false) => self.announce_offline(&id, false),
             None => {}
         }
     }
 
-    fn announce_online(&self, id: EndpointId) {
-        if id == self.shared.my_id {
+    fn announce_online(&self, id: &DeviceId) {
+        if *id == self.shared.my_id {
             return;
         }
-        let display = self.display_nick(&id);
+        let display = self.display_nick(id);
         self.shared.events.lock().unwrap().push(
             EventKind::Presence,
-            id.to_string(),
+            id.as_str().to_string(),
             display.clone(),
             format!("{display} is online"),
         );
         self.ring_presence_doorbell();
     }
 
-    fn announce_offline(&self, id: EndpointId, left: bool) {
-        let display = self.display_nick(&id);
+    fn announce_offline(&self, id: &DeviceId, left: bool) {
+        let display = self.display_nick(id);
         let text = if left {
             format!("{display} left")
         } else {
             format!("{display} went offline")
         };
-        self.shared
-            .events
-            .lock()
-            .unwrap()
-            .push(EventKind::Presence, id.to_string(), display, text);
+        self.shared.events.lock().unwrap().push(
+            EventKind::Presence,
+            id.as_str().to_string(),
+            display,
+            text,
+        );
         self.ring_presence_doorbell();
     }
 
     async fn reaper_loop(self: Arc<Self>) {
         let mut interval = tokio::time::interval(REAP_INTERVAL);
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = self.cancel.cancelled() => break,
+            }
             let now = Instant::now();
-            let stale: Vec<EndpointId> = {
+            let stale: Vec<DeviceId> = {
                 let p = self.shared.presence.lock().unwrap();
                 p.iter()
                     .filter(|(_, peer)| peer.presence.should_reap(now))
-                    .map(|(id, _)| *id)
+                    .map(|(id, _)| id.clone())
                     .collect()
             };
             for id in stale {
-                self.mark_offline(id, false);
+                self.mark_offline(&id, false);
             }
             self.shared.presence.lock().unwrap().retain(|_, peer| {
                 peer.presence.is_online() || peer.last_seen.elapsed() < PRUNE_WINDOW
@@ -650,42 +703,42 @@ impl Node {
         }
     }
 
-    fn display_nick(&self, id: &EndpointId) -> String {
+    fn display_nick(&self, id: &DeviceId) -> String {
         self.shared
             .presence
             .lock()
             .unwrap()
             .get(id)
             .map(|p| p.nick.clone())
-            .unwrap_or_else(|| id.fmt_short().to_string())
+            .unwrap_or_else(|| id.short())
     }
 
-    async fn handle_payload(self: &Arc<Self>, from: EndpointId, payload: Payload) {
+    async fn handle_payload(self: &Arc<Self>, from: DeviceId, payload: Payload) {
         match payload {
             Payload::Hello { nick } => {
-                self.touch(from, Some(nick));
+                self.touch(&from, Some(nick));
                 // A newly visible peer may have state we missed; pull to backfill.
                 self.clone().trigger_pull(from);
             }
             Payload::Presence { nick, state } => {
-                self.touch(from, Some(nick));
+                self.touch(&from, Some(nick));
                 if let Some(p) = self.shared.presence.lock().unwrap().get_mut(&from) {
                     p.away = matches!(state, crate::proto::PresenceState::Away);
                 }
             }
             Payload::Bye { nick } => {
-                self.touch(from, Some(nick));
-                self.mark_offline(from, true);
+                self.touch(&from, Some(nick));
+                self.mark_offline(&from, true);
             }
             Payload::JoinRequest {
                 nick,
                 invite,
                 incept,
             } => {
-                let display = self.touch(from, Some(nick.clone()));
+                let display = self.touch(&from, Some(nick.clone()));
                 self.shared.events.lock().unwrap().push(
                     EventKind::Join,
-                    from.to_string(),
+                    from.as_str().to_string(),
                     display.clone(),
                     format!("{display} joined the room"),
                 );
@@ -696,10 +749,9 @@ impl Node {
                 // unauthenticated peer cannot grow the container.
                 if let Some(incept) = &incept {
                     const MAX_PENDING_INCEPTS: usize = 256;
-                    let dev = DeviceId::from_key_string(from.to_string());
                     let mut pend = self.pending_incepts.lock().unwrap();
-                    if pend.contains_key(&dev) || pend.len() < MAX_PENDING_INCEPTS {
-                        pend.insert(dev, incept.clone());
+                    if pend.contains_key(&from) || pend.len() < MAX_PENDING_INCEPTS {
+                        pend.insert(from.clone(), incept.clone());
                     }
                 }
                 // Pattern A: if the joiner presented a valid pre-authorization and
@@ -707,7 +759,7 @@ impl Node {
                 // On any failure we simply leave the request pending (the event
                 // above already surfaces it to `members requests`).
                 if let Some(invite) = invite {
-                    self.clone().try_auto_approve(from, invite, incept);
+                    self.clone().try_auto_approve(&from, invite, incept);
                 }
                 // a joiner wants our state — and may have state we lack; pull.
                 self.clone().trigger_pull(from);
@@ -716,7 +768,7 @@ impl Node {
                 space,
                 catalog_head,
             } => {
-                self.touch(from, None);
+                self.touch(&from, None);
                 let (our_ws, our_head) = {
                     let t = self.replica.lock().unwrap();
                     (t.space_str(), t.sync_head_bytes())
@@ -733,44 +785,107 @@ impl Node {
     /// Spawn a deduplicated sync pull from a peer. At most one in-flight pull
     /// per peer; on success (something changed) ring a doorbell and re-announce
     /// so peers that are behind us pull in turn.
-    fn trigger_pull(self: Arc<Self>, peer: EndpointId) {
+    fn trigger_pull(self: Arc<Self>, peer: DeviceId) {
+        self.trigger_pull_within(peer, PULL_RETRIES);
+    }
+
+    /// `retries` bounds the prompt re-pull after an *incomplete* transfer, so a
+    /// peer that truncates every time costs a fixed number of attempts rather
+    /// than an unbounded loop. Convergence still has the announce/heartbeat
+    /// backstop underneath it.
+    fn trigger_pull_within(self: Arc<Self>, peer: DeviceId, retries: u32) {
         if peer == self.shared.my_id {
             return;
         }
         // Ensure the sync dial can resolve the peer under Local.
-        self.peers.learn(peer);
-        tokio::spawn(async move {
-            if !self.syncing.lock().unwrap().insert(peer) {
+        self.transport.learn(peer.clone(), &[]);
+        let cancel = self.cancel.clone();
+        let tracker = self.clone();
+        tracker.spawn(async move {
+            if !self.syncing.lock().unwrap().insert(peer.clone()) {
                 return; // already syncing this peer
             }
-            let result = self.do_pull(peer).await;
+            // A pull has no read deadline of its own (a stalled peer would park
+            // the task forever), so teardown is what bounds it.
+            let result = tokio::select! {
+                r = self.do_pull(&peer) => r,
+                _ = cancel.cancelled() => Err(anyhow!("daemon shutting down")),
+            };
             self.syncing.lock().unwrap().remove(&peer);
             match result {
-                Ok(dirty) => {
-                    if !dirty.is_empty() {
-                        self.ring_doorbell(dirty);
+                Ok(outcome) => {
+                    if !outcome.dirty.is_empty() {
+                        self.ring_doorbell(outcome.dirty);
                         let _ = self.broadcast_announce().await;
                     }
-                    // We successfully reached this peer — persist it immediately so
-                    // even a short-lived daemon (up for less than a heartbeat) can
-                    // bootstrap from it on the next start.
+                    // We reached this peer — persist it immediately so even a
+                    // short-lived daemon (up for less than a heartbeat) can
+                    // bootstrap from it on the next start. True whether or not
+                    // the transfer finished: reachability is what is being
+                    // recorded.
                     self.persist_known_peers();
+                    if !outcome.complete && retries > 0 {
+                        tokio::time::sleep(PULL_RETRY_DELAY).await;
+                        self.clone().trigger_pull_within(peer, retries - 1);
+                    }
                 }
                 Err(e) => tracing::debug!("pull from {peer} failed: {e:#}"),
             }
         });
     }
 
-    async fn do_pull(&self, peer: EndpointId) -> Result<crate::replica::DirtySet> {
-        let conn = tokio::time::timeout(
+    async fn do_pull(&self, peer: &DeviceId) -> Result<crate::sync::PullOutcome> {
+        let mut stream = tokio::time::timeout(
             Duration::from_secs(20),
-            self.endpoint.connect(peer, crate::sync::SYNC_ALPN),
+            self.transport.connect(peer.clone(), crate::sync::SYNC_ALPN),
         )
         .await
         .map_err(|_| anyhow!("connect to peer for sync timed out"))??;
-        let dirty = crate::sync::pull(&conn, &self.replica).await?;
-        conn.close(0u32.into(), b"sync done");
-        Ok(dirty)
+        let outcome = crate::sync::pull(&mut *stream, &self.replica).await?;
+        // Dropping the dialer's stream closes the connection: the dialer's
+        // "done" signal, and what releases the accepter from `wait_closed`.
+        Ok(outcome)
+    }
+
+    /// The daemon's inbound side: one loop over the transport's accepted
+    /// connections, dispatched by ALPN. It replaces a per-protocol handler
+    /// registry, and it is why the daemon needs no network type of its own.
+    ///
+    /// `accept` yields `None` only after the transport has shut down, so this
+    /// ends on teardown without a cancellation arm of its own.
+    async fn accept_loop(self: Arc<Self>) {
+        while let Some(inc) = self.transport.accept().await {
+            let me = self.clone();
+            self.spawn(async move { me.serve_incoming(inc).await });
+        }
+    }
+
+    async fn serve_incoming(self: Arc<Self>, inc: Incoming) {
+        let mut stream = inc.stream;
+        if inc.alpn == crate::sync::SYNC_ALPN {
+            if let Err(e) = crate::sync::serve(&mut *stream, &self.replica).await {
+                tracing::debug!("sync serve error: {e:#}");
+            }
+            // Unconditional, including on the error path above. `finish` only
+            // queues end-of-stream; dropping the stream tears the connection
+            // down and truncates whatever the puller has not yet drained —
+            // issue-doc bodies that then silently never sync. Bounded by
+            // cancellation so a peer holding its side open cannot park
+            // teardown, but with no timeout of its own: a deadline short
+            // enough to be useful is short enough to cut a large transfer.
+            tokio::select! {
+                _ = stream.wait_closed() => {}
+                _ = self.cancel.cancelled() => {}
+            }
+        } else if inc.alpn == PRESENCE_ALPN {
+            // A probe sends nothing; it is alive iff the dial landed here.
+            tokio::select! {
+                _ = stream.wait_closed() => {}
+                _ = self.cancel.cancelled() => {}
+            }
+        } else {
+            tracing::debug!("inbound connection on an unregistered alpn: {:?}", inc.alpn);
+        }
     }
 
     /// Broadcast our current catalog head so peers that are behind pull from us.
@@ -789,11 +904,11 @@ impl Node {
     /// Snapshot the peers we currently know (excluding ourselves) and persist
     /// them as the next start's gossip bootstrap set. Best-effort.
     fn persist_known_peers(&self) {
-        let peers: Vec<EndpointId> = {
+        let peers: Vec<DeviceId> = {
             let p = self.shared.presence.lock().unwrap();
             p.keys()
-                .copied()
-                .filter(|id| *id != self.shared.my_id)
+                .filter(|id| **id != self.shared.my_id)
+                .cloned()
                 .collect()
         };
         if !peers.is_empty() {
@@ -813,33 +928,28 @@ impl Node {
     }
 
     async fn broadcast(&self, payload: Payload) -> Result<()> {
-        let bytes =
-            SignedMessage::sign_and_encode(&self.space, &self.secret_key.to_bytes(), &payload)?;
+        let bytes = SignedMessage::sign_and_encode(&self.space, &self.identity_seed, &payload)?;
+        // Clone the sender out from under the lock: a std mutex guard must never
+        // cross an await, and the broadcast below is one.
         let sender = self.sender.lock().unwrap().clone();
         sender
-            .broadcast(bytes)
+            .broadcast(bytes.to_vec())
             .await
             .map_err(|e| anyhow!("broadcast failed: {e}"))?;
         Ok(())
     }
 
-    async fn join_topic(self: &Arc<Self>, topic: TopicId, peers: Vec<EndpointId>) -> Result<()> {
-        // Register the bootstrap peers (e.g. a ticket's host) before gossip dials
-        // them, so bare-id resolution succeeds under Local.
-        for id in &peers {
-            self.peers.learn(*id);
-        }
-        let gtopic = tokio::time::timeout(
-            Duration::from_secs(15),
-            self.gossip.subscribe_and_join(topic, peers),
-        )
-        .await
-        .map_err(|_| anyhow!("timed out connecting to the room's peers"))?
-        .map_err(|e| anyhow!("subscribe_and_join: {e}"))?;
-        let (sender, receiver) = gtopic.split();
-        *self.sender.lock().unwrap() = sender;
+    async fn join_topic(self: &Arc<Self>, topic: Topic, peers: Vec<DeviceId>) -> Result<()> {
+        let (tx, mut rx) = self.transport.subscribe(topic, &peers).await?;
+        // Install nothing until the room is actually reachable: a join that
+        // times out must leave the node in the room it was already in, rather
+        // than swapping in a sender that broadcasts into nowhere.
+        tokio::time::timeout(Duration::from_secs(15), rx.joined())
+            .await
+            .map_err(|_| anyhow!("timed out connecting to the room's peers"))??;
+        *self.sender.lock().unwrap() = Arc::from(tx);
         let gen = self.recv_gen.fetch_add(1, Ordering::SeqCst) + 1;
-        tokio::spawn(self.clone().recv_loop(receiver, gen));
+        self.spawn(self.clone().recv_loop(rx, gen));
         Ok(())
     }
 
@@ -862,8 +972,9 @@ impl Node {
         // Under Isolated the host is reachable only at the addresses the ticket
         // carries — register them so the bare-id dial below resolves. A no-op for
         // Public/Local tickets (which carry none and resolve by relay/discovery).
-        self.peers.learn_direct(ticket.host, &ticket.host_addrs);
-        self.join_topic(ticket.topic(), vec![ticket.host]).await?;
+        let host = ticket.host.clone();
+        self.transport.learn(host.clone(), &ticket.host_addrs);
+        self.join_topic(ticket.topic(), vec![host.clone()]).await?;
         // Mint (or recover) our actor inception so an admin can admit our actor.
         let incept = self.replica.lock().unwrap().self_inception().ok();
         // Seal the pre-authorization to the HOST and bind it to our actor, so the
@@ -873,8 +984,7 @@ impl Node {
         let sealed_invite = match (&ticket.invite, &incept) {
             (Some(inv), Some(ic)) => {
                 let redeemer = crate::ids::ActorId::from_incept_hash(&ic.hash());
-                let host_device = DeviceId::from_key_string(ticket.host.to_string());
-                seal_bound_invite(&host_device, inv, &redeemer)
+                seal_bound_invite(&host, inv, &redeemer)
             }
             _ => None,
         };
@@ -886,7 +996,7 @@ impl Node {
         .await
         .ok();
         let _ = self.broadcast_announce().await;
-        self.clone().trigger_pull(ticket.host);
+        self.clone().trigger_pull(host);
         Ok(())
     }
 
@@ -930,7 +1040,7 @@ impl Node {
     async fn seed_add(self: &Arc<Self>, arg: &str) -> Result<Response> {
         // Try the ticket form first; a bare id will not decode as a ticket.
         if let Ok(ticket) = arg.parse::<SpaceTicket>() {
-            let id = ticket.host;
+            let id = ticket.host.clone();
             if id == self.shared.my_id {
                 return Ok(Response::err("that ticket points at this node's own id"));
             }
@@ -945,12 +1055,12 @@ impl Node {
             let newly = upsert_seed(
                 &self.home,
                 SeedRecord {
-                    id,
+                    id: id.clone(),
                     nick: ticket.host_nick.clone(),
                     space: ticket.space.clone(),
                 },
             );
-            self.clone().trigger_pull(id);
+            self.clone().trigger_pull(id.clone());
             return Ok(Response::Ok {
                 message: Some(format!(
                     "{} seed {id} \u{2014} backfilling",
@@ -958,7 +1068,7 @@ impl Node {
                 )),
             });
         }
-        if let Ok(id) = arg.parse::<EndpointId>() {
+        if let Some(id) = DeviceId::parse(arg) {
             if id == self.shared.my_id {
                 return Ok(Response::err("that's this node's own id"));
             }
@@ -966,12 +1076,12 @@ impl Node {
             let newly = upsert_seed(
                 &self.home,
                 SeedRecord {
-                    id,
+                    id: id.clone(),
                     nick: String::new(),
                     space,
                 },
             );
-            self.clone().trigger_pull(id);
+            self.clone().trigger_pull(id.clone());
             return Ok(Response::Ok {
                 message: Some(format!(
                     "{} seed {id}",
@@ -984,49 +1094,57 @@ impl Node {
             });
         }
         Ok(Response::err(
-            "expected a room ticket (from `lait invite`) or an endpoint id",
+            "expected a room ticket (from `lait invite`) or a 64-character device id",
         ))
     }
 
-    async fn recv_loop(self: Arc<Self>, mut receiver: GossipReceiver, gen: u64) {
+    async fn recv_loop(
+        self: Arc<Self>,
+        mut receiver: Box<dyn crate::transport::GossipReceiver>,
+        gen: u64,
+    ) {
         loop {
             if self.recv_gen.load(Ordering::SeqCst) != gen {
                 break;
             }
-            match receiver.try_next().await {
-                Ok(Some(event)) => match event {
-                    Event::Received(msg) => {
-                        match SignedMessage::verify_and_decode(&self.space, &msg.content) {
-                            Ok((from, payload)) => self.handle_payload(from, payload).await,
-                            // A decode failure here is almost always a version-skewed
-                            // peer: postcard is not self-describing, so a payload whose
-                            // shape changed across releases fails to deserialize (see
-                            // `docs/PROTOCOL.md` — incompatible wire epochs require
-                            // all nodes to upgrade together).
-                            // Swallowing it silently made mixed-version fleets
-                            // undiagnosable; log at debug with the error so the drop is
-                            // at least visible under `RUST_LOG=lait=debug`.
-                            Err(e) => tracing::debug!(
-                                error = %e,
-                                "dropped an undecodable gossip payload (likely a \
-                                 version-skewed or malformed peer)"
-                            ),
-                        }
+            let event = tokio::select! {
+                event = receiver.next() => event,
+                _ = self.cancel.cancelled() => break,
+            };
+            // `None` means the room is gone; there is nothing left to receive.
+            let Some(event) = event else { break };
+            match event {
+                GossipEvent::Received { bytes, .. } => {
+                    // The delivering neighbor is a routing hint, never the
+                    // author: gossip relays peer to peer, so authorship comes
+                    // from the signature and nowhere else.
+                    match SignedMessage::verify_and_decode(&self.space, &bytes) {
+                        Ok((from, payload)) => self.handle_payload(from, payload).await,
+                        // A decode failure here is almost always a version-skewed
+                        // peer: postcard is not self-describing, so a payload whose
+                        // shape changed across releases fails to deserialize (see
+                        // `docs/PROTOCOL.md` — incompatible wire epochs require
+                        // all nodes to upgrade together).
+                        // Swallowing it silently made mixed-version fleets
+                        // undiagnosable; log at debug with the error so the drop is
+                        // at least visible under `RUST_LOG=lait=debug`.
+                        Err(e) => tracing::debug!(
+                            error = %e,
+                            "dropped an undecodable gossip payload (likely a \
+                             version-skewed or malformed peer)"
+                        ),
                     }
-                    Event::NeighborUp(id) => {
-                        self.touch(id, None);
-                        // The mesh formed with this peer: pull to converge and
-                        // persist it immediately for restart bootstrap.
-                        self.clone().trigger_pull(id);
-                        self.persist_known_peers();
-                    }
-                    Event::NeighborDown(id) => {
-                        self.clone().on_neighbor_down(id);
-                    }
-                    Event::Lagged => {}
-                },
-                Ok(None) => break,
-                Err(_) => break,
+                }
+                GossipEvent::NeighborUp(id) => {
+                    self.touch(&id, None);
+                    // The mesh formed with this peer: pull to converge and
+                    // persist it immediately for restart bootstrap.
+                    self.clone().trigger_pull(id);
+                    self.persist_known_peers();
+                }
+                GossipEvent::NeighborDown(id) => {
+                    self.clone().on_neighbor_down(id);
+                }
             }
         }
     }
@@ -1034,7 +1152,10 @@ impl Node {
     async fn heartbeat_loop(self: Arc<Self>) {
         let mut interval = tokio::time::interval(heartbeat_from_env());
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = self.cancel.cancelled() => break,
+            }
             if let Err(e) = self
                 .broadcast(Payload::Presence {
                     nick: self.shared.nick(),
@@ -1063,7 +1184,10 @@ impl Node {
         let mut interval = tokio::time::interval(CHECKPOINT_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = self.cancel.cancelled() => break,
+            }
             if self.replica.lock().unwrap().checkpoint() {
                 tracing::debug!("store checkpoint committed");
             }
@@ -1135,11 +1259,6 @@ impl Node {
         }
     }
 
-    /// Our key as a [`DeviceId`]; the endpoint ID is the Ed25519 key.
-    fn my_device_id(&self) -> DeviceId {
-        DeviceId::from_key_string(self.shared.my_id.to_string())
-    }
-
     /// Pattern A: try to auto-admit `joiner` against a presented invite. Verifies
     /// the issuer signature, the space binding, and expiry here (transport
     /// concerns), then hands the state-dependent checks + sealing to the replica's
@@ -1149,7 +1268,7 @@ impl Node {
     /// freshly-sealed joiner pulls and decrypts.
     fn try_auto_approve(
         self: Arc<Self>,
-        _joiner_id: EndpointId,
+        _joiner_id: &DeviceId,
         sealed: Vec<u8>,
         incept: Option<crate::actor::SignedEvent>,
     ) {
@@ -1159,9 +1278,8 @@ impl Node {
         // kept the nonce off the topic — and only for the actor it names, so a
         // blob copied off the wire cannot be re-paired with an eavesdropper's
         // inception.
-        let me = DeviceId::from_key_string(self.shared.my_id.to_string());
-        let Some(invite) = open_bound_invite(&self.secret_key.to_bytes(), &me, &sealed, &incept)
-        else {
+        let me = self.shared.my_id.clone();
+        let Some(invite) = open_bound_invite(&self.identity_seed, &me, &sealed, &incept) else {
             return;
         };
         let (issuer, grant) = match invite.verify() {
@@ -1186,7 +1304,7 @@ impl Node {
         }
         if changed {
             let me = self.clone();
-            tokio::spawn(async move {
+            self.spawn(async move {
                 me.broadcast_announce().await.ok();
             });
         }
@@ -1202,11 +1320,11 @@ impl Node {
     /// (after `--as bob`) and `assign ENG-1 c3ab21` into real keys.
     fn device_directory(&self) -> Vec<KnownDevice> {
         let mut keys: HashSet<DeviceId> = HashSet::new();
-        keys.insert(self.my_device_id());
+        keys.insert(self.shared.my_id.clone());
         {
             let presence = self.shared.presence.lock().unwrap();
             for id in presence.keys() {
-                keys.insert(DeviceId::from_key_string(id.to_string()));
+                keys.insert(id.clone());
             }
         }
         {
@@ -1285,7 +1403,7 @@ impl Node {
             return Ok(req);
         }
         let dir = self.device_directory();
-        let me = self.my_device_id();
+        let me = self.shared.my_id.clone();
         let resolve = |who: &str| -> std::result::Result<String, Response> {
             match resolve_device_dir(who, &me, &dir) {
                 DeviceResolution::One(u) => Ok(u.as_str().to_string()),
@@ -1426,7 +1544,9 @@ impl Node {
                 if changed {
                     // Announce a changed catalog head so peers pull.
                     let me = self.clone();
-                    tokio::spawn(async move { me.broadcast_announce().await.ok() });
+                    self.spawn(async move {
+                        me.broadcast_announce().await.ok();
+                    });
                 }
                 Ok(resp)
             }
@@ -1458,7 +1578,9 @@ impl Node {
                         upsert_alias(&self.home, &who, name.trim());
                     }
                     let me = self.clone();
-                    tokio::spawn(async move { me.broadcast_announce().await.ok() });
+                    self.spawn(async move {
+                        me.broadcast_announce().await.ok();
+                    });
                 }
                 Ok(resp)
             }
@@ -1475,7 +1597,9 @@ impl Node {
                 let (resp, changed) = self.dispatch_replica(Request::AgentAdd { key });
                 if changed {
                     let me = self.clone();
-                    tokio::spawn(async move { me.broadcast_announce().await.ok() });
+                    self.spawn(async move {
+                        me.broadcast_announce().await.ok();
+                    });
                 }
                 Ok(resp)
             }
@@ -1515,7 +1639,7 @@ impl Node {
             // the name locally — never synced, never a signed op.
             Request::MemberAlias { who, name } => {
                 let dir = self.device_directory();
-                match resolve_device_dir(who.trim(), &self.my_device_id(), &dir) {
+                match resolve_device_dir(who.trim(), &self.shared.my_id.clone(), &dir) {
                     DeviceResolution::One(u) => {
                         let name = name.trim();
                         upsert_alias(&self.home, u.as_str(), name);
@@ -1557,7 +1681,7 @@ impl Node {
                         nick: String::new(),
                     })
                     .collect();
-                match resolve_device_dir(who.trim(), &self.my_device_id(), &dir) {
+                match resolve_device_dir(who.trim(), &self.shared.my_id.clone(), &dir) {
                     DeviceResolution::One(u) => {
                         let key = u.as_str().to_string();
                         // Import the joiner's stashed inception (from its join
@@ -1577,7 +1701,9 @@ impl Node {
                                 upsert_alias(&self.home, &key, name.trim());
                             }
                             let me = self.clone();
-                            tokio::spawn(async move { me.broadcast_announce().await.ok() });
+                            self.spawn(async move {
+                                me.broadcast_announce().await.ok();
+                            });
                         }
                         Ok(resp)
                     }
@@ -1721,7 +1847,7 @@ impl Node {
                     const DEFAULT_TTL_HOURS: u64 = 24 * 7;
                     let ttl_secs = ttl_hours.unwrap_or(DEFAULT_TTL_HOURS).saturating_mul(3600);
                     let grant = InviteGrant::mint(space.clone(), now_secs(), ttl_secs, !reusable);
-                    SignedInvite::sign(&self.secret_key.to_bytes(), &grant).ok()
+                    SignedInvite::sign(&self.identity_seed, &grant).ok()
                 };
                 // Carry the verifiable founding proof (salt + founder inception),
                 // NOT a bare anchor string. The joiner checks the space id
@@ -1737,18 +1863,15 @@ impl Node {
                             ))
                         }
                     };
-                // Under Isolated (no relay, no discovery) a ticket must carry the
-                // host's direct addresses so a joiner can reach it. Public/Local
-                // tickets stay address-free (iroh/relay resolves the host by id).
-                let host_addrs = if self.peers.is_isolated() {
-                    self.endpoint.addr().ip_addrs().copied().collect()
-                } else {
-                    vec![]
-                };
+                // Under a policy with no relay and no discovery a ticket must
+                // carry the host's direct addresses. Which policies those are is
+                // the transport's business, not the daemon's: it returns the
+                // addresses a ticket needs, empty when bare ids already resolve.
+                let host_addrs = self.transport.advertised_addrs();
                 let ticket = SpaceTicket {
                     space,
                     name,
-                    host: self.shared.my_id,
+                    host: self.shared.my_id.clone(),
                     host_nick: self.shared.nick(),
                     salt,
                     recovery_root,
@@ -1785,7 +1908,7 @@ impl Node {
                             _ => ("offline", false),
                         };
                         SeedDto {
-                            id: s.id.to_string(),
+                            id: s.id.as_str().to_string(),
                             nick: s.nick,
                             space: s.space,
                             state: state.to_string(),
@@ -1828,7 +1951,7 @@ impl Node {
                             "online"
                         };
                         PresenceEntry {
-                            id: id.to_string(),
+                            id: id.as_str().to_string(),
                             nick: p.nick.clone(),
                             state: state.to_string(),
                             online,
@@ -1858,7 +1981,7 @@ impl Node {
                         .filter(|n| !n.is_empty());
                     let pres = presence
                         .iter()
-                        .find(|(id, _)| id.to_string() == actor)
+                        .find(|(id, _)| id.as_str() == actor)
                         .map(|(_, p)| p.nick.clone())
                         .filter(|n| !n.is_empty());
                     let short: String = actor.chars().take(8).collect();
@@ -1877,7 +2000,7 @@ impl Node {
                 // Broadcast the new nick right away so peers don't wait a
                 // heartbeat to see it.
                 let me = self.clone();
-                tokio::spawn(async move {
+                self.spawn(async move {
                     me.broadcast(Payload::Hello {
                         nick: me.shared.nick(),
                     })
@@ -1890,7 +2013,7 @@ impl Node {
             }
             Request::Stop => {
                 let me = self.clone();
-                tokio::spawn(async move {
+                self.spawn(async move {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     me.signal_shutdown();
                 });
@@ -1955,7 +2078,7 @@ impl Node {
         {
             return true;
         }
-        !load_bootstrap_peers(&self.home, self.shared.my_id).is_empty()
+        !load_bootstrap_peers(&self.home, &self.shared.my_id).is_empty()
     }
 
     async fn idle_shutdown_loop(self: Arc<Self>) {
@@ -1964,7 +2087,10 @@ impl Node {
         }
         let mut interval = tokio::time::interval(IDLE_CHECK_INTERVAL);
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = self.cancel.cancelled() => break,
+            }
             let active = self.active_conns.load(Ordering::SeqCst);
             let idle_for = self.last_active.lock().unwrap().elapsed();
             if should_idle_shutdown(active, idle_for, self.idle_window, self.is_mesh_member()) {
@@ -2064,6 +2190,10 @@ impl Node {
             tokio::select! {
                 _ = &mut notified => continue,
                 _ = shutdown.notified() => return,
+                // A stream that outlived the stop signal (it parked between the
+                // notify and its re-park) still has to end, or teardown waits on
+                // a client that will never disconnect.
+                _ = self.cancel.cancelled() => return,
             }
         }
     }
@@ -2088,14 +2218,39 @@ async fn write_line_half<T: serde::Serialize>(
     write_half.flush().await
 }
 
-/// Build and run the daemon until a Stop request arrives. When `seed` is set the
-/// node runs as an always-on seed and never idle-shuts-down (DUR-4).
+/// The production daemon entry: run until a Stop request arrives, then exit the
+/// process. When `seed` is set the node runs as an always-on seed and never
+/// idle-shuts-down (DUR-4).
+///
+/// Exiting is a hard guarantee of the *process* form of the daemon: "stop" means
+/// the process is gone, so nothing left running (a wedged endpoint task, a
+/// non-tokio thread) can leave a zombie whose half-dead control channel hangs
+/// every later client. It lives here and not in [`run_daemon_with`] because an
+/// in-process daemon that exited would take its host down with it.
 pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
-    let _daemon_lock = acquire_daemon_lock(&home)?;
-
     // Identity is global by default (DUR-5); store (repo/lock/socket/config) is
     // this per-repo home. `$LAIT_HOME` collapses both back into `home`.
-    let identity_seed = load_or_create_identity(&crate::config::identity_dir()?)?;
+    run_daemon_with(home, seed, crate::config::identity_dir()?, &IrohFactory).await?;
+    std::process::exit(0);
+}
+
+/// The injectable daemon: everything [`run_daemon`] does, but it **returns**
+/// after teardown instead of exiting, and takes its identity directory rather
+/// than reading the process-global one — so several daemons can run in one
+/// process, each with its own identity, without sharing anything but the runtime.
+///
+/// Returning is a stronger contract than exiting: by the time it returns, every
+/// task the daemon spawned has ended or been aborted, because returning drops the
+/// daemon lock and legalizes a restart on the same home.
+pub async fn run_daemon_with(
+    home: PathBuf,
+    seed: bool,
+    identity_dir: PathBuf,
+    factory: &dyn TransportFactory,
+) -> Result<()> {
+    let _daemon_lock = acquire_daemon_lock(&home)?;
+
+    let identity_seed = load_or_create_identity(&identity_dir)?;
     let settings = Settings::load(Some(&home));
     let nick = settings.nick();
 
@@ -2103,10 +2258,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     // initialized (`lait init` / `lait join`) — a daemon never founds a
     // space as a side effect of starting.
     let store = Store::open(&home)?;
-    // The transport keypair is constructed from lait's identity seed here, at the
-    // net edge — the seed itself is the identity (see config::load_or_create_identity).
-    let secret_key = SecretKey::from_bytes(&identity_seed);
-    let me = DeviceId::from_key_string(secret_key.public().to_string());
+    let me = crate::crypto::device_from_seed(&identity_seed);
     let replica = Replica::open(
         store,
         me,
@@ -2131,12 +2283,12 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     }
     let replica = Arc::new(Mutex::new(replica));
 
-    // lait states its network requirement; iroh executes it (crate::net is the
-    // sole place relay/discovery vocabulary lives). Defaults to Public.
+    // lait states its network requirement; the transport executes it (crate::net
+    // is the sole place relay/discovery vocabulary lives). Defaults to Public.
     let network = crate::net::Network::from_env()?;
-    // Public and Local are both wired: Public resolves bare ids via n0 discovery,
-    // Local via the PeerBook we populate below. Isolated has no relay and needs
-    // addresses to travel in tickets (not yet) — warn rather than fail silently.
+    // Public and Local both resolve bare ids. Isolated has neither relay nor
+    // discovery and reaches peers only by addresses carried in a ticket — say so
+    // rather than fail silently on the first wider dial.
     if matches!(network, crate::net::Network::Isolated) {
         tracing::info!(
             "LAIT_NETWORK=isolated: no relay and no discovery — peers are reached \
@@ -2144,39 +2296,29 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
              beyond the ticket host is not resolved"
         );
     }
-    let (endpoint, peers) = crate::net::build_endpoint(&secret_key, &network).await?;
-    let my_id = endpoint.id();
-
-    let gossip = Gossip::builder().spawn(endpoint.clone());
+    let transport = factory
+        .build(
+            &identity_seed,
+            &network,
+            &[PRESENCE_ALPN, crate::sync::SYNC_ALPN],
+        )
+        .await?;
+    // The transport's identity MUST be the daemon's. Nothing downstream can
+    // detect a mismatch: signed gossip would carry one key while the peer
+    // dialed back is another, minted tickets would advertise a host nobody can
+    // reach, and every symptom would surface far from the cause.
+    let expected = crate::crypto::device_from_seed(&identity_seed);
+    if transport.my_id() != expected {
+        anyhow::bail!("transport identity does not match daemon identity");
+    }
+    let my_id = transport.my_id();
 
     let shared = Shared {
         nick: Arc::new(Mutex::new(nick)),
-        my_id,
+        my_id: my_id.clone(),
         presence: Arc::new(Mutex::new(HashMap::new())),
         events: Arc::new(Mutex::new(EventLog::default())),
     };
-
-    let router = Router::builder(endpoint.clone())
-        .accept(GOSSIP_ALPN, gossip.clone())
-        .accept(PRESENCE_ALPN, PresencePing)
-        .accept(
-            crate::sync::SYNC_ALPN,
-            SyncHandler {
-                replica: replica.clone(),
-            },
-        )
-        .spawn();
-
-    // Waiting for a home relay only makes sense when the policy provides one.
-    // Bound so a valid-URL-but-unreachable relay can't hang startup forever
-    // (iroh's `online()` never times out on its own).
-    if network.uses_relay()
-        && tokio::time::timeout(Duration::from_secs(30), endpoint.online())
-            .await
-            .is_err()
-    {
-        tracing::warn!("no home relay after 30s — continuing; peers may be unreachable");
-    }
 
     // The topic is a pure function of the space id — no user-settable
     // network name, so a cold boot can never subscribe to the wrong topic.
@@ -2185,23 +2327,16 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     // rejoins the mesh instead of waiting to be re-announced, unioned with the
     // explicit, sticky seed pins so a restart always dials its
     // always-on seeds even when no ordinary peer was seen last run.
-    let pinned_seeds = seed_ids(&home, my_id);
-    let mut bootstrap = load_bootstrap_peers(&home, my_id);
+    let pinned_seeds = seed_ids(&home, &my_id);
+    let mut bootstrap = load_bootstrap_peers(&home, &my_id);
     for id in &pinned_seeds {
         if !bootstrap.contains(id) {
-            bootstrap.push(*id);
+            bootstrap.push(id.clone());
         }
     }
-    // Teach the endpoint how to reach each bootstrap peer before dialing them
-    // (under Local this registers `{id, relay}`; under Public it is a no-op).
-    for id in &bootstrap {
-        peers.learn(*id);
-    }
-    let gtopic = gossip
-        .subscribe(topic, bootstrap)
-        .await
-        .map_err(|e| anyhow!("subscribe to room: {e}"))?;
-    let (sender, receiver) = gtopic.split();
+    // Subscribing also teaches the transport how to reach each bootstrap peer,
+    // so a later bare-id dial to one of them resolves.
+    let (sender, receiver) = transport.subscribe(topic, &bootstrap).await?;
 
     // A seed never idles out (DUR-4): it must stay reachable to serve sync and
     // backfill history even with no local client and no peer currently online.
@@ -2217,15 +2352,14 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
 
     let space = replica.lock().unwrap().space_str();
     let node = Arc::new(Node {
-        endpoint,
-        gossip,
-        sender: Mutex::new(sender),
-        secret_key,
-        peers,
+        transport,
+        sender: Mutex::new(Arc::from(sender)),
+        identity_seed,
         space,
-        router,
         shared,
         shutdown: Arc::new(Notify::new()),
+        cancel: Cancel::new(),
+        tasks: Arc::new(Mutex::new(JoinSet::new())),
         recv_gen: AtomicU64::new(1),
         active_conns: AtomicU64::new(0),
         last_active: Mutex::new(Instant::now()),
@@ -2238,11 +2372,14 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         home: home.clone(),
     });
 
-    tokio::spawn(node.clone().recv_loop(receiver, 1));
-    tokio::spawn(node.clone().heartbeat_loop());
-    tokio::spawn(node.clone().reaper_loop());
-    tokio::spawn(node.clone().checkpoint_loop());
-    tokio::spawn(node.clone().idle_shutdown_loop());
+    // The accept loop goes up first: ALPNs were registered when the transport
+    // was built, so inbound connections can already be queued behind it.
+    node.spawn(node.clone().accept_loop());
+    node.spawn(node.clone().recv_loop(receiver, 1));
+    node.spawn(node.clone().heartbeat_loop());
+    node.spawn(node.clone().reaper_loop());
+    node.spawn(node.clone().checkpoint_loop());
+    node.spawn(node.clone().idle_shutdown_loop());
 
     node.broadcast(Payload::Hello {
         nick: node.shared.nick(),
@@ -2282,7 +2419,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
                 match accept {
                     Ok(stream) => {
                         let n = node.clone();
-                        tokio::spawn(async move { n.handle_conn(stream).await; });
+                        node.spawn(async move { n.handle_conn(stream).await; });
                     }
                     Err(e) => tracing::warn!("control accept error: {e}"),
                 }
@@ -2301,26 +2438,40 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     // seconds behind (the data itself is already fsync-durable regardless).
     node.replica.lock().unwrap().checkpoint();
 
-    // The rest of the teardown is courtesy (Bye broadcast, router close) — it
-    // must never keep a "shutting down" daemon alive. A gossip/endpoint close
-    // that hangs past the deadline gets abandoned; state is already durable.
-    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+    // Teardown order is load-bearing: `Bye` must reach the room while gossip is
+    // still up, so peers mark us offline immediately instead of waiting out a
+    // heartbeat lapse. Only then does cancellation go out, and only then does
+    // the network close under the tasks that were using it.
+    let _ = tokio::time::timeout(SHUTDOWN_DEADLINE, async {
         node.broadcast(Payload::Bye {
             nick: node.shared.nick(),
         })
         .await
         .ok();
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        node.router.shutdown().await.ok();
+        tokio::time::sleep(BYE_GRACE).await;
+    })
+    .await;
+    node.cancel.cancel();
+
+    // Take the task set out from under its lock: joining is an await, and the
+    // lock must never be held across one.
+    let mut tasks = std::mem::take(&mut *node.tasks.lock().unwrap());
+    let _ = tokio::time::timeout(SHUTDOWN_DEADLINE, async {
+        node.transport.shutdown().await;
+        while tasks.join_next().await.is_some() {}
+    })
+    .await;
+    // Whatever is still running past the deadline is wedged, not slow. Abort it
+    // and reap the handles so nothing is left running behind our return.
+    tasks.abort_all();
+    let _ = tokio::time::timeout(SHUTDOWN_DEADLINE, async {
+        while tasks.join_next().await.is_some() {}
     })
     .await;
 
     #[cfg(unix)]
     let _ = std::fs::remove_file(crate::config::socket_path(&home));
-    // Hard guarantee: "stop" means the process exits. Anything still running
-    // (a wedged endpoint task, a non-tokio thread) would otherwise leave a
-    // zombie whose half-dead control channel hangs every later client.
-    std::process::exit(0);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2335,8 +2486,7 @@ mod tests {
 
         let ws = SpaceId::mint(&SystemUlidSource);
         let host_seed = [10u8; 32];
-        let host_sk = SecretKey::from_bytes(&host_seed);
-        let host = DeviceId::from_key_string(host_sk.public().to_string());
+        let host = crate::crypto::device_from_seed(&host_seed);
 
         // The legit joiner and an eavesdropper, each with their own actor.
         let (j_incept, j_actor) = incept_single(&[11u8; 32], &ws, [1u8; 16], [2u8; 16], None);
@@ -2359,8 +2509,7 @@ mod tests {
             "a copied blob cannot admit a different actor"
         );
         // And a non-host cannot even read the blob — the nonce stays off the topic.
-        let atk_device =
-            DeviceId::from_key_string(SecretKey::from_bytes(&[12u8; 32]).public().to_string());
+        let atk_device = crate::crypto::device_from_seed(&[12u8; 32]);
         assert!(
             open_bound_invite(&[12u8; 32], &atk_device, &sealed, &j_incept).is_none(),
             "only the host can open the sealed invite"
@@ -2418,16 +2567,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let me = SecretKey::from_bytes(&[1u8; 32]).public();
-        let peer = SecretKey::from_bytes(&[2u8; 32]).public();
+        let me = crate::crypto::device_from_seed(&[1u8; 32]);
+        let peer = crate::crypto::device_from_seed(&[2u8; 32]);
 
         // Nothing persisted yet → empty bootstrap (the old always-empty case).
-        assert!(load_bootstrap_peers(&dir, me).is_empty());
+        assert!(load_bootstrap_peers(&dir, &me).is_empty());
 
         // Persist a set that includes ourselves; reload must drop self and keep
         // the real peer, so a restart bootstraps from the peer.
-        save_known_peers(&dir, &[me, peer]);
-        assert_eq!(load_bootstrap_peers(&dir, me), vec![peer]);
+        save_known_peers(&dir, &[me.clone(), peer.clone()]);
+        assert_eq!(load_bootstrap_peers(&dir, &me), vec![peer]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The on-disk peer cache is written by one daemon and read by the next,
+    /// possibly across an upgrade, so its encoding is a compatibility surface.
+    /// This fixture is a literal `peers.json` written by a pre-cutover build; it
+    /// must still load, and must still resolve to the same key the identity seed
+    /// derives.
+    #[test]
+    fn a_legacy_peers_file_still_bootstraps() {
+        let dir = std::env::temp_dir().join(format!("gc-legacy-peers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            peers_path(&dir),
+            r#"["8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394"]"#,
+        )
+        .unwrap();
+
+        let me = crate::crypto::device_from_seed(&[9u8; 32]);
+        assert_eq!(
+            load_bootstrap_peers(&dir, &me),
+            vec![crate::crypto::device_from_seed(&[2u8; 32])],
+            "a legacy peers.json must still name the same peer"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same obligation for `seeds.json`, plus the one that matters more:
+    /// a seed is pinned infrastructure, so a file with one bad record keeps
+    /// every good one instead of silently unpinning the lot.
+    #[test]
+    fn a_legacy_seeds_file_keeps_its_pins_and_rejects_only_the_bad_rows() {
+        let dir = std::env::temp_dir().join(format!("gc-legacy-seeds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            seeds_path(&dir),
+            r#"[
+  {
+    "id": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+    "nick": "nas",
+    "space": "ws_x"
+  }
+]"#,
+        )
+        .unwrap();
+
+        let seeds = load_seeds(&dir);
+        assert_eq!(seeds.len(), 1, "a legacy seeds.json must still load");
+        assert_eq!(seeds[0].id, crate::crypto::device_from_seed(&[2u8; 32]));
+        assert_eq!(seeds[0].nick, "nas");
+        assert_eq!(seeds[0].space, "ws_x");
+
+        // One good pin, one row missing its id, one row whose id is not a key.
+        std::fs::write(
+            seeds_path(&dir),
+            r#"[
+  {"id": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394", "nick": "nas", "space": "ws_x"},
+  {"nick": "no-id", "space": "ws_x"},
+  {"id": "not-a-key", "nick": "junk", "space": "ws_x"}
+]"#,
+        )
+        .unwrap();
+        let seeds = load_seeds(&dir);
+        assert_eq!(
+            seeds.len(),
+            1,
+            "a bad row must cost its own pin and no others"
+        );
+        assert_eq!(seeds[0].nick, "nas");
+
+        // A file that is not a list at all pins nothing rather than panicking.
+        std::fs::write(seeds_path(&dir), "not json at all").unwrap();
+        assert!(load_seeds(&dir).is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2440,8 +2665,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let a = SecretKey::from_bytes(&[2u8; 32]).public();
-        let b = SecretKey::from_bytes(&[3u8; 32]).public();
+        let a = crate::crypto::device_from_seed(&[2u8; 32]);
+        let b = crate::crypto::device_from_seed(&[3u8; 32]);
 
         assert!(load_seeds(&dir).is_empty());
 
@@ -2449,7 +2674,7 @@ mod tests {
         assert!(upsert_seed(
             &dir,
             SeedRecord {
-                id: a,
+                id: a.clone(),
                 nick: "nas".into(),
                 space: "ws".into()
             }
@@ -2457,7 +2682,7 @@ mod tests {
         assert!(!upsert_seed(
             &dir,
             SeedRecord {
-                id: a,
+                id: a.clone(),
                 nick: "nas2".into(),
                 space: "ws".into()
             }
@@ -2468,21 +2693,21 @@ mod tests {
         assert!(upsert_seed(
             &dir,
             SeedRecord {
-                id: b,
+                id: b.clone(),
                 nick: String::new(),
                 space: "ws".into()
             }
         ));
         // Bootstrap ids list both, but filter out our own id when we are `a`.
-        assert_eq!(seed_ids(&dir, b).len(), 1);
+        assert_eq!(seed_ids(&dir, &b).len(), 1);
         assert_eq!(
-            seed_ids(&dir, SecretKey::from_bytes(&[9u8; 32]).public()).len(),
+            seed_ids(&dir, &crate::crypto::device_from_seed(&[9u8; 32])).len(),
             2
         );
 
         // Remove by nick, then by full id.
         assert_eq!(remove_seed(&dir, "nas2"), 1);
-        assert_eq!(remove_seed(&dir, &b.to_string()), 1);
+        assert_eq!(remove_seed(&dir, b.as_str()), 1);
         assert!(load_seeds(&dir).is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);

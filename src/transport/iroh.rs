@@ -47,16 +47,10 @@ const INCOMING_BUFFER: usize = 16;
 
 // ---- id / topic conversion at the edge (T0: same 32 bytes) ----
 
-/// [`PeerId`] → iroh `EndpointId`: hex-decode the 64-char lowercase key string
-/// into the 32 key bytes. (Same decode as `proto::endpoint_of`, which is
-/// private to `proto.rs`; duplicated here so PR-1 touches nothing outside the
-/// transport — PR-2 can dedupe by promoting that fn to `pub(crate)`.)
+/// [`PeerId`] → iroh `EndpointId`: the same 32 ed25519 bytes under another name.
+/// Fallible because a `PeerId` is only *asserted* to be a key on construction.
 fn endpoint_id(peer: &PeerId) -> Result<EndpointId> {
-    let raw = data_encoding::HEXLOWER_PERMISSIVE
-        .decode(peer.as_str().as_bytes())
-        .ok()
-        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
-        .context("peer id is not a 32-byte key")?;
+    let raw = peer.key_bytes().context("peer id is not a 32-byte key")?;
     EndpointId::from_bytes(&raw).context("peer id is not a valid endpoint id")
 }
 
@@ -170,6 +164,23 @@ impl IrohTransport {
             shutdown: watch::Sender::new(false),
             my_id,
         })
+    }
+}
+
+/// The production network: a real endpoint under lait's policy.
+pub struct IrohFactory;
+
+#[async_trait]
+impl super::TransportFactory for IrohFactory {
+    async fn build(
+        &self,
+        identity_seed: &[u8; 32],
+        network: &crate::net::Network,
+        alpns: &[Alpn],
+    ) -> Result<std::sync::Arc<dyn Transport>> {
+        Ok(std::sync::Arc::new(
+            IrohTransport::new(identity_seed, network, alpns).await?,
+        ))
     }
 }
 
@@ -491,8 +502,7 @@ mod tests {
 
         // A space topic derived by proto survives the Topic round-trip.
         let derived = crate::proto::topic_for_space("ws-under-test");
-        let roundtrip = topic_id(Topic(*derived.as_bytes()));
-        assert_eq!(roundtrip, derived);
+        assert_eq!(topic_id(derived).as_bytes(), &derived.0);
 
         // Garbage is a loud error, not a bogus id.
         assert!(endpoint_id(&DeviceId::from_key_string("nope".into())).is_err());
