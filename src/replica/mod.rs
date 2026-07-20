@@ -49,9 +49,9 @@ pub use recovery::{
     RecoveryStatus,
 };
 // private re-imports so `use super::*` in children keeps unqualified helper names working:
-pub(self) use lifecycle::mint_recovery;
-pub(self) use mutate::WorkAction;
-pub(self) use recovery::{persist_recovery_key, persist_space_recovery};
+use lifecycle::mint_recovery;
+use mutate::WorkAction;
+use recovery::{persist_recovery_key, persist_space_recovery};
 
 /// The batched, project-keyed dirty set produced by a mutation. The
 /// node layer stamps it with an epoch + session `seq` to form a `Doorbell`.
