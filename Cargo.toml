@@ -86,15 +86,12 @@ getrandom = "0.3"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 
-# E2EE (P3) — all pure-Rust (RustCrypto/dalek), no C toolchain, no aws-lc:
-# ed25519 signing for the ACL op-graph, X25519 sealed boxes for workspace-key
-# distribution (ed25519→x25519 conversion), ChaCha20-Poly1305 AEAD for the
-# encrypted sync payloads (the blind-relay envelope).
-ed25519-dalek = "2"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-curve25519-dalek = "4"
-chacha20poly1305 = "0.10"
-sha2 = "0.10"
+# E2EE (P3) is the KERNEL's job now: ed25519 signing, X25519 sealed boxes, and
+# the ChaCha20-Poly1305 envelope all live in `lait-kernel::crypto`, which is the
+# only crate that names those primitives. The app deliberately lists NONE of
+# them, so reaching around the kernel to hand-roll a key derivation does not
+# compile — the same manifest-edge enforcement that seals Loro into lait-engine.
+# (`ed25519-dalek` remains a dev-dependency: interop tests forge raw keys.)
 # iroh core + gossip (the room/announce transport). iroh-blobs returns at P2 for
 # snapshots/attachments. All pin iroh =1.0.0-rc.1.
 iroh = "=1.0.0-rc.1"
@@ -164,8 +161,6 @@ schemars = "1"
 # keeps it pure-Rust (no reqwest/native-tls/OpenSSL C dep); gzip/zip extraction
 # only (no xz), matching the `.tar.gz` release archives.
 self_update = { version = "0.44.0", default-features = false, features = ["ureq", "rustls", "archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate"] }
-frost-ed25519 = "3"
-rand_core = { version = "0.6", features = ["getrandom"] }
 
 # unix-only: reset SIGPIPE to default so piping CLI output to head/less/grep
 # exits cleanly instead of panicking (Rust ignores SIGPIPE by default). Already
@@ -179,6 +174,11 @@ libc = "0.2"
 # inherit flag on our own stdio — `disinherit_stdio` in app.rs) and
 # `CreateProcessW` + `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (inherit exactly the
 # three handles we name — `daemon_spawn`), which std only exposes as an unstable
+# feature. Already present transitively (iroh/tokio); declared directly for those.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
     # `secretfs`: secrets are created with an explicit owner-only DACL rather
     # than inheriting the parent's. std gives us no way to do that — there is no
     # `DirBuilderExt` on Windows, and `OpenOptionsExt` exposes only CreateFileW's
@@ -189,14 +189,16 @@ libc = "0.2"
     "Win32_System_Memory",
     # DPAPI wrap for device-bound secrets (never for portable recovery keys).
     "Win32_Security_Cryptography",
-# feature. Already present transitively (iroh/tokio); declared directly for those.
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = [
-    "Win32_Foundation",
-    "Win32_System_Threading",
 ] }
 
 [dev-dependencies]
+# Raw crypto primitives are TEST-ONLY at this layer: `identity_interop.rs` and
+# `frost_interop.rs` forge keys and drive ceremony rounds against the kernel's
+# public surface, which is exactly the kind of adversarial construction that has
+# to reach past `lait-kernel::crypto`. Production code goes through the kernel.
+ed25519-dalek = "2"
+frost-ed25519 = "3"
+rand_core = { version = "0.6", features = ["getrandom"] }
 # in-process relay + DNS/pkarr servers for hermetic multi-node tests (crate::net).
 # The `test-utils` feature is dev-only, so the shipped binary never links it.
 iroh = { version = "=1.0.0-rc.1", features = ["test-utils"] }

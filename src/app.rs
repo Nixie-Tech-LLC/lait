@@ -676,8 +676,10 @@ async fn run_join_cli(m: &ArgMatches, out: Out) -> Result<()> {
                 "this invite carries no founding proof — it may be from an older lait; ask for a fresh one"
             )
         })?;
+        let seed = load_or_create_identity(&config::identity_dir()?)?;
         crate::tracker::join_workspace_store(
             &store,
+            &crate::crypto::user_from_seed(&seed),
             &ticket.workspace,
             &ticket.salt,
             &ticket.recovery_root,
