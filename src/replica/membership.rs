@@ -2,6 +2,40 @@
 
 use super::*;
 
+/// How an actor came to hold a seat, or why it did not need one.
+///
+/// The three paths produce three different sentences, and which one a caller
+/// hears is a fact about what happened rather than a choice of wording — so the
+/// domain reports the path and the adapter writes the sentence.
+/// [`AlreadyMember`](Admission::AlreadyMember) is always paired with
+/// [`Change::unchanged`]: it is the branch that seals nothing.
+#[derive(Debug)]
+pub enum Admission {
+    /// An admin decided, directly.
+    Added(ActorId),
+    /// A valid invite grant decided, with no human step.
+    AutoApproved(ActorId),
+    /// Already seated; nothing to seal.
+    AlreadyMember(ActorId),
+}
+
+/// A member lost their seat and the key rotated behind them.
+#[derive(Debug)]
+pub struct MemberRemoved(pub ActorId);
+
+/// The space key rotated, to this generation.
+#[derive(Debug)]
+pub struct KeyRotated {
+    pub generation: u64,
+}
+
+/// An invite was revoked. Whether it had *already* been redeemed decides what
+/// can honestly be promised, so that fact travels with the result.
+#[derive(Debug)]
+pub struct InviteRevocation {
+    pub already_spent: bool,
+}
+
 impl Replica {
     // ---- membership and authorization operations ----
 
@@ -182,45 +216,32 @@ impl Replica {
     /// Add (or re-grant) a member by actor and seal them the space key
     /// Administrator-only. The target actor's inception must already be
     /// known locally (the enrollment path imports it first via `redeem_invite`).
-    pub fn member_add(
-        &mut self,
-        actor: &ActorId,
-        grants: Vec<Grant>,
-    ) -> (Response, Option<DirtySet>) {
+    pub fn member_add(&mut self, actor: &ActorId, grants: Vec<Grant>) -> ChangeResult<Admission> {
         let acl = self.acl_state();
         match self.my_actor() {
             Some(me) if acl.is_admin(&me) => {}
-            _ => return (Response::err("only an admin can add members"), None),
+            _ => {
+                return Err(ReplicaError::Denied(Denied::NotAdmin(
+                    AdminAction::AddMember,
+                )))
+            }
         }
         if !self.actor_plane().exists(actor) {
-            return (
-                Response::err(format!(
-                    "unknown actor {} — invite them so their identity arrives first",
-                    actor.short()
-                )),
-                None,
-            );
+            return Err(ReplicaError::Conflict(Conflict::ActorUnknown {
+                short: actor.short(),
+            }));
         }
-        let op = match self.author_acl(AclAction::AddMember {
+        let op = self.author_acl(AclAction::AddMember {
             actor: actor.clone(),
             grants,
-        }) {
-            Ok(op) => op,
-            Err(e) => return (Response::err(format!("{e:#}")), None),
-        };
+        })?;
         let target = actor.clone();
-        if let Err(e) =
-            self.member_apply(op, "member_add", |t| Self::seal_epochs_to_actor(t, &target))
-        {
-            return (Response::err(format!("{e:#}")), None);
-        }
+        self.member_apply(op, "member_add", |t| Self::seal_epochs_to_actor(t, &target))?;
         self.push_activity(None, &actor.short(), "member_added", vec![], &actor.short());
-        (
-            Response::Ok {
-                message: Some(format!("added member {}", actor.short())),
-            },
-            Some(DirtySet::catalog(CatalogScope::Acl)),
-        )
+        Ok(Change::committed(
+            Admission::Added(actor.clone()),
+            DirtySet::catalog(CatalogScope::Acl),
+        ))
     }
 
     /// Import a joiner's actor **inception** (from a `JoinRequest`) so a manual
@@ -253,48 +274,42 @@ impl Replica {
         &mut self,
         incept: &actor::SignedEvent,
         grants: Vec<Grant>,
-    ) -> (Response, Option<DirtySet>) {
+    ) -> ChangeResult<Admission> {
         let acl = self.acl_state();
         match self.my_actor() {
             Some(me) if acl.is_admin(&me) => {}
-            _ => return (Response::err("only an admin can add members"), None),
+            _ => {
+                return Err(ReplicaError::Denied(Denied::NotAdmin(
+                    AdminAction::AddMember,
+                )))
+            }
         }
         let actor = ActorId::from_incept_hash(&incept.hash());
         let mut candidate = self.membership.actor_events();
         candidate.push(incept.clone());
         if !actor::replay(&self.space_id, &candidate).exists(&actor) {
-            return (Response::err("invalid actor inception"), None);
+            return Err(ReplicaError::Invalid(Invalid::ActorInception {
+                in_join_request: false,
+            }));
         }
         if acl.is_member(&actor) {
-            return (
-                Response::Ok {
-                    message: Some(format!("{} is already a member", actor.short())),
-                },
-                None,
-            );
+            return Ok(Change::unchanged(Admission::AlreadyMember(actor)));
         }
-        let op = match self.author_acl(AclAction::AddMember {
+        let op = self.author_acl(AclAction::AddMember {
             actor: actor.clone(),
             grants,
-        }) {
-            Ok(op) => op,
-            Err(e) => return (Response::err(format!("{e:#}")), None),
-        };
+        })?;
         let incept = incept.clone();
         let target = actor.clone();
-        if let Err(e) = self.member_apply(op, "member_admit", |t| {
+        self.member_apply(op, "member_admit", |t| {
             t.membership.add_actor_event(&incept)?;
             Self::seal_epochs_to_actor(t, &target)
-        }) {
-            return (Response::err(format!("{e:#}")), None);
-        }
+        })?;
         self.push_activity(None, &actor.short(), "member_added", vec![], &actor.short());
-        (
-            Response::Ok {
-                message: Some(format!("added member {}", actor.short())),
-            },
-            Some(DirtySet::catalog(CatalogScope::Acl)),
-        )
+        Ok(Change::committed(
+            Admission::Added(actor),
+            DirtySet::catalog(CatalogScope::Acl),
+        ))
     }
 
     /// **Pattern A auto-approval.** Admit a joiner who presented a valid,
@@ -314,7 +329,7 @@ impl Replica {
         joiner_incept: &actor::SignedEvent,
         nonce: &[u8; 16],
         single_use: bool,
-    ) -> (Response, Option<DirtySet>) {
+    ) -> ChangeResult<Admission> {
         // The joiner's self-certifying actor id is its inception's hash. Validate
         // the inception cleanly incepts for THIS space before admitting it —
         // a forged inception must never enter the actors container.
@@ -322,10 +337,9 @@ impl Replica {
         let mut candidate = self.membership.actor_events();
         candidate.push(joiner_incept.clone());
         if !actor::replay(&self.space_id, &candidate).exists(&joiner_actor) {
-            return (
-                Response::err("join request carried an invalid actor inception"),
-                None,
-            );
+            return Err(ReplicaError::Invalid(Invalid::ActorInception {
+                in_join_request: true,
+            }));
         }
 
         let plane = self.actor_plane();
@@ -335,59 +349,49 @@ impl Replica {
             .actor_of_device(issuer_device)
             .is_some_and(|a| acl.is_admin(a));
         if !issuer_ok {
-            return (Response::err("invite issuer is not a space admin"), None);
+            return Err(ReplicaError::Denied(Denied::IssuerNotAdmin));
         }
         // We can only seal if we ourselves are an admin holding the key.
         match self.my_actor() {
             Some(me) if acl.is_admin(&me) => {}
-            _ => return (Response::err("this node is not an admin"), None),
+            _ => return Err(ReplicaError::Denied(Denied::NodeNotAdmin)),
         }
         // Revocation kill switch: an admin-signed RevokeInvite voids this nonce
         // convergently — the only way to retire a leaked (esp. reusable) invite.
         if acl.is_invite_revoked(nonce) {
-            return (Response::err("this invite has been revoked"), None);
+            return Err(ReplicaError::Conflict(Conflict::InviteRevoked));
         }
         // Single-use replay guard — read from the SIGNED ACL (an authorized
         // AddMember that spent this nonce), never an unsigned side container.
         // The convergent nonce dedup in replay is the real guarantee; this is the
         // fast-fail so we don't author a doomed op.
         if single_use && acl.is_nonce_spent(nonce) {
-            return (Response::err("invite already redeemed"), None);
+            return Err(ReplicaError::Conflict(Conflict::InviteRedeemed));
         }
         // Idempotent: already a member ⇒ nothing to seal, no ACL churn.
         if acl.is_member(&joiner_actor) {
-            return (
-                Response::Ok {
-                    message: Some(format!("{} is already a member", joiner_actor.short())),
-                },
-                None,
-            );
+            return Ok(Change::unchanged(Admission::AlreadyMember(joiner_actor)));
         }
         // Bind the nonce into the op for single-use invites so concurrent
         // redemptions of the same invite converge to one admitted actor.
         let op_nonce = if single_use { Some(*nonce) } else { None };
-        let op = match self.author_acl_nonce(
+        let op = self.author_acl_nonce(
             AclAction::AddMember {
                 actor: joiner_actor.clone(),
                 grants: vec![Grant::Write],
             },
             op_nonce,
-        ) {
-            Ok(op) => op,
-            Err(e) => return (Response::err(format!("{e:#}")), None),
-        };
+        )?;
         let incept = joiner_incept.clone();
         let target = joiner_actor.clone();
-        if let Err(e) = self.member_apply(op, "invite_redeem", |t| {
+        self.member_apply(op, "invite_redeem", |t| {
             // Import the joiner's identity, then seal every epoch to its devices.
             // The single-use nonce is recorded by the AddMember op itself (bound
             // above), so replay is the redemption record — no side container.
             t.membership.add_actor_event(&incept)?;
             Self::seal_epochs_to_actor(t, &target)?;
             Ok(())
-        }) {
-            return (Response::err(format!("{e:#}")), None);
-        }
+        })?;
         self.push_activity(
             None,
             &joiner_actor.short(),
@@ -395,36 +399,33 @@ impl Replica {
             vec![],
             &joiner_actor.short(),
         );
-        (
-            Response::Ok {
-                message: Some(format!("auto-approved {} via invite", joiner_actor.short())),
-            },
-            Some(DirtySet::catalog(CatalogScope::Acl)),
-        )
+        Ok(Change::committed(
+            Admission::AutoApproved(joiner_actor),
+            DirtySet::catalog(CatalogScope::Acl),
+        ))
     }
 
     /// Remove a member (signed RemoveMember op) and **rotate the space key**
     /// using lazy revocation: a new epoch is sealed only to the remaining
     /// members' devices, so the removed actor cannot read *future* content.
     /// Admin-only.
-    pub fn member_remove(&mut self, actor: &ActorId) -> (Response, Option<DirtySet>) {
+    pub fn member_remove(&mut self, actor: &ActorId) -> ChangeResult<MemberRemoved> {
         let acl = self.acl_state();
         let me = match self.my_actor() {
             Some(me) if acl.is_admin(&me) => me,
-            _ => return (Response::err("only an admin can remove members"), None),
+            _ => {
+                return Err(ReplicaError::Denied(Denied::NotAdmin(
+                    AdminAction::RemoveMember,
+                )))
+            }
         };
         if actor == &me {
-            return (Response::err("refusing to remove yourself"), None);
+            return Err(ReplicaError::Denied(Denied::SelfRemoval));
         }
-        let op = match self.author_acl(AclAction::RemoveMember {
+        let op = self.author_acl(AclAction::RemoveMember {
             actor: actor.clone(),
-        }) {
-            Ok(op) => op,
-            Err(e) => return (Response::err(format!("{e:#}")), None),
-        };
-        if let Err(e) = self.member_apply(op, "member_remove", |t| t.rotate_key()) {
-            return (Response::err(format!("{e:#}")), None);
-        }
+        })?;
+        self.member_apply(op, "member_remove", |t| t.rotate_key())?;
         self.push_activity(
             None,
             &actor.short(),
@@ -432,89 +433,54 @@ impl Replica {
             vec![],
             &actor.short(),
         );
-        (
-            Response::Ok {
-                message: Some(format!(
-                    "removed member {} and rotated the key",
-                    actor.short()
-                )),
-            },
-            Some(DirtySet::catalog(CatalogScope::Acl)),
-        )
+        Ok(Change::committed(
+            MemberRemoved(actor.clone()),
+            DirtySet::catalog(CatalogScope::Acl),
+        ))
     }
 
     /// Rotate the space key without a membership change (key hygiene).
-    pub fn key_rotate_cmd(&mut self) -> (Response, Option<DirtySet>) {
+    pub fn key_rotate_cmd(&mut self) -> ChangeResult<KeyRotated> {
         let is_admin = self
             .my_actor()
             .is_some_and(|me| self.acl_state().is_admin(&me));
         if !is_admin {
-            return (Response::err("only an admin can rotate the key"), None);
+            return Err(ReplicaError::Denied(Denied::NotAdmin(
+                AdminAction::RotateKey,
+            )));
         }
-        match self.rotate_key() {
-            Ok(()) => {
-                if let Err(e) = self.persist_membership("key_rotate") {
-                    return (Response::err(format!("{e:#}")), None);
-                }
-                let gen = self.active_epoch().map(|e| e.gen).unwrap_or(0);
-                (
-                    Response::Ok {
-                        message: Some(format!("rotated the space key (generation {gen})")),
-                    },
-                    Some(DirtySet::catalog(CatalogScope::Acl)),
-                )
-            }
-            Err(e) => (Response::err(format!("{e:#}")), None),
-        }
+        self.rotate_key()?;
+        self.persist_membership("key_rotate")?;
+        let generation = self.active_epoch().map(|e| e.gen).unwrap_or(0);
+        Ok(Change::committed(
+            KeyRotated {
+                generation: generation.into(),
+            },
+            DirtySet::catalog(CatalogScope::Acl),
+        ))
     }
 
     /// Revoke an outstanding invite (admin-only). Accepts the invite's 32-hex
     /// nonce or a full ticket to lift it from. Authors a signed
     /// [`AclAction::RevokeInvite`]; once it syncs, no admin admits via that nonce
     /// — the kill switch for a leaked (especially reusable) invite.
-    pub fn invite_revoke_cmd(&mut self, invite: String) -> (Response, Option<DirtySet>) {
+    pub fn invite_revoke_cmd(&mut self, invite: String) -> ChangeResult<InviteRevocation> {
         if !self.am_i_admin() {
-            return (Response::err("only an admin can revoke an invite"), None);
+            return Err(ReplicaError::Denied(Denied::NotAdmin(
+                AdminAction::RevokeInvite,
+            )));
         }
         let Some(nonce) = Self::parse_invite_nonce(&invite) else {
-            return (
-                Response::err("not a valid invite — pass the ticket or its 32-hex nonce"),
-                None,
-            );
+            return Err(ReplicaError::Invalid(Invalid::InviteRef));
         };
-        let op = match self.author_acl(AclAction::RevokeInvite { nonce }) {
-            Ok(op) => op,
-            Err(e) => return (Response::err(format!("{e:#}")), None),
-        };
+        let op = self.author_acl(AclAction::RevokeInvite { nonce })?;
         // Whether it was *already* spent decides what we can honestly promise.
         let already_spent = self.acl_state().is_nonce_spent(&nonce);
-        if let Err(e) = self.member_apply(op, "invite_revoke", |_| Ok(())) {
-            return (Response::err(format!("{e:#}")), None);
-        }
-        // Never claim the invite was undone. A redemption that causally precedes
-        // this revoke stands (it was legitimate); a concurrent one is evicted on
-        // merge and the key rotates — but in both cases content already shared
-        // stays readable by whoever was admitted. That is lazy revocation, and
-        // no amount of re-keying closes it.
-        // `spent_nonces` is grow-only, so a spent nonce says an admission
-        // *happened* — not that the actor is still a member. They may have been
-        // removed since. Point at the member list rather than asserting a seat.
-        let message = if already_spent {
-            "the invite had already been redeemed, so revoking it does not undo \
-             that admission. Check the member list and remove the actor if they \
-             should no longer have access."
-        } else {
-            "revoked the invite — it admits no one from here on. If it was \
-             redeemed elsewhere before this synced, that member is removed and \
-             the key rotates on merge, but content shared before then stays \
-             readable by them."
-        };
-        (
-            Response::Ok {
-                message: Some(message.into()),
-            },
-            Some(DirtySet::catalog(CatalogScope::Acl)),
-        )
+        self.member_apply(op, "invite_revoke", |_| Ok(()))?;
+        Ok(Change::committed(
+            InviteRevocation { already_spent },
+            DirtySet::catalog(CatalogScope::Acl),
+        ))
     }
 
     /// Extract an invite nonce from either a full ticket (via its signed invite)
@@ -545,18 +511,12 @@ impl Replica {
         self.actor_plane().actor_of_device(&dev).cloned()
     }
 
-    pub(super) fn member_add_cmd(
-        &mut self,
-        who: String,
-        admin: bool,
-    ) -> (Response, Option<DirtySet>) {
+    pub(super) fn member_add_cmd(&mut self, who: String, admin: bool) -> ChangeResult<Admission> {
         let Some(actor) = self.resolve_actor(&who) else {
-            return (
-                Response::not_found(format!(
-                    "no known actor matches '{who}' — invite them first so their identity arrives"
-                )),
-                None,
-            );
+            return Err(ReplicaError::NotFound(NotFound::Actor {
+                named: who,
+                invite_hint: true,
+            }));
         };
         let grants = if admin {
             vec![Grant::Admin, Grant::Write]
@@ -565,16 +525,16 @@ impl Replica {
         };
         self.member_add(&actor, grants)
     }
-    pub(super) fn member_remove_cmd(&mut self, who: String) -> (Response, Option<DirtySet>) {
+    pub(super) fn member_remove_cmd(&mut self, who: String) -> ChangeResult<MemberRemoved> {
         let Some(actor) = self.resolve_actor(&who) else {
-            return (
-                Response::not_found(format!("no known actor matches '{who}'")),
-                None,
-            );
+            return Err(ReplicaError::NotFound(NotFound::Actor {
+                named: who,
+                invite_hint: false,
+            }));
         };
         self.member_remove(&actor)
     }
-    pub(super) fn members_response(&self) -> Response {
+    pub(super) fn member_list(&self) -> Vec<crate::dto::MemberDto> {
         let acl = self.acl_state();
         let mine = self.my_actor();
         let members = acl
@@ -594,13 +554,13 @@ impl Replica {
                 }
             })
             .collect();
-        Response::Members { members }
+        members
     }
 
     /// The membership audit log: the signed ACL DAG replayed into a rendered,
     /// causally ordered list of operations and their verdicts. This provides
     /// cryptographic provenance, unlike the advisory activity feed.
-    pub(super) fn member_log_response(&self) -> Response {
+    pub(super) fn member_log(&self) -> Vec<crate::dto::MemberLogEntry> {
         let (_state, audit) = acl::replay_with_audit(
             &self.effective_genesis(),
             &self.membership.actor_events(),
@@ -627,7 +587,7 @@ impl Replica {
                 authorized: e.authorized,
             })
             .collect();
-        Response::MemberLog { entries }
+        entries
     }
 
     /// Apply a signed op + an extra key-sealing step, then commit + persist.

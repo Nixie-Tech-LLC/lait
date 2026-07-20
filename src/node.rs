@@ -48,7 +48,7 @@ use crate::{
     index::{resolve_device_dir, DeviceResolution, KnownDevice},
     presence::{PeerState, PRESENCE_ALPN},
     proto::{InviteGrant, Payload, SignedInvite, SignedMessage, SpaceTicket},
-    replica::{DirtySet, Replica},
+    replica::{Change, DirtySet, Replica},
     store::Store,
     transport::{
         DefaultFactory, GossipEvent, GossipSender, Incoming, Topic, Transport, TransportFactory,
@@ -1296,7 +1296,14 @@ impl Node {
             if grant.space != t.space_str() {
                 return;
             }
-            let (_resp, dirty) = t.redeem_invite(&issuer, &incept, &grant.nonce, grant.single_use);
+            // Gossip-triggered, so there is no client to answer: the outcome
+            // matters only for whether anything changed. A refusal here is
+            // ordinary — a revoked or already-spent invite, or a joiner who is
+            // already a member — and rings nothing.
+            let dirty = t
+                .redeem_invite(&issuer, &incept, &grant.nonce, grant.single_use)
+                .ok()
+                .and_then(Change::into_dirty);
             (dirty.is_some(), dirty)
         };
         if let Some(dirty) = dirty {

@@ -2,6 +2,32 @@ use super::*;
 use crate::control::CatalogScope;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Drive a command that must succeed, yielding its value and what it committed.
+/// Panics with the typed error rather than an opaque response, so a broken
+/// setup step names itself.
+fn ok<T>(r: ChangeResult<T>) -> (T, Option<DirtySet>) {
+    match r {
+        Ok(change) => change.into_parts(),
+        Err(e) => panic!("expected the command to succeed, got: {e}"),
+    }
+}
+
+/// Drive a command that must be refused, yielding the typed reason. Asserts the
+/// half of validate-then-commit that the type guarantees: a refusal carries no
+/// dirty set, so nothing rang.
+fn refused<T: std::fmt::Debug>(r: ChangeResult<T>) -> ReplicaError {
+    match r {
+        Err(e) => e,
+        Ok(change) => {
+            let (value, dirty) = change.into_parts();
+            panic!(
+                "expected a refusal, got {value:?} (dirty: {})",
+                dirty.is_some()
+            )
+        }
+    }
+}
+
 /// Deterministic, Send+Sync clock/entropy: fixed ms, monotonic entropy so
 /// minted ids are distinct (and canonical handles unique) without wall-clock
 /// or RNG flakiness.
@@ -787,8 +813,8 @@ fn single_use_invite_admits_exactly_one_actor_under_concurrency() {
         &a.replica.founding_proof().unwrap(),
     );
     let b_incept = b.replica.self_inception().unwrap();
-    a.replica
-        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
+    ok(a.replica
+        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]));
     sync_all(&mut a.replica, &mut b.replica);
     assert!(b.replica.am_i_admin());
 
@@ -800,8 +826,8 @@ fn single_use_invite_admits_exactly_one_actor_under_concurrency() {
     let issuer = a.replica.me.clone(); // an admin's device signed the invite
 
     // Concurrent redemptions on the two un-merged admins.
-    a.replica.redeem_invite(&issuer, &j1, &nonce, true);
-    b.replica.redeem_invite(&issuer, &j2, &nonce, true);
+    ok(a.replica.redeem_invite(&issuer, &j1, &nonce, true));
+    ok(b.replica.redeem_invite(&issuer, &j2, &nonce, true));
 
     sync_all(&mut a.replica, &mut b.replica);
     sync_all(&mut b.replica, &mut a.replica);
@@ -849,10 +875,10 @@ fn concurrent_rotations_converge_and_fence() {
     let d_actor = actor_of(&d_incept);
 
     // B is a second admin; C and D are members.
-    a.replica
-        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
-    a.replica.admit_member(&c_incept, vec![Grant::Write]);
-    a.replica.admit_member(&d_incept, vec![Grant::Write]);
+    ok(a.replica
+        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]));
+    ok(a.replica.admit_member(&c_incept, vec![Grant::Write]));
+    ok(a.replica.admit_member(&d_incept, vec![Grant::Write]));
     for n in [&mut b, &mut c, &mut d] {
         sync_all(&mut a.replica, &mut n.replica);
     }
@@ -860,8 +886,8 @@ fn concurrent_rotations_converge_and_fence() {
 
     // Concurrent removals (no sync between): A removes C, B removes D. Each
     // rotates locally to a fresh content-addressed epoch.
-    a.replica.member_remove(&c_actor);
-    b.replica.member_remove(&d_actor);
+    ok(a.replica.member_remove(&c_actor));
+    ok(b.replica.member_remove(&d_actor));
 
     // Merge both ways + a settling round so the heal epoch propagates.
     sync_all(&mut a.replica, &mut b.replica);
@@ -930,8 +956,7 @@ fn e2ee_membership_gates_decryption() {
     // B's inception rides to A (here: passed directly, as a JoinRequest would).
     let b_incept = b.replica.self_inception().unwrap();
     let b_actor = actor_of(&b_incept);
-    let (resp, _) = a.replica.admit_member(&b_incept, vec![Grant::Write]);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica.admit_member(&b_incept, vec![Grant::Write]));
     sync_all(&mut a.replica, &mut b.replica);
     assert!(b.replica.am_i_member(), "B is now a member");
     assert_eq!(
@@ -941,8 +966,7 @@ fn e2ee_membership_gates_decryption() {
     );
 
     // A removes B + rotates; new content is encrypted under an epoch B lacks.
-    let (resp, _) = a.replica.member_remove(&b_actor);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica.member_remove(&b_actor));
     new_issue(&mut a.replica, "post-removal");
     sync_all(&mut a.replica, &mut b.replica);
     assert!(
@@ -973,8 +997,7 @@ fn a_viewer_reads_but_is_refused_writes_until_granted() {
     let b_actor = actor_of(&b_incept);
 
     // Admit B as a VIEWER (no grants), then sync.
-    let (resp, _) = a.replica.admit_member(&b_incept, vec![]);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica.admit_member(&b_incept, vec![]));
     sync_all(&mut a.replica, &mut b.replica);
     assert!(b.replica.am_i_member(), "a viewer is a member");
     assert_eq!(
@@ -1005,10 +1028,8 @@ fn a_viewer_reads_but_is_refused_writes_until_granted() {
     );
 
     // Admin grants B Write; the same write now succeeds.
-    let (resp, _) = a
-        .replica
-        .member_add(&b_actor, vec![Grant::Admin, Grant::Write]);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .member_add(&b_actor, vec![Grant::Admin, Grant::Write]));
     // member_add re-grant is authored against the *actor* frontier; grant
     // Write specifically (Admin+Write here) and sync so B sees its new grant.
     sync_all(&mut a.replica, &mut b.replica);
@@ -1116,15 +1137,12 @@ fn heal_supersedes_the_epoch_of_a_removed_minter() {
     );
     let b_incept = b.replica.self_inception().unwrap();
     let b_actor = actor_of(&b_incept);
-    let (resp, _) = a
-        .replica
-        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]));
     sync_all(&mut a.replica, &mut b.replica);
 
     // B (admin) rotates the key: the active epoch is now minted by B.
-    let (resp, _) = b.replica.key_rotate_cmd();
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(b.replica.key_rotate_cmd());
     sync_all(&mut b.replica, &mut a.replica);
     assert_eq!(
         a.replica.active_epoch().unwrap().minted_by,
@@ -1183,7 +1201,7 @@ fn a_non_admin_device_revoke_is_honest_about_pending_rotation() {
     );
     let b_incept = b.replica.self_inception().unwrap();
     let b_actor = actor_of(&b_incept);
-    a.replica.admit_member(&b_incept, vec![Grant::Write]); // writer, not admin
+    ok(a.replica.admit_member(&b_incept, vec![Grant::Write])); // writer, not admin
     sync_all(&mut a.replica, &mut b.replica);
 
     // B adds a second device so it has one to revoke.
@@ -1246,8 +1264,8 @@ fn a_non_founder_invite_roots_the_joiner_on_the_true_founder() {
     );
     let b_incept = b.replica.self_inception().unwrap();
     let b_actor = actor_of(&b_incept);
-    a.replica
-        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
+    ok(a.replica
+        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]));
     sync_all(&mut a.replica, &mut b.replica);
     assert!(b.replica.am_i_member());
     // The fix: B (a non-founder) anchors an invite on the FOUNDER, not itself.
@@ -1274,7 +1292,7 @@ fn a_non_founder_invite_roots_the_joiner_on_the_true_founder() {
         &b.replica.founding_proof().unwrap(),
     );
     let c_incept = c.replica.self_inception().unwrap();
-    b.replica.admit_member(&c_incept, vec![Grant::Write]);
+    ok(b.replica.admit_member(&c_incept, vec![Grant::Write]));
     sync_all(&mut b.replica, &mut c.replica);
     assert!(c.replica.am_i_member(), "C is a member");
     assert!(
@@ -1384,8 +1402,8 @@ fn elevate_solo_recovery_to_a_2_of_2_dkg_group_key() {
         &a.replica.founding_proof().unwrap(),
     );
     let b_incept = b.replica.self_inception().unwrap();
-    a.replica
-        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
+    ok(a.replica
+        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]));
     sync_all(&mut a.replica, &mut b.replica);
 
     // A elevates to a 2-of-2 over {A, B}.
@@ -1581,8 +1599,8 @@ fn a_nonce_bound_to_another_package_refuses_to_sign() {
         &a.replica.founding_proof().unwrap(),
     );
     let b_incept = b.replica.self_inception().unwrap();
-    a.replica
-        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
+    ok(a.replica
+        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]));
     sync_all(&mut a.replica, &mut b.replica);
 
     // Elevate {A, B} to a 2-of-2 group recovery key.
@@ -1676,8 +1694,8 @@ fn an_unreadable_share_is_reported_as_degraded_not_absent() {
         &a.replica.founding_proof().unwrap(),
     );
     let b_incept = b.replica.self_inception().unwrap();
-    a.replica
-        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
+    ok(a.replica
+        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]));
     sync_all(&mut a.replica, &mut b.replica);
     let (resp, _) = a
         .replica
@@ -1874,9 +1892,9 @@ fn a_non_admin_is_told_a_rekey_is_pending() {
     let mut c = new_joiner_node_as(device_from_seed(c_seed), c_seed, &a_ws, &proof);
     let b_incept = b.replica.self_inception().unwrap();
     let c_incept = c.replica.self_inception().unwrap();
-    a.replica
-        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
-    a.replica.admit_member(&c_incept, vec![Grant::Write]);
+    ok(a.replica
+        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]));
+    ok(a.replica.admit_member(&c_incept, vec![Grant::Write]));
     sync_all(&mut a.replica, &mut b.replica);
     sync_all(&mut a.replica, &mut c.replica);
     assert!(!c.replica.am_i_admin(), "C cannot mint");
@@ -1889,12 +1907,9 @@ fn a_non_admin_is_told_a_rekey_is_pending() {
     let nonce = [7u8; 16];
     let x_incept = incept_for([61u8; 32], &b.replica);
     let x_actor = actor_of(&x_incept);
-    let (resp, _) = b.replica.redeem_invite(&b_device, &x_incept, &nonce, true);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
-    let (resp, _) = a
-        .replica
-        .invite_revoke_cmd(data_encoding::HEXLOWER.encode(&nonce));
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(b.replica.redeem_invite(&b_device, &x_incept, &nonce, true));
+    ok(a.replica
+        .invite_revoke_cmd(data_encoding::HEXLOWER.encode(&nonce)));
 
     // C observes BOTH branches before any admin has rotated past the fence.
     sync_membership(&mut b.replica, &mut c.replica);
@@ -2108,8 +2123,8 @@ fn a_group_authorizes_and_installs_its_own_replacement() {
         b.replica.self_inception().unwrap(),
         c.replica.self_inception().unwrap(),
     ] {
-        a.replica
-            .admit_member(&incept, vec![Grant::Admin, Grant::Write]);
+        ok(a.replica
+            .admit_member(&incept, vec![Grant::Admin, Grant::Write]));
     }
     sync_all(&mut a.replica, &mut b.replica);
     sync_all(&mut a.replica, &mut c.replica);
@@ -2275,8 +2290,8 @@ fn any_k_of_n_can_sign_without_the_lowest_index_holder() {
         b.replica.self_inception().unwrap(),
         c.replica.self_inception().unwrap(),
     ] {
-        a.replica
-            .admit_member(&incept, vec![Grant::Admin, Grant::Write]);
+        ok(a.replica
+            .admit_member(&incept, vec![Grant::Admin, Grant::Write]));
     }
     sync_all(&mut a.replica, &mut b.replica);
     sync_all(&mut a.replica, &mut c.replica);
@@ -2380,8 +2395,8 @@ fn an_indispensable_arrangement_waits_for_verified_custody() {
         &a.replica.founding_proof().unwrap(),
     );
     let b_incept = b.replica.self_inception().unwrap();
-    a.replica
-        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
+    ok(a.replica
+        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]));
     sync_all(&mut a.replica, &mut b.replica);
 
     let commit0 = crate::space::replay(
@@ -2487,8 +2502,8 @@ fn a_redundant_arrangement_installs_without_universal_attestation() {
         b.replica.self_inception().unwrap(),
         c.replica.self_inception().unwrap(),
     ] {
-        a.replica
-            .admit_member(&incept, vec![Grant::Admin, Grant::Write]);
+        ok(a.replica
+            .admit_member(&incept, vec![Grant::Admin, Grant::Write]));
     }
     sync_all(&mut a.replica, &mut b.replica);
     sync_all(&mut a.replica, &mut c.replica);
@@ -2536,8 +2551,8 @@ fn a_lost_share_is_restored_from_its_portable_package() {
         &a.replica.founding_proof().unwrap(),
     );
     let b_incept = b.replica.self_inception().unwrap();
-    a.replica
-        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
+    ok(a.replica
+        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]));
     sync_all(&mut a.replica, &mut b.replica);
     let (resp, _) = a
         .replica
@@ -2678,8 +2693,8 @@ fn a_rotation_that_could_never_install_is_refused_up_front() {
         c.replica.self_inception().unwrap(),
         d.replica.self_inception().unwrap(),
     ] {
-        a.replica
-            .admit_member(&incept, vec![Grant::Admin, Grant::Write]);
+        ok(a.replica
+            .admit_member(&incept, vec![Grant::Admin, Grant::Write]));
     }
     for other in [&mut b, &mut c, &mut d] {
         sync_all(&mut a.replica, &mut other.replica);
@@ -2913,8 +2928,8 @@ fn a_swapped_public_key_package_cannot_redirect_the_rotation() {
         &a.replica.founding_proof().unwrap(),
     );
     let b_incept = b.replica.self_inception().unwrap();
-    a.replica
-        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
+    ok(a.replica
+        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]));
     sync_all(&mut a.replica, &mut b.replica);
 
     let (resp, _) = a
@@ -2973,8 +2988,8 @@ fn group_break_glass_recovery_needs_the_threshold_and_re_roots() {
         &a.replica.founding_proof().unwrap(),
     );
     let b_incept = b.replica.self_inception().unwrap();
-    a.replica
-        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
+    ok(a.replica
+        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]));
     sync_all(&mut a.replica, &mut b.replica);
 
     // Elevate {A, B} to a 2-of-2 group recovery key.
@@ -3078,8 +3093,7 @@ fn redeem_invite_seals_joiner_and_burns_single_use_nonce() {
     let j_actor = actor_of(&j_incept);
     let nonce = [1u8; 16];
 
-    let (resp, dirty) = a.replica.redeem_invite(&me(), &j_incept, &nonce, true);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    let (_, dirty) = ok(a.replica.redeem_invite(&me(), &j_incept, &nonce, true));
     assert!(
         dirty.is_some(),
         "a successful admit dirties the catalog/ACL"
@@ -3095,12 +3109,11 @@ fn redeem_invite_seals_joiner_and_burns_single_use_nonce() {
 
     // Replay: the same nonce must not seat a second, different joiner.
     let other = incept_for([9u8; 32], &a.replica);
-    let (resp2, dirty2) = a.replica.redeem_invite(&me(), &other, &nonce, true);
+    let refusal = refused(a.replica.redeem_invite(&me(), &other, &nonce, true));
     assert!(
-        matches!(resp2, Response::Error { .. }),
-        "spent nonce is rejected: {resp2:?}"
+        matches!(refusal, ReplicaError::Conflict(Conflict::InviteRedeemed)),
+        "spent nonce is rejected as a replay, not something else: {refusal:?}"
     );
-    assert!(dirty2.is_none(), "a rejected replay changes nothing");
     assert!(
         !a.replica.is_member_actor(&actor_of(&other)),
         "replay seats no one"
@@ -3116,25 +3129,24 @@ fn a_revoked_invite_admits_no_one() {
     let j_incept = incept_for([61u8; 32], &a.replica);
     let j_actor = actor_of(&j_incept);
 
-    let (resp, _) = a
-        .replica
-        .invite_revoke_cmd(data_encoding::HEXLOWER.encode(&nonce));
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .invite_revoke_cmd(data_encoding::HEXLOWER.encode(&nonce)));
     assert!(a.replica.acl_state().is_invite_revoked(&nonce));
 
-    let (resp, dirty) = a.replica.redeem_invite(&me(), &j_incept, &nonce, true);
+    let refusal = refused(a.replica.redeem_invite(&me(), &j_incept, &nonce, true));
     assert!(
-        matches!(resp, Response::Error { .. }) && dirty.is_none(),
-        "a revoked invite admits no one: {resp:?}"
+        matches!(refusal, ReplicaError::Conflict(Conflict::InviteRevoked)),
+        "a revoked invite admits no one: {refusal:?}"
     );
     assert!(!a.replica.is_member_actor(&j_actor));
 
     // A different, un-revoked nonce still admits the same joiner.
-    let (resp, dirty) = a.replica.redeem_invite(&me(), &j_incept, &[8u8; 16], true);
+    let (admitted, dirty) = ok(a.replica.redeem_invite(&me(), &j_incept, &[8u8; 16], true));
     assert!(
-        matches!(resp, Response::Ok { .. }) && dirty.is_some(),
-        "{resp:?}"
+        matches!(admitted, Admission::AutoApproved(_)),
+        "{admitted:?}"
     );
+    assert!(dirty.is_some(), "an admission commits");
     assert!(a.replica.is_member_actor(&j_actor));
 }
 
@@ -3164,10 +3176,8 @@ fn concurrent_fence_repairs_converge_and_then_stop() {
         b.replica.self_inception().unwrap(),
         c.replica.self_inception().unwrap(),
     ] {
-        let (resp, _) = a
-            .replica
-            .admit_member(&incept, vec![Grant::Admin, Grant::Write]);
-        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        ok(a.replica
+            .admit_member(&incept, vec![Grant::Admin, Grant::Write]));
     }
     sync_all(&mut a.replica, &mut b.replica);
     sync_all(&mut a.replica, &mut c.replica);
@@ -3179,12 +3189,9 @@ fn concurrent_fence_repairs_converge_and_then_stop() {
     let x_device = device_from_seed(x_seed);
     let x_incept = incept_for(x_seed, &b.replica);
     let x_actor = actor_of(&x_incept);
-    let (resp, _) = b.replica.redeem_invite(&b_device, &x_incept, &nonce, true);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
-    let (resp, _) = a
-        .replica
-        .invite_revoke_cmd(data_encoding::HEXLOWER.encode(&nonce));
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(b.replica.redeem_invite(&b_device, &x_incept, &nonce, true));
+    ok(a.replica
+        .invite_revoke_cmd(data_encoding::HEXLOWER.encode(&nonce)));
 
     // C sees the redemption first (no fence yet), then the revoke — so C
     // raises the fence and repairs without having seen anyone else's mint.
@@ -3284,20 +3291,16 @@ fn a_concurrently_revoked_invite_is_fenced_by_an_automatic_rekey() {
         &a.replica.founding_proof().unwrap(),
     );
     let b_incept = b.replica.self_inception().unwrap();
-    let (resp, _) = a
-        .replica
-        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]));
     sync_all(&mut a.replica, &mut b.replica);
     let epoch_before = b.replica.active_epoch().expect("an epoch exists");
 
     // ---- PARTITION ----
     // A revokes the leaked invite.
     let nonce = [7u8; 16];
-    let (resp, _) = a
-        .replica
-        .invite_revoke_cmd(data_encoding::HEXLOWER.encode(&nonce));
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .invite_revoke_cmd(data_encoding::HEXLOWER.encode(&nonce)));
 
     // B, not having seen the revoke, redeems it for X — sealing X the epochs
     // live at that moment.
@@ -3305,8 +3308,7 @@ fn a_concurrently_revoked_invite_is_fenced_by_an_automatic_rekey() {
     let x_device = device_from_seed(x_seed);
     let x_incept = incept_for(x_seed, &b.replica);
     let x_actor = actor_of(&x_incept);
-    let (resp, _) = b.replica.redeem_invite(&b_device, &x_incept, &nonce, true);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(b.replica.redeem_invite(&b_device, &x_incept, &nonce, true));
     assert!(
         b.replica
             .membership
@@ -3362,14 +3364,14 @@ fn redeem_invite_rejects_a_non_admin_issuer() {
     let issuer = device_from_seed([5u8; 32]); // never added to the ACL
     let j_incept = incept_for([8u8; 32], &a.replica);
 
-    let (resp, dirty) = a
-        .replica
-        .redeem_invite(&issuer, &j_incept, &[2u8; 16], true);
-    assert!(
-        matches!(resp, Response::Error { .. }),
-        "a pass signed by a non-admin is not honored: {resp:?}"
+    let refusal = refused(
+        a.replica
+            .redeem_invite(&issuer, &j_incept, &[2u8; 16], true),
     );
-    assert!(dirty.is_none());
+    assert!(
+        matches!(refusal, ReplicaError::Denied(Denied::IssuerNotAdmin)),
+        "a pass signed by a non-admin is not honored: {refusal:?}"
+    );
     assert!(
         !a.replica.is_member_actor(&actor_of(&j_incept)),
         "no membership granted on a bad issuer"
@@ -3381,11 +3383,14 @@ fn redeem_invite_is_idempotent_for_an_existing_member() {
     let mut a = new_node();
     let j_incept = incept_for([8u8; 32], &a.replica);
     let j_actor = actor_of(&j_incept);
-    let (_r, _d) = a.replica.admit_member(&j_incept, vec![Grant::Write]);
+    ok(a.replica.admit_member(&j_incept, vec![Grant::Write]));
     assert!(a.replica.is_member_actor(&j_actor));
 
-    let (resp, dirty) = a.replica.redeem_invite(&me(), &j_incept, &[3u8; 16], true);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    let (admitted, dirty) = ok(a.replica.redeem_invite(&me(), &j_incept, &[3u8; 16], true));
+    assert!(
+        matches!(admitted, Admission::AlreadyMember(_)),
+        "the seat was already held: {admitted:?}"
+    );
     assert!(dirty.is_none(), "already a member ⇒ no ACL churn");
 }
 
@@ -3396,9 +3401,10 @@ fn redeem_invite_reusable_pass_admits_many_without_burning() {
     let j1 = incept_for([8u8; 32], &a.replica);
     let j2 = incept_for([9u8; 32], &a.replica);
 
-    let (r1, _) = a.replica.redeem_invite(&me(), &j1, &nonce, false);
-    let (r2, _) = a.replica.redeem_invite(&me(), &j2, &nonce, false);
-    assert!(matches!(r1, Response::Ok { .. }) && matches!(r2, Response::Ok { .. }));
+    let (r1, _) = ok(a.replica.redeem_invite(&me(), &j1, &nonce, false));
+    let (r2, _) = ok(a.replica.redeem_invite(&me(), &j2, &nonce, false));
+    assert!(matches!(r1, Admission::AutoApproved(_)), "{r1:?}");
+    assert!(matches!(r2, Admission::AutoApproved(_)), "{r2:?}");
     assert!(a.replica.is_member_actor(&actor_of(&j1)) && a.replica.is_member_actor(&actor_of(&j2)));
     assert!(
         !a.replica.acl_state().is_nonce_spent(&nonce),
@@ -3723,8 +3729,7 @@ fn inbox_derives_addressed_to_me_from_imports() {
         &a.replica.founding_proof().unwrap(),
     );
     let b_incept = b.replica.self_inception().unwrap();
-    let (resp, _) = a.replica.admit_member(&b_incept, vec![Grant::Write]);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica.admit_member(&b_incept, vec![Grant::Write]));
 
     // A files an issue assigned to B, then syncs: the doc is NEW to B, so
     // backfill emits exactly ONE entry (assigned), no comment/status flood.
@@ -3857,8 +3862,7 @@ fn synced_rows_carry_field_changes_actor_and_collision() {
         &a.replica.founding_proof().unwrap(),
     );
     let b_incept = b.replica.self_inception().unwrap();
-    let (resp, _) = a.replica.admit_member(&b_incept, vec![Grant::Write]);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica.admit_member(&b_incept, vec![Grant::Write]));
     let reff = new_issue(&mut a.replica, "contested");
     sync_all(&mut a.replica, &mut b.replica);
 
@@ -4048,8 +4052,7 @@ fn signed_delete_syncs_agents_cannot_delete_and_restore_wins() {
         &a.replica.founding_proof().unwrap(),
     );
     let b_incept = b.replica.self_inception().unwrap();
-    let (resp, _) = a.replica.admit_member(&b_incept, vec![Grant::Write]);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica.admit_member(&b_incept, vec![Grant::Write]));
     // B must sync to learn it is a member before it can act as one.
     sync_all(&mut a.replica, &mut b.replica);
     let b_actor = actor_of(&b_incept);
@@ -4747,4 +4750,107 @@ fn deleting_and_restoring_pick_their_own_verb() {
         matches!(&resp, Response::Ok { message } if message.as_deref() == Some(&*format!("restored {reff}"))),
         "{resp:?}"
     );
+}
+
+// ---- the membership sentences, pinned at the adapter ----
+//
+// The direct tests above now assert typed outcomes, which is the point — but it
+// means nothing above would notice if a membership message changed wording on
+// its way out. These drive `handle` and pin the observable text and kind.
+
+#[test]
+fn membership_refusals_read_exactly_as_before() {
+    let mut n = new_node();
+    let cases: Vec<(Request, &str, crate::control::ErrorKind)> = vec![
+        (
+            Request::MemberAdd {
+                who: "nobody".into(),
+                admin: false,
+                as_name: None,
+            },
+            "no known actor matches 'nobody' — invite them first so their identity arrives",
+            crate::control::ErrorKind::NotFound,
+        ),
+        (
+            // The remove path drops the invitation hint: you do not invite
+            // someone in order to remove them.
+            Request::MemberRemove {
+                who: "nobody".into(),
+            },
+            "no known actor matches 'nobody'",
+            crate::control::ErrorKind::NotFound,
+        ),
+        (
+            Request::InviteRevoke {
+                invite: "not-a-ticket".into(),
+            },
+            "not a valid invite — pass the ticket or its 32-hex nonce",
+            crate::control::ErrorKind::Error,
+        ),
+    ];
+    for (req, expected, expected_kind) in cases {
+        let (resp, dirty) = n.replica.handle(req);
+        let (msg, kind) = refusal(resp);
+        assert_eq!(msg, expected);
+        assert_eq!(kind, expected_kind, "{expected}");
+        assert!(dirty.is_none(), "a refused membership op rings nothing");
+    }
+}
+
+#[test]
+fn membership_acknowledgements_read_exactly_as_before() {
+    let mut a = new_node();
+
+    let (resp, dirty) = a.replica.handle(Request::KeyRotate);
+    let gen = a.replica.active_epoch().unwrap().gen;
+    assert!(
+        matches!(&resp, Response::Ok { message }
+            if message.as_deref() == Some(&*format!("rotated the space key (generation {gen})"))),
+        "{resp:?}"
+    );
+    assert!(dirty.is_some());
+
+    // A fresh revoke promises only what it can keep: the invite admits no one
+    // from here on. It never claims to undo an admission.
+    let nonce = [9u8; 16];
+    let (resp, dirty) = a.replica.handle(Request::InviteRevoke {
+        invite: data_encoding::HEXLOWER.encode(&nonce),
+    });
+    let message = match resp {
+        Response::Ok { message } => message.unwrap_or_default(),
+        other => panic!("expected an acknowledgement, got {other:?}"),
+    };
+    assert!(
+        message.starts_with("revoked the invite — it admits no one from here on."),
+        "{message}"
+    );
+    assert!(
+        message.contains("content shared before then stays readable by them"),
+        "the honest caveat survives: {message}"
+    );
+    assert!(dirty.is_some());
+}
+
+#[test]
+fn admitting_someone_already_seated_says_so_and_commits_nothing() {
+    let mut a = new_node();
+    let b_seed = [8u8; 32];
+    let mut b = new_joiner_node_as(
+        device_from_seed(b_seed),
+        b_seed,
+        &a.replica.space_str(),
+        &a.replica.founding_proof().unwrap(),
+    );
+    let b_incept = b.replica.self_inception().unwrap();
+
+    let (admitted, dirty) = ok(a.replica.admit_member(&b_incept, vec![Grant::Write]));
+    assert!(matches!(admitted, Admission::Added(_)), "{admitted:?}");
+    assert!(dirty.is_some(), "the first admission commits");
+
+    let (again, dirty) = ok(a.replica.admit_member(&b_incept, vec![Grant::Write]));
+    assert!(
+        matches!(again, Admission::AlreadyMember(_)),
+        "the second is a no-op: {again:?}"
+    );
+    assert!(dirty.is_none(), "re-admitting rings nothing");
 }
