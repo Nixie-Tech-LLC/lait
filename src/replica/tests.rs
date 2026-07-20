@@ -4432,3 +4432,114 @@ fn the_infallible_reads_answer_without_a_doorbell() {
     assert!(matches!(resp, Response::Activity { .. }));
     assert!(dirty.is_none());
 }
+
+// ---- the mutation taxonomy renders the sentences it replaces ----
+//
+// These variants exist to carry the data a refusal interpolates, so the prose
+// can live at the adapter instead of at the detection site. The strings below
+// are the ones `mutate.rs` produced before the conversion; asserting them here,
+// before any call site uses a variant, is what makes the conversion provably
+// text-neutral rather than merely intended to be.
+
+#[test]
+fn the_mutation_refusals_read_exactly_as_before() {
+    let cases: Vec<(ReplicaError, &str)> = vec![
+        (
+            ReplicaError::Invalid(Invalid::Priority { value: "urgent".into() }),
+            "bad priority 'urgent'",
+        ),
+        (
+            ReplicaError::Invalid(Invalid::Status { value: "wip".into() }),
+            "no such status 'wip'",
+        ),
+        (
+            ReplicaError::Invalid(Invalid::LinkKind { value: "causes".into() }),
+            "unknown link kind 'causes' — one of: blocks, relates, duplicates",
+        ),
+        (
+            ReplicaError::Invalid(Invalid::ProjectKey { value: "toolongkey".into() }),
+            "bad project key 'toolongkey' — use 1-8 ASCII letters (it becomes the KEY in KEY-1 refs)",
+        ),
+        (
+            ReplicaError::Invalid(Invalid::Empty(EmptyField::Title)),
+            "title must not be empty",
+        ),
+        (
+            ReplicaError::Invalid(Invalid::Empty(EmptyField::Comment)),
+            "comment body must not be empty",
+        ),
+        (
+            ReplicaError::Invalid(Invalid::Empty(EmptyField::LabelName)),
+            "label name is required",
+        ),
+        (
+            ReplicaError::Invalid(Invalid::Empty(EmptyField::ProjectNameKey)),
+            "project name and key are required",
+        ),
+        (
+            ReplicaError::Conflict(Conflict::NoStatusInCategory {
+                category: StatusCategory::Active,
+            }),
+            "this space's workflow has no active-category status",
+        ),
+        (
+            ReplicaError::Conflict(Conflict::ProjectKeyExists { key: "ENG".into() }),
+            "project key 'ENG' already exists",
+        ),
+        (
+            ReplicaError::Conflict(Conflict::LabelExists { name: "bug".into() }),
+            "label 'bug' already exists",
+        ),
+        (
+            ReplicaError::NotFound(NotFound::Member { named: "ab".into() }),
+            "no known member matches 'ab'",
+        ),
+        (
+            ReplicaError::NotFound(NotFound::Link(Box::new(LinkRef {
+                reff: "ENG-1".into(),
+                kind: "blocks".into(),
+                target: "ENG-2".into(),
+            }))),
+            "no such link: ENG-1 blocks ENG-2",
+        ),
+    ];
+    for (error, expected) in cases {
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
+#[test]
+fn the_two_not_found_families_score_exit_two() {
+    // NotFound is the one family the control plane reports as absent rather
+    // than refused, and scripts branch on that.
+    for error in [
+        ReplicaError::NotFound(NotFound::Member { named: "ab".into() }),
+        ReplicaError::NotFound(NotFound::Link(Box::new(LinkRef {
+            reff: "ENG-1".into(),
+            kind: "blocks".into(),
+            target: "ENG-2".into(),
+        }))),
+    ] {
+        let (_, kind) = refusal(Replica::error_response(error));
+        assert_eq!(kind, crate::control::ErrorKind::NotFound);
+    }
+    // The link *kind* being unknown is a bad argument, not an absence.
+    let (_, kind) = refusal(Replica::error_response(ReplicaError::Invalid(
+        Invalid::LinkKind {
+            value: "causes".into(),
+        },
+    )));
+    assert_eq!(kind, crate::control::ErrorKind::Error);
+}
+
+#[test]
+fn a_replica_error_stays_small_enough_to_return_by_value() {
+    // Ceremony is boxed precisely so every Result in the replica does not pay
+    // for the widest variant; this is what keeps clippy::result_large_err quiet
+    // across ~50 signatures.
+    assert!(
+        std::mem::size_of::<ReplicaError>() <= 64,
+        "ReplicaError grew to {} bytes — box the variant that did it",
+        std::mem::size_of::<ReplicaError>()
+    );
+}

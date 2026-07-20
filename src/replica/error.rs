@@ -16,6 +16,7 @@
 //! message is produced, never what a person sees. Wording changes are their own
 //! commits, with their own reasons.
 
+use crate::dto::StatusCategory;
 use std::fmt;
 
 /// A replica operation's failure.
@@ -71,8 +72,29 @@ pub enum RefError {
 /// Something was named that does not exist here.
 #[derive(Debug)]
 pub enum NotFound {
-    Project { named: String },
-    Label { named: String },
+    Project {
+        named: String,
+    },
+    Label {
+        named: String,
+    },
+    /// No member of this space answers to that handle. Distinct from an unknown
+    /// *actor*: this asks the membership roll, not the directory.
+    Member {
+        named: String,
+    },
+    /// The edge named by (source, kind, target) is not in the graph. Boxed: it
+    /// is the widest failure in this family, and every `Result` in the replica
+    /// would otherwise carry its three strings by value.
+    Link(Box<LinkRef>),
+}
+
+/// The three handles that name one edge of the issue graph.
+#[derive(Debug)]
+pub struct LinkRef {
+    pub reff: String,
+    pub kind: String,
+    pub target: String,
 }
 
 /// Why no single project could be chosen for a request that needs one.
@@ -120,9 +142,30 @@ pub enum AdminAction {
 #[derive(Debug)]
 pub enum Invalid {
     /// A field that must carry text was empty.
-    Empty { field: &'static str },
+    Empty(EmptyField),
     /// An edit that names no change.
     NothingToEdit,
+    /// Not one of the priority names.
+    Priority { value: String },
+    /// Not a status this space's workflow defines.
+    Status { value: String },
+    /// Not one of [`LINK_KINDS`](super::LINK_KINDS).
+    LinkKind { value: String },
+    /// Not a usable project key. The rule is narrow because the key becomes the
+    /// `KEY` in `KEY-1` refs, which both alias parsing and git-branch inference
+    /// scan as a single alphabetic run.
+    ProjectKey { value: String },
+}
+
+/// The fields that must carry text. A closed set rather than a string: these
+/// name domain inputs, and their refusals are not all phrased alike, so a
+/// caller-supplied name could not render them anyway.
+#[derive(Debug, Clone, Copy)]
+pub enum EmptyField {
+    Title,
+    Comment,
+    LabelName,
+    ProjectNameKey,
 }
 
 /// The operation contradicts state that already exists.
@@ -132,6 +175,17 @@ pub enum Conflict {
     InviteRevoked,
     /// An issue-graph edge that would make a cycle or a self-reference.
     IssueGraph(GraphViolation),
+    /// The request is well-formed; this space's workflow simply defines no
+    /// status in the category the verb targets.
+    NoStatusInCategory {
+        category: StatusCategory,
+    },
+    ProjectKeyExists {
+        key: String,
+    },
+    LabelExists {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -198,6 +252,11 @@ impl fmt::Display for NotFound {
         match self {
             Self::Project { named } => write!(f, "no project matches '{named}'"),
             Self::Label { named } => write!(f, "no label matches '{named}'"),
+            Self::Member { named } => write!(f, "no known member matches '{named}'"),
+            Self::Link(link) => {
+                let LinkRef { reff, kind, target } = &**link;
+                write!(f, "no such link: {reff} {kind} {target}")
+            }
         }
     }
 }
@@ -250,14 +309,26 @@ impl fmt::Display for Denied {
 impl fmt::Display for Invalid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Empty { field } => match *field {
-                "title" => f.write_str("title must not be empty"),
-                "comment" => f.write_str("comment body must not be empty"),
-                "label" => f.write_str("label name is required"),
-                "project" => f.write_str("project name and key are required"),
-                other => write!(f, "{other} must not be empty"),
+            Self::Empty(field) => match field {
+                EmptyField::Title => f.write_str("title must not be empty"),
+                EmptyField::Comment => f.write_str("comment body must not be empty"),
+                EmptyField::LabelName => f.write_str("label name is required"),
+                EmptyField::ProjectNameKey => f.write_str("project name and key are required"),
             },
             Self::NothingToEdit => f.write_str("nothing to edit"),
+            Self::Priority { value } => write!(f, "bad priority '{value}'"),
+            Self::Status { value } => write!(f, "no such status '{value}'"),
+            // The accepted set is a constant, so the adapter renders it rather
+            // than the failure carrying a copy of it.
+            Self::LinkKind { value } => write!(
+                f,
+                "unknown link kind '{value}' — one of: {}",
+                super::LINK_KINDS.join(", ")
+            ),
+            Self::ProjectKey { value } => write!(
+                f,
+                "bad project key '{value}' — use 1-8 ASCII letters (it becomes the KEY in KEY-1 refs)"
+            ),
         }
     }
 }
@@ -274,6 +345,13 @@ impl fmt::Display for Conflict {
                     f.write_str("that would make an issue its own ancestor")
                 }
             },
+            Self::NoStatusInCategory { category } => write!(
+                f,
+                "this space's workflow has no {}-category status",
+                category.as_str()
+            ),
+            Self::ProjectKeyExists { key } => write!(f, "project key '{key}' already exists"),
+            Self::LabelExists { name } => write!(f, "label '{name}' already exists"),
         }
     }
 }
