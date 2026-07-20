@@ -79,10 +79,32 @@ pub struct CustodyImport {
     pub incomplete: Option<anyhow::Error>,
 }
 
+/// What one pass over the ceremony board accomplished.
+///
+/// Two kinds of failure come out of a pass, and they must not share a channel.
+/// A per-transcript fault — a malformed package from one participant — is
+/// isolated and logged, because propagating it would wedge membership sync
+/// permanently on an already-persisted event. `install_incomplete` is the other
+/// kind: *this* node installed something durable and the follow-on step failed.
+/// That is our failure, it is not isolatable, and on the recovery path it is a
+/// security claim, so it travels back to the caller.
+#[derive(Debug, Default)]
+pub struct CeremonyProgress {
+    pub progressed: bool,
+    pub install_incomplete: Option<anyhow::Error>,
+}
+
 /// A holder co-signed a pending recovery.
+///
+/// Co-signing can *be* the last signature: the threshold completes inside this
+/// command, the re-root installs, and the re-key runs — so `incomplete` carries
+/// a re-key failure for the same reason the recovery outcomes do. Without it a
+/// holder would be told the recovery "installs once the threshold has
+/// co-signed" at the exact moment it had installed unfenced.
 #[derive(Debug)]
 pub struct RecoveryApproved {
     pub roots: Vec<ActorId>,
+    pub incomplete: Option<anyhow::Error>,
 }
 
 /// Persist the recovery secret beside the store. This is a root credential (the
@@ -433,20 +455,26 @@ impl Replica {
         // holders. A failure from here is this device failing to contribute, not
         // the ceremony failing to open, so it rides out with the committed
         // outcome instead of erasing it.
-        let incomplete = self
+        let incomplete = match self
             .dkg_write(&signing, "intent", &op_bytes)
             .and_then(|()| self.dkg_advance())
-            .err();
+        {
+            Ok(progress) => progress.install_incomplete,
+            Err(e) => Some(e),
+        };
         let after = crate::space::replay(
             &self.genesis,
             &self.space_id,
             &self.membership.space_events(),
         );
         let installed = after.gen > cur.gen && after.root == vec![me_actor.clone()];
+        // If the re-root installed on this pass, a follow-on failure *is* the
+        // re-key failure — the same degraded state the solo path reports. It
+        // must not be dropped on the way into the installed arm.
         let outcome = if installed {
             SpaceRecovery::Installed(SpaceRecovered {
                 root: me_actor,
-                rekey_failed: None,
+                rekey_failed: incomplete,
             })
         } else {
             SpaceRecovery::Pending {
@@ -553,9 +581,12 @@ impl Replica {
         // Both steps precede any durable ceremony write on this path, so a
         // failure here has committed nothing.
         self.dkg_write(&session, "intent", &op_bytes)?;
-        self.dkg_advance()?;
+        let incomplete = self.dkg_advance()?.install_incomplete;
         Ok(Change::committed(
-            RecoveryApproved { roots: target },
+            RecoveryApproved {
+                roots: target,
+                incomplete,
+            },
             DirtySet::catalog(CatalogScope::Acl),
         ))
     }
@@ -566,6 +597,13 @@ impl Replica {
     /// import, so whichever node completes the threshold re-keys.
     pub(super) fn bootstrap_root_epoch_if_needed(&mut self) -> Result<()> {
         if self.am_i_admin() && self.active_epoch().is_none() {
+            // Injected inside the guard, not before it: this stands in for the
+            // rotation failing, and firing on the calls where the function is a
+            // no-op would simulate something that cannot happen.
+            #[cfg(test)]
+            if self.fail_rekey {
+                anyhow::bail!("epoch store is unwritable");
+            }
             self.rotate_key()?;
             self.persist_membership("recover_bootstrap_epoch")?;
         }
@@ -871,8 +909,15 @@ impl Replica {
         // Driving the ceremony is opportunistic — it advances again on the next
         // sync — but a failure here is still worth surfacing rather than
         // discarding, provided something worse has not already been recorded.
-        if let Err(e) = self.dkg_advance() {
-            incomplete.get_or_insert(e);
+        match self.dkg_advance() {
+            Ok(progress) => {
+                if let Some(e) = progress.install_incomplete {
+                    incomplete.get_or_insert(e);
+                }
+            }
+            Err(e) => {
+                incomplete.get_or_insert(e);
+            }
         }
         Ok(Change::committed(
             Elevation {
@@ -1075,22 +1120,31 @@ impl Replica {
     /// abandoned sessions are never pruned, so a member could pad it to inflate
     /// per-import work (bounded per call by the `guard` below). Session GC/expiry
     /// is future work — see the `C_CEREMONY` container in `fabric::membership`.
-    pub fn dkg_advance(&mut self) -> Result<bool> {
-        let mut any = false;
+    pub fn dkg_advance(&mut self) -> Result<CeremonyProgress> {
+        let mut out = CeremonyProgress::default();
         // A ceremony has a bounded number of steps; the guard is a backstop
         // against any unforeseen non-convergence, never reached in normal flow.
         let mut guard = 0;
-        while self.dkg_advance_once()? {
-            any = true;
+        loop {
+            let pass = self.dkg_advance_once()?;
+            // First one wins: the earliest install failure is the one whose
+            // cause is still legible.
+            if out.install_incomplete.is_none() {
+                out.install_incomplete = pass.install_incomplete;
+            }
+            if !pass.progressed {
+                break;
+            }
+            out.progressed = true;
             guard += 1;
             if guard > 64 {
                 break;
             }
         }
-        Ok(any)
+        Ok(out)
     }
 
-    fn dkg_advance_once(&mut self) -> Result<bool> {
+    fn dkg_advance_once(&mut self) -> Result<CeremonyProgress> {
         // ONE verified pass over the board. Everything below reads from this —
         // discovery included. Previously sessions were discovered by decoding
         // events *unverified* and the whole board was then re-verified once per
@@ -1125,14 +1179,18 @@ impl Replica {
         }
         // Threshold-signing transcripts I can co-sign.
         let sign_ids: Vec<crate::dkg::TranscriptId> = board.signing.keys().copied().collect();
+        let mut install_incomplete = None;
         for id in sign_ids {
             let t = &board.signing[&id];
-            match self.sign_advance_session(&id, t, &board) {
+            match self.sign_advance_session(&id, t, &board, &mut install_incomplete) {
                 Ok(p) => progressed |= p,
                 Err(e) => tracing::warn!("recovery signing advance failed (skipped): {e:#}"),
             }
         }
-        Ok(progressed)
+        Ok(CeremonyProgress {
+            progressed,
+            install_incomplete,
+        })
     }
 
     /// Whether `claimed` really is the authority standing here.
@@ -1538,7 +1596,10 @@ impl Replica {
         }
         // The share is on disk and validated by now, so a failure to drive the
         // ceremony is worth reporting but must not deny the restore.
-        let incomplete = self.dkg_advance().err();
+        let incomplete = match self.dkg_advance() {
+            Ok(progress) => progress.install_incomplete,
+            Err(e) => Some(e),
+        };
         Ok(Change::committed(
             CustodyImport {
                 ceremony: dkg,
@@ -1885,11 +1946,16 @@ impl Replica {
     /// not an input to the cryptography.
     ///
     /// [`SigningPlan`]: crate::dkg::SigningPlan
+    /// `install_incomplete` is an out-parameter rather than part of the return
+    /// value because the caller isolates this function's `Err` — one participant's
+    /// bad package must not wedge the import — and a failed re-key after our own
+    /// durable install must survive exactly that isolation.
     fn sign_advance_session(
         &mut self,
         signing: &crate::dkg::TranscriptId,
         t: &crate::dkg::SignTranscript,
         board: &crate::dkg::CeremonyBoard,
+        install_incomplete: &mut Option<anyhow::Error>,
     ) -> Result<bool> {
         let Some(request) = t.request.as_ref() else {
             return Ok(false);
@@ -2133,7 +2199,15 @@ impl Replica {
                     {
                         self.membership.add_space_event(&node)?;
                         self.persist_membership("group_recover")?;
-                        self.bootstrap_root_epoch_if_needed()?;
+                        // The re-root is durable now. Re-keying fences the old
+                        // root, and if it fails the space stays readable under
+                        // the old key — a degraded state, not a failed recovery.
+                        // It must not be reported as this session erroring, or
+                        // the caller's isolation would turn a false "and
+                        // re-keyed" into what the operator reads.
+                        if let Err(e) = self.bootstrap_root_epoch_if_needed() {
+                            *install_incomplete = Some(e);
+                        }
                         return Ok(true);
                     }
                 }

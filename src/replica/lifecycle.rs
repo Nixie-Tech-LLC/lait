@@ -238,6 +238,8 @@ impl Replica {
             genesis,
             seed,
             keyring: BTreeMap::new(),
+            #[cfg(test)]
+            fail_rekey: false,
         };
         replica.refresh_keyring();
         replica.recompute_all_rows()?;

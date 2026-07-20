@@ -462,10 +462,20 @@ impl Replica {
             .map(|r| r.short())
             .collect::<Vec<_>>()
             .join(", ");
-        Response::Ok {
-            message: Some(format!(
+        // If this co-signature completed the threshold, the recovery installed
+        // here and now — saying it "installs once the threshold has co-signed"
+        // would be wrong, and saying nothing about a failed re-key would be
+        // worse.
+        let message = match a.incomplete {
+            None => format!(
                 "co-signed the recovery re-rooting the space to {roots} — it installs once the threshold has co-signed"
-            )),
+            ),
+            Some(e) => format!(
+                "co-signed the recovery re-rooting the space to {roots}, and that completed the threshold — but re-keying failed ({e:#}), so the space is still readable under the old key until an admin rotates it"
+            ),
+        };
+        Response::Ok {
+            message: Some(message),
         }
     }
 
@@ -775,76 +785,6 @@ mod tests {
             },
         )));
         assert_eq!(kind, crate::control::ErrorKind::Error);
-    }
-
-    #[test]
-    fn a_re_root_that_cannot_re_key_still_reports_the_re_root() {
-        // The shape this guards: `space_recover_solo` commits the re-root, then
-        // bootstraps a fresh content key. That second step used to be able to fail
-        // into an error with no dirty set — denying a change that was already
-        // durable and, because `ring_doorbell` never fires, leaving every
-        // subscriber unaware the space had been re-rooted at all.
-        //
-        // The outcome type no longer has room for that: the re-root is `Installed`
-        // either way, and a failed re-key rides along as data the adapter reports.
-        let done = SpaceRecovered {
-            root: ActorId::from_incept_hash(&"a".repeat(64)),
-            rekey_failed: Some(anyhow!("epoch store is read-only")),
-        };
-        let (resp, dirty) = Replica::respond(
-            Ok(Change::committed(
-                SpaceRecovery::Installed(done),
-                DirtySet::catalog(CatalogScope::Acl),
-            )),
-            Replica::space_recovery_response,
-        );
-        assert!(
-            dirty.is_some(),
-            "a landed re-root rings, whatever happened after it"
-        );
-        let message = match resp {
-            Response::Ok { message } => message.unwrap_or_default(),
-            other => panic!("a committed re-root is not an error: {other:?}"),
-        };
-        assert!(
-            message.contains("recovered the space") && message.contains("re-keying failed"),
-            "says both what landed and what did not: {message}"
-        );
-        assert!(
-            message.contains("still readable under the old key"),
-            "names the consequence the operator has to act on: {message}"
-        );
-    }
-
-    #[test]
-    fn a_group_recovery_reports_a_share_it_could_not_add() {
-        // Same shape on the group path: once the signing request is on the board it
-        // is durable and visible to the other holders, so a local failure to
-        // contribute must not erase it.
-        let (resp, dirty) = Replica::respond(
-            Ok(Change::committed(
-                SpaceRecovery::Pending {
-                    session: crate::dkg::TranscriptId::parse_hex(&"b".repeat(64)).unwrap(),
-                    incomplete: Some(anyhow!("share file is unreadable")),
-                },
-                DirtySet::catalog(CatalogScope::Acl),
-            )),
-            Replica::space_recovery_response,
-        );
-        assert!(dirty.is_some(), "the open request rings");
-        let message = match resp {
-            Response::Ok { message } => message.unwrap_or_default(),
-            other => panic!("an open ceremony is not an error: {other:?}"),
-        };
-        assert!(
-            message.contains("group recovery under way"),
-            "the request stands: {message}"
-        );
-        assert!(
-            message.contains("could not add its own share")
-                && message.contains("other holders can still complete it"),
-            "says what this device failed to do without implying the ceremony died: {message}"
-        );
     }
 
     #[test]

@@ -4848,3 +4848,59 @@ fn the_device_projections_render_as_text() {
 }
 
 // ---- a recovery that lands but does not finish ----
+
+// ---- a recovery that lands but does not fence ----
+//
+// These drive the real commands with the re-key made to fail, rather than
+// handing a constructed outcome to the renderer. The distinction matters: the
+// bug these guard was not that `rekey_failed: Some(_)` renders badly, but that
+// the command could never produce it — the failure was swallowed inside the
+// ceremony pass and the operator was told the space had been re-keyed.
+
+#[test]
+fn a_solo_recovery_that_cannot_re_key_says_so() {
+    let mut a = new_node();
+    let a_ws = a.replica.space_str();
+    let c_seed = [11u8; 32];
+    let mut c = new_joiner_node_as(
+        device_from_seed(c_seed),
+        c_seed,
+        &a_ws,
+        &a.replica.founding_proof().unwrap(),
+    );
+    sync_all(&mut a.replica, &mut c.replica);
+    std::fs::copy(
+        a.home.join("space-recovery.key"),
+        c.home.join("space-recovery.key"),
+    )
+    .unwrap();
+
+    c.replica.fail_rekey = true;
+    // Through `handle`, so this is the whole path an operator drives: the
+    // command, the outcome it builds, and the sentence they end up reading.
+    let (resp, dirty) = c.replica.handle(Request::SpaceRecover);
+
+    // The re-root is durable, so it rings — whatever happened after it.
+    assert!(
+        dirty.is_some(),
+        "a landed re-root announces itself even when the re-key fails"
+    );
+    let c_actor = c.replica.my_actor().unwrap();
+    assert!(
+        c.replica.acl_state().is_admin(&c_actor),
+        "the re-root really did install"
+    );
+    let message = match resp {
+        Response::Ok { message } => message.unwrap_or_default(),
+        other => panic!("a committed re-root is not an error: {other:?}"),
+    };
+    assert!(
+        message.contains("recovered the space"),
+        "the re-root is reported: {message}"
+    );
+    assert!(
+        message.contains("re-keying failed")
+            && message.contains("still readable under the old key"),
+        "never claim the space was fenced when it was not: {message}"
+    );
+}
