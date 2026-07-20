@@ -1,7 +1,7 @@
 //! The daemon's issue-tracking core — the bridge from Layer B (the control
 //! façade, [`crate::control`]) to Layer A (the Loro docs, [`crate::catalog`] +
 //! [`crate::issue`]) over the git-backed [`crate::store`]. Fully testable
-//! in-process (no socket, no iroh, injected clock), which is where the SCHEMA and
+//! in-process (no socket, no network, injected clock), which is where the SCHEMA and
 //! control-plane invariants are exercised.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};

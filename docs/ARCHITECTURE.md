@@ -13,7 +13,7 @@ transport or a shared source of truth.
 
 ```text
 CLI ───────┐
-Web ───────┼─ local control protocol ─ daemon ─ iroh ─ peer daemon
+Web ───────┼─ local control protocol ─ daemon ─ lait-net ─ peer daemon
 MCP ───────┘                          │
                                       ├─ Loro documents
                                       ├─ signed authority planes
@@ -33,8 +33,12 @@ dirty notifications, not state; clients re-read the affected projection.
 - `lait-fabric` owns Loro containers, storage, history projection, and the
   plaintext membership document that transports signed kernel events and sealed
   key material.
-- the application crate owns commands, the daemon, iroh transport, sync,
-  configuration, local secrets, projections, and product surfaces.
+- `lait-net` owns the peer-to-peer seam — dialing, gossip rooms, framed streams —
+  and the network policy behind it. It is the only crate that names a concrete
+  network, so the transport is replaceable by a manifest change rather than a
+  daemon rewrite.
+- the application crate owns commands, the daemon, sync, configuration, local
+  secrets, projections, and product surfaces.
 
 This boundary is intentional. The kernel determines **legitimacy** — identity,
 authority, custody, recovery, and which transitions are valid given signed
@@ -44,6 +48,11 @@ dependency edge is a correctness boundary: convergence cannot confer legitimacy.
 Authority is a pure function of signed inputs; replication and persistence move
 those inputs but do not decide whether they are trusted. The two ship, test, and
 version together as lait's substrate.
+
+`lait-net` is not a third pillar of that substrate. It is the replaceable
+mechanism by which independently held replicas exchange their material, sealed
+behind its own dependency edge for the same reason: a scaffold that moves bytes
+must not be able to decide what those bytes mean.
 
 ## Identity
 

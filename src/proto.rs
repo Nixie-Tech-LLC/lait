@@ -2,10 +2,9 @@
 //!
 //! Messages broadcast on the gossip topic are postcard-encoded `SignedMessage`s
 //! carrying a **lait** ed25519 signature over a `Payload` — authored, signed, and
-//! verified by [`crate::sigdag`], lait's own signing plane. (This once mirrored
-//! iroh-gossip's `chat.rs` example and signed with the transport's key type; the
-//! authenticity is now lait's, so a message's author is a lait [`DeviceId`], not an
-//! iroh key, and the primitive is the same one the trust planes use.)
+//! verified by [`crate::sigdag`], lait's own signing plane — so a message's
+//! author is a lait [`DeviceId`] rather than a transport key, and the primitive
+//! is the same one the trust planes use.
 //!
 //! No concrete transport type is named here. A room selector is the transport
 //! seam's opaque [`Topic`]; this module owns only the rule that derives one from
@@ -285,8 +284,8 @@ pub const TICKET_VERSION: u8 = 1;
 /// the space's display name (so the joiner sees what they're joining before
 /// the catalog arrives), the host's endpoint id, and the host's nick (for
 /// one-step `connect`). We deliberately do NOT ship relay/socket addresses —
-/// iroh discovery resolves a reachable address from the pubkey — so the ticket
-/// stays short enough to survive copy-paste as a single line.
+/// the adapter's discovery resolves a reachable address from the pubkey — so the
+/// ticket stays short enough to survive copy-paste as a single line.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpaceTicket {
     /// The space id the joiner bootstraps from (required — a brand-new
@@ -327,8 +326,8 @@ pub struct SpaceTicket {
     pub invite: Option<SignedInvite>,
     /// The host's direct socket addresses, for the **Isolated** network policy
     /// only (no relay, no discovery). Empty in a normal `Public`/`Local` ticket —
-    /// there the ticket stays address-free and iroh/relay resolves the host from
-    /// its id. Present, the joiner registers `{host, these addrs}` and dials the
+    /// there the ticket stays address-free and the relay mesh resolves the host
+    /// from its id. Present, the joiner registers `{host, these addrs}` and dials the
     /// host directly on a LAN with no infrastructure.
     #[serde(default)]
     pub host_addrs: Vec<std::net::SocketAddr>,

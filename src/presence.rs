@@ -2,7 +2,7 @@
 //!
 //! Presence is driven by the gossip *membership* signal (NeighborUp/Down) and a
 //! direct liveness probe — NOT by whether periodic heartbeats are delivered.
-//! iroh-gossip uses a Plumtree broadcast tree that, in a small room, prunes the
+//! The gossip overlay uses a Plumtree broadcast tree that, in a small room, prunes the
 //! link to "lazy push" after the first exchange, so heartbeats are only
 //! delivered in ~100s bursts even though the peer stays continuously connected.
 //! Timing presence off heartbeat delivery therefore flaps a live peer offline

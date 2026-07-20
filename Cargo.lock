@@ -2860,12 +2860,9 @@ dependencies = [
  "getrandom 0.3.4",
  "include_dir",
  "interprocess",
- "iroh",
- "iroh-base",
- "iroh-gossip",
- "iroh-relay",
  "lait-fabric",
  "lait-kernel",
+ "lait-net",
  "libc",
  "n0-future",
  "postcard",
@@ -2924,6 +2921,24 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "x25519-dalek",
+]
+
+[[package]]
+name = "lait-net"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "data-encoding",
+ "ed25519-dalek 2.2.0",
+ "iroh",
+ "iroh-base",
+ "iroh-gossip",
+ "iroh-relay",
+ "lait-kernel",
+ "n0-future",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

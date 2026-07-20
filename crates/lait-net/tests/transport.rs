@@ -1,4 +1,4 @@
-//! Transport-level tests for [`lait::transport::iroh::IrohTransport`] — no
+//! Transport-level tests for the shipped transport ([`lait_net::DefaultTransport`]) — no
 //! daemon. Two real iroh endpoints over loopback under `Network::Isolated`
 //! (no relay, no discovery: each `learn`s the other's `advertised_addrs`,
 //! exactly the ticket path), plus one Local-policy test on an in-process relay
@@ -12,28 +12,31 @@ use std::time::Duration;
 
 use iroh::{endpoint::presets, Endpoint, RelayMap, RelayMode, RelayUrl, SecretKey};
 use iroh_relay::tls::CaRootsConfig;
-use lait::net::Network;
-use lait::transport::iroh::IrohTransport;
-use lait::transport::{Alpn, GossipEvent, Transport};
+use lait_net::policy::Network;
+use lait_net::{Alpn, DefaultTransport, GossipEvent, Topic, Transport};
 
-// The real ALPNs, not copies: an epoch bump is a production concern, and a
-// transport test that pins its own spelling of one stops exercising the ALPN
-// the daemon will actually negotiate.
-const SYNC_ALPN: Alpn = lait::sync::SYNC_ALPN;
-const PRESENCE_ALPN: Alpn = lait::presence::PRESENCE_ALPN;
+// Protocol selectors belong to the application; any two distinct ALPNs exercise
+// dispatch identically, so the seam's tests name their own rather than pinning
+// the daemon's spelling of them.
+const SYNC_ALPN: Alpn = b"lait-net/test-sync/1";
+const PRESENCE_ALPN: Alpn = b"lait-net/test-presence/1";
 
-fn device(seed: u8) -> lait::ids::DeviceId {
-    lait::crypto::device_from_seed(&[seed; 32])
+fn device(seed: u8) -> lait_kernel::ids::DeviceId {
+    lait_kernel::crypto::device_from_seed(&[seed; 32])
 }
 
 /// Two Isolated transports that can reach each other: build both, then cross-
 /// `learn` their advertised (loopback) addresses — the production ticket path,
 /// which also exercises `advertised_addrs` (G6).
-async fn isolated_pair(a_seed: u8, b_seed: u8, alpns: &[Alpn]) -> (IrohTransport, IrohTransport) {
-    let a = IrohTransport::new(&[a_seed; 32], &Network::Isolated, alpns)
+async fn isolated_pair(
+    a_seed: u8,
+    b_seed: u8,
+    alpns: &[Alpn],
+) -> (DefaultTransport, DefaultTransport) {
+    let a = DefaultTransport::new(&[a_seed; 32], &Network::Isolated, alpns)
         .await
         .expect("build A");
-    let b = IrohTransport::new(&[b_seed; 32], &Network::Isolated, alpns)
+    let b = DefaultTransport::new(&[b_seed; 32], &Network::Isolated, alpns)
         .await
         .expect("build B");
     let a_addrs = a.advertised_addrs();
@@ -139,18 +142,18 @@ async fn framing_interops_with_legacy_read_msg_bytes() {
         conn.closed().await;
     });
 
-    let dialer = IrohTransport::new(&[81u8; 32], &Network::Isolated, &[])
+    let dialer = DefaultTransport::new(&[81u8; 32], &Network::Isolated, &[])
         .await
         .expect("build dialer");
     dialer.learn(
-        lait::ids::DeviceId::from_key_string(raw_id.to_string()),
+        lait_kernel::ids::DeviceId::from_key_string(raw_id.to_string()),
         &raw_addrs,
     );
 
     tokio::time::timeout(Duration::from_secs(20), async {
         let mut s = dialer
             .connect(
-                lait::ids::DeviceId::from_key_string(raw_id.to_string()),
+                lait_kernel::ids::DeviceId::from_key_string(raw_id.to_string()),
                 ALPN,
             )
             .await
@@ -255,7 +258,7 @@ async fn wait_closed_parks_until_dialer_drops() {
 #[tokio::test]
 async fn gossip_room_roundtrip() {
     let (a, b) = isolated_pair(7, 8, &[]).await;
-    let topic = lait::proto::topic_for_space("gossip-test");
+    let topic = Topic([9u8; 32]);
     let a_id = a.my_id();
 
     let (_b_send, mut b_recv) = b.subscribe(topic, &[]).await.expect("B subscribes");
@@ -319,7 +322,7 @@ async fn gossip_room_roundtrip() {
 async fn shutdown_unblocks_accept() {
     use std::sync::Arc;
     let a = Arc::new(
-        IrohTransport::new(&[9u8; 32], &Network::Isolated, &[SYNC_ALPN])
+        DefaultTransport::new(&[9u8; 32], &Network::Isolated, &[SYNC_ALPN])
             .await
             .expect("build"),
     );
@@ -357,7 +360,7 @@ async fn probe_semantics_connect_fails_when_peer_down() {
 /// endpoints converge by bare-id dial through the `PeerBook`, proving the Local
 /// policy path through the transport. Needs the self-signed cert skip, so it
 /// builds the endpoints via the raw harness and drives them directly — the
-/// production `IrohTransport::new` deliberately does not link the cert skip.
+/// production `DefaultTransport::new` deliberately does not link the cert skip.
 #[tokio::test]
 async fn local_policy_relay_resolution() {
     // Stand up a relay entirely in this process.
@@ -402,7 +405,7 @@ async fn local_policy_relay_resolution() {
     });
 
     // Register {server_id, relay} exactly as PeerBook::learn does under Local.
-    c_lookup.add_endpoint_info(lait::net::relay_addr(&relay_url, server_id));
+    c_lookup.add_endpoint_info(lait_net::policy::relay_addr(&relay_url, server_id));
     let result = tokio::time::timeout(Duration::from_secs(20), async move {
         let conn = client.connect(server_id, ALPN).await.expect("connect");
         let (mut send, mut recv) = conn.open_bi().await.unwrap();

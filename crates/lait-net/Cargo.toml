@@ -1,0 +1,40 @@
+[package]
+name = "lait-net"
+version = "0.6.0"
+edition = "2021"
+rust-version = "1.91"
+description = "The lait network adapter: lait's peer-to-peer seam, with iroh as the contractor behind it. The ONLY crate that names iroh."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# lait's roots. The seam speaks `DeviceId` and nothing else of lait's: a peer is
+# its ed25519 key, so identity crosses this boundary already self-certifying.
+lait-kernel = { path = "../lait-kernel" }
+
+# The connectivity scaffold. This is the only crate in the workspace that lists
+# it, so `iroh::*` is nameable here and nowhere else — the seal is the manifest.
+# All pin iroh =1.0.0-rc.1.
+iroh = "=1.0.0-rc.1"
+iroh-base = "=1.0.0-rc.1"
+iroh-gossip = "0.100"
+
+anyhow = "1"
+async-trait = "0.1"
+# `broadcast`/`mpsc`/`watch` for the in-memory transport's buses and the iroh
+# accept forwarding; no runtime features — the host application owns the runtime.
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+n0-future = "0.3"
+tracing = "0.1"
+
+[dev-dependencies]
+# In-process relay + DNS/pkarr servers for hermetic multi-node tests. The
+# `test-utils` feature is dev-only, so the shipped binary never links it.
+iroh = { version = "=1.0.0-rc.1", features = ["test-utils"] }
+# Insecure-cert TLS for the in-process test relay (self-signed) — test-only.
+iroh-relay = { version = "=1.0.0-rc.1", features = ["test-utils"] }
+tokio = { version = "1", features = ["full"] }
+# The identity-agreement test forges a raw keypair to prove iroh's key encoding
+# is the same ed25519 pair lait derives from a seed. Production goes through the
+# kernel; only this adversarial construction reaches past it.
+ed25519-dalek = "2"
+data-encoding = "2.6"

@@ -9,8 +9,8 @@
 //! iroh changes its key encoding, THIS test breaks — not the kernel.
 
 use ed25519_dalek::SigningKey;
-use lait::crypto::{device_from_seed, open_sealed, random_key, seal_to};
-use lait::ids::DeviceId;
+use lait_kernel::crypto::{device_from_seed, open_sealed, random_key, seal_to};
+use lait_kernel::ids::DeviceId;
 
 #[test]
 fn iroh_keypair_is_the_same_ed25519_pair_as_a_lait_seed() {

@@ -1,31 +1,45 @@
-//! **The transport seam** — lait's own interface to a peer-to-peer network, with
-//! the concrete network (iroh today) as a swappable *contractor* behind it.
+//! **The network adapter** — how independently held replicas exchange their
+//! material, and the only crate that names a concrete network.
 //!
-//! Where [`crate::net`] owns the network *policy* (which relay/discovery), this
-//! owns the network *mechanism*: the daemon dials peers, gossips, and accepts
-//! connections through [`Transport`] in lait's vocabulary ([`PeerId`], [`Topic`],
-//! framed [`Stream`]s, [`GossipEvent`]s) — not through `iroh::Endpoint`/`Gossip`/
-//! `Router`/`Connection` directly. iroh becomes one implementation
-//! (the planned iroh transport), and a deterministic in-process one
-//! ([`mem::MemTransport`]) lets the *real daemon* run hermetically in tests.
+//! Kernel determines legitimacy and Fabric maintains the shared world; those two
+//! are lait's substrate. This crate is neither: it is the replaceable mechanism
+//! that moves their bytes between peers. The application composes all three.
 //!
-//! **The daemon is the consumer, not the transport.** `node.rs` stays the
-//! composition of the replica core + control plane + protocol logic; it holds an
-//! `Arc<dyn Transport>` and drives it. Swapping iroh for the in-memory transport
-//! swaps *nothing* in the daemon — which is the whole point: the thing under test
-//! is the actual daemon, over a network we control.
+//! Two halves, and the distinction is the point:
 //!
-//! Identity note: [`PeerId`] is a lait [`DeviceId`] — a peer *is* its ed25519 key,
-//! the same bytes iroh calls an `EndpointId` (the T0 identity agreement). The
-//! iroh impl converts at its own edge; nothing above this seam names an iroh id.
+//! - [`policy`] owns *where* lait operates — the public relay mesh, a named local
+//!   relay, or isolated. lait states its requirement; the contractor fulfils it.
+//! - this module owns *how* — dialing, gossiping, and accepting through
+//!   [`Transport`] in lait's own vocabulary ([`PeerId`], [`Topic`], framed
+//!   [`Stream`]s, [`GossipEvent`]s), never through a vendor's connection types.
+//!
+//! One policy, N transports: the shipped one over QUIC ([`DefaultFactory`]) and a
+//! deterministic in-process one ([`mem::MemTransport`]) that lets the *real
+//! daemon* run with no network at all.
+//!
+//! **The daemon is the consumer, not the transport.** It holds an
+//! `Arc<dyn Transport>` and drives it, so swapping the in-memory transport for
+//! the shipped one changes *nothing* above this seam — which is what makes the
+//! thing under test the actual daemon rather than a stand-in.
+//!
+//! Identity note: [`PeerId`] is a [`DeviceId`] — a peer *is* its ed25519 key (the
+//! T0 identity agreement). The concrete transport converts at its own edge;
+//! nothing above this seam names a foreign id type.
 
-pub mod iroh;
+mod iroh;
 pub mod mem;
+pub mod policy;
 
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::ids::DeviceId;
+use lait_kernel::ids::DeviceId;
+
+/// The transport lait ships with: QUIC over the relay mesh its [`policy`]
+/// selects, and the factory that builds it. Exported under their role rather
+/// than their vendor, so replacing the contractor is a change here and nowhere
+/// else — no consumer names it, and the module behind these is private.
+pub use iroh::{IrohFactory as DefaultFactory, IrohTransport as DefaultTransport};
 
 /// A peer's stable identity — its ed25519 public key. Same 32 bytes iroh calls an
 /// `EndpointId`; lait names it a `DeviceId` everywhere above the transport edge.
@@ -34,7 +48,7 @@ pub type PeerId = DeviceId;
 /// A protocol selector for a direct connection (lait's ALPNs: sync, presence).
 pub type Alpn = &'static [u8];
 
-/// A gossip room id — a pure function of the space id ([`crate::proto`]).
+/// A gossip room id — a pure function of the space id (derived by the application protocol).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Topic(pub [u8; 32]);
 
@@ -58,7 +72,7 @@ pub trait TransportFactory: Send + Sync {
     async fn build(
         &self,
         identity_seed: &[u8; 32],
-        network: &crate::net::Network,
+        network: &policy::Network,
         alpns: &[Alpn],
     ) -> Result<std::sync::Arc<dyn Transport>>;
 }
@@ -159,7 +173,7 @@ pub trait GossipReceiver: Send {
 ///
 /// This is the narrow waist: dial (direct connections for sync/presence), gossip
 /// (announce/presence room), and accept (inbound direct connections routed by
-/// ALPN). Reachability lives in [`crate::net::PeerBook`], which the concrete
+/// ALPN). Reachability lives in [`policy::PeerBook`], which the concrete
 /// transport owns and the daemon populates.
 #[async_trait]
 pub trait Transport: Send + Sync {

@@ -51,7 +51,7 @@ use crate::{
     replica::{DirtySet, Replica},
     store::Store,
     transport::{
-        iroh::IrohFactory, GossipEvent, GossipSender, Incoming, Topic, Transport, TransportFactory,
+        DefaultFactory, GossipEvent, GossipSender, Incoming, Topic, Transport, TransportFactory,
     },
 };
 
@@ -2230,7 +2230,7 @@ async fn write_line_half<T: serde::Serialize>(
 pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     // Identity is global by default (DUR-5); store (repo/lock/socket/config) is
     // this per-repo home. `$LAIT_HOME` collapses both back into `home`.
-    run_daemon_with(home, seed, crate::config::identity_dir()?, &IrohFactory).await?;
+    run_daemon_with(home, seed, crate::config::identity_dir()?, &DefaultFactory).await?;
     std::process::exit(0);
 }
 

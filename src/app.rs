@@ -924,7 +924,7 @@ fn update_bin_path_in_archive() -> &'static str {
 ///
 /// **Only for short-lived, output-printing CLI commands.** The `daemon` and the
 /// `mcp` stdio server must NOT reset it (they are the `service` specs): they are
-/// long-running and do network / socket I/O (iroh, tokio), which relies on
+/// long-running and do network / socket I/O, which relies on
 /// `SIGPIPE` staying ignored so a write to a closed socket returns `EPIPE` instead
 /// of *killing the process*. Resetting it there makes a dropped relay/socket write
 /// terminate the daemon.

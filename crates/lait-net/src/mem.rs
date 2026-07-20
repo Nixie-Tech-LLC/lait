@@ -257,8 +257,12 @@ mod tests {
 
     use super::*;
 
+    /// Any ALPN routes the same way here; the daemon's real protocol selectors
+    /// are the application's to name, not the transport's.
+    const TEST_ALPN: Alpn = b"lait-net/test/1";
+
     fn id(seed: u8) -> PeerId {
-        crate::crypto::device_from_seed(&[seed; 32])
+        lait_kernel::crypto::device_from_seed(&[seed; 32])
     }
 
     #[tokio::test]
@@ -302,12 +306,12 @@ mod tests {
         let b_accept = tokio::spawn(async move {
             let inc = b.accept().await.expect("incoming");
             assert_eq!(inc.from, id(1));
-            assert_eq!(inc.alpn, crate::sync::SYNC_ALPN);
+            assert_eq!(inc.alpn, TEST_ALPN);
             let mut s = inc.stream;
             assert_eq!(s.recv().await.unwrap().as_deref(), Some(&b"ping"[..]));
             s.send(b"pong").await.unwrap();
         });
-        let mut s = a.connect(id(2), crate::sync::SYNC_ALPN).await.unwrap();
+        let mut s = a.connect(id(2), TEST_ALPN).await.unwrap();
         s.send(b"ping").await.unwrap();
         assert_eq!(s.recv().await.unwrap().as_deref(), Some(&b"pong"[..]));
         b_accept.await.unwrap();
@@ -327,7 +331,7 @@ mod tests {
             assert_eq!(s.recv().await.unwrap().as_deref(), Some(&b"two"[..]));
             assert_eq!(s.recv().await.unwrap(), None, "clean end after drain");
         });
-        let mut s = a.connect(id(2), crate::sync::SYNC_ALPN).await.unwrap();
+        let mut s = a.connect(id(2), TEST_ALPN).await.unwrap();
         s.send(b"one").await.unwrap();
         s.send(b"two").await.unwrap();
         s.finish().await.unwrap();
@@ -359,7 +363,7 @@ mod tests {
                 .expect("wait_closed must resolve after the dialer drops");
         });
 
-        let mut s = a.connect(id(2), crate::sync::SYNC_ALPN).await.unwrap();
+        let mut s = a.connect(id(2), TEST_ALPN).await.unwrap();
         assert_eq!(s.recv().await.unwrap().as_deref(), Some(&b"payload"[..]));
         tokio::time::sleep(Duration::from_millis(200)).await;
         drop(s); // the dialer's "done" signal
@@ -373,6 +377,6 @@ mod tests {
         let a = net.peer(id(1));
         let b = net.peer(id(2));
         b.shutdown().await;
-        assert!(a.connect(id(2), crate::sync::SYNC_ALPN).await.is_err());
+        assert!(a.connect(id(2), TEST_ALPN).await.is_err());
     }
 }

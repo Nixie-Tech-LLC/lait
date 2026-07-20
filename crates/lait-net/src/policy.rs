@@ -13,7 +13,7 @@
 //!
 //! **Reachability.** Every peer dial in `node.rs` is a bare `EndpointId`, which
 //! iroh resolves through the endpoint's address lookups (the address-free design
-//! in `crate::proto`). `Public` gets that resolution from n0 discovery. `Local`
+//! by the application protocol). `Public` gets that resolution from n0 discovery. `Local`
 //! has NO discovery service — instead lait registers `{id, relay}` for each peer
 //! it learns into a [`PeerBook`] (an in-process `MemoryLookup`), because lait
 //! already knows its relay and can build the address directly. Nothing is

@@ -1,9 +1,9 @@
 //! The iroh implementation of the transport seam — the ONLY file besides
-//! [`crate::net`] that names iroh connection/gossip types, and the only one
+//! [`crate::policy`] that names iroh connection/gossip types, and the only one
 //! anywhere that names `GOSSIP_ALPN` (gossip is transport plumbing here; it
 //! never surfaces through [`Transport::accept`]).
 //!
-//! Division of labour: [`crate::net`] owns network *policy* (which
+//! Division of labour: [`crate::policy`] owns network *policy* (which
 //! relay/discovery — `RelayMode`, presets, address lookups are spoken only
 //! there, inside `build_endpoint`); this module owns the *mechanism* — dialing,
 //! accepting, framing, gossip — in lait's vocabulary. Identity converts at this
@@ -39,7 +39,7 @@ use super::{
     Alpn, GossipEvent, GossipReceiver, GossipSender, Incoming, PeerId, Stream, Topic, Transport,
     MAX_FRAME,
 };
-use crate::ids::DeviceId;
+use lait_kernel::ids::DeviceId;
 
 /// Inbound connections buffered between the Router's handlers and a slow
 /// [`Transport::accept`] loop before handlers start parking in their forward.
@@ -88,13 +88,13 @@ fn check_frame_len(len: u32) -> Result<()> {
 /// gossip instance, and an internal [`Router`] forwarding lait's ALPNs out
 /// through [`Transport::accept`].
 ///
-/// [`Network`]: crate::net::Network
+/// [`Network`]: crate::policy::Network
 pub struct IrohTransport {
     endpoint: iroh::Endpoint,
     gossip: Gossip,
     /// Reachability policy — populated via [`Transport::learn`], queried by the
-    /// endpoint on every bare-id dial. Policy semantics live in [`crate::net`].
-    peers: crate::net::PeerBook,
+    /// endpoint on every bare-id dial. Policy semantics live in [`crate::policy`].
+    peers: crate::policy::PeerBook,
     /// Owns ALPN dispatch and graceful teardown (internal — never surfaced).
     router: Router,
     /// Fed by the [`ForwardHandler`]s; drained by [`Transport::accept`].
@@ -108,7 +108,7 @@ pub struct IrohTransport {
 
 impl IrohTransport {
     /// Bind an endpoint under lait's [`Network`] policy (via
-    /// [`crate::net::build_endpoint`] — the sole relay/discovery vocabulary
+    /// [`crate::policy::build_endpoint`] — the sole relay/discovery vocabulary
     /// site), spawn gossip, register `alpns` plus the internal gossip ALPN on a
     /// [`Router`], and — when the policy provides a relay — wait (bounded, 30s,
     /// warn-and-continue) for the home relay so early dials are routable.
@@ -117,14 +117,14 @@ impl IrohTransport {
     /// the seed *is* the identity, and the transport keypair is derived here at
     /// the edge, exactly as the daemon does today.
     ///
-    /// [`Network`]: crate::net::Network
+    /// [`Network`]: crate::policy::Network
     pub async fn new(
         identity_seed: &[u8; 32],
-        network: &crate::net::Network,
+        network: &crate::policy::Network,
         alpns: &[Alpn],
     ) -> Result<Self> {
         let secret_key = SecretKey::from_bytes(identity_seed);
-        let (endpoint, peers) = crate::net::build_endpoint(&secret_key, network).await?;
+        let (endpoint, peers) = crate::policy::build_endpoint(&secret_key, network).await?;
         let gossip = Gossip::builder().spawn(endpoint.clone());
 
         let (tx, rx) = mpsc::channel(INCOMING_BUFFER);
@@ -175,7 +175,7 @@ impl super::TransportFactory for IrohFactory {
     async fn build(
         &self,
         identity_seed: &[u8; 32],
-        network: &crate::net::Network,
+        network: &crate::policy::Network,
         alpns: &[Alpn],
     ) -> Result<std::sync::Arc<dyn Transport>> {
         Ok(std::sync::Arc::new(
@@ -371,8 +371,8 @@ impl Transport for IrohTransport {
     /// non-empty ⇒ those direct addresses ([`PeerBook::learn_direct`] — the
     /// Isolated ticket path).
     ///
-    /// [`PeerBook::learn`]: crate::net::PeerBook::learn
-    /// [`PeerBook::learn_direct`]: crate::net::PeerBook::learn_direct
+    /// [`PeerBook::learn`]: crate::policy::PeerBook::learn
+    /// [`PeerBook::learn_direct`]: crate::policy::PeerBook::learn_direct
     fn learn(&self, peer: PeerId, addrs: &[SocketAddr]) {
         let id = match endpoint_id(&peer) {
             Ok(id) => id,
@@ -392,7 +392,7 @@ impl Transport for IrohTransport {
     /// [`PeerBook`], or carried addresses) and opens the stream eagerly. NO
     /// internal timeout — callers own timeouts, as the daemon's pull/probe do.
     ///
-    /// [`PeerBook`]: crate::net::PeerBook
+    /// [`PeerBook`]: crate::policy::PeerBook
     async fn connect(&self, peer: PeerId, alpn: Alpn) -> Result<Box<dyn Stream>> {
         let id = endpoint_id(&peer)?;
         let conn = self
@@ -493,16 +493,14 @@ mod tests {
     /// conversions at this edge are exact inverses.
     #[test]
     fn id_topic_conversions() {
-        let device = crate::crypto::device_from_seed(&[7u8; 32]);
+        let device = lait_kernel::crypto::device_from_seed(&[7u8; 32]);
         let ep = endpoint_id(&device).expect("a lait device id is a valid endpoint id");
         assert_eq!(peer_id(ep), device, "peer_id ∘ endpoint_id = identity");
 
+        // A topic is opaque here: whatever 32 bytes the protocol above derived
+        // reach the room unchanged.
         let bytes = [42u8; 32];
         assert_eq!(topic_id(Topic(bytes)).as_bytes(), &bytes);
-
-        // A space topic derived by proto survives the Topic round-trip.
-        let derived = crate::proto::topic_for_space("ws-under-test");
-        assert_eq!(topic_id(derived).as_bytes(), &derived.0);
 
         // Garbage is a loud error, not a bogus id.
         assert!(endpoint_id(&DeviceId::from_key_string("nope".into())).is_err());

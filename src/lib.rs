@@ -19,7 +19,7 @@
 //!   * **Layer B — control protocol** ([`control`], [`dto`]): a stable, versioned,
 //!     hand-maintained projection of Layer A over the local socket. Never a dump.
 //!   * **Peer wire and sync** ([`proto`] and `sync`): opaque Loro bytes plus
-//!     the minimum framing to route them over iroh.
+//!     the minimum framing to route them over the network adapter.
 
 pub mod app;
 pub mod cli;
@@ -34,7 +34,6 @@ pub mod install;
 pub mod list_picker;
 pub mod mcp;
 pub mod members_ui;
-pub mod net;
 pub mod node;
 pub mod presence;
 pub mod proto;
@@ -44,7 +43,6 @@ pub mod secretfs;
 pub mod serve;
 pub mod spaces;
 pub mod sync;
-pub mod transport;
 
 // The **kernel** (`lait-kernel`) holds lait's roots — identity, the trust
 // planes, derivation rules — in a crate that lists no scaffold, so a `loro::`
@@ -63,3 +61,11 @@ pub use lait_kernel::{
 // the app crate's manifest lists no `loro`, so `loro::*` is unnameable outside
 // the fabric.
 pub use lait_fabric::{self as fabric, catalog, issue, membership, store};
+
+// The **net adapter** (`lait-net`) is how independently held replicas exchange
+// their material: lait's own `Transport` seam plus the network policy behind it,
+// in a crate that alone lists iroh. `iroh` is absent from THIS manifest, so no
+// `iroh::` reference compiles in the app layer. Re-exported so the daemon keeps
+// reaching the seam by its historical paths (`crate::transport`, `crate::net`).
+pub use lait_net as transport;
+pub use lait_net::policy as net;
