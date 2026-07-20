@@ -2,7 +2,7 @@
 # packagers, Homebrew, Nix, …) can verify lait is authentically ours and build
 # their own binaries from source — independent of the Nixie-built, code-signed
 # artifacts. This is source provenance (GPG), separate from the OS code signing
-# in build-binaries.yml (Apple/Azure). See docs/RELEASES.md.
+# in build-binaries.yml (Apple/Azure). See docs/RELEASE-SIGNING.md.
 #
 # Signs with a dedicated release SUBKEY (the master key stays offline). The
 # private subkey is stored base64-encoded in the GPG_SIGNING_KEY secret; the
