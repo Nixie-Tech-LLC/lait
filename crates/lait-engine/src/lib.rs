@@ -1,5 +1,5 @@
 //! Layer A — the **engine**: lait's data type behind the Layer-A contract
-//! (`docs/LAIT-DATA-CONTRACT.md`).
+//! (`docs/DATA-CONTRACT.md`).
 //!
 //! The lait data type is *a convergent data body ⊕ a causal authority envelope*.
 //! This crate owns both halves' storage representation and is the **only crate**

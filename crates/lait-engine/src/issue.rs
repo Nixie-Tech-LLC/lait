@@ -13,7 +13,7 @@
 //!
 //! `projectId` is the **single source of project membership** (S§5.5).
 //!
-//! Mutation contract (LAIT-DATA-CONTRACT §5-§6): callers stage typed writes and
+//! Mutation contract (`docs/DATA-CONTRACT.md`): callers stage typed writes and
 //! land them with exactly one [`IssueDoc::apply`] per Request — the only commit
 //! path, and it stamps the op metadata every change must carry.
 

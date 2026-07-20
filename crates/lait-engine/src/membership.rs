@@ -8,7 +8,7 @@
 //! decrypt the workspace. A non-member sees the signed ops + envelopes it cannot
 //! open — and therefore only ciphertext for the actual issue data.
 //!
-//! This doc is the reference Regime-C surface (LAIT-DATA-CONTRACT §1): its
+//! This doc is the signed-authority transport surface (`docs/DATA-CONTRACT.md`): its
 //! Loro layer only *moves* the signed ops; trust comes from `acl::replay`.
 //! Commits go through [`MembershipDoc::apply`] like every other doc — note the
 //! commit metadata here is **plaintext on the wire** (fine: it names ACL ops

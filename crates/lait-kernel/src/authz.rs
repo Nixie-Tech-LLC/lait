@@ -1,5 +1,5 @@
-//! Content authority — the second signed hash-DAG plane (LAIT-DATA-CONTRACT
-//! §3.4 "CRAIT"), domain `lait/authz/1`. Where the membership plane
+//! Content authority — the second signed hash-DAG plane
+//! (`docs/DATA-CONTRACT.md`), domain `lait/authz/1`. Where the membership plane
 //! ([`crate::acl`]) answers *who is here*, this plane answers *which
 //! high-consequence content actions were validly taken* — starting with issue
 //! tombstones (delete/restore).

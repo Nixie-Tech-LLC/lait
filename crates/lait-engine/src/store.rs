@@ -50,7 +50,7 @@ pub struct Store {
     /// it — every `.loro` write is fsync'd in [`write_atomic`] — so coalescing
     /// commits only coarsens git history, never risks data.
     pending: AtomicU64,
-    /// The store's **stable peer id** (LAIT-DATA-CONTRACT §5): minted randomly
+    /// The store's **stable peer id** (`docs/DATA-CONTRACT.md`): minted randomly
     /// once per store and persisted beside the docs, so a daemon restart reuses
     /// it (no version-vector growth per session) while a re-created store mints
     /// a fresh one (reusing a peer id over an empty store and then importing

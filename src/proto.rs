@@ -185,7 +185,7 @@ pub enum Payload {
     /// shorter frame and a newer peer fails to decode it with
     /// `DeserializeUnexpectedEnd` (the drop is now logged in node.rs). Adding
     /// `state` was a coordinated format bump; the `#[serde(default)]` only helps
-    /// the JSON/DTO paths, not the postcard wire. See docs/HARDENING.md.
+    /// the JSON/DTO paths, not the postcard wire. See `docs/PROTOCOL.md`.
     Presence {
         nick: String,
         #[serde(default)]

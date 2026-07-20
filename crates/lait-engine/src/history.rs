@@ -1,4 +1,4 @@
-//! Derived history (LAIT-DATA-CONTRACT §5): the activity/history feed read
+//! Derived history (`docs/DATA-CONTRACT.md`): the activity/history feed read
 //! **from the oplog on disk**, not from a per-session ring. Every change in an
 //! issue doc's causal DAG carries a timestamp and an [`OpMeta`] commit message
 //! (post-contract writes), so `lait history` survives daemon restarts and

@@ -8,3 +8,10 @@ target
 viewer/node_modules/
 viewer/dist/
 *.tsbuildinfo
+# Local design history and working notes. Current product and protocol truth
+# belongs in the lean tracked documentation set under docs/.
+/docs/GUIDED-JOIN.md
+/docs/HARDENING.md
+/docs/ROADMAP.md
+/docs/SCHEMA.md
+/docs/SERVE.md

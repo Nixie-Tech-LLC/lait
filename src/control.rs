@@ -378,7 +378,7 @@ pub enum Request {
 
     // ---- transport / presence (kept from the skeleton; the P1 surface) ----
     Status,
-    /// Guided-join verifier (UI onboarding, `docs/GUIDED-JOIN.md`): project live
+    /// Guided-join verifier (`docs/UI.md`, joining): project live
     /// node state into an ordered list of onboarding gates so a stalled joiner
     /// gets one legible blocker instead of a blank board. `expected_workspace`
     /// (supplied by the `join` tail from the invite ticket) lets it catch a

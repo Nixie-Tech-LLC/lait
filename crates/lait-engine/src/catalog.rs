@@ -6,7 +6,7 @@
 //!
 //! The catalog is the multi-document container the engine structurally lacks
 //! (one Loro doc = one tree): issue docs are *content*, the catalog is *nodes,
-//! ordering, hierarchy, and edges* (LAIT-DATA-CONTRACT §3.2).
+//! ordering, hierarchy, and edges* (`docs/DATA-CONTRACT.md`, catalog document).
 //!
 //! **Authority (S§3).** `Catalog.docs` existence, `projects`, `labels`,
 //! `workflow`, board *ordering*, `subs`, `edges`, and `acl` are authoritative.
@@ -60,7 +60,7 @@ const C_SUBS: &str = "subs";
 const C_EDGES: &str = "edges";
 /// The content-authority DAG (`crate::authz`): signed tombstone ops et al.
 /// Encrypted with the rest of the catalog — the blind relay learns nothing,
-/// and old builds never parse it (LAIT-DATA-CONTRACT §3.4 placement rule).
+/// and old builds never parse it (the data contract's authority-tier rule).
 const C_AUTHZ: &str = "authz";
 /// The tree-node meta key carrying the issue DocId a `subs` node stands for.
 const META_DOC: &str = "docId";

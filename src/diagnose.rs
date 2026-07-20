@@ -1,4 +1,4 @@
-//! The guided-join verifier core (see `docs/GUIDED-JOIN.md`).
+//! The guided-join verifier core (see `docs/UI.md`, joining).
 //!
 //! A **pure projection** of live daemon state into an ordered list of onboarding
 //! *gates*, so a stalled joiner gets one legible line naming what's blocking them

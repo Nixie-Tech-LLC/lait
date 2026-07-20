@@ -1,4 +1,4 @@
-//! The workspace registry (see `docs/GUIDED-JOIN.md` §B).
+//! The workspace registry (see `docs/UI.md`, joining).
 //!
 //! A small global index, `workspaces.json` under [`crate::config::config_root`],
 //! mapping each **store path** to the workspace it holds. Written at every

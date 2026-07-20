@@ -1,5 +1,5 @@
 //! The shared **signed hash-DAG envelope** — the Regime-C primitive
-//! (LAIT-DATA-CONTRACT §1) both authority planes ride:
+//! (`docs/DATA-CONTRACT.md`) the authority planes ride:
 //!
 //! * membership / ACL ([`crate::acl`], domain `lait/aclop/1`, plaintext-synced),
 //! * content authority ([`crate::authz`], domain `lait/authz/1`, encrypted).

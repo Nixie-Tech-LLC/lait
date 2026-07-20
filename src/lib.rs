@@ -6,14 +6,14 @@
 //!   * `lait <cmd>` is the CLI client, driving the daemon over a local IPC
 //!     control channel.
 //!   * `lait serve` binds that same façade to loopback HTTP + SSE so a browser
-//!     can be a client too ([`serve`], `docs/SERVE.md`). The only surface global
+//!     can be a client too ([`serve`], `docs/UI.md`). The only surface global
 //!     to the machine: it supervises one daemon per space.
 //!   * `lait mcp` exposes the same Layer-B façade as MCP tools for an agent.
 //!
 //! The crate is split lib + bin so integration tests, doctests, and the MCP/DTO
 //! parity check can exercise the same code the binary runs. See `docs/`.
 //!
-//! Layering (see `docs/ARCHITECTURE.md` §4, `docs/SCHEMA.md` §1):
+//! Layering (see `docs/ARCHITECTURE.md` and `docs/DATA-CONTRACT.md`):
 //!   * **Layer A — storage/CRDT** ([`catalog`], [`issue`], [`store`], [`ids`]):
 //!     Loro documents are the single source of truth for all merge semantics.
 //!   * **Layer B — control protocol** ([`control`], [`dto`]): a stable, versioned,

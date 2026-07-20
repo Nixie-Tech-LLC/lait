@@ -8,7 +8,7 @@ platform — they all land the same `lait` executable. Upgrade any install in pl
 
 > **Heads-up on the crypto:** lait's end-to-end encryption is research-grade and
 > **not yet independently audited** — don't trust it with sensitive data yet. See
-> [`docs/HARDENING.md`](HARDENING.md).
+> [`THREAT-MODEL.md`](./THREAT-MODEL.md).
 
 ## Quick pick
 

@@ -1,4 +1,4 @@
-//! The operation contract (LAIT-DATA-CONTRACT §2, §4, §5): every commit in
+//! The operation contract (`docs/DATA-CONTRACT.md`): every commit in
 //! lait carries a request kind, an (advisory) actor, and a **trust tier** — and
 //! the engine is configured so those commits survive as distinct, timestamped,
 //! self-labelled changes in the oplog instead of fusing into one anonymous blob.

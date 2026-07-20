@@ -594,7 +594,7 @@ pub const KEYS: &[KeySpec] = &[
 /// The `tui.*` namespace (theme, saved tabs, and the open `tui.key.<action-id>`
 /// override prefix) went with the TUI. The web client keeps the same *shape* of
 /// idea — rebind by stable action id, warn rather than gate — but its overrides
-/// live client-side for now; see docs/SERVE.md. If they ever want a home on disk,
+/// live client-side for now; see `docs/UI.md`. If they ever want a home on disk,
 /// this table is where a `web.key.*` prefix would go.
 pub fn key_spec(name: &str) -> Result<&'static KeySpec> {
     if name.starts_with("workspace.") {
