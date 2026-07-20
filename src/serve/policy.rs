@@ -45,7 +45,7 @@ pub fn is_read(req: &Request) -> bool {
         // Reads the inbox, but `clear` advances the watermark on the way out.
         Request::Inbox { clear } => !clear,
 
-        // Writes: the tracker plane…
+        // Writes: the replica plane…
         Request::IssueNew { .. }
         | Request::IssueEdit { .. }
         | Request::IssueMove { .. }

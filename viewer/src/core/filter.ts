@@ -25,7 +25,7 @@ import type { BoardView, Row } from "../types";
  * 1. **There is no semantic to preserve.** `Row.status` is a status id the daemon
  *    put there, and `WorkflowState.id` is a status id the daemon put there.
  *    Comparing them re-derives nothing — it is the identical operation the daemon
- *    performs (`tracker.rs:1333-1339` is `r.status == s`, exact string equality on
+ *    performs (`replica.rs:1333-1339` is `r.status == s`, exact string equality on
  *    the same cached row). Contrast `mine`, which is an authorization question, and
  *    `label`, which is a resolution step. Neither has an analogue here.
  * 2. **`Filter.status` is `Option<String>` — one status, or none.** A status filter

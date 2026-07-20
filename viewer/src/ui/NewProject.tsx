@@ -18,7 +18,7 @@ import { Button, IconButton, Kbd } from "./primitives";
  * the first few letters — and stops the moment you touch it, because a derived value
  * that keeps overwriting your edit is worse than no derivation at all.
  *
- * The rules are mirrored from `tracker.rs::project_new` for *feedback*, never for
+ * The rules are mirrored from `replica.rs::project_new` for *feedback*, never for
  * enforcement: the daemon validates and its refusal is the answer. What this buys is
  * that you find out before you press the button rather than after.
  */

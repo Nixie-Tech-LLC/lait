@@ -112,12 +112,12 @@ fn found_home(home: &Path) {
     let key = lait::config::load_or_create_identity(home).expect("identity");
     let me = lait::crypto::user_from_seed(&key);
     let store = lait::store::Store::open(home).expect("store");
-    lait::tracker::found_workspace(&store, &me, &key, "test", &lait::ids::SystemUlidSource)
+    lait::replica::found_workspace(&store, &me, &key, "test", &lait::ids::SystemUlidSource)
         .expect("found workspace");
 }
 
 /// Seed a project + one issue and return the issue's canonical ref (e.g.
-/// `ENG-1`). Exercises the tracker mutation path that feeds the doorbell.
+/// `ENG-1`). Exercises the replica mutation path that feeds the doorbell.
 async fn seed_project_and_issue(home: &Path) -> String {
     let resp = request(
         home,

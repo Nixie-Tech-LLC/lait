@@ -332,7 +332,7 @@ export function IssueDetail({
               open={pickerOpen("label")}
               onOpenChange={setPicker("label")}
               // The registry is keyed by id, but `Request::Label` resolves **names**
-              // (`tracker.rs::label`), so the selection is tracked by name too —
+              // (`replica.rs::label`), so the selection is tracked by name too —
               // matching what we send rather than translating at the boundary.
               selected={issue.label_names}
               emptyText={labels.length ? "No matches" : "No labels yet"}

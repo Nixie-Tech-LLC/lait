@@ -35,7 +35,7 @@
 //!   provides the algebra, and nonce reuse across messages is a caller error the
 //!   plan-bound nonce record is responsible for preventing.
 //!
-//! Nothing here is wired into the tracker or the space plane. It exists to
+//! Nothing here is wired into the replica or the space plane. It exists to
 //! isolate and validate the signing/witness algebra. It is not production-ready.
 
 use std::collections::BTreeMap;

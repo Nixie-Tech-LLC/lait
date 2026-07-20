@@ -292,7 +292,7 @@ export function App() {
       if (p?.kind === "projects") setProjects(p.projects);
       if (m?.kind === "members") {
         // `members` carries no alias for **you**: a petname is something you assign
-        // to other people, so `tracker.rs::members` reports `alias: ""` for `me`.
+        // to other people, so `replica.rs::members` reports `alias: ""` for `me`.
         // Your own name lives in `user.nick`, which only `status` reports — and
         // without it yours is the one avatar in the workspace with no letter on it,
         // which is a strange way to meet yourself. Patched here rather than in the
@@ -529,7 +529,7 @@ export function App() {
        * daemon on a Unix socket that is a few milliseconds.
        *
        * Refused in a Done column, and that is not a nicety. Entering a done-category
-       * status **removes the doc from `boards[P]`** (`tracker.rs:858-869`); done
+       * status **removes the doc from `boards[P]`** (`replica.rs:858-869`); done
        * columns are rendered by the append rule instead, sorted `created_at desc`.
        * So a reorder there mutates a list the column isn't drawn from — the request
        * succeeds, the daemon rings, and the card lands exactly where it was. Doing
@@ -625,7 +625,7 @@ export function App() {
    * The **order is load-bearing**. Status first, position second:
    *
    * - Moving *into* a done status removes the doc from `boards[P]`; moving *out of*
-   *   one re-inserts it at the top (`tracker.rs:858-869`). Doing the placement first
+   *   one re-inserts it at the top (`replica.rs:858-869`). Doing the placement first
    *   would have that re-insert stomp the position we just asked for.
    * - Dropping into a done column sends **no** `issue_move` at all (`pos` is null):
    *   done columns are rendered by the append rule and ignore the movable list, so

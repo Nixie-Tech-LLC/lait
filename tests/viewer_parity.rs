@@ -30,8 +30,8 @@
 //! check the *semantics* of a field (what value the daemon puts there). That gap is
 //! not hypothetical: durable history changed `ActivityEvent.actor`/`actor_nick`
 //! semantics under the viewer and this test was blind to it. The behavioral pin for
-//! that class lives in `tracker.rs::tests::history_is_the_contract_the_viewer_reads`
-//! — it drives a real tracker and asserts the read-DTO values the client depends on.
+//! that class lives in `replica.rs::tests::history_is_the_contract_the_viewer_reads`
+//! — it drives a real replica and asserts the read-DTO values the client depends on.
 
 use std::collections::{BTreeMap, BTreeSet};
 

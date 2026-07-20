@@ -21,7 +21,7 @@
 //! signing — so every replica computes the same status. Crucially, a custody ack
 //! proves a share was *backed up*, not that its holder is reachable or willing;
 //! [`status`] therefore never derives live recoverability from the grow-only
-//! ledger alone. Wiring it to the tracker's `RecoveryStatus` surface and the
+//! ledger alone. Wiring it to the replica's `RecoveryStatus` surface and the
 //! ceremony board is app-layer integration, deliberately not done here.
 
 use std::collections::BTreeSet;
@@ -75,7 +75,7 @@ impl CustodyLedger {
 }
 
 /// The readiness of a recovery arrangement — the kernel projection behind the
-/// tracker's status surface.
+/// replica's status surface.
 ///
 /// **Durability** (can recovery *ever* happen from the backups on record?) and
 /// **availability** (can it happen *right now* with holders that are reachable?)

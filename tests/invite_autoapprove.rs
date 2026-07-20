@@ -120,7 +120,7 @@ fn found_home(home: &Path) {
     let key = lait::config::load_or_create_identity(home).expect("identity");
     let me = lait::crypto::user_from_seed(&key);
     let store = lait::store::Store::open(home).expect("store");
-    lait::tracker::found_workspace(&store, &me, &key, "test", &lait::ids::SystemUlidSource)
+    lait::replica::found_workspace(&store, &me, &key, "test", &lait::ids::SystemUlidSource)
         .expect("found workspace");
 }
 
@@ -130,7 +130,7 @@ fn found_home(home: &Path) {
 fn join_home(home: &Path, ticket: &str) {
     let t: lait::proto::WorkspaceTicket = ticket.parse().expect("parse ticket");
     let store = lait::store::Store::open(home).expect("store");
-    lait::tracker::join_workspace_store(
+    lait::replica::join_workspace_store(
         &store,
         &t.workspace,
         &t.salt,

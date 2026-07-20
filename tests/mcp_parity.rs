@@ -3,7 +3,7 @@
 //! The MCP tools return the **same** versioned control `Response` DTO the
 //! CLI `--json` emits, so agent and human surfaces never drift. These tests are
 //! the "check" half of "generate/check, don't hand-maintain twice": they fail
-//! the build gate if a tracker `Request` is added without a corresponding MCP
+//! the build gate if a replica `Request` is added without a corresponding MCP
 //! tool, or if a `Response` DTO stops round-tripping (a silent contract break).
 
 use lait::control::Response;
@@ -14,21 +14,21 @@ use lait::dto::{
 use lait::ids::{DocId, ProjectId, SystemUlidSource, WorkspaceId};
 use lait::mcp::{MCP_TOOL_NAMES, REQUIRED_TRACKER_COMMANDS};
 
-/// Every tracker command an agent must drive has exactly one MCP tool. Adding a
-/// `Request` variant to the tracker surface without wiring an MCP tool for it
+/// Every replica command an agent must drive has exactly one MCP tool. Adding a
+/// `Request` variant to the replica surface without wiring an MCP tool for it
 /// fails here (the parity guard).
 #[test]
-fn every_tracker_command_has_an_mcp_tool() {
+fn every_replica_command_has_an_mcp_tool() {
     for cmd in REQUIRED_TRACKER_COMMANDS {
         assert!(
             MCP_TOOL_NAMES.contains(cmd),
-            "tracker command `{cmd}` has no MCP tool — the agent surface drifted \
+            "replica command `{cmd}` has no MCP tool — the agent surface drifted \
              from the Layer-B command surface"
         );
     }
 }
 
-/// Onboarding/transport tools an agent needs but that live outside the tracker
+/// Onboarding/transport tools an agent needs but that live outside the replica
 /// CRUD set (and so aren't covered by `REQUIRED_TRACKER_COMMANDS`). Pinned here so
 /// removing, say, the `doctor` tool — the guided-join verifier's agent surface —
 /// fails the build instead of silently dropping a channel.

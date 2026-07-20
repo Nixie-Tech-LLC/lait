@@ -532,7 +532,7 @@ async fn run_init(m: &ArgMatches, out: Out) -> Result<()> {
     let me = crate::crypto::user_from_seed(&seed);
     let store = Store::open(&home)?;
     let (ws, project) =
-        crate::tracker::found_workspace(&store, &me, &seed, &name, &SystemUlidSource)?;
+        crate::replica::found_workspace(&store, &me, &seed, &name, &SystemUlidSource)?;
     // Register the founder — this is what makes `lait workspaces` complete.
     if let Err(e) = workspaces::upsert(workspaces::WorkspaceEntry {
         workspace: ws.to_string(),
@@ -675,7 +675,7 @@ async fn run_join_cli(m: &ArgMatches, out: Out) -> Result<()> {
                 "this invite carries no founding proof — it may be from an older lait; ask for a fresh one"
             )
         })?;
-        crate::tracker::join_workspace_store(
+        crate::replica::join_workspace_store(
             &store,
             &ticket.workspace,
             &ticket.salt,

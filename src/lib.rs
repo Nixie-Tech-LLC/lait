@@ -2,7 +2,7 @@
 //!
 //! One binary, four roles:
 //!   * `lait daemon` runs the node (endpoint, gossip room, presence, and —
-//!     the tracker core — the Loro-CRDT catalog + issue documents, git-backed).
+//!     the replica core — the Loro-CRDT catalog + issue documents, git-backed).
 //!   * `lait <cmd>` is the CLI client, driving the daemon over a local IPC
 //!     control channel.
 //!   * `lait serve` binds that same façade to loopback HTTP + SSE so a browser
@@ -39,10 +39,10 @@ pub mod node;
 pub mod presence;
 pub mod proto;
 pub mod registry;
+pub mod replica;
 pub mod secretfs;
 pub mod serve;
 pub mod sync;
-pub mod tracker;
 pub mod transport;
 pub mod workspaces;
 

@@ -1474,10 +1474,10 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
             // when break-glass is attempted: by then it is too late to fix.
             for h in &s.degraded_recovery {
                 let why = match &h.reason {
-                    crate::tracker::RecoveryArtifactFailure::Undecryptable(_) => {
+                    crate::replica::RecoveryArtifactFailure::Undecryptable(_) => {
                         "it was protected under another Windows account or machine"
                     }
-                    crate::tracker::RecoveryArtifactFailure::Io(_) => {
+                    crate::replica::RecoveryArtifactFailure::Io(_) => {
                         "it is present but could not be read"
                     }
                 };

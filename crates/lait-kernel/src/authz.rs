@@ -21,7 +21,7 @@
 //! **Why self-declared `asof` is safe here.** At-position authorization alone
 //! would let a removed member sign a *new* tombstone against a pre-removal
 //! frontier. The **E2EE epoch** is the recency fence:
-//! Removal always rotates the workspace key (the app layer's `tracker::member_remove`
+//! Removal always rotates the workspace key (the app layer's `replica::member_remove`
 //! → `rotate_key`); post-rotation a removed member cannot produce a payload any
 //! member will decrypt, so their forged tombstone never enters any member's
 //! catalog. The epoch plane is the recency anchor for the authority plane

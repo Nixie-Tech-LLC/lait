@@ -41,7 +41,7 @@ export type View = "list" | "board" | "inbox" | "activity" | "members";
 export type IssueField = "assignee" | "label" | "status" | "priority" | "project";
 
 /** The work-state verbs. One `Request` each, and each bundles more than a status —
- *  see `tracker.rs::work_state`. */
+ *  see `replica.rs::work_state`. */
 export type WorkAction = "start" | "done" | "stop";
 
 /** Everything a command can touch. The app supplies it; extensions receive it. */

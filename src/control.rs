@@ -113,7 +113,7 @@ pub struct Filter {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
-    // ---- tracker (Layer-B façade over the issue model) ----
+    // ---- replica (Layer-B façade over the issue model) ----
     IssueNew {
         title: String,
         #[serde(default)]
@@ -602,7 +602,7 @@ pub struct Doorbell {
     pub activity_advanced: bool,
     /// New presence or join rows exist; pull via `Log{since}`. Rows are never
     /// streamed: like every other plane this is a dirty *flag*, not the events.
-    /// The presence plane rings independently of the tracker dirty-set, so a
+    /// The presence plane rings independently of the replica dirty-set, so a
     /// peer coming online wakes a subscriber even when no doc moved.
     /// `default` so a frame from a pre-plane daemon (stale across `lait update`)
     /// still decodes because fields are add-only and absence means default.
@@ -679,12 +679,12 @@ pub struct StatusInfo {
     /// learn their founder share is unusable *before* the day they need it,
     /// which is exactly the day it is too late to fix.
     #[serde(default)]
-    pub degraded_recovery: Vec<crate::tracker::DegradedRecoveryHolder>,
+    pub degraded_recovery: Vec<crate::replica::DegradedRecoveryHolder>,
     /// This device's recovery readiness: the standing authority's shape and our
     /// own custody standing. Reports what THIS node knows; it deliberately makes
     /// no claim about whether other holders still have their shares.
     #[serde(default)]
-    pub recovery: Option<crate::tracker::RecoveryStatus>,
+    pub recovery: Option<crate::replica::RecoveryStatus>,
 }
 
 /// What probing a home's control channel found. These three must be told apart

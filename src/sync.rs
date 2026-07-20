@@ -8,7 +8,7 @@
 //! strictly turn-taking and therefore deadlock-free on one bi-stream. Both
 //! directions are covered because each node pulls from a peer whenever it hears
 //! that peer's catalog head moved (gossip announce, [`crate::proto`]). All Loro
-//! work happens under the tracker lock in short synchronous sections; all QUIC
+//! work happens under the replica lock in short synchronous sections; all QUIC
 //! IO happens outside the lock.
 //!
 //! For forward compatibility, frames are per-document `export(updates)` blobs
@@ -21,7 +21,7 @@ use anyhow::{anyhow, Context, Result};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 
-use crate::tracker::{DirtySet, Tracker};
+use crate::replica::{DirtySet, Replica};
 
 /// The ALPN for the pairwise Loro-sync protocol. The trailing number is the
 /// protocol **epoch** — bump it for a change so breaking that peers of the old
@@ -133,12 +133,12 @@ async fn read_msg(recv: &mut RecvStream) -> Result<Option<Msg>> {
 /// **Dialer side.** Pull a peer's state up to date and return a coalesced
 /// dirty-set describing everything that changed locally (the node rings one
 /// doorbell for it through daemon-side batching.
-pub async fn pull(conn: &Connection, tracker: &Mutex<Tracker>) -> Result<DirtySet> {
+pub async fn pull(conn: &Connection, replica: &Mutex<Replica>) -> Result<DirtySet> {
     let (mut send, mut recv) = conn.open_bi().await.context("open sync stream")?;
 
     // 1. send our membership + catalog VVs.
     let (workspace, membership_vv, catalog_vv) = {
-        let t = tracker.lock().unwrap();
+        let t = replica.lock().unwrap();
         (
             t.workspace_str(),
             t.membership_vv_bytes(),
@@ -162,7 +162,7 @@ pub async fn pull(conn: &Connection, tracker: &Mutex<Tracker>) -> Result<DirtySe
     match read_msg(&mut recv).await? {
         Some(Msg::Membership { update }) => {
             if !update.is_empty() {
-                let mut t = tracker.lock().unwrap();
+                let mut t = replica.lock().unwrap();
                 t.import_membership(&update)?;
                 dirty.merge(DirtySet::catalog_structure());
             }
@@ -175,7 +175,7 @@ pub async fn pull(conn: &Connection, tracker: &Mutex<Tracker>) -> Result<DirtySe
         Some(Msg::Catalog { update }) => {
             let changed = !update.is_empty();
             let needs = {
-                let mut t = tracker.lock().unwrap();
+                let mut t = replica.lock().unwrap();
                 t.import_catalog_and_compute_needs(&update)?
             };
             // A non-empty catalog diff may have changed registries/board order the
@@ -205,7 +205,7 @@ pub async fn pull(conn: &Connection, tracker: &Mutex<Tracker>) -> Result<DirtySe
     loop {
         match read_msg(&mut recv).await? {
             Some(Msg::DocUpdate { doc_id, bytes }) => {
-                let mut t = tracker.lock().unwrap();
+                let mut t = replica.lock().unwrap();
                 if let Some(d) = t.import_doc(&doc_id, &bytes)? {
                     dirty.merge(d);
                 }
@@ -223,7 +223,7 @@ pub async fn pull(conn: &Connection, tracker: &Mutex<Tracker>) -> Result<DirtySe
 /// **Accepter side.** Serve a pull: answer the dialer's catalog + doc requests.
 /// Read-only with respect to our own state (a pull never mutates the provider),
 /// so it never rings a doorbell here.
-pub async fn serve(conn: Connection, tracker: &Mutex<Tracker>) -> Result<()> {
+pub async fn serve(conn: Connection, replica: &Mutex<Replica>) -> Result<()> {
     let (mut send, mut recv) = conn.accept_bi().await.context("accept sync stream")?;
 
     // 1. read the Pull; guard the workspace.
@@ -237,7 +237,7 @@ pub async fn serve(conn: Connection, tracker: &Mutex<Tracker>) -> Result<()> {
             // Version before workspace: an out-of-window peer gets a clear
             // "upgrade" error rather than a confusing downstream failure.
             check_sync_protocol(protocol_version)?;
-            let mine = tracker.lock().unwrap().workspace_str();
+            let mine = replica.lock().unwrap().workspace_str();
             if workspace != mine {
                 return Err(anyhow!("workspace mismatch: {workspace} != {mine}"));
             }
@@ -249,7 +249,7 @@ pub async fn serve(conn: Connection, tracker: &Mutex<Tracker>) -> Result<()> {
     // 2a. send the plaintext membership diff (signed ACL + sealed keys), then
     // 2b. the encrypted catalog diff.
     let (membership, catalog) = {
-        let t = tracker.lock().unwrap();
+        let t = replica.lock().unwrap();
         (
             t.export_membership_from(&membership_vv)?,
             t.export_catalog_from(&catalog_vv)?,
@@ -262,7 +262,7 @@ pub async fn serve(conn: Connection, tracker: &Mutex<Tracker>) -> Result<()> {
     loop {
         match read_msg(&mut recv).await? {
             Some(Msg::DocRequest { doc_id, vv }) => {
-                let exported = tracker.lock().unwrap().export_doc_from(&doc_id, &vv)?;
+                let exported = replica.lock().unwrap().export_doc_from(&doc_id, &vv)?;
                 match exported {
                     Some(bytes) => write_msg(&mut send, &Msg::DocUpdate { doc_id, bytes }).await?,
                     None => write_msg(&mut send, &Msg::DocMissing { doc_id }).await?,

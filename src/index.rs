@@ -418,7 +418,7 @@ pub fn resolve_project(catalog: &CatalogDoc, input: &str) -> Option<ProjectDto> 
 /// Resolve a `<userref>`: `@me`, or a full ed25519 key. (Alias/prefix resolution
 /// lives in [`resolve_user_dir`], which the daemon calls with a directory it
 /// assembles from members + presence + join requests, named by the local alias
-/// store. This 2-arg form is the directory-free fallback used inside the tracker,
+/// store. This 2-arg form is the directory-free fallback used inside the replica,
 /// where a ref has already been resolved to `@me`/a full key by the node layer.)
 pub fn resolve_user(input: &str, me: &UserId) -> Option<UserId> {
     let input = input.trim();

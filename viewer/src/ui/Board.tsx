@@ -57,7 +57,7 @@ export function Board({
     const isDone = col.state.category === "done";
     // A done column is not drawn from `boards[P]` — entering a done status removes
     // the doc from the movable list and the column is rendered by the append rule
-    // instead (`tracker.rs:858-869`). So there is no position to ask for, and
+    // instead (`replica.rs:858-869`). So there is no position to ask for, and
     // asking anyway would write to a list this column ignores.
     onDrop(drag.reff, col.state.id, isDone ? null : over.pos);
     reset();

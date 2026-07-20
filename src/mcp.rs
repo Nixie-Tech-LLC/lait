@@ -3,7 +3,7 @@
 //! Each tool is a thin wrapper over the **same** Layer-B `Request`/`Response`
 //! the CLI uses, so an agent drives the local daemon natively and gets back the
 //! **same versioned DTO** emitted by CLI `--json`. The tool
-//! set is checked against the tracker command surface by `tests/mcp_parity.rs`
+//! set is checked against the replica command surface by `tests/mcp_parity.rs`
 //! so the agent and human surfaces never drift.
 
 use std::path::{Path, PathBuf};
@@ -25,7 +25,7 @@ use crate::{
     control::{BoardPos, Filter, Request, Response},
 };
 
-/// The tracker command tags (`Request` serde `cmd` values) an agent must be able
+/// The replica command tags (`Request` serde `cmd` values) an agent must be able
 /// to drive. `tests/mcp_parity.rs` asserts every one has a tool below, so adding
 /// a `Request` without an MCP tool fails the interface-parity build gate.
 pub const REQUIRED_TRACKER_COMMANDS: &[&str] = &[
@@ -65,7 +65,7 @@ pub const REQUIRED_TRACKER_COMMANDS: &[&str] = &[
 /// The set of MCP tool names this server exposes (kept beside the `#[tool]`
 /// methods; the parity test cross-checks it covers `REQUIRED_TRACKER_COMMANDS`).
 pub const MCP_TOOL_NAMES: &[&str] = &[
-    // tracker
+    // replica
     "issue_new",
     "issue_edit",
     "issue_move",
@@ -362,7 +362,7 @@ impl LaitMcp {
         }
     }
 
-    // ---- tracker tools ----
+    // ---- replica tools ----
 
     #[tool(description = "Create an issue. Returns the resolved canonical handle.")]
     async fn issue_new(

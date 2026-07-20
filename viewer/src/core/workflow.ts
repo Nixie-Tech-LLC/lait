@@ -5,7 +5,7 @@ import type { StatusCategory, WorkflowState } from "../types";
  *
  * `issue_start`/`_done`/`_stop` do not name a status — they name a **category**, and
  * the daemon resolves it as *the first state in workflow-list order whose category
- * matches* (`tracker.rs::first_state_in`). So `start` on the default workflow means
+ * matches* (`replica.rs::first_state_in`). So `start` on the default workflow means
  * `in_progress`, and on a workflow whose first Active state is `triage` it means
  * `triage`.
  *
@@ -28,7 +28,7 @@ export function firstStateIn(
   return states.find((s) => s.category === category) ?? null;
 }
 
-/** The category each work verb targets. Mirrors `tracker.rs:797-799`. */
+/** The category each work verb targets. Mirrors `replica.rs:797-799`. */
 export const WORK_CATEGORY = {
   start: "active",
   done: "done",

@@ -1,14 +1,14 @@
 //! The lait daemon: owns the iroh endpoint, the gossip room, presence, the
-//! Loro-CRDT tracker core ([`crate::tracker`]), and the local control server that
+//! Loro-CRDT replica core ([`crate::replica`]), and the local control server that
 //! CLI, web, and MCP clients drive.
 //!
 //! The iroh transport (signed-gossip room for announce/presence, a liveness
 //! probe ALPN, and daemon/control plumbing) is the networking substrate. The
-//! tracker rides on top: the daemon is the **only** owner of the Loro docs, and
+//! replica rides on top: the daemon is the **only** owner of the Loro docs, and
 //! every local interface is a control client.
 //!
 //! **Doorbells.** A mutation produces a
-//! [`crate::tracker::DirtySet`]; the daemon stamps it with a per-boot `epoch` and
+//! [`crate::replica::DirtySet`]; the daemon stamps it with a per-boot `epoch` and
 //! a per-session `seq`, pushes it onto a bounded ring, and wakes every parked
 //! [`Request::Subscribe`] stream. `seq` is never persisted; the first frame of
 //! every Subscribe is a `Reset`, which unifies first-connect / reconnect /
@@ -57,8 +57,8 @@ use crate::{
     index::{resolve_user_dir, KnownUser, UserResolution},
     presence::PeerState,
     proto::{InviteGrant, Payload, SignedInvite, SignedMessage, WorkspaceTicket},
+    replica::{DirtySet, Replica},
     store::Store,
-    tracker::{DirtySet, Tracker},
 };
 
 // Presence-probe ALPN. Bumped to /1 in lockstep with the epoch-1 wire changes
@@ -320,7 +320,7 @@ impl ProtocolHandler for PresencePing {
 /// read-only and rings no doorbell.
 #[derive(Clone)]
 struct SyncHandler {
-    tracker: Arc<Mutex<Tracker>>,
+    replica: Arc<Mutex<Replica>>,
 }
 
 impl std::fmt::Debug for SyncHandler {
@@ -339,7 +339,7 @@ impl ProtocolHandler for SyncHandler {
         // until the puller has read everything and closes it — same as the
         // presence handler above.
         let keepalive = connection.clone();
-        if let Err(e) = crate::sync::serve(connection, &self.tracker).await {
+        if let Err(e) = crate::sync::serve(connection, &self.replica).await {
             tracing::debug!("sync serve error: {e:#}");
         }
         keepalive.closed().await;
@@ -483,8 +483,8 @@ pub struct Node {
     active_conns: AtomicU64,
     last_active: Mutex<Instant>,
     idle_window: Duration,
-    /// The Loro-CRDT tracker core. The daemon is its only owner.
-    tracker: Arc<Mutex<Tracker>>,
+    /// The Loro-CRDT replica core. The daemon is its only owner.
+    replica: Arc<Mutex<Replica>>,
     /// The doorbell ring and its wake source.
     doorbell: Arc<Mutex<DoorbellRing>>,
     doorbell_notify: Arc<Notify>,
@@ -714,7 +714,7 @@ impl Node {
             } => {
                 self.touch(from, None);
                 let (our_ws, our_head) = {
-                    let t = self.tracker.lock().unwrap();
+                    let t = self.replica.lock().unwrap();
                     (t.workspace_str(), t.sync_head_bytes())
                 };
                 // Only pull when the peer's catalog head differs from ours — the
@@ -757,14 +757,14 @@ impl Node {
         });
     }
 
-    async fn do_pull(&self, peer: EndpointId) -> Result<crate::tracker::DirtySet> {
+    async fn do_pull(&self, peer: EndpointId) -> Result<crate::replica::DirtySet> {
         let conn = tokio::time::timeout(
             Duration::from_secs(20),
             self.endpoint.connect(peer, crate::sync::SYNC_ALPN),
         )
         .await
         .map_err(|_| anyhow!("connect to peer for sync timed out"))??;
-        let dirty = crate::sync::pull(&conn, &self.tracker).await?;
+        let dirty = crate::sync::pull(&conn, &self.replica).await?;
         conn.close(0u32.into(), b"sync done");
         Ok(dirty)
     }
@@ -772,7 +772,7 @@ impl Node {
     /// Broadcast our current catalog head so peers that are behind pull from us.
     async fn broadcast_announce(&self) -> Result<()> {
         let (workspace, catalog_head) = {
-            let t = self.tracker.lock().unwrap();
+            let t = self.replica.lock().unwrap();
             (t.workspace_str(), t.sync_head_bytes())
         };
         self.broadcast(Payload::Announce {
@@ -842,12 +842,12 @@ impl Node {
     /// Connect to the bound workspace's mesh through a ticket: join the topic,
     /// broadcast our join request, announce, and eagerly pull from the host to
     /// backfill. The store was already bootstrapped by the CLI
-    /// ([`crate::tracker::join_workspace_store`]) — a ticket for a *different*
+    /// ([`crate::replica::join_workspace_store`]) — a ticket for a *different*
     /// workspace is a hard error, never an adoption: a daemon is only ever
     /// subscribed to its own workspace's topic, so split-brain is structurally
     /// impossible.
     async fn connect_workspace(self: &Arc<Self>, ticket: &WorkspaceTicket) -> Result<()> {
-        let bound = self.tracker.lock().unwrap().workspace_str();
+        let bound = self.replica.lock().unwrap().workspace_str();
         if ticket.workspace != bound {
             anyhow::bail!(
                 "this store is bound to space {bound}, but the invite is for {} — \
@@ -861,7 +861,7 @@ impl Node {
         self.peers.learn_direct(ticket.host, &ticket.host_addrs);
         self.join_topic(ticket.topic(), vec![ticket.host]).await?;
         // Mint (or recover) our actor inception so an admin can admit our actor.
-        let incept = self.tracker.lock().unwrap().self_inception().ok();
+        let incept = self.replica.lock().unwrap().self_inception().ok();
         // Seal the pre-authorization to the HOST and bind it to our actor, so the
         // invite nonce never rides the shared topic in the clear (a removed member
         // subscribed to the topic can't lift it), and a copied blob can only ever
@@ -896,7 +896,7 @@ impl Node {
         } else {
             ticket.host_nick.clone()
         };
-        let already_member = self.tracker.lock().unwrap().am_i_member();
+        let already_member = self.replica.lock().unwrap().am_i_member();
         if already_member {
             "joined \u{2014} you're on the board and syncing.".to_string()
         } else if ticket.invite.is_some() {
@@ -930,7 +930,7 @@ impl Node {
             if id == self.shared.my_id {
                 return Ok(Response::err("that ticket points at this node's own id"));
             }
-            let bound = self.tracker.lock().unwrap().workspace_str();
+            let bound = self.replica.lock().unwrap().workspace_str();
             if ticket.workspace != bound {
                 return Ok(Response::err(format!(
                     "that ticket is for a different space ({}) — join it first: `lait join <ticket>`",
@@ -958,7 +958,7 @@ impl Node {
             if id == self.shared.my_id {
                 return Ok(Response::err("that's this node's own id"));
             }
-            let workspace = self.tracker.lock().unwrap().workspace_str();
+            let workspace = self.replica.lock().unwrap().workspace_str();
             let newly = upsert_seed(
                 &self.home,
                 SeedRecord {
@@ -1060,7 +1060,7 @@ impl Node {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            if self.tracker.lock().unwrap().checkpoint() {
+            if self.replica.lock().unwrap().checkpoint() {
                 tracing::debug!("store checkpoint committed");
             }
         }
@@ -1079,9 +1079,9 @@ impl Node {
     }
 
     /// Ring the presence plane — a peer joined or changed presence. Carries no
-    /// tracker dirty-set: the `EventLog` moved, not a doc. Subscribers re-read
+    /// replica dirty-set: the `EventLog` moved, not a doc. Subscribers re-read
     /// `Log{since}`. This is what lets a stream wake on presence at all; the
-    /// tracker `DirtySet` paths below never touch the `EventLog`.
+    /// replica `DirtySet` paths below never touch the `EventLog`.
     fn ring_presence_doorbell(&self) {
         let mut d = self.doorbell.lock().unwrap();
         d.seq += 1;
@@ -1100,11 +1100,11 @@ impl Node {
         self.doorbell_notify.notify_waiters();
     }
 
-    /// Stamp a tracker [`DirtySet`] into a doorbell and wake every parked stream.
+    /// Stamp a replica [`DirtySet`] into a doorbell and wake every parked stream.
     fn ring_doorbell(&self, dirty: DirtySet) {
         // Project config moved (local edit or sync import) — keep the machine
         // registry's advisory project snapshot fresh. Every ring_doorbell call
-        // site has already released the tracker lock, so the re-lock inside is
+        // site has already released the replica lock, so the re-lock inside is
         // safe.
         let projects_moved = dirty
             .dirty_catalog
@@ -1138,7 +1138,7 @@ impl Node {
 
     /// Pattern A: try to auto-admit `joiner` against a presented invite. Verifies
     /// the issuer signature, the workspace binding, and expiry here (transport
-    /// concerns), then hands the state-dependent checks + sealing to the tracker's
+    /// concerns), then hands the state-dependent checks + sealing to the replica's
     /// `redeem_invite`. Best-effort: any failure is a silent fallback to the
     /// classic pending-request flow, so a bad/expired/foreign invite never blocks
     /// a manual approve. On success we ring the doorbell and re-announce so the
@@ -1169,7 +1169,7 @@ impl Node {
             return;
         }
         let (changed, dirty) = {
-            let mut t = self.tracker.lock().unwrap();
+            let mut t = self.replica.lock().unwrap();
             // Bind the grant to *our* workspace before doing anything.
             if grant.workspace != t.workspace_str() {
                 return;
@@ -1214,7 +1214,7 @@ impl Node {
             }
         }
         {
-            for key in self.tracker.lock().unwrap().member_device_keys() {
+            for key in self.replica.lock().unwrap().member_device_keys() {
                 keys.insert(key);
             }
         }
@@ -1238,7 +1238,7 @@ impl Node {
         // A joiner's announced id is a *device* key; it is "already a member" if
         // that device speaks for a member actor.
         let members: HashSet<String> = self
-            .tracker
+            .replica
             .lock()
             .unwrap()
             .member_device_keys()
@@ -1265,7 +1265,7 @@ impl Node {
     }
 
     /// Resolve the user-refs carried by a request (local-alias / id-prefix → full
-    /// key) against the directory, before the tracker sees them. Returns
+    /// key) against the directory, before the replica sees them. Returns
     /// the rewritten request, or an early `Response` (not-found / ambiguous) to
     /// send back verbatim. Only the ref-bearing requests are touched; everything
     /// else passes through untouched (and without building the directory).
@@ -1352,15 +1352,15 @@ impl Node {
         })
     }
 
-    /// Dispatch a tracker request against the Loro core, ringing a doorbell for
+    /// Dispatch a replica request against the Loro core, ringing a doorbell for
     /// any resulting dirty-set. The lock is held only for the synchronous handle
     /// (never across an await).
-    /// Dispatch a tracker request; ring a local doorbell for any dirty-set and
+    /// Dispatch a replica request; ring a local doorbell for any dirty-set and
     /// return `(response, did_change)`. A change means our catalog head moved, so
     /// the caller announces it for peer propagation.
-    fn dispatch_tracker(&self, req: Request) -> (Response, bool) {
+    fn dispatch_replica(&self, req: Request) -> (Response, bool) {
         let (resp, dirty) = {
-            let mut t = self.tracker.lock().unwrap();
+            let mut t = self.replica.lock().unwrap();
             t.handle(req)
         };
         let changed = dirty.is_some();
@@ -1371,14 +1371,14 @@ impl Node {
     }
 
     async fn dispatch(self: Arc<Self>, req: Request) -> Result<Response> {
-        // Resolve nick / id-prefix user-refs to full keys before the tracker sees
+        // Resolve nick / id-prefix user-refs to full keys before the replica sees
         // them; a not-found / ambiguous ref short-circuits with its own response.
         let req = match self.resolve_refs_in(req) {
             Ok(r) => r,
             Err(resp) => return Ok(resp),
         };
         match req {
-            // ---- tracker ----
+            // ---- replica ----
             Request::IssueNew { .. }
             | Request::IssueEdit { .. }
             | Request::IssueMove { .. }
@@ -1418,7 +1418,7 @@ impl Node {
             | Request::SpaceCustodyExport { .. }
             | Request::SpaceCustodyImport { .. }
             | Request::SpaceRecover => {
-                let (resp, changed) = self.dispatch_tracker(req);
+                let (resp, changed) = self.dispatch_replica(req);
                 if changed {
                     // Announce a changed catalog head so peers pull.
                     let me = self.clone();
@@ -1441,10 +1441,10 @@ impl Node {
                 if let Some(dev) = UserId::parse(&who) {
                     let pending = self.pending_incepts.lock().unwrap().get(&dev).cloned();
                     if let Some(incept) = pending {
-                        let _ = self.tracker.lock().unwrap().import_inception(&incept);
+                        let _ = self.replica.lock().unwrap().import_inception(&incept);
                     }
                 }
-                let (resp, changed) = self.dispatch_tracker(Request::MemberAdd {
+                let (resp, changed) = self.dispatch_replica(Request::MemberAdd {
                     who: who.clone(),
                     admin,
                     as_name: None,
@@ -1460,15 +1460,15 @@ impl Node {
             }
 
             // Sponsor an agent: import its stashed inception (from the agent's
-            // join) so the tracker can resolve its actor, then dispatch.
+            // join) so the replica can resolve its actor, then dispatch.
             Request::AgentAdd { key } => {
                 if let Some(dev) = UserId::parse(&key) {
                     let pending = self.pending_incepts.lock().unwrap().get(&dev).cloned();
                     if let Some(incept) = pending {
-                        let _ = self.tracker.lock().unwrap().import_inception(&incept);
+                        let _ = self.replica.lock().unwrap().import_inception(&incept);
                     }
                 }
-                let (resp, changed) = self.dispatch_tracker(Request::AgentAdd { key });
+                let (resp, changed) = self.dispatch_replica(Request::AgentAdd { key });
                 if changed {
                     let me = self.clone();
                     tokio::spawn(async move { me.broadcast_announce().await.ok() });
@@ -1478,7 +1478,7 @@ impl Node {
 
             // Members list, with local petnames overlaid onto the projection.
             Request::Members => {
-                let (resp, _) = self.dispatch_tracker(Request::Members);
+                let (resp, _) = self.dispatch_replica(Request::Members);
                 Ok(match resp {
                     Response::Members { mut members } => {
                         let aliases = load_aliases(&self.home);
@@ -1486,7 +1486,7 @@ impl Node {
                         // have been set on the actor id OR on any of its device
                         // keys (e.g. the device seen in the join request). Resolve
                         // through the actor's device set.
-                        let plane = self.tracker.lock().unwrap().actor_plane();
+                        let plane = self.replica.lock().unwrap().actor_plane();
                         for m in &mut members {
                             if let Some(a) = aliases.iter().find(|a| a.key == m.key) {
                                 m.alias = a.name.clone();
@@ -1557,13 +1557,13 @@ impl Node {
                     UserResolution::One(u) => {
                         let key = u.as_str().to_string();
                         // Import the joiner's stashed inception (from its join
-                        // request) so the tracker can resolve its actor — admin-
+                        // request) so the replica can resolve its actor — admin-
                         // gated persistence, only on this explicit approve.
                         if let Some(incept) = self.pending_incepts.lock().unwrap().get(&u).cloned()
                         {
-                            let _ = self.tracker.lock().unwrap().import_inception(&incept);
+                            let _ = self.replica.lock().unwrap().import_inception(&incept);
                         }
-                        let (resp, changed) = self.dispatch_tracker(Request::MemberAdd {
+                        let (resp, changed) = self.dispatch_replica(Request::MemberAdd {
                             who: key.clone(),
                             admin: false,
                             as_name: None,
@@ -1602,7 +1602,7 @@ impl Node {
                     .filter(|p| p.presence.is_online())
                     .count();
                 let (workspace, name, issues, projects, membership) = {
-                    let t = self.tracker.lock().unwrap();
+                    let t = self.replica.lock().unwrap();
                     let membership = if t.am_i_admin() {
                         "admin"
                     } else if t.am_i_member() {
@@ -1620,7 +1620,7 @@ impl Node {
                 };
                 let pending_requests = self.pending_join_requests().len();
                 let (degraded_recovery, recovery) = {
-                    let t = self.tracker.lock().unwrap();
+                    let t = self.replica.lock().unwrap();
                     (t.degraded_recovery_holders(), Some(t.recovery_status()))
                 };
                 Ok(Response::Status(Box::new(StatusInfo {
@@ -1649,7 +1649,7 @@ impl Node {
                     .filter(|p| p.presence.is_online())
                     .count();
                 let (workspace, name, issues, projects, membership) = {
-                    let t = self.tracker.lock().unwrap();
+                    let t = self.replica.lock().unwrap();
                     let membership = if t.am_i_admin() {
                         "admin"
                     } else if t.am_i_member() {
@@ -1666,7 +1666,7 @@ impl Node {
                     )
                 };
                 let (degraded_recovery, rekey_pending, local_custody) = {
-                    let t = self.tracker.lock().unwrap();
+                    let t = self.replica.lock().unwrap();
                     (
                         t.degraded_recovery_holders(),
                         t.rekey_pending_notice(),
@@ -1696,7 +1696,7 @@ impl Node {
                 ttl_hours,
             } => {
                 let (workspace, name) = {
-                    let t = self.tracker.lock().unwrap();
+                    let t = self.replica.lock().unwrap();
                     // Only an admin can meaningfully onboard: `redeem_invite`
                     // honors a pre-authorization only from an admin device, and a
                     // manual approve is admin-gated too. Refuse up front rather
@@ -1726,7 +1726,7 @@ impl Node {
                 // on the TRUE founder and a tampered anchor is rejected — every
                 // correctly-joined node holds the same proof (lait/space/1).
                 let (salt, recovery_root, founder_inception) =
-                    match self.tracker.lock().unwrap().founding_proof() {
+                    match self.replica.lock().unwrap().founding_proof() {
                         Some(p) => p,
                         None => {
                             return Ok(Response::err(
@@ -1760,7 +1760,7 @@ impl Node {
             Request::Join { ticket } | Request::Connect { ticket } => {
                 let ticket: WorkspaceTicket = ticket.parse().context("parse workspace ticket")?;
                 // The CLI already bootstrapped this store from the ticket
-                // (`tracker::join_workspace_store`) and registered it; the
+                // (`replica::join_workspace_store`) and registered it; the
                 // daemon's part is transport only — connect, request admission,
                 // backfill.
                 self.connect_workspace(&ticket).await?;
@@ -1870,7 +1870,7 @@ impl Node {
                 let settings = Settings::load(Some(&self.home));
                 let nick = settings.nick();
                 *self.shared.nick.lock().unwrap() = nick.clone();
-                self.tracker.lock().unwrap().set_nick(nick.clone());
+                self.replica.lock().unwrap().set_nick(nick.clone());
                 // Broadcast the new nick right away so peers don't wait a
                 // heartbeat to see it.
                 let me = self.clone();
@@ -1912,7 +1912,7 @@ impl Node {
     /// registry's merge keeps `origin`/`host_nick` from the init/join upsert.
     fn refresh_registry_row(&self) {
         let (workspace, name, projects) = {
-            let t = self.tracker.lock().unwrap();
+            let t = self.replica.lock().unwrap();
             (t.workspace_str(), t.workspace_name(), t.project_briefs())
         };
         if let Err(e) = crate::workspaces::upsert(crate::workspaces::WorkspaceEntry {
@@ -2096,7 +2096,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     let settings = Settings::load(Some(&home));
     let nick = settings.nick();
 
-    // Tracker core: open the git-backed store. The store must already be
+    // Replica core: open the git-backed store. The store must already be
     // initialized (`lait init` / `lait join`) — a daemon never founds a
     // workspace as a side effect of starting.
     let store = Store::open(&home)?;
@@ -2104,7 +2104,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     // net edge — the seed itself is the identity (see config::load_or_create_identity).
     let secret_key = SecretKey::from_bytes(&identity_seed);
     let me = UserId::from_key_string(secret_key.public().to_string());
-    let tracker = Tracker::open(
+    let replica = Replica::open(
         store,
         me,
         nick.clone(),
@@ -2116,17 +2116,17 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     // `-w`. Best-effort (navigation state, never a gate); the merge keeps the
     // origin/host_nick recorded by `lait init`/`lait join`.
     if let Err(e) = crate::workspaces::upsert(crate::workspaces::WorkspaceEntry {
-        workspace: tracker.workspace_str(),
-        name: tracker.workspace_name(),
+        workspace: replica.workspace_str(),
+        name: replica.workspace_name(),
         path: home.display().to_string(),
         origin: crate::workspaces::Origin::default(),
         host_nick: String::new(),
         last_opened: now_secs(),
-        projects: tracker.project_briefs(),
+        projects: replica.project_briefs(),
     }) {
         tracing::warn!("workspace registry upsert failed: {e:#}");
     }
-    let tracker = Arc::new(Mutex::new(tracker));
+    let replica = Arc::new(Mutex::new(replica));
 
     // lait states its network requirement; iroh executes it (crate::net is the
     // sole place relay/discovery vocabulary lives). Defaults to Public.
@@ -2159,7 +2159,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         .accept(
             crate::sync::SYNC_ALPN,
             SyncHandler {
-                tracker: tracker.clone(),
+                replica: replica.clone(),
             },
         )
         .spawn();
@@ -2177,7 +2177,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
 
     // The topic is a pure function of the workspace id — no user-settable
     // network name, so a cold boot can never subscribe to the wrong topic.
-    let topic = crate::proto::topic_for_workspace(&tracker.lock().unwrap().workspace_str());
+    let topic = crate::proto::topic_for_workspace(&replica.lock().unwrap().workspace_str());
     // Seed gossip bootstrap from previously-seen peers so a restart actively
     // rejoins the mesh instead of waiting to be re-announced, unioned with the
     // explicit, sticky seed pins so a restart always dials its
@@ -2212,7 +2212,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         tracing::info!("running as an always-on seed — idle-shutdown disabled");
     }
 
-    let workspace = tracker.lock().unwrap().workspace_str();
+    let workspace = replica.lock().unwrap().workspace_str();
     let node = Arc::new(Node {
         endpoint,
         gossip,
@@ -2227,7 +2227,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         active_conns: AtomicU64::new(0),
         last_active: Mutex::new(Instant::now()),
         idle_window,
-        tracker,
+        replica,
         doorbell: Arc::new(Mutex::new(DoorbellRing::new(now_secs()))),
         doorbell_notify: Arc::new(Notify::new()),
         syncing: Arc::new(Mutex::new(HashSet::new())),
@@ -2263,7 +2263,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         .context("bind control channel")?;
 
     {
-        let t = node.tracker.lock().unwrap();
+        let t = node.replica.lock().unwrap();
         tracing::info!(
             "lait daemon online as {my_id} in space '{}' ({})",
             t.workspace_name(),
@@ -2296,7 +2296,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     // Flush any mutations marked since the last checkpoint tick, so a clean
     // shutdown (e.g. idle-out) leaves the git history current rather than a few
     // seconds behind (the data itself is already fsync-durable regardless).
-    node.tracker.lock().unwrap().checkpoint();
+    node.replica.lock().unwrap().checkpoint();
 
     // The rest of the teardown is courtesy (Bye broadcast, router close) — it
     // must never keep a "shutting down" daemon alive. A gossip/endpoint close

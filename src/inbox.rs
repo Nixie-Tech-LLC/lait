@@ -1,5 +1,5 @@
 //! The durable inbox — things **addressed to you**, derived at sync-import time
-//! (the only place remote changes can be honestly detected; see the tracker's
+//! (the only place remote changes can be honestly detected; see the replica's
 //! `import_doc`). Distinct from the `activity` firehose in three load-bearing
 //! ways: it is filtered to *you* (assignments, comments on your issues,
 //! `@nick` mentions, status moves on your work), it is **durable** (the

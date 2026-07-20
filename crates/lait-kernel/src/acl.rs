@@ -1622,7 +1622,7 @@ mod tests {
     }
 
     /// A fenced eviction raises a rekey obligation naming the fence, the actor,
-    /// and the nonce — replay cannot rotate, so it must hand the tracker enough
+    /// and the nonce — replay cannot rotate, so it must hand the replica enough
     /// to discharge the fence causally.
     #[test]
     fn a_fenced_eviction_raises_a_rekey_obligation() {

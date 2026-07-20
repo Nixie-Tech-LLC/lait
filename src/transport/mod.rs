@@ -10,7 +10,7 @@
 //! ([`mem::MemTransport`]) lets the *real daemon* run hermetically in tests.
 //!
 //! **The daemon is the consumer, not the transport.** `node.rs` stays the
-//! composition of the tracker core + control plane + protocol logic; it holds an
+//! composition of the replica core + control plane + protocol logic; it holds an
 //! `Arc<dyn Transport>` and drives it. Swapping iroh for the in-memory transport
 //! swaps *nothing* in the daemon — which is the whole point: the thing under test
 //! is the actual daemon, over a network we control.

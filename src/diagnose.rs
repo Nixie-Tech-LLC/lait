@@ -105,14 +105,14 @@ pub struct DiagnoseInput<'a> {
     pub expected_workspace: Option<&'a str>,
     /// Recovery shares present on this device that cannot be used. Borrowed as a
     /// slice so the struct stays `Copy`.
-    pub degraded_recovery: &'a [crate::tracker::DegradedRecoveryHolder],
+    pub degraded_recovery: &'a [crate::replica::DegradedRecoveryHolder],
     /// An outstanding rekey obligation this node cannot discharge itself — an
     /// actor evicted by a revoked invite still holds live keys and no admin has
     /// rotated past the fence yet.
     pub rekey_pending: Option<&'a str>,
     /// This device's custody standing for the recovery authority. Borrowed so
     /// the struct stays `Copy`.
-    pub local_custody: Option<&'a crate::tracker::LocalCustodyState>,
+    pub local_custody: Option<&'a crate::replica::LocalCustodyState>,
 }
 
 /// Project daemon state into the ordered gate list (pure — the validation core).
@@ -256,9 +256,9 @@ pub fn diagnose(input: DiagnoseInput<'_>) -> DiagnosisView {
         key_notes.push(format!(
             "your share of {scope} is unusable ({})",
             match &h.reason {
-                crate::tracker::RecoveryArtifactFailure::Undecryptable(_) =>
+                crate::replica::RecoveryArtifactFailure::Undecryptable(_) =>
                     "protected under another Windows account or machine",
-                crate::tracker::RecoveryArtifactFailure::Io(_) => "present but could not be read",
+                crate::replica::RecoveryArtifactFailure::Io(_) => "present but could not be read",
             }
         ));
     }
@@ -268,11 +268,11 @@ pub fn diagnose(input: DiagnoseInput<'_>) -> DiagnosisView {
     match input.local_custody {
         // Usable today, unrecoverable tomorrow — and the difference is invisible
         // until it matters, which is exactly why it is worth a standing warning.
-        Some(crate::tracker::LocalCustodyState::BackupUnverified) => key_notes.push(
+        Some(crate::replica::LocalCustodyState::BackupUnverified) => key_notes.push(
             "your share of an all-holders arrangement has no verified portable backup              (`space custody-export`)"
                 .into(),
         ),
-        Some(crate::tracker::LocalCustodyState::Missing) => {
+        Some(crate::replica::LocalCustodyState::Missing) => {
             key_notes.push("this device should hold a recovery share and does not".into())
         }
         _ => {}
@@ -343,10 +343,10 @@ mod tests {
         }
     }
 
-    fn degraded(current: Option<bool>) -> crate::tracker::DegradedRecoveryHolder {
-        crate::tracker::DegradedRecoveryHolder {
+    fn degraded(current: Option<bool>) -> crate::replica::DegradedRecoveryHolder {
+        crate::replica::DegradedRecoveryHolder {
             transcript: "a".repeat(64),
-            reason: crate::tracker::RecoveryArtifactFailure::Undecryptable("dpapi".into()),
+            reason: crate::replica::RecoveryArtifactFailure::Undecryptable("dpapi".into()),
             is_current_authority: current,
         }
     }
@@ -384,7 +384,7 @@ mod tests {
     #[test]
     fn an_unbacked_indispensable_share_warns() {
         let v = diagnose(DiagnoseInput {
-            local_custody: Some(&crate::tracker::LocalCustodyState::BackupUnverified),
+            local_custody: Some(&crate::replica::LocalCustodyState::BackupUnverified),
             ..input()
         });
         assert_eq!(gate(&v, "keys").state, GateState::Warn);
@@ -395,7 +395,7 @@ mod tests {
     #[test]
     fn a_ready_holder_does_not_warn() {
         let v = diagnose(DiagnoseInput {
-            local_custody: Some(&crate::tracker::LocalCustodyState::Ready),
+            local_custody: Some(&crate::replica::LocalCustodyState::Ready),
             ..input()
         });
         assert_eq!(gate(&v, "keys").state, GateState::Pass);

@@ -1,7 +1,7 @@
 /**
  * The work verbs' target resolution.
  *
- * This is a deliberate second copy of a daemon rule (`tracker.rs::first_state_in`),
+ * This is a deliberate second copy of a daemon rule (`replica.rs::first_state_in`),
  * kept only to feed the optimistic overlay — so the tests that matter are the ones
  * pinning *which* rule it copies. "First in list order matching the category" is not
  * "the state whose id is `in_progress`", and a workflow that renames or reorders its

@@ -154,7 +154,7 @@ export const coreCommands = contribute({
 
     // ---- the work-state verbs ----------------------------------------------
     // Not status changes with a nicer name: each bundles assignment in the *same*
-    // commit (`start` takes it, `stop` puts it down — tracker.rs:834-849), which is
+    // commit (`start` takes it, `stop` puts it down — replica.rs:834-849), which is
     // exactly why they are their own verbs and not `issue_edit --status`.
     ...(
       [
