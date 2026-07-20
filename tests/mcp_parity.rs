@@ -1,4 +1,4 @@
-//! DTO / MCP parity guard (SCHEMA §1, §7.3; UI.md §8 P4).
+//! Guards parity between the versioned DTO contract and the MCP surface.
 //!
 //! The MCP tools (A§12) return the **same** versioned Layer-B `Response` DTO the
 //! CLI `--json` emits, so agent and human surfaces never drift. These tests are
@@ -23,7 +23,7 @@ fn every_tracker_command_has_an_mcp_tool() {
         assert!(
             MCP_TOOL_NAMES.contains(cmd),
             "tracker command `{cmd}` has no MCP tool — the agent surface drifted \
-             from the Layer-B command surface (SCHEMA §7.3)"
+             from the Layer-B command surface"
         );
     }
 }

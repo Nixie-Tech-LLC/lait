@@ -4,8 +4,8 @@
 //! *gates*, so a stalled joiner gets one legible line naming what's blocking them
 //! instead of a blank board. Kept deliberately free of I/O, ANSI, and daemon
 //! types: it takes primitive inputs and returns a [`DiagnosisView`] DTO, so the
-//! exact same logic backs all three client surfaces (CLI `doctor`, the `join`
-//! tail, the MCP `doctor` tool, the TUI panel) and is unit-tested without a
+//! exact same logic backs CLI `doctor`, the `join` tail, and the MCP `doctor`
+//! tool, and is unit-tested without a
 //! running node. The daemon handler ([`crate::node`]) is the only caller that
 //! gathers the inputs; everything downstream renders the DTO.
 
@@ -32,8 +32,8 @@ pub enum GateState {
 }
 
 impl GateState {
-    /// A plain (non-ANSI) glyph for the gate — shared by the CLI and TUI renderers
-    /// so the three surfaces read identically. Colour is layered on separately.
+    /// A plain (non-ANSI) glyph for the gate, shared by human-facing renderers.
+    /// Colour is layered on separately.
     pub fn glyph(self) -> &'static str {
         match self {
             GateState::Warn => "\u{26a0}", // ⚠

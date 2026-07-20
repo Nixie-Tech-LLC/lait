@@ -1,4 +1,4 @@
-//! Layer B — the local control protocol (SCHEMA §7). Newline-delimited JSON over
+//! Layer B — the local control protocol. Newline-delimited JSON over
 //! the cross-platform local IPC channel (a Unix-domain socket on unix, a named
 //! pipe on Windows; see [`control_name`]). One request → one response, plus the
 //! streaming [`Request::Subscribe`] mode that writes [`Doorbell`] frames until
@@ -25,7 +25,7 @@ use crate::dto::{
     LabelDto, MemberDto, MemberLogEntry, ProjectDto, Row, SeedDto,
 };
 
-/// The control-plane protocol version this build **speaks** — the CLI/TUI/MCP
+/// The control-plane protocol version this build **speaks** — CLI, web, and MCP
 /// ↔ daemon channel, exchanged in the [`Request::Hello`] handshake.
 ///
 /// The third plane to get one. The sync plane has [`crate::sync::PROTOCOL_VERSION`]
@@ -109,7 +109,7 @@ pub struct Filter {
     pub all: bool,
 }
 
-/// A request from a client to the daemon (SCHEMA §7).
+/// A request from a client to the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
@@ -369,7 +369,7 @@ pub enum Request {
         who: String,
         name: String,
     },
-    /// Streaming doorbells for the TUI (S§7.5). Turns the one-shot handler into a
+    /// Streaming dirty notifications for live clients. Turns the one-shot handler into a
     /// stream of [`Doorbell`] frames until the client disconnects.
     Subscribe {
         #[serde(default)]
@@ -449,7 +449,7 @@ fn default_true() -> bool {
     true
 }
 
-/// A response from the daemon (SCHEMA §7). A snapshot at a version — there is
+/// A response from the daemon. A snapshot at a version — there is
 /// **no CAS token** (S§7.2). Internally tagged by `kind` (not `status`, which
 /// would collide with `IssueView.status` when the `Issue` variant is flattened).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -610,7 +610,7 @@ pub struct Doorbell {
     pub presence_advanced: bool,
 }
 
-/// A catalog-structure dirty scope (SCHEMA §7, UI.md §4.2).
+/// Identifies which catalog structure became dirty.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "scope", rename_all = "snake_case")]
 pub enum CatalogScope {
@@ -851,7 +851,7 @@ async fn exchange_raw(stream: Stream, req: &Request) -> Result<String> {
     Ok(resp_line)
 }
 
-/// A live doorbell subscription — the TUI's read side of a [`Request::Subscribe`]
+/// A live dirty-notification subscription — the client side of [`Request::Subscribe`]
 /// stream (UI.md §4.1). Holds the whole duplex stream (never split, so nothing
 /// leaks); the subscribe verb is write-once, then read-many.
 pub struct Subscription {

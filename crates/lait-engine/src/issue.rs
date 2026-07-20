@@ -1,4 +1,4 @@
-//! Layer A — the Issue document (SCHEMA §5). One Loro document per issue,
+//! Layer A — the issue document. One Loro document per issue,
 //! addressed by [`DocId`]. This wrapper owns the container layout and exposes
 //! typed reads/writes; **all merge semantics live in Loro** (S§1). A "register"
 //! is a single key in the root `LoroMap` resolved by Lamport order (LWW).
@@ -162,8 +162,8 @@ impl IssueDoc {
             .map_err(|e| anyhow!("import issue update: {e}"))
     }
 
-    /// The issue doc's oplog frontiers — the causal head used as the sync digest
-    /// (SCHEMA §3.2, §8). Engine-internal; the world sees [`Self::head_hash`].
+    /// The issue document's oplog frontiers: the causal head used as the sync
+    /// digest. Engine-internal; external callers use [`Self::head_hash`].
     pub(crate) fn head(&self) -> Frontiers {
         self.doc.oplog_frontiers()
     }

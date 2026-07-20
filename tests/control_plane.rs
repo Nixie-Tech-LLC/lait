@@ -1,5 +1,5 @@
-//! End-to-end control-plane tests for the doorbell / `Reset` invariants
-//! (UI.md §4.1, §4.3, SCHEMA §7.5).
+//! End-to-end tests for control-plane dirty notifications and `Reset`
+//! recovery. See `docs/PROTOCOL.md`.
 //!
 //! These drive the **real** daemon binary (`CARGO_BIN_EXE_lait daemon`)
 //! over the actual local IPC control channel — a Unix-domain socket on unix, a

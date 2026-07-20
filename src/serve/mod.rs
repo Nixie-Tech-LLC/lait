@@ -2,7 +2,7 @@
 //!
 //! The engine's contract has always been [`crate::control`]: a versioned,
 //! hand-maintained imperative façade over the CRDT, spoken over a Unix socket or
-//! a named pipe. Every client so far (CLI, TUI, MCP) is a local process, so that
+//! a named pipe. Native clients are local processes, so that
 //! transport cost them nothing. A browser cannot speak a named pipe. This module
 //! is the *one* adapter that closes that gap — the same `Request`/`Response`
 //! types, the same `Doorbell` stream, re-bound to a loopback TCP socket and SSE.
@@ -19,8 +19,8 @@
 //! that never existed before: the web pages the user visits. See [`auth`].
 //!
 //! The browser is deliberately *not* a peer. It holds no key, has no entry in the
-//! ACL, and is never invited: it is a lens on a device's replica, exactly like
-//! the TUI was, and the device remains the only network identity.
+//! ACL, and is never invited: it is a lens on a device's replica, and the device
+//! remains the only network identity.
 
 pub mod auth;
 pub mod policy;
@@ -289,7 +289,7 @@ struct RpcQuery {
 /// second, hand-maintained projection of a façade that is *already* the stable,
 /// versioned, hand-maintained projection (S§7). Two of those drift; the viewer
 /// branch is the proof — it still calls `projects new --key`, a shape that stopped
-/// existing. This cannot drift: it is the same enum the CLI, TUI and MCP send.
+/// existing. This cannot drift: it is the same enum the CLI and MCP send.
 ///
 /// Selecting a space is what attaches its daemon, so this is also the first point
 /// at which anything is started.
@@ -384,7 +384,7 @@ async fn rpc(
 /// The doorbell multiplex: one `EventSource` over every attached space.
 ///
 /// Carries dirty *flags*, never state — the browser re-reads the authoritative
-/// projection for each dirty scope, exactly as the TUI does (UI.md §4.2). A
+/// projection for each dirty scope, as required by the shared subscription contract. A
 /// `Lagged` receiver is surfaced rather than hidden: the client's response is the
 /// same rebaseline it already performs for `reset`/epoch changes (UI.md §4.1), so
 /// dropping frames under load is recoverable by construction.

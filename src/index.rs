@@ -1,6 +1,6 @@
-//! Local materialized index (SCHEMA §3 "local cache"): the `KEY-n` alias table
-//! and ref resolution. Never synced — rebuilt from the Catalog on load. All
-//! three surfaces share this one grammar, resolved **daemon-side** (UI.md §3).
+//! Local materialized index for `KEY-n` aliases and reference resolution.
+//! It is never synced and is rebuilt from the catalog on load. Every client
+//! uses this grammar, which the daemon resolves.
 //!
 //! - The **canonical** handle is a short `DocId` prefix (`iss_3f9`), collision-
 //!   free by construction (S§5.4).

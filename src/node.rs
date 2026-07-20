@@ -1,6 +1,6 @@
 //! The lait daemon: owns the iroh endpoint, the gossip room, presence, the
 //! Loro-CRDT tracker core ([`crate::tracker`]), and the local control server that
-//! CLI/TUI/MCP clients drive.
+//! CLI, web, and MCP clients drive.
 //!
 //! The iroh transport (signed-gossip room for announce/presence, a liveness
 //! probe ALPN, the daemon/control plumbing) is the P1 networking substrate. The

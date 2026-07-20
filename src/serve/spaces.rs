@@ -34,7 +34,7 @@ use crate::workspaces::{self, StorePresence, WorkspaceEntry};
 /// The tab holds one `EventSource` over N attached spaces, so the space id is the
 /// demultiplexing key. Flattened so the wire shape is a [`Doorbell`] plus one
 /// field — the browser re-reads the authoritative projection for each dirty
-/// scope exactly as the TUI does (UI.md §4.2); this is still a dirty *flag*, not
+/// scope according to the shared subscription contract; this is still a dirty *flag*, not
 /// state.
 #[derive(Debug, Clone, Serialize)]
 pub struct SpaceDoorbell {

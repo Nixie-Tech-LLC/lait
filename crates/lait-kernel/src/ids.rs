@@ -1,9 +1,9 @@
-//! Identifiers (SCHEMA §2). Every id is exactly one kind of thing with one
+//! Identifiers. Every id is exactly one kind of thing with one
 //! stability guarantee. App-minted ids are `<prefix>_<ULID>`: a ULID is a
 //! 128-bit, lexicographically-sortable, time-ordered identifier rendered in
 //! Crockford base32 (26 chars), so ids sort by creation time and never collide
-//! in practice. These are **content-independent** and **not** Loro `PeerId`s
-//! (SCHEMA §2): a `DocId` is minted once and is forever, while a Loro `PeerId`
+//! in practice. These are **content-independent** and **not** Loro `PeerId`s:
+//! a `DocId` is minted once and is permanent, while a Loro `PeerId`
 //! is an internal, per-session `u64`.
 //!
 //! `UserId` is an ed25519 public key — the same bytes as the iroh `EndpointId`.
@@ -101,7 +101,7 @@ macro_rules! prefixed_id {
             }
 
             /// A short, git-style prefix of the id (prefix + first `n` ULID
-            /// chars) — the canonical human handle (SCHEMA §5.4). `n` counts
+            /// chars) — the canonical human handle. `n` counts
             /// ULID characters after the textual prefix.
             pub fn short(&self, n: usize) -> String {
                 let ulid = &self.0[$prefix.len()..];

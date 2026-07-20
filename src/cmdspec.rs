@@ -398,8 +398,8 @@ pub fn parse_to_request(argv: &[&str]) -> Result<Request> {
 }
 
 /// A parsed command line, surfacing `Special` leaves instead of erroring on
-/// them — the seam the TUI command palette dispatches through (one grammar,
-/// two entry points, UI.md tenet 4). The palette decides per-`Special` whether
+/// them — the seam interactive clients dispatch through. The caller decides per
+/// `Special` whether
 /// it has a native equivalent (start/done/stop, config, spaces, …) or rejects
 /// with "CLI-only".
 pub enum ParsedCommand {

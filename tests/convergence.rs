@@ -1,5 +1,5 @@
-//! Property-based CRDT convergence tests (SCHEMA §1: "all merge semantics live
-//! in Loro"). Each test drives a proptest-generated sequence of operations
+//! Property-based tests for the invariant that all merge semantics live in
+//! Loro. Each test drives a proptest-generated sequence of operations
 //! across 2–3 independent replicas of one document, exchanges updates all-pairs
 //! until quiescence, and asserts every replica reaches identical state
 //! (deep-value equality via `state_json()`) plus the schema-level invariant
@@ -79,8 +79,8 @@ impl Replica for CatalogDoc {
     }
 }
 
-/// The core sync primitive (SCHEMA §8): all-pairs exchange of version-vector
-/// deltas. For every ordered pair (i, j) we ship i's ops that j is missing into
+/// Exchanges version-vector deltas between every pair of replicas. For every
+/// ordered pair (i, j), this ships i's ops that j is missing into
 /// j. Running the full all-pairs loop three times drives the mesh to quiescence
 /// even when an update produced in an earlier round only becomes relevant to a
 /// third replica after a later import.

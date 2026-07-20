@@ -143,7 +143,7 @@ impl Store {
         }
         let bytes = fs::read(&p).context("read catalog.loro")?;
         let catalog = CatalogDoc::from_snapshot(&bytes, Some(self.peer_id))?;
-        // Refuse a store written by a newer lait before handing it out (SCHEMA §9).
+        // Reject a store written by a newer lait before exposing its contents.
         check_schema_version(catalog.schema_version())?;
         Ok(Some(catalog))
     }
@@ -356,8 +356,8 @@ fn run_git(repo: &Path, args: &[&str]) -> Option<String> {
 
 /// Gate a loaded store's on-disk schema version against what this build supports
 /// (`dto::SCHEMA_VERSION`). Refuses a store written by a **newer** lait — opening
-/// it with an older binary risks dropping or misreading fields it doesn't know
-/// (SCHEMA §9). An older-or-equal store is accepted; migrations for older
+/// it with an older binary risks dropping or misreading unknown fields. An
+/// older-or-equal store is accepted; migrations for older
 /// versions would run at the call site (none yet — only v1 exists). Pure, so the
 /// policy is unit-tested without touching the filesystem.
 fn check_schema_version(found: u32) -> Result<()> {

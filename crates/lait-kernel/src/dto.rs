@@ -1,5 +1,5 @@
 //! Layer-B data-transfer objects: the **stable, versioned, hand-maintained
-//! projection** of Layer A (SCHEMA §1, §7.3). These are the shapes the CLI
+//! projection** of Layer A. These are the shapes the CLI
 //! `--json` contract emits and the MCP tools return; they are checked against
 //! the MCP tool schemas (see `tests/mcp_parity.rs`) so agent and human surfaces
 //! never drift. They are **not** an automatic dump of the Loro layout — a
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{ActorId, DocId, LabelId, ProjectId, UserId, WorkspaceId};
 
-/// Schema version gate (SCHEMA §9). Every top-level DTO carries it so a reader
+/// Schema version gate. Every top-level DTO carries it so a reader
 /// can detect drift; bump on any additive change.
 ///
 /// v2: the actor-identity cutover (`lait/actor/1`) — members, assignees, and
@@ -24,7 +24,7 @@ use crate::ids::{ActorId, DocId, LabelId, ProjectId, UserId, WorkspaceId};
 /// the `person ≡ key ≡ device` model.
 pub const SCHEMA_VERSION: u32 = 2;
 
-/// Issue priority (SCHEMA §5). Stored inside the issue doc as a lowercase
+/// Issue priority. Stored inside the issue document as a lowercase
 /// string leaf and projected here.
 ///
 /// ```
@@ -79,8 +79,8 @@ impl Priority {
     }
 }
 
-/// Workflow-state category (SCHEMA §4). Governs board columns and the
-/// completion rule (S§5.7): a `Done`-category status removes the issue from the
+/// Workflow-state category. Governs board columns and the completion rule: a
+/// `Done`-category status removes the issue from the
 /// board movable list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -108,7 +108,7 @@ impl StatusCategory {
     }
 }
 
-/// An ordered status column (SCHEMA §4). `id` is the `StatusId` stored on the
+/// An ordered status column. `id` is the `StatusId` stored on the
 /// issue's `status` field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowState {
@@ -254,7 +254,7 @@ pub fn partition<T>(items: impl IntoIterator<Item = Projected<T>>) -> (Vec<T>, V
 // Projections (read DTOs)
 // ----------------------------------------------------------------------------
 
-/// A project registry entry (SCHEMA §4).
+/// A project registry entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectDto {
     pub id: ProjectId,
@@ -263,7 +263,7 @@ pub struct ProjectDto {
     pub color: String,
 }
 
-/// A label registry entry (SCHEMA §4).
+/// A label registry entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LabelDto {
     pub id: LabelId,
@@ -271,9 +271,9 @@ pub struct LabelDto {
     pub color: String,
 }
 
-/// One board/list row — the `DocMeta` cache projected for rendering (SCHEMA §4,
-/// §7.4). Never opens the issue doc. A row whose issue body hasn't arrived is
-/// `provisional` (UI.md §3.3).
+/// One board or list row, projected from the `DocMeta` cache for rendering.
+/// This projection never opens the issue document. A row whose issue body has
+/// not arrived is `provisional`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Row {
     /// Canonical short handle (`iss_3f9`), the collision-free id (S§5.4).
@@ -315,7 +315,7 @@ pub struct BoardView {
     pub columns: Vec<BoardColumn>,
 }
 
-/// A comment projection (SCHEMA §5.3).
+/// A comment projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommentDto {
     /// The authoring **actor** — the person, stable across their devices.
@@ -367,9 +367,9 @@ pub struct IssueView {
     pub corrupt_records: Vec<CorruptRecord>,
 }
 
-/// One derived activity transition (SCHEMA §7.4). `changes` is a **list** so one
-/// Request = one commit = one activity row even when it moved several fields
-/// (S§7.1). Pulled via `Activity{since}`, never force-streamed (S§7.5).
+/// One derived activity transition. `changes` is a list so one request, one
+/// commit, and one activity row remain equivalent even when several fields
+/// change. Clients pull activity via `Activity { since }`; it is not streamed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivityEvent {
     pub seq: u64,
@@ -385,7 +385,7 @@ pub struct ActivityEvent {
     pub collision: bool,
 }
 
-/// A single field transition inside an [`ActivityEvent`] (SCHEMA §7.4).
+/// A single field transition inside an [`ActivityEvent`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FieldChange {
     pub field: String,

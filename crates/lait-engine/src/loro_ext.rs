@@ -1,6 +1,6 @@
 //! Small read helpers over Loro containers, so the Layer-A wrappers
 //! ([`crate::issue`], [`crate::catalog`]) stay readable. All merge semantics
-//! live in Loro itself (SCHEMA §1); these only *read* leaf values back out.
+//! live in Loro itself; these helpers only read leaf values back out.
 
 use loro::{Container, LoroMap, LoroMovableList, ValueOrContainer};
 

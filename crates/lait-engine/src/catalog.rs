@@ -1,4 +1,4 @@
-//! Layer A — the Catalog document (SCHEMA §4): the workspace's **structure
+//! Layer A — the catalog document: the workspace's **structure
 //! doc**. ONE Loro document per workspace holding the authoritative registry of
 //! which issue docs exist, project/label config, board ordering, the workflow
 //! columns, the sub-issue hierarchy, the issue-link edge set, and the `DocMeta`
@@ -65,7 +65,7 @@ const C_AUTHZ: &str = "authz";
 /// The tree-node meta key carrying the issue DocId a `subs` node stands for.
 const META_DOC: &str = "docId";
 
-/// Internal read of one `DocMeta` row (SCHEMA §4). The `Row` DTO is projected
+/// Internal read of one `DocMeta` row. The `Row` DTO is projected
 /// from this plus viewer context (UI "you" awareness) in the node layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowMeta {
@@ -818,8 +818,8 @@ impl CatalogDoc {
     }
 }
 
-/// The opaque `DocMeta.head` digest: `blake3(frontiers.encode())` → 32 bytes
-/// (SCHEMA §3.2, `head: value<bytes32>`).
+/// Returns the opaque 32-byte `DocMeta.head` digest:
+/// `blake3(frontiers.encode())`.
 pub(crate) fn head_hash(frontiers: &Frontiers) -> Vec<u8> {
     blake3::hash(&frontiers.encode()).as_bytes().to_vec()
 }

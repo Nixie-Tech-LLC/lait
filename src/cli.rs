@@ -1,7 +1,8 @@
 //! CLI client: builds control requests, auto-spawns the daemon, prints results.
 //!
-//! All three surfaces (CLI, TUI, MCP) are Layer-B clients of the daemon (UI.md
-//! §1); this one renders `Response` snapshots for a human shell, or the versioned
+//! CLI and MCP are Layer-B clients of the daemon (`docs/UI.md`); the web
+//! application uses the same contract through its loopback adapter. This module
+//! renders `Response` snapshots for a human shell, or the versioned
 //! `--json` DTO for scripts/agents (UI.md §2.3). Exit codes: `0` ok · `1`
 //! usage/error · `2` ref not found / ambiguous · `3` daemon unreachable.
 
@@ -1788,7 +1789,7 @@ pub(crate) fn copy_to_clipboard(s: &str) -> bool {
 /// Render a scannable QR of the invite link as terminal half-block glyphs. Uses
 /// the lowest error-correction level (`L`) so a long invite ticket yields the
 /// smallest module count — the QR still scans, but takes far fewer lines than the
-/// default level. `pub(crate)`: the TUI invite panel renders the same QR.
+/// default level. `pub(crate)` so other local presentation code can reuse it.
 pub(crate) fn render_qr(data: &str) -> Result<String> {
     use qrcode::{render::unicode, EcLevel, QrCode};
     let code = QrCode::with_error_correction_level(data.as_bytes(), EcLevel::L)

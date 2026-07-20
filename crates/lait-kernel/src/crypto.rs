@@ -45,7 +45,7 @@ pub fn random_seed() -> [u8; 32] {
 }
 
 /// The lait [`UserId`] (device key) of an identity seed: the ed25519 public key
-/// of the 32-byte seed, hex-encoded. A `UserId` *is* this public key (SCHEMA §2),
+/// of the 32-byte seed, hex-encoded. A `UserId` *is* this public key,
 /// and it equals the transport's node id for the same seed (see [`crate::ids`]) —
 /// so identity is defined here, in lait's own terms, with no transport type.
 pub fn user_from_seed(seed: &[u8; 32]) -> UserId {
