@@ -428,8 +428,8 @@ mod tests {
     }
 
     /// A `SpaceTicket` exactly as the build before the transport cutover minted
-    /// it: the sample below, postcard-encoded, with the host as an iroh
-    /// `EndpointId`. Two obligations ride on it.
+    /// it: the sample below, postcard-encoded, with the host spelled in the
+    /// network's own key type. Two obligations ride on it.
     ///
     /// The host was 32 raw bytes at offset 35 and must stay 32 raw bytes there:
     /// the identity did not change, so the wire must not grow. And the whole
