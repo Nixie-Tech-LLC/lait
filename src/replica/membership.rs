@@ -216,7 +216,11 @@ impl Replica {
     /// Add (or re-grant) a member by actor and seal them the space key
     /// Administrator-only. The target actor's inception must already be
     /// known locally (the enrollment path imports it first via `redeem_invite`).
-    pub fn member_add(&mut self, actor: &ActorId, grants: Vec<Grant>) -> ChangeResult<Admission> {
+    pub(crate) fn member_add(
+        &mut self,
+        actor: &ActorId,
+        grants: Vec<Grant>,
+    ) -> ChangeResult<Admission> {
         let acl = self.acl_state();
         match self.my_actor() {
             Some(me) if acl.is_admin(&me) => {}
@@ -270,7 +274,13 @@ impl Replica {
     /// one is refused) before it enters the actors container.
     ///
     /// [`redeem_invite`]: Self::redeem_invite
-    pub fn admit_member(
+    // No production path reaches this today: dispatch routes `MemberAdd` through
+    // `member_add_cmd`, which resolves an already-known actor. This is the entry
+    // that carries the inception with it — the manual counterpart to
+    // `redeem_invite` — and it is exercised only by tests. Kept because the
+    // capability is real and the gap is in the routing, not here.
+    #[allow(dead_code)]
+    pub(crate) fn admit_member(
         &mut self,
         incept: &actor::SignedEvent,
         grants: Vec<Grant>,
@@ -323,7 +333,7 @@ impl Replica {
     /// re-presented grant or an already-member joiner is a harmless no-op.
     ///
     /// [`member_add`]: Self::member_add
-    pub fn redeem_invite(
+    pub(crate) fn redeem_invite(
         &mut self,
         issuer_device: &DeviceId,
         joiner_incept: &actor::SignedEvent,
@@ -409,7 +419,7 @@ impl Replica {
     /// using lazy revocation: a new epoch is sealed only to the remaining
     /// members' devices, so the removed actor cannot read *future* content.
     /// Admin-only.
-    pub fn member_remove(&mut self, actor: &ActorId) -> ChangeResult<MemberRemoved> {
+    pub(crate) fn member_remove(&mut self, actor: &ActorId) -> ChangeResult<MemberRemoved> {
         let acl = self.acl_state();
         let me = match self.my_actor() {
             Some(me) if acl.is_admin(&me) => me,
@@ -440,7 +450,7 @@ impl Replica {
     }
 
     /// Rotate the space key without a membership change (key hygiene).
-    pub fn key_rotate_cmd(&mut self) -> ChangeResult<KeyRotated> {
+    pub(crate) fn key_rotate_cmd(&mut self) -> ChangeResult<KeyRotated> {
         let is_admin = self
             .my_actor()
             .is_some_and(|me| self.acl_state().is_admin(&me));
@@ -464,7 +474,7 @@ impl Replica {
     /// nonce or a full ticket to lift it from. Authors a signed
     /// [`AclAction::RevokeInvite`]; once it syncs, no admin admits via that nonce
     /// — the kill switch for a leaked (especially reusable) invite.
-    pub fn invite_revoke_cmd(&mut self, invite: String) -> ChangeResult<InviteRevocation> {
+    pub(crate) fn invite_revoke_cmd(&mut self, invite: String) -> ChangeResult<InviteRevocation> {
         if !self.am_i_admin() {
             return Err(ReplicaError::Denied(Denied::NotAdmin(
                 AdminAction::RevokeInvite,

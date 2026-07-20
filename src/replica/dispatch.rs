@@ -1,6 +1,7 @@
 //! Dispatch and resolution helpers (see `mutate` for the validate-then-commit invariant).
 
 use super::*;
+use crate::control::{Request, Response};
 
 impl Replica {
     // ---- dispatch ----
@@ -238,21 +239,42 @@ impl Replica {
             Request::Recover => {
                 return Self::respond(self.recover(), Self::actor_recovered_response)
             }
-            Request::SpaceRecover => Ok(self.space_recover_cmd()),
-            Request::SpaceElevate { cofounders, k } => Ok(self.space_elevate_cmd(cofounders, k)),
+            Request::SpaceRecover => {
+                return Self::respond(self.space_recover_cmd(), Self::space_recovery_response)
+            }
+            Request::SpaceElevate { cofounders, k } => {
+                return Self::respond(
+                    self.space_elevate_cmd(cofounders, k),
+                    Self::elevation_response,
+                )
+            }
             Request::SpaceElevateApprove { session, proposal } => {
-                Ok(self.space_elevate_approve_cmd(session, proposal))
+                return Self::respond(
+                    self.space_elevate_approve_cmd(session, proposal),
+                    Self::elevation_approved_response,
+                )
             }
             Request::SpaceCustodyExport { path, passphrase } => {
-                Ok(self.space_custody_export_cmd(path, passphrase))
+                return Self::respond(
+                    self.space_custody_export_cmd(path, passphrase),
+                    Self::custody_export_response,
+                )
             }
             Request::SpaceCustodyImport {
                 path,
                 passphrase,
                 force,
-            } => Ok(self.space_custody_import_cmd(path, passphrase, force)),
+            } => {
+                return Self::respond(
+                    self.space_custody_import_cmd(path, passphrase, force),
+                    Self::custody_import_response,
+                )
+            }
             Request::SpaceRecoverApprove { session, expect } => {
-                Ok(self.space_recover_approve_cmd(session, expect))
+                return Self::respond(
+                    self.space_recover_approve_cmd(session, expect),
+                    Self::recovery_approved_response,
+                )
             }
             Request::Members => Ok((
                 Response::Members {
@@ -288,7 +310,7 @@ impl Replica {
     /// The `Err` arm hard-codes `None`: a refused command has nothing to
     /// announce. [`Change`] makes that unrepresentable on the way in, and this
     /// makes it unrepresentable on the way out.
-    pub(super) fn respond<T>(
+    fn respond<T>(
         result: ChangeResult<T>,
         into_response: impl FnOnce(T) -> Response,
     ) -> (Response, Option<DirtySet>) {
@@ -317,6 +339,143 @@ impl Replica {
         let verb = if d.restored { "restored" } else { "deleted" };
         Response::Ok {
             message: Some(format!("{verb} {}", d.reff)),
+        }
+    }
+
+    /// A recovery always reports what durably happened, then what did not.
+    ///
+    /// Both arms are committed outcomes, so both are acknowledgements rather
+    /// than errors — but a re-root whose re-key failed, or a ceremony this
+    /// device could not contribute to, must say so plainly. Silence there reads
+    /// as success and leaves a degraded space looking healthy.
+    fn space_recovery_response(r: SpaceRecovery) -> Response {
+        let message = match r {
+            SpaceRecovery::Installed(done) => {
+                let head = format!("recovered the space — root reset to {}", done.root.short());
+                match done.rekey_failed {
+                    None => format!("{head} and re-keyed"),
+                    Some(e) => format!(
+                        "{head}, but re-keying failed ({e:#}) — the space is still readable under the old key until an admin rotates it"
+                    ),
+                }
+            }
+            SpaceRecovery::Pending {
+                session,
+                incomplete,
+            } => {
+                let hex = session.to_hex();
+                let head = format!(
+                    "group recovery under way (session {hex}) — each other holder must approve it with `space recover-approve {hex}` until the threshold co-signs"
+                );
+                match incomplete {
+                    None => head,
+                    Some(e) => format!(
+                        "{head}. This device could not add its own share ({e:#}); the request stands and the other holders can still complete it"
+                    ),
+                }
+            }
+        };
+        Response::Ok {
+            message: Some(message),
+        }
+    }
+
+    /// An elevation always reports a posted proposal, then what still has to
+    /// happen to it — a group authorization, or a step this device could not
+    /// finish.
+    fn elevation_response(e: Elevation) -> Response {
+        let Elevation {
+            k,
+            n,
+            proposal,
+            grant_request,
+            incomplete,
+        } = e;
+        let message = match (grant_request, incomplete) {
+            (_, Some(why)) => format!(
+                "proposed a {k}-of-{n} recovery arrangement (proposal {}) — but this device could not carry it further ({why:#}); the proposal stands and can still be authorized",
+                proposal.to_hex()
+            ),
+            (None, None) => format!(
+                "started {k}-of-{n} recovery elevation — the DKG completes automatically as the co-founders' nodes sync; the group key installs once every share is in"
+            ),
+            (Some(signing), None) => format!(
+                "proposed a {k}-of-{n} recovery arrangement (proposal {}) — the current group must authorize it: each holder runs `space elevate-approve {} --proposal {}`",
+                proposal.to_hex(),
+                signing.to_hex(),
+                proposal.to_hex(),
+            ),
+        };
+        Response::Ok {
+            message: Some(message),
+        }
+    }
+
+    /// Whether a custodian still owes an attestation is derived here from what
+    /// the export reported, so the domain never carries one of three sentences.
+    fn custody_export_response(e: CustodyExport) -> Response {
+        let note = if !e.indispensable {
+            "this arrangement tolerates a lost holder, so no attestation is required to install it"
+                .to_string()
+        } else if e.outstanding == 0 {
+            "every custodian has attested — the arrangement can now install".to_string()
+        } else {
+            format!("still waiting on {} custodian(s)", e.outstanding)
+        };
+        Response::Ok {
+            message: Some(format!(
+                "exported and verified your share package to {} — {note}. Keep it somewhere the passphrase alone cannot be found.",
+                e.path
+            )),
+        }
+    }
+
+    fn custody_import_response(i: CustodyImport) -> Response {
+        let head = format!(
+            "restored and verified your share for ceremony {} — this device can take part in recovery again",
+            i.ceremony.to_hex()
+        );
+        let message = match i.incomplete {
+            None => head,
+            Some(e) => format!(
+                "{head}. The ceremony did not advance here ({e:#}); it will retry on the next sync"
+            ),
+        };
+        Response::Ok {
+            message: Some(message),
+        }
+    }
+
+    fn elevation_approved_response(a: ElevationApproved) -> Response {
+        Response::Ok {
+            message: Some(format!(
+                "co-signed the authorization for a {}-of-{} arrangement — it takes effect once the threshold has signed",
+                a.k, a.n
+            )),
+        }
+    }
+
+    fn recovery_approved_response(a: RecoveryApproved) -> Response {
+        let roots = a
+            .roots
+            .iter()
+            .map(|r| r.short())
+            .collect::<Vec<_>>()
+            .join(", ");
+        // If this co-signature completed the threshold, the recovery installed
+        // here and now — saying it "installs once the threshold has co-signed"
+        // would be wrong, and saying nothing about a failed re-key would be
+        // worse.
+        let message = match a.incomplete {
+            None => format!(
+                "co-signed the recovery re-rooting the space to {roots} — it installs once the threshold has co-signed"
+            ),
+            Some(e) => format!(
+                "co-signed the recovery re-rooting the space to {roots}, and that completed the threshold — but re-keying failed ({e:#}), so the space is still readable under the old key until an admin rotates it"
+            ),
+        };
+        Response::Ok {
+            message: Some(message),
         }
     }
 
@@ -447,7 +606,7 @@ impl Replica {
     /// `Change::unchanged` in reach and could manufacture a commit report for
     /// something that never wrote. Separating them reserves `unchanged` for
     /// command branches that provably wrote nothing.
-    pub(super) fn respond_read<T>(
+    fn respond_read<T>(
         result: ReplicaResult<T>,
         into_response: impl FnOnce(T) -> Response,
     ) -> (Response, Option<DirtySet>) {
@@ -459,7 +618,7 @@ impl Replica {
 
     /// Render a domain failure. `NotFound` is the only family the control plane
     /// reports as such — scripts read the kind, people read the message.
-    pub(super) fn error_response(e: ReplicaError) -> Response {
+    fn error_response(e: ReplicaError) -> Response {
         match e {
             // A ref that named several issues, or none but with near misses, is
             // answered with the list rather than a refusal: the useful reply to
@@ -553,5 +712,114 @@ impl Replica {
                 }))
             }
         }
+    }
+}
+
+/// Adapter tests.
+///
+/// These live beside the adapter rather than in `replica::tests` because they
+/// drive `respond`, `respond_read`, and the renderers directly — the helpers
+/// that are private to this boundary. Several assert failures that `handle`
+/// cannot reach, which is exactly why they must be injected here.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::ErrorKind;
+
+    /// The message and kind of a refusal, or a panic naming what came back.
+    fn refusal(resp: Response) -> (String, ErrorKind) {
+        match resp {
+            Response::Error {
+                message,
+                error_kind,
+            } => (message, error_kind),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_successful_read_announces_nothing() {
+        let (resp, dirty) = Replica::respond_read(Ok(7), |n| Response::Ok {
+            message: Some(n.to_string()),
+        });
+        assert!(matches!(resp, Response::Ok { message } if message.as_deref() == Some("7")));
+        assert!(
+            dirty.is_none(),
+            "a read has no persistence effect to report"
+        );
+    }
+
+    #[test]
+    fn a_refused_read_renders_its_error_and_announces_nothing() {
+        let refusal: ReplicaResult<u8> = Err(ReplicaError::NotFound(NotFound::Project {
+            named: "web".into(),
+        }));
+        let (resp, dirty) = Replica::respond_read(refusal, |_| unreachable!("not the Ok arm"));
+        // NotFound is the one family the control plane reports as such: exit 2,
+        // so a script can tell "absent" from "refused" without reading prose.
+        assert!(matches!(&resp, Response::Error { message, error_kind }
+                if message == "no project matches 'web'"
+                    && *error_kind == crate::control::ErrorKind::NotFound));
+        assert!(dirty.is_none());
+    }
+
+    #[test]
+    fn the_two_not_found_families_score_exit_two() {
+        // NotFound is the one family the control plane reports as absent rather
+        // than refused, and scripts branch on that.
+        for error in [
+            ReplicaError::NotFound(NotFound::Member { named: "ab".into() }),
+            ReplicaError::NotFound(NotFound::Link(Box::new(LinkRef {
+                reff: "ENG-1".into(),
+                kind: "blocks".into(),
+                target: "ENG-2".into(),
+            }))),
+        ] {
+            let (_, kind) = refusal(Replica::error_response(error));
+            assert_eq!(kind, crate::control::ErrorKind::NotFound);
+        }
+        // The link *kind* being unknown is a bad argument, not an absence.
+        let (_, kind) = refusal(Replica::error_response(ReplicaError::Invalid(
+            Invalid::LinkKind {
+                value: "causes".into(),
+            },
+        )));
+        assert_eq!(kind, crate::control::ErrorKind::Error);
+    }
+
+    #[test]
+    fn an_elevation_that_cannot_finish_still_reports_its_proposal() {
+        // `space_elevate_cmd` posts the proposal, then attaches an authorization —
+        // signing it outright with a solo key, or opening a request for the standing
+        // group. Every step after the post used to be able to fail into an error
+        // with no dirty set, discarding a proposal that was already on the board and
+        // that the other participants would see on their next sync. The old code
+        // also swallowed the ceremony drive entirely (`let _ = self.dkg_advance()`).
+        let (resp, dirty) = Replica::respond(
+            Ok(Change::committed(
+                Elevation {
+                    k: 2,
+                    n: 3,
+                    proposal: crate::dkg::TranscriptId::parse_hex(&"c".repeat(64)).unwrap(),
+                    grant_request: None,
+                    incomplete: Some(anyhow!("recovery key disappeared mid-elevation")),
+                },
+                DirtySet::catalog(CatalogScope::Acl),
+            )),
+            Replica::elevation_response,
+        );
+        assert!(dirty.is_some(), "a posted proposal rings");
+        let message = match resp {
+            Response::Ok { message } => message.unwrap_or_default(),
+            other => panic!("a posted proposal is not an error: {other:?}"),
+        };
+        assert!(
+            message.contains("proposed a 2-of-3 recovery arrangement"),
+            "names what landed: {message}"
+        );
+        assert!(
+            message.contains("recovery key disappeared") && message.contains("the proposal stands"),
+            "says what failed without implying the proposal is gone: {message}"
+        );
     }
 }

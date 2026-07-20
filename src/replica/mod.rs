@@ -12,7 +12,12 @@ use crate::acl::{self, AclAction, AclOp, AclState, Grant, SignedOp};
 use crate::actor::{self, ActorPlane};
 use crate::authz;
 use crate::catalog::{CatalogDoc, RowMeta};
-use crate::control::{BoardPos, CatalogScope, Filter, Request, Response};
+// `Filter`, `BoardPos`, and `CatalogScope` are request *input* types that the
+// domain legitimately takes as parameters — they carry no rendering concern.
+// `Request` and `Response` are the control protocol itself, and are imported by
+// `dispatch` alone, so the boundary holds by name resolution and not only by the
+// CI guard.
+use crate::control::{BoardPos, CatalogScope, Filter};
 use crate::crypto::{self, SpaceKey};
 use crate::dto::{
     ActivityEvent, BoardColumn, BoardView, FieldChange, GraphView, IssueView, LabelDto, LinkDto,
@@ -54,8 +59,9 @@ pub use error::{
 pub use lifecycle::{derive_project_key, found_space, join_space_store};
 pub use membership::{Admission, InviteRevocation, KeyRotated, MemberRemoved};
 pub use recovery::{
-    ArtifactRead, DegradedRecoveryHolder, LocalCustodyState, RecoveryArtifactFailure,
-    RecoveryStatus,
+    ArtifactRead, CeremonyProgress, CustodyExport, CustodyImport, DegradedRecoveryHolder,
+    Elevation, ElevationApproved, LocalCustodyState, RecoveryApproved, RecoveryArtifactFailure,
+    RecoveryStatus, SpaceRecovered, SpaceRecovery,
 };
 // private re-imports so `use super::*` in children keeps unqualified helper names working:
 use lifecycle::mint_recovery;
@@ -164,6 +170,16 @@ pub struct Replica {
     /// Every key-epoch we can unseal (a keyring; older epochs stay decryptable —
     /// lazy revocation). Empty ⇒ we are not a member and see only ciphertext.
     keyring: BTreeMap<[u8; 16], SpaceKey>,
+    /// Test-only fault injection for the re-key that follows a recovery
+    /// re-root.
+    ///
+    /// This exists because the failure it simulates — the epoch store being
+    /// unwritable at exactly that moment — is real, is the one place where a
+    /// silent failure tells an operator their space was fenced when it was not,
+    /// and cannot otherwise be provoked from a test. Asserting the outcome type
+    /// renders correctly is not the same as proving the command produces it.
+    #[cfg(test)]
+    pub(super) fail_rekey: bool,
 }
 
 /// 16 random bytes (an actor inception / consent nonce). Non-deterministic by

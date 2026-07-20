@@ -1,5 +1,6 @@
 use super::*;
 use crate::control::CatalogScope;
+use crate::control::{Request, Response};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Drive a command that must succeed, yielding its value and what it committed.
@@ -78,14 +79,10 @@ fn test_proposal(
 /// portable package, verify it by reopening, and attest on the board.
 fn attest_custody(node: &mut TestNode, tag: &str) {
     let path = node.home.join(format!("custody-{tag}.pkg"));
-    let (resp, _) = node.replica.space_custody_export_cmd(
+    ok(node.replica.space_custody_export_cmd(
         path.to_string_lossy().to_string(),
         "a-sufficiently-long-passphrase".into(),
-    );
-    assert!(
-        matches!(resp, Response::Ok { .. }),
-        "custody export: {resp:?}"
-    );
+    ));
 }
 
 fn me() -> DeviceId {
@@ -1346,8 +1343,7 @@ fn break_glass_recovery_re_roots_the_space() {
     .unwrap();
 
     // C recovers: the solo recovery key re-roots the space to C.
-    let (resp, _) = c.replica.space_recover_cmd();
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(c.replica.space_recover_cmd());
     let c_actor = c.replica.my_actor().unwrap();
     assert!(
         c.replica.acl_state().is_admin(&c_actor),
@@ -1397,10 +1393,8 @@ fn elevate_solo_recovery_to_a_2_of_2_dkg_group_key() {
     sync_all(&mut a.replica, &mut b.replica);
 
     // A elevates to a 2-of-2 over {A, B}.
-    let (resp, _) = a
-        .replica
-        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2));
 
     // Drive the DKG to a fixpoint via sync round-trips (each import advances).
     for _ in 0..6 {
@@ -1459,8 +1453,7 @@ fn elevate_solo_recovery_to_a_2_of_2_dkg_group_key() {
 
     // A's solo key is retired: recovery now runs through the group ceremony,
     // and a lone holder cannot meet the 2-of-2 threshold by itself.
-    let (resp, _) = a.replica.space_recover_cmd();
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica.space_recover_cmd());
     let still = crate::space::replay(
         &a.replica.genesis,
         &a.replica.space_id,
@@ -1594,10 +1587,8 @@ fn a_nonce_bound_to_another_package_refuses_to_sign() {
     sync_all(&mut a.replica, &mut b.replica);
 
     // Elevate {A, B} to a 2-of-2 group recovery key.
-    let (resp, _) = a
-        .replica
-        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2));
     for _ in 0..6 {
         sync_all(&mut a.replica, &mut b.replica);
         sync_all(&mut b.replica, &mut a.replica);
@@ -1612,8 +1603,7 @@ fn a_nonce_bound_to_another_package_refuses_to_sign() {
     }
 
     // B opens a break-glass recovery: this commits B's nonces.
-    let (resp, _) = b.replica.space_recover_cmd();
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(b.replica.space_recover_cmd());
     let events = b.replica.membership.ceremony_events();
     let board = crate::dkg::parse_board(&events, &b.replica.space_id);
     let signing = *board.signing.keys().next().expect("B opened a request");
@@ -1636,10 +1626,8 @@ fn a_nonce_bound_to_another_package_refuses_to_sign() {
         sync_all(&mut b.replica, &mut a.replica);
         sync_all(&mut a.replica, &mut b.replica);
     }
-    let (resp, _) = a
-        .replica
-        .space_recover_approve_cmd(signing.to_hex(), vec![b_actor.as_str().to_string()]);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .space_recover_approve_cmd(signing.to_hex(), vec![b_actor.as_str().to_string()]));
     for _ in 0..6 {
         sync_all(&mut a.replica, &mut b.replica);
         sync_all(&mut b.replica, &mut a.replica);
@@ -1687,10 +1675,8 @@ fn an_unreadable_share_is_reported_as_degraded_not_absent() {
     ok(a.replica
         .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]));
     sync_all(&mut a.replica, &mut b.replica);
-    let (resp, _) = a
-        .replica
-        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2));
     for _ in 0..6 {
         sync_all(&mut a.replica, &mut b.replica);
         sync_all(&mut b.replica, &mut a.replica);
@@ -1743,32 +1729,37 @@ fn an_unreadable_share_is_reported_as_degraded_not_absent() {
 
     // Break-glass tells the operator what actually happened rather than
     // "no way to recover from this device".
-    let (resp, _) = b.replica.space_recover_cmd();
-    match resp {
-        Response::Error { message, .. } => {
-            assert!(
-                message.contains("another Windows account"),
-                "must name the actual cause: {message}"
-            );
-            assert!(
-                message.contains("current recovery key"),
-                "must say this share is for the live authority: {message}"
-            );
-            assert!(
-                message.contains(&dkg_id.to_hex()),
-                "must name the transcript: {message}"
-            );
-            assert!(
-                message.contains("cannot take part in recovery"),
-                "must say what THIS device can do: {message}"
-            );
-            assert!(
-                !message.contains("can still recover the space"),
-                "must not claim other holders can recover — this device cannot know that: {message}"
-            );
-        }
-        other => panic!("expected a typed failure, got {other:?}"),
-    }
+    let refusal = refused(b.replica.space_recover_cmd());
+    // The refusal names the holders rather than a pre-rendered sentence, so the
+    // remedy can be derived from the cause. The text it renders is the contract.
+    assert!(
+        matches!(
+            &refusal,
+            ReplicaError::Ceremony(c) if matches!(&**c, Ceremony::ShareUnusable { holders } if holders.len() == 1)
+        ),
+        "{refusal:?}"
+    );
+    let message = refusal.to_string();
+    assert!(
+        message.contains("another Windows account"),
+        "must name the actual cause: {message}"
+    );
+    assert!(
+        message.contains("current recovery key"),
+        "must say this share is for the live authority: {message}"
+    );
+    assert!(
+        message.contains(&dkg_id.to_hex()),
+        "must name the transcript: {message}"
+    );
+    assert!(
+        message.contains("cannot take part in recovery"),
+        "must say what THIS device can do: {message}"
+    );
+    assert!(
+        !message.contains("can still recover the space"),
+        "must not claim other holders can recover — this device cannot know that: {message}"
+    );
 }
 
 /// A share belonging to a group that is **not** the space's recovery
@@ -2120,10 +2111,8 @@ fn a_group_authorizes_and_installs_its_own_replacement() {
     sync_all(&mut a.replica, &mut c.replica);
 
     // ---- solo → group: {A, B} 2-of-2.
-    let (resp, _) = a
-        .replica
-        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2));
     for _ in 0..8 {
         sync_all(&mut a.replica, &mut b.replica);
         sync_all(&mut b.replica, &mut a.replica);
@@ -2157,17 +2146,18 @@ fn a_group_authorizes_and_installs_its_own_replacement() {
     // ---- group → group: {A, B, C} 2-of-3, proposed by a group holder.
     // A no longer has a usable solo key, so this can only proceed by
     // threshold authorization.
-    let (resp, _) = a.replica.space_elevate_cmd(
+    let (elevation, _) = ok(a.replica.space_elevate_cmd(
         vec![b_device.as_str().to_string(), c_device.as_str().to_string()],
         2,
-    );
-    let msg = match resp {
-        Response::Ok { message: Some(m) } => m,
-        other => panic!("expected a pending group authorization, got {other:?}"),
-    };
+    ));
     assert!(
-        msg.contains("elevate-approve"),
-        "a group elevation must ask the other holders to authorize: {msg}"
+        elevation.grant_request.is_some(),
+        "a group elevation must ask the other holders to authorize"
+    );
+    assert!(
+        elevation.incomplete.is_none(),
+        "nothing was left unfinished: {:?}",
+        elevation.incomplete
     );
 
     // Pull the request and the proposal ids off the verified board.
@@ -2195,17 +2185,19 @@ fn a_group_authorizes_and_installs_its_own_replacement() {
         sync_all(&mut a.replica, &mut b.replica);
         sync_all(&mut b.replica, &mut a.replica);
     }
-    let (bad, _) = b
-        .replica
-        .space_elevate_approve_cmd(signing.to_hex(), "f".repeat(64));
+    let bad = refused(
+        b.replica
+            .space_elevate_approve_cmd(signing.to_hex(), "f".repeat(64)),
+    );
     assert!(
-        matches!(bad, Response::Error { .. }),
+        matches!(
+            &bad,
+            ReplicaError::Ceremony(c) if matches!(&**c, Ceremony::ProposalMismatch { .. })
+        ),
         "approving a session while naming the wrong proposal must be refused: {bad:?}"
     );
-    let (resp, _) = b
-        .replica
-        .space_elevate_approve_cmd(signing.to_hex(), proposal.to_hex());
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(b.replica
+        .space_elevate_approve_cmd(signing.to_hex(), proposal.to_hex()));
 
     // Everything else is automatic: the group signs the grant, the new DKG
     // runs, the group signs the rotation, the plane installs it.
@@ -2287,11 +2279,10 @@ fn any_k_of_n_can_sign_without_the_lowest_index_holder() {
     sync_all(&mut a.replica, &mut c.replica);
 
     // A 2-of-3 group over {A, B, C}.
-    let (resp, _) = a.replica.space_elevate_cmd(
+    ok(a.replica.space_elevate_cmd(
         vec![b_device.as_str().to_string(), c_device.as_str().to_string()],
         2,
-    );
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ));
     let mut nodes = vec![a, b, c];
     sync_mesh(&mut nodes, 8);
     assert_eq!(
@@ -2313,8 +2304,7 @@ fn any_k_of_n_can_sign_without_the_lowest_index_holder() {
 
     // The remaining two recover, with #1 never syncing again.
     let recovering = nodes[0].replica.my_actor().unwrap();
-    let (resp, _) = nodes[0].replica.space_recover_cmd();
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(nodes[0].replica.space_recover_cmd());
     sync_mesh(&mut nodes, 3);
 
     let events = nodes[1].replica.membership.ceremony_events();
@@ -2324,10 +2314,9 @@ fn any_k_of_n_can_sign_without_the_lowest_index_holder() {
         .keys()
         .next()
         .expect("a recovery request reached the other holder");
-    let (resp, _) = nodes[1]
+    ok(nodes[1]
         .replica
-        .space_recover_approve_cmd(session.to_hex(), vec![recovering.as_str().to_string()]);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        .space_recover_approve_cmd(session.to_hex(), vec![recovering.as_str().to_string()]));
     sync_mesh(&mut nodes, 8);
 
     let after = crate::space::replay(
@@ -2396,10 +2385,8 @@ fn an_indispensable_arrangement_waits_for_verified_custody() {
     )
     .recovery_commit;
 
-    let (resp, _) = a
-        .replica
-        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2));
     for _ in 0..8 {
         sync_all(&mut a.replica, &mut b.replica);
         sync_all(&mut b.replica, &mut a.replica);
@@ -2498,11 +2485,10 @@ fn a_redundant_arrangement_installs_without_universal_attestation() {
     sync_all(&mut a.replica, &mut b.replica);
     sync_all(&mut a.replica, &mut c.replica);
 
-    let (resp, _) = a.replica.space_elevate_cmd(
+    ok(a.replica.space_elevate_cmd(
         vec![b_device.as_str().to_string(), c_device.as_str().to_string()],
         2, // 2-of-3: one holder may be lost
-    );
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ));
     let mut nodes = vec![a, b, c];
     sync_mesh(&mut nodes, 8);
     assert_eq!(
@@ -2544,10 +2530,8 @@ fn a_lost_share_is_restored_from_its_portable_package() {
     ok(a.replica
         .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]));
     sync_all(&mut a.replica, &mut b.replica);
-    let (resp, _) = a
-        .replica
-        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2));
     for _ in 0..6 {
         sync_all(&mut a.replica, &mut b.replica);
         sync_all(&mut b.replica, &mut a.replica);
@@ -2562,11 +2546,10 @@ fn a_lost_share_is_restored_from_its_portable_package() {
 
     // B exports a portable package, then loses its local material.
     let pkg_path = b.home.join("rescue.pkg");
-    let (resp, _) = b.replica.space_custody_export_cmd(
+    ok(b.replica.space_custody_export_cmd(
         pkg_path.to_string_lossy().to_string(),
         "a-sufficiently-long-passphrase".into(),
-    );
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ));
     // Only the SHARE goes. The public-key package is stored portable exactly
     // so it survives an account change — which is what lets this device still
     // say which group it belongs to after losing the ability to sign for it.
@@ -2591,12 +2574,11 @@ fn a_lost_share_is_restored_from_its_portable_package() {
     );
 
     // The package brings it back.
-    let (resp, _) = b.replica.space_custody_import_cmd(
+    ok(b.replica.space_custody_import_cmd(
         pkg_path.to_string_lossy().to_string(),
         "a-sufficiently-long-passphrase".into(),
         false,
-    );
-    assert!(matches!(resp, Response::Ok { .. }), "restore: {resp:?}");
+    ));
     assert_eq!(
         b.replica.recovery_status().local_custody,
         LocalCustodyState::Ready
@@ -2609,29 +2591,28 @@ fn a_lost_share_is_restored_from_its_portable_package() {
 
     // Re-importing over usable material is refused unless forced, so a
     // mistaken run cannot turn a working device into the loss it prevents.
-    let (resp, _) = b.replica.space_custody_import_cmd(
+    let refusal = refused(b.replica.space_custody_import_cmd(
         pkg_path.to_string_lossy().to_string(),
         "a-sufficiently-long-passphrase".into(),
         false,
-    );
+    ));
     assert!(
-        matches!(resp, Response::Error { .. }),
-        "must not clobber a readable share: {resp:?}"
+        refusal.to_string().contains("--force"),
+        "must not clobber a readable share, and must say how to mean it: {refusal}"
     );
-    let (resp, _) = b.replica.space_custody_import_cmd(
+    ok(b.replica.space_custody_import_cmd(
         pkg_path.to_string_lossy().to_string(),
         "a-sufficiently-long-passphrase".into(),
         true,
-    );
-    assert!(matches!(resp, Response::Ok { .. }), "forced: {resp:?}");
+    ));
 
     // A wrong passphrase restores nothing.
-    let (resp, _) = b.replica.space_custody_import_cmd(
+    // A wrong passphrase restores nothing, even with --force.
+    refused(b.replica.space_custody_import_cmd(
         pkg_path.to_string_lossy().to_string(),
         "not-the-right-passphrase".into(),
         true,
-    );
-    assert!(matches!(resp, Response::Error { .. }), "{resp:?}");
+    ));
 
     // Losing the public package too is a harder case, and the honest answer
     // is that this device can no longer tell which group it belonged to —
@@ -2644,12 +2625,11 @@ fn a_lost_share_is_restored_from_its_portable_package() {
         LocalCustodyState::NotAHolder,
         "with no public package there is nothing to attribute the device to"
     );
-    let (resp, _) = b.replica.space_custody_import_cmd(
+    ok(b.replica.space_custody_import_cmd(
         pkg_path.to_string_lossy().to_string(),
         "a-sufficiently-long-passphrase".into(),
         true,
-    );
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ));
     assert_eq!(
         b.replica.active_dkg_session(),
         Some(dkg),
@@ -2691,10 +2671,8 @@ fn a_rotation_that_could_never_install_is_refused_up_front() {
     }
 
     // A 2-of-2 group over {A, B}.
-    let (resp, _) = a
-        .replica
-        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2));
     for _ in 0..6 {
         sync_all(&mut a.replica, &mut b.replica);
         sync_all(&mut b.replica, &mut a.replica);
@@ -2713,29 +2691,22 @@ fn a_rotation_that_could_never_install_is_refused_up_front() {
     // Now propose a handover to {C, D} — disjoint from the current holders.
     // The current group is 2-of-2, so it needs BOTH of {A, B} to sign the
     // rotation, and neither would be able to derive the new key.
-    let (resp, _) = a.replica.space_elevate_cmd(
+    let refusal = refused(a.replica.space_elevate_cmd(
         vec![c_device.as_str().to_string(), d_device.as_str().to_string()],
         2,
+    ));
+    assert!(
+        refusal.to_string().contains("current holders"),
+        "must explain why it cannot work: {refusal}"
     );
-    match resp {
-        Response::Error { message, .. } => assert!(
-            message.contains("current holders"),
-            "must explain why it cannot work: {message}"
-        ),
-        other => panic!("a disjoint handover must be refused, got {other:?}"),
-    }
 
     // Keeping one current holder is still not enough for a 2-of-2: two
     // signatures are needed and only one signer could derive the key.
-    let (resp, _) = a.replica.space_elevate_cmd(
+    // {A, B, C}: both current holders are present, so this one CAN install.
+    ok(a.replica.space_elevate_cmd(
         vec![b_device.as_str().to_string(), c_device.as_str().to_string()],
         2,
-    );
-    // {A, B, C}: both current holders are present, so this one CAN install.
-    assert!(
-        matches!(resp, Response::Ok { .. }),
-        "an overlapping arrangement is allowed: {resp:?}"
-    );
+    ));
 }
 
 /// A rogue proposal carries a perfectly
@@ -2922,10 +2893,8 @@ fn a_swapped_public_key_package_cannot_redirect_the_rotation() {
         .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]));
     sync_all(&mut a.replica, &mut b.replica);
 
-    let (resp, _) = a
-        .replica
-        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2));
     for _ in 0..6 {
         sync_all(&mut a.replica, &mut b.replica);
         sync_all(&mut b.replica, &mut a.replica);
@@ -2983,10 +2952,8 @@ fn group_break_glass_recovery_needs_the_threshold_and_re_roots() {
     sync_all(&mut a.replica, &mut b.replica);
 
     // Elevate {A, B} to a 2-of-2 group recovery key.
-    let (resp, _) = a
-        .replica
-        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2));
     for _ in 0..6 {
         sync_all(&mut a.replica, &mut b.replica);
         sync_all(&mut b.replica, &mut a.replica);
@@ -3007,8 +2974,7 @@ fn group_break_glass_recovery_needs_the_threshold_and_re_roots() {
     assert!(!elevated.recovered);
 
     // B triggers break-glass recovery, re-rooting to itself.
-    let (resp, _) = b.replica.space_recover_cmd();
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(b.replica.space_recover_cmd());
     let b_actor = b.replica.my_actor().unwrap();
     // The transcript id B posted its request under — the hash of the signed
     // request node, read off the verified board.
@@ -3041,18 +3007,21 @@ fn group_break_glass_recovery_needs_the_threshold_and_re_roots() {
 
     // A must name the expected target: approving with the WRONG target is
     // refused before any share is contributed (consent binds to the roots).
-    let (bad, _) = a
-        .replica
-        .space_recover_approve_cmd(session_hex.clone(), vec![a_actor.as_str().to_string()]);
+    let bad = refused(
+        a.replica
+            .space_recover_approve_cmd(session_hex.clone(), vec![a_actor.as_str().to_string()]),
+    );
     assert!(
-        matches!(bad, Response::Error { .. }),
-        "approving a mismatched target must be refused: {bad:?}"
+        matches!(
+            &bad,
+            ReplicaError::Ceremony(c) if matches!(&**c, Ceremony::RootMismatch { .. })
+        ),
+        "approving a mismatched target must be refused as a root mismatch, \
+         not something a holder could read as a transient fault: {bad:?}"
     );
     // A explicitly co-signs, having verified out-of-band that it re-roots to B.
-    let (resp, _) = a
-        .replica
-        .space_recover_approve_cmd(session_hex, vec![b_actor.as_str().to_string()]);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .space_recover_approve_cmd(session_hex, vec![b_actor.as_str().to_string()]));
 
     // Now the threshold consents; the group signature aggregates and installs.
     for _ in 0..6 {
@@ -4271,32 +4240,6 @@ fn into_dirty_yields_the_report_alone() {
     );
 }
 
-#[test]
-fn a_successful_read_announces_nothing() {
-    let (resp, dirty) = Replica::respond_read(Ok(7), |n| Response::Ok {
-        message: Some(n.to_string()),
-    });
-    assert!(matches!(resp, Response::Ok { message } if message.as_deref() == Some("7")));
-    assert!(
-        dirty.is_none(),
-        "a read has no persistence effect to report"
-    );
-}
-
-#[test]
-fn a_refused_read_renders_its_error_and_announces_nothing() {
-    let refusal: ReplicaResult<u8> = Err(ReplicaError::NotFound(NotFound::Project {
-        named: "web".into(),
-    }));
-    let (resp, dirty) = Replica::respond_read(refusal, |_| unreachable!("not the Ok arm"));
-    // NotFound is the one family the control plane reports as such: exit 2,
-    // so a script can tell "absent" from "refused" without reading prose.
-    assert!(matches!(&resp, Response::Error { message, error_kind }
-            if message == "no project matches 'web'"
-                && *error_kind == crate::control::ErrorKind::NotFound));
-    assert!(dirty.is_none());
-}
-
 // ---- the read surface's refusals, pinned exactly ----
 //
 // Stage 2 moved every project read off `Response` and onto typed results, so
@@ -4498,30 +4441,6 @@ fn the_mutation_refusals_read_exactly_as_before() {
     for (error, expected) in cases {
         assert_eq!(error.to_string(), expected);
     }
-}
-
-#[test]
-fn the_two_not_found_families_score_exit_two() {
-    // NotFound is the one family the control plane reports as absent rather
-    // than refused, and scripts branch on that.
-    for error in [
-        ReplicaError::NotFound(NotFound::Member { named: "ab".into() }),
-        ReplicaError::NotFound(NotFound::Link(Box::new(LinkRef {
-            reff: "ENG-1".into(),
-            kind: "blocks".into(),
-            target: "ENG-2".into(),
-        }))),
-    ] {
-        let (_, kind) = refusal(Replica::error_response(error));
-        assert_eq!(kind, crate::control::ErrorKind::NotFound);
-    }
-    // The link *kind* being unknown is a bad argument, not an absence.
-    let (_, kind) = refusal(Replica::error_response(ReplicaError::Invalid(
-        Invalid::LinkKind {
-            value: "causes".into(),
-        },
-    )));
-    assert_eq!(kind, crate::control::ErrorKind::Error);
 }
 
 #[test]
@@ -4926,4 +4845,62 @@ fn the_device_projections_render_as_text() {
     let (actor, space) = text.split_once(' ').expect("two fields");
     assert_eq!(actor, n.replica.my_actor().unwrap().as_str());
     assert_eq!(space, n.replica.space_str());
+}
+
+// ---- a recovery that lands but does not finish ----
+
+// ---- a recovery that lands but does not fence ----
+//
+// These drive the real commands with the re-key made to fail, rather than
+// handing a constructed outcome to the renderer. The distinction matters: the
+// bug these guard was not that `rekey_failed: Some(_)` renders badly, but that
+// the command could never produce it — the failure was swallowed inside the
+// ceremony pass and the operator was told the space had been re-keyed.
+
+#[test]
+fn a_solo_recovery_that_cannot_re_key_says_so() {
+    let mut a = new_node();
+    let a_ws = a.replica.space_str();
+    let c_seed = [11u8; 32];
+    let mut c = new_joiner_node_as(
+        device_from_seed(c_seed),
+        c_seed,
+        &a_ws,
+        &a.replica.founding_proof().unwrap(),
+    );
+    sync_all(&mut a.replica, &mut c.replica);
+    std::fs::copy(
+        a.home.join("space-recovery.key"),
+        c.home.join("space-recovery.key"),
+    )
+    .unwrap();
+
+    c.replica.fail_rekey = true;
+    // Through `handle`, so this is the whole path an operator drives: the
+    // command, the outcome it builds, and the sentence they end up reading.
+    let (resp, dirty) = c.replica.handle(Request::SpaceRecover);
+
+    // The re-root is durable, so it rings — whatever happened after it.
+    assert!(
+        dirty.is_some(),
+        "a landed re-root announces itself even when the re-key fails"
+    );
+    let c_actor = c.replica.my_actor().unwrap();
+    assert!(
+        c.replica.acl_state().is_admin(&c_actor),
+        "the re-root really did install"
+    );
+    let message = match resp {
+        Response::Ok { message } => message.unwrap_or_default(),
+        other => panic!("a committed re-root is not an error: {other:?}"),
+    };
+    assert!(
+        message.contains("recovered the space"),
+        "the re-root is reported: {message}"
+    );
+    assert!(
+        message.contains("re-keying failed")
+            && message.contains("still readable under the old key"),
+        "never claim the space was fenced when it was not: {message}"
+    );
 }

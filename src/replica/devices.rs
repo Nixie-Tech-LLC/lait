@@ -53,7 +53,13 @@ impl Replica {
     /// no recovery) that self-incepted in its own home.
     ///
     /// [`agent_add_by_actor`]: Self::agent_add_by_actor
-    pub fn agent_add(&mut self, agent_incept: &actor::SignedEvent) -> ChangeResult<AgentSponsored> {
+    // Same situation as `admit_member`: dispatch sponsors an agent whose actor is
+    // already known, so the inception-carrying entry has no production caller yet.
+    #[allow(dead_code)]
+    pub(crate) fn agent_add(
+        &mut self,
+        agent_incept: &actor::SignedEvent,
+    ) -> ChangeResult<AgentSponsored> {
         let agent_actor = ActorId::from_incept_hash(&agent_incept.hash());
         let mut candidate = self.membership.actor_events();
         candidate.push(agent_incept.clone());
@@ -91,7 +97,10 @@ impl Replica {
     /// no membership or content authority, and its standing dies with the
     /// sponsor. The agent's inception must already be present (it self-incepts
     /// on join). Delegation, not elevation.
-    pub fn agent_add_by_actor(&mut self, agent_actor: &ActorId) -> ChangeResult<AgentSponsored> {
+    pub(crate) fn agent_add_by_actor(
+        &mut self,
+        agent_actor: &ActorId,
+    ) -> ChangeResult<AgentSponsored> {
         self.sponsorship_gate(agent_actor)?;
         if !self.actor_plane().exists(agent_actor) {
             return Err(ReplicaError::Conflict(Conflict::AgentUnknown {
@@ -264,7 +273,7 @@ impl Replica {
     /// device set to *this* device. **Lazy** (design): identity/standing is
     /// restored immediately, but this fresh device holds no space key until
     /// an admin or surviving peer re-seals it (self-heal on their next sync).
-    pub fn recover(&mut self) -> ChangeResult<ActorRecovered> {
+    pub(crate) fn recover(&mut self) -> ChangeResult<ActorRecovered> {
         let Some(seed) = self.read_recovery_key() else {
             return Err(ReplicaError::Conflict(Conflict::RecoveryKeyMissing));
         };

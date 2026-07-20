@@ -130,6 +130,13 @@ jobs:
         shell: bash
         run: bash ci/portability-guard.sh
 
+      # Boundary guard: the replica domain must not speak the client protocol.
+      # `dispatch.rs` is the one adapter; a domain module naming Request or
+      # Response compiles fine, so only this catches the regression.
+      - name: Replica boundary guard (no control protocol in the domain)
+        shell: bash
+        run: bash ci/replica-boundary-guard.sh
+
       # End-to-end smoke against the REAL binary (no network): drive the P0
       # tracker flow — create a project + issues, render the board, edit an
       # issue, and read the activity feed — asserting on observed output. Proves
