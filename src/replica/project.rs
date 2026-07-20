@@ -58,11 +58,7 @@ impl Replica {
         }
     }
 
-    pub(super) fn list(
-        &self,
-        project: Option<String>,
-        filter: Filter,
-    ) -> std::result::Result<Outcome<Vec<Row>>, ReplicaError> {
+    pub(super) fn list(&self, project: Option<String>, filter: Filter) -> ReplicaResult<Vec<Row>> {
         let project_filter = match &project {
             Some(p) => match self.resolve_project(p) {
                 Some(pr) => Some(pr.id),
@@ -114,7 +110,7 @@ impl Replica {
         }
         // stable order: priority desc, then created (ULID) asc via doc_id.
         rows.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.doc_id.cmp(&b.doc_id)));
-        Ok(Outcome::unchanged(rows))
+        Ok(rows)
     }
 
     /// Build the board, deduplicating its ordering projection:

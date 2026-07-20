@@ -4219,3 +4219,88 @@ fn history_is_the_contract_the_viewer_reads() {
         "even `created` carries a resolvable actor — the viewer names it"
     );
 }
+
+// ---- Change, and the read side of the control adapter ----
+//
+// These assert the distinction the daemon actually acts on: `None` means
+// nothing happened and no doorbell rings, while `Some(empty)` means a commit
+// landed whose scope no subscriber needs. `node::ring_doorbell` does not check
+// `DirtySet::is_empty()`, so collapsing the two would ring for rejected writes.
+
+#[test]
+fn an_unchanged_command_reports_no_dirty_set() {
+    let (value, dirty) = Change::unchanged("ok").into_parts();
+    assert_eq!(value, "ok");
+    assert!(dirty.is_none(), "an idempotent no-op rings no doorbell");
+}
+
+#[test]
+fn a_committed_command_reports_its_dirty_set() {
+    let dirty = DirtySet::catalog(CatalogScope::Acl);
+    let (value, reported) = Change::committed("ok", dirty.clone()).into_parts();
+    assert_eq!(value, "ok");
+    assert_eq!(reported, Some(dirty));
+}
+
+#[test]
+fn an_empty_dirty_set_survives_as_some() {
+    let (_, dirty) = Change::committed((), DirtySet::default()).into_parts();
+    assert_eq!(
+        dirty,
+        Some(DirtySet::default()),
+        "a commit with no subscriber-visible scope is still a commit"
+    );
+}
+
+#[test]
+fn mapping_a_change_keeps_its_report() {
+    let dirty = DirtySet::catalog(CatalogScope::Projects);
+    let (value, reported) = Change::committed(1u8, dirty.clone())
+        .map(|n| n + 1)
+        .into_parts();
+    assert_eq!(value, 2);
+    assert_eq!(
+        reported,
+        Some(dirty),
+        "adapting the value is not a re-report"
+    );
+
+    let (value, reported) = Change::unchanged(1u8).map(|n| n + 1).into_parts();
+    assert_eq!(value, 2);
+    assert!(reported.is_none());
+}
+
+#[test]
+fn into_dirty_yields_the_report_alone() {
+    assert!(Change::unchanged(()).into_dirty().is_none());
+    assert_eq!(
+        Change::committed((), DirtySet::default()).into_dirty(),
+        Some(DirtySet::default())
+    );
+}
+
+#[test]
+fn a_successful_read_announces_nothing() {
+    let (resp, dirty) = Replica::respond_read(Ok(7), |n| Response::Ok {
+        message: Some(n.to_string()),
+    });
+    assert!(matches!(resp, Response::Ok { message } if message.as_deref() == Some("7")));
+    assert!(
+        dirty.is_none(),
+        "a read has no persistence effect to report"
+    );
+}
+
+#[test]
+fn a_refused_read_renders_its_error_and_announces_nothing() {
+    let refusal: ReplicaResult<u8> = Err(ReplicaError::NotFound(NotFound::Project {
+        named: "web".into(),
+    }));
+    let (resp, dirty) = Replica::respond_read(refusal, |_| unreachable!("not the Ok arm"));
+    // NotFound is the one family the control plane reports as such: exit 2,
+    // so a script can tell "absent" from "refused" without reading prose.
+    assert!(matches!(&resp, Response::Error { message, error_kind }
+            if message == "no project matches 'web'"
+                && *error_kind == crate::control::ErrorKind::NotFound));
+    assert!(dirty.is_none());
+}

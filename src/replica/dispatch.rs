@@ -99,7 +99,9 @@ impl Replica {
             Request::IssueStop { reff } => self.work_state(reff, WorkAction::Stop),
             Request::IssueView { reff } => self.issue_view(reff).map(|r| (r, None)),
             Request::List { project, filter } => {
-                return Self::respond(self.list(project, filter), |rows| Response::List { rows })
+                return Self::respond_read(self.list(project, filter), |rows| Response::List {
+                    rows,
+                })
             }
             Request::Board {
                 project,
@@ -153,25 +155,26 @@ impl Replica {
     //
     // The single door between the domain and the client protocol. Everything
     // below this line speaks `Response`; everything the replica exposes above it
-    // speaks [`Outcome`] and [`ReplicaError`]. Keeping the conversion in one
+    // speaks [`Change`] and [`ReplicaError`]. Keeping the conversion in one
     // place is what lets the domain be lifted out from under the daemon later,
     // and what keeps error prose from scattering back into the modules that
     // detect failures.
 
-    /// Turn a domain result into a wire response and a doorbell.
+    /// Turn a fallible read's result into a wire response. Always `None`: a read
+    /// has no persistence effect, so there is nothing for it to report.
     ///
-    /// The `Err` arm hard-codes `None`: a failed operation committed nothing, so
-    /// it has nothing to announce. [`Outcome`] makes that unrepresentable on the
-    /// way in, and this makes it unrepresentable on the way out.
-    pub(super) fn respond<T>(
-        result: std::result::Result<Outcome<T>, ReplicaError>,
+    /// A command's [`Change`] needs the sibling helper that splits it into value
+    /// and doorbell. The two are kept apart so that reads never need `Change` at
+    /// all: were a read to adapt through it, every domain module would need
+    /// `Change::unchanged` in reach and could manufacture a commit report for
+    /// something that never wrote. Separating them reserves `unchanged` for
+    /// command branches that provably wrote nothing.
+    pub(super) fn respond_read<T>(
+        result: ReplicaResult<T>,
         into_response: impl FnOnce(T) -> Response,
     ) -> (Response, Option<DirtySet>) {
         match result {
-            Ok(outcome) => {
-                let (value, dirty) = outcome.into_parts();
-                (into_response(value), dirty)
-            }
+            Ok(value) => (into_response(value), None),
             Err(e) => (Self::error_response(e), None),
         }
     }
