@@ -4304,3 +4304,131 @@ fn a_refused_read_renders_its_error_and_announces_nothing() {
                 && *error_kind == crate::control::ErrorKind::NotFound));
     assert!(dirty.is_none());
 }
+
+// ---- the read surface's refusals, pinned exactly ----
+//
+// Stage 2 moved every project read off `Response` and onto typed results, so
+// its prose now renders at the dispatch adapter instead of at the detection
+// site. These assert the observable half of that move: the exact sentence and
+// the exact `ErrorKind`, since scripts branch on the kind (NotFound is exit 2)
+// and people read the message. They are the behavioral lock for this stage —
+// the golden-strings fixture is provenance, not a gate, and never covered
+// these paths.
+
+/// The message and kind of a refusal, or a panic naming what came back instead.
+fn refusal(resp: Response) -> (String, crate::control::ErrorKind) {
+    match resp {
+        Response::Error {
+            message,
+            error_kind,
+        } => (message, error_kind),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_read_that_names_a_missing_project_or_label_is_not_found() {
+    let mut n = new_node();
+    use crate::control::ErrorKind::NotFound;
+
+    let (msg, kind) = refusal(
+        n.replica
+            .handle(Request::List {
+                project: Some("NOPE".into()),
+                filter: Filter::default(),
+            })
+            .0,
+    );
+    assert_eq!(msg, "no project matches 'NOPE'");
+    assert_eq!(kind, NotFound, "exit 2: absent, not refused");
+
+    let (msg, kind) = refusal(
+        n.replica
+            .handle(Request::List {
+                project: None,
+                filter: Filter {
+                    label: Some("nope".into()),
+                    ..Filter::default()
+                },
+            })
+            .0,
+    );
+    assert_eq!(msg, "no label matches 'nope'");
+    assert_eq!(kind, NotFound);
+
+    let (msg, kind) = refusal(
+        n.replica
+            .handle(Request::Board {
+                project: Some("NOPE".into()),
+                project_hint: None,
+            })
+            .0,
+    );
+    assert_eq!(msg, "no project matches 'NOPE'");
+    assert_eq!(kind, NotFound);
+}
+
+#[test]
+fn a_read_that_names_a_missing_issue_is_not_found() {
+    let mut n = new_node();
+    use crate::control::ErrorKind::NotFound;
+
+    // No issues exist, so nothing is near enough to offer as a candidate and
+    // the reply is a refusal rather than a picker.
+    let (msg, kind) = refusal(
+        n.replica
+            .handle(Request::IssueView {
+                reff: "zz-999".into(),
+            })
+            .0,
+    );
+    assert_eq!(msg, "no issue matches 'zz-999'");
+    assert_eq!(kind, NotFound);
+
+    let (msg, kind) = refusal(
+        n.replica
+            .handle(Request::History {
+                reff: "zz-999".into(),
+            })
+            .0,
+    );
+    assert_eq!(msg, "no issue matches 'zz-999'");
+    assert_eq!(kind, NotFound);
+}
+
+#[test]
+fn a_read_that_cannot_choose_a_project_teaches_the_fix() {
+    let mut n = new_node();
+    with_project(&mut n.replica); // TEST + ENG → ambiguous
+    let (msg, kind) = refusal(
+        n.replica
+            .handle(Request::Board {
+                project: None,
+                project_hint: None,
+            })
+            .0,
+    );
+    // Ambiguity is a configuration gap, not an absence: exit 1, and the
+    // message carries the way out.
+    assert_eq!(
+        msg,
+        "more than one project (ENG, TEST) — pass -p <KEY> or set a default: `lait config set project.default <KEY>`"
+    );
+    assert_eq!(kind, crate::control::ErrorKind::Error);
+}
+
+#[test]
+fn the_infallible_reads_answer_without_a_doorbell() {
+    let mut n = new_node();
+    let (resp, dirty) = n.replica.handle(Request::ProjectList);
+    assert!(matches!(resp, Response::Projects { projects } if !projects.is_empty()));
+    assert!(dirty.is_none(), "a read commits nothing");
+
+    let (resp, dirty) = n.replica.handle(Request::LabelList);
+    assert!(matches!(resp, Response::Labels { .. }));
+    assert!(dirty.is_none());
+
+    let (resp, dirty) = n.replica.handle(Request::Activity { since: 0 });
+    assert!(matches!(resp, Response::Activity { .. }));
+    assert!(dirty.is_none());
+}

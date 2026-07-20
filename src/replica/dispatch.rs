@@ -97,7 +97,11 @@ impl Replica {
             Request::IssueStart { reff } => self.work_state(reff, WorkAction::Start),
             Request::IssueDone { reff } => self.work_state(reff, WorkAction::Done),
             Request::IssueStop { reff } => self.work_state(reff, WorkAction::Stop),
-            Request::IssueView { reff } => self.issue_view(reff).map(|r| (r, None)),
+            Request::IssueView { reff } => {
+                return Self::respond_read(self.issue_view(reff), |view| {
+                    Response::Issue(Box::new(view))
+                })
+            }
             Request::List { project, filter } => {
                 return Self::respond_read(self.list(project, filter), |rows| Response::List {
                     rows,
@@ -106,13 +110,41 @@ impl Replica {
             Request::Board {
                 project,
                 project_hint,
-            } => self.board(project, project_hint).map(|r| (r, None)),
-            Request::History { reff } => self.history(reff).map(|r| (r, None)),
+            } => {
+                return Self::respond_read(self.board(project, project_hint), |view| {
+                    Response::Board(Box::new(view))
+                })
+            }
+            Request::History { reff } => {
+                return Self::respond_read(self.history(reff), |page| Response::Activity {
+                    events: page.events,
+                    last: page.last,
+                })
+            }
             Request::ProjectNew { name, key } => self.project_new(name, key),
-            Request::ProjectList => Ok((self.project_list(), None)),
+            Request::ProjectList => Ok((
+                Response::Projects {
+                    projects: self.project_list(),
+                },
+                None,
+            )),
             Request::LabelNew { name, color } => self.label_new(name, color),
-            Request::LabelList => Ok((self.label_list(), None)),
-            Request::Activity { since } => Ok((self.activity_response(since), None)),
+            Request::LabelList => Ok((
+                Response::Labels {
+                    labels: self.label_list(),
+                },
+                None,
+            )),
+            Request::Activity { since } => {
+                let page = self.activity_page(since);
+                Ok((
+                    Response::Activity {
+                        events: page.events,
+                        last: page.last,
+                    },
+                    None,
+                ))
+            }
             // `as_name` is a node-layer local-petname concern; the replica only
             // seals the ACL op, so it ignores it here.
             Request::MemberAdd { who, admin, .. } => Ok(self.member_add_cmd(who, admin)),

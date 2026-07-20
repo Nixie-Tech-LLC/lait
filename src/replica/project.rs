@@ -4,6 +4,16 @@ use super::*;
 
 const ACTIVITY_RING: usize = 1000;
 
+/// A page of activity events and the high-water `seq` a client resumes from.
+///
+/// Shared by the space feed and per-issue history because both answer the same
+/// question — what happened, and where to pick up — even though one reads the
+/// session ring and the other derives from the oplog on disk.
+pub(super) struct ActivityPage {
+    pub events: Vec<ActivityEvent>,
+    pub last: u64,
+}
+
 impl Replica {
     // ---- projections (reads) ----
 
@@ -121,11 +131,8 @@ impl Replica {
         &self,
         project: Option<String>,
         project_hint: Option<String>,
-    ) -> Result<Response> {
-        let project_dto = match self.choose_project(project.as_deref(), project_hint.as_deref()) {
-            Ok(pr) => pr,
-            Err(e) => return Ok(Self::error_response(e)),
-        };
+    ) -> ReplicaResult<BoardView> {
+        let project_dto = self.choose_project(project.as_deref(), project_hint.as_deref())?;
         let pid = &project_dto.id;
         let rows_by_doc: HashMap<String, RowMeta> = self
             .catalog
@@ -184,18 +191,15 @@ impl Replica {
                 rows,
             });
         }
-        Ok(Response::Board(Box::new(BoardView {
+        Ok(BoardView {
             schema_version: SCHEMA_VERSION,
             project: project_dto,
             columns,
-        })))
+        })
     }
 
-    pub(super) fn issue_view(&mut self, reff: String) -> Result<Response> {
-        let doc_id = match self.resolve_issue(&reff) {
-            Ok(id) => id,
-            Err(e) => return Ok(Self::error_response(e)),
-        };
+    pub(super) fn issue_view(&mut self, reff: String) -> ReplicaResult<IssueView> {
+        let doc_id = self.resolve_issue(&reff)?;
         // Clone viewer context up front so it doesn't conflict with the issue
         // borrow below.
         let ws = self.space_id.clone();
@@ -217,7 +221,7 @@ impl Replica {
             None => {
                 // Provisional: only the catalog row is known until sync completes.
                 let row = row.ok_or_else(|| anyhow!("no such issue"))?;
-                return Ok(Response::Issue(Box::new(IssueView {
+                return Ok(IssueView {
                     schema_version: SCHEMA_VERSION,
                     reff: canonical.clone(),
                     doc_id,
@@ -239,7 +243,7 @@ impl Replica {
                     created_at: row.created_at,
                     provisional: true,
                     corrupt_records: Vec::new(),
-                })));
+                });
             }
         };
         let labels = issue.labels();
@@ -281,18 +285,15 @@ impl Replica {
             provisional: false,
             corrupt_records,
         };
-        Ok(Response::Issue(Box::new(view)))
+        Ok(view)
     }
 
     /// The issue's history, derived from the **oplog on disk**:
     /// durable across daemon restarts, field-level, attributed (advisory) for
     /// remote changes, with DAG-derived collision flags. The per-session
     /// activity ring stays what it is — the space feed's batch cursor.
-    pub(super) fn history(&mut self, reff: String) -> Result<Response> {
-        let doc_id = match self.resolve_issue(&reff) {
-            Ok(id) => id,
-            Err(e) => return Ok(Self::error_response(e)),
-        };
+    pub(super) fn history(&mut self, reff: String) -> ReplicaResult<ActivityPage> {
+        let doc_id = self.resolve_issue(&reff)?;
         let canonical = self.aliases.canonical_for(&doc_id);
         let issue = self
             .issue(&doc_id)?
@@ -318,17 +319,14 @@ impl Replica {
             })
             .collect();
         let last = events.last().map(|e| e.seq).unwrap_or(0);
-        Ok(Response::Activity { events, last })
+        Ok(ActivityPage { events, last })
     }
 
-    pub(super) fn project_list(&self) -> Response {
-        Response::Projects {
-            projects: self.catalog.projects_list(),
-        }
+    pub(super) fn project_list(&self) -> Vec<ProjectDto> {
+        self.catalog.projects_list()
     }
-    pub(super) fn label_list(&self) -> Response {
-        let labels: Vec<LabelDto> = self.catalog.labels_list();
-        Response::Labels { labels }
+    pub(super) fn label_list(&self) -> Vec<LabelDto> {
+        self.catalog.labels_list()
     }
 
     // ---- activity feed ----
@@ -366,7 +364,7 @@ impl Replica {
         }
     }
 
-    pub(super) fn activity_response(&self, since: u64) -> Response {
+    pub(super) fn activity_page(&self, since: u64) -> ActivityPage {
         let events: Vec<ActivityEvent> = self
             .activity
             .iter()
@@ -374,7 +372,7 @@ impl Replica {
             .cloned()
             .collect();
         let last = self.activity.back().map(|e| e.seq).unwrap_or(since);
-        Response::Activity { events, last }
+        ActivityPage { events, last }
     }
 
     /// The current activity high-water (for doorbell `activity_advanced` clients).
