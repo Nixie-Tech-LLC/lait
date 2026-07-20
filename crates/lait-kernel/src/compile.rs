@@ -47,8 +47,9 @@ use serde::{Deserialize, Serialize};
 use curve25519_dalek::scalar::Scalar;
 
 use crate::authority::LeafId;
-use crate::expand::{ExpandedPolicy, Expansion};
-use crate::policy::PolicyId;
+use crate::authority::{GeneralAccessConfig, PrincipalId};
+use crate::expand::{expand, ExpandedPolicy, Expansion, PrincipalDescriptor};
+use crate::policy::{CanonicalPolicy, PolicyId};
 
 const COMMITMENT_DOMAIN: &[u8] = b"lait/space/1/policy/1/access-structure";
 
@@ -411,6 +412,64 @@ pub fn verify_compilation(
     Ok(recompiled)
 }
 
+/// The error of [`verify_general_access_config`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigError {
+    /// The supplied canonical policy is not the one the config names.
+    PolicyMismatch,
+    /// The expansion the config committed does not match one recomputed from the
+    /// policy and the custody snapshot — a different custody arrangement.
+    LeafMismatch,
+    /// The config's access structure does not implement the policy.
+    Verify(VerifyError),
+    /// The policy or its expansion is malformed.
+    Malformed,
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigError::PolicyMismatch => write!(f, "the policy does not match the config"),
+            ConfigError::LeafMismatch => {
+                write!(f, "the committed leaves do not match the expansion")
+            }
+            ConfigError::Verify(e) => write!(f, "{e}"),
+            ConfigError::Malformed => write!(f, "the policy or expansion is malformed"),
+        }
+    }
+}
+impl std::error::Error for ConfigError {}
+
+/// **The C4 acceptance invariant.** Accept a general-access configuration only
+/// when deterministic recompilation of its committed canonical policy and
+/// immutable expansion reproduces exactly its advertised access structure.
+///
+/// The accepter supplies the canonical policy it approved and the custody
+/// resolver (the immutable snapshot of how each principal expands). This
+/// function checks the policy is the one named, recomputes the expansion,
+/// confirms the committed leaf snapshot matches it (same custody arrangement),
+/// and recompiles — returning the structurally-validated compilation only if its
+/// commitment equals the advertised one.
+///
+/// This is what makes the advertised matrix trustworthy: not that it is
+/// well-shaped, but that it is *the* compilation of the approved policy.
+pub fn verify_general_access_config(
+    config: &GeneralAccessConfig,
+    canonical_policy: &CanonicalPolicy,
+    resolve: &impl Fn(&PrincipalId) -> Option<PrincipalDescriptor>,
+) -> Result<StructurallyValidatedCompiledPolicy, ConfigError> {
+    if canonical_policy.id() != config.policy {
+        return Err(ConfigError::PolicyMismatch);
+    }
+    let expansion = expand(canonical_policy, resolve).map_err(|_| ConfigError::Malformed)?;
+    // The config's committed leaves must be exactly the expansion's — same order,
+    // same ids, same provenance — or a different custody snapshot was used.
+    if expansion.leaves() != config.leaves.as_slice() {
+        return Err(ConfigError::LeafMismatch);
+    }
+    verify_compilation(&expansion, config.access_structure).map_err(ConfigError::Verify)
+}
+
 fn build(
     node: &ExpandedPolicy,
     mut row: Vec<Scalar>,
@@ -691,6 +750,68 @@ mod tests {
             members: vec![key(1), key(2)],
         });
         assert_ne!(a.commitment(), b.commitment());
+    }
+
+    fn general_access_config(
+        canon: &crate::policy::CanonicalPolicy,
+    ) -> crate::authority::GeneralAccessConfig {
+        let exp = expand(canon, &resolver()).unwrap();
+        let compiled = compile(&exp).unwrap();
+        crate::authority::GeneralAccessConfig {
+            policy: canon.id(),
+            access_structure: compiled.commitment(),
+            leaves: exp.leaves().to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_general_access_config_accepts_only_under_recompilation() {
+        let canon = OwnershipPolicy::Threshold {
+            k: 2,
+            members: vec![key(1), key(2), key(3)],
+        }
+        .canonicalize()
+        .unwrap();
+        let config = general_access_config(&canon);
+
+        // Honest: policy, leaves and commitment all recompile.
+        assert!(verify_general_access_config(&config, &canon, &resolver()).is_ok());
+
+        // Wrong policy supplied.
+        let other = OwnershipPolicy::AnyOf(vec![key(1), key(2)])
+            .canonicalize()
+            .unwrap();
+        assert_eq!(
+            verify_general_access_config(&config, &other, &resolver()),
+            Err(ConfigError::PolicyMismatch)
+        );
+
+        // Tampered access structure (a different policy's commitment).
+        let mut bad = config.clone();
+        bad.access_structure = general_access_config(&other).access_structure;
+        assert!(matches!(
+            verify_general_access_config(&bad, &canon, &resolver()),
+            Err(ConfigError::Verify(VerifyError::CommitmentMismatch))
+        ));
+
+        // Tampered leaf snapshot.
+        let mut bad = config;
+        bad.leaves.pop();
+        assert_eq!(
+            verify_general_access_config(&bad, &canon, &resolver()),
+            Err(ConfigError::LeafMismatch)
+        );
+    }
+
+    #[test]
+    fn a_general_access_config_is_structurally_well_formed() {
+        let canon = OwnershipPolicy::AllOf(vec![key(1), key(2)])
+            .canonicalize()
+            .unwrap();
+        let cfg = general_access_config(&canon);
+        let authority_cfg = crate::authority::AuthorityConfiguration::general_access(&cfg);
+        assert!(authority_cfg.is_well_formed());
+        assert_eq!(authority_cfg.as_general_access().unwrap(), cfg);
     }
 
     #[test]

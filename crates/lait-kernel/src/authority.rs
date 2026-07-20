@@ -86,6 +86,22 @@ impl AuthorityConfiguration {
             .flatten()
     }
 
+    /// A general-access configuration over a compiled ownership policy (Phase C/D).
+    pub fn general_access(config: &GeneralAccessConfig) -> Self {
+        AuthorityConfiguration {
+            version: 1,
+            scheme: AuthorityScheme::GeneralAccess,
+            payload: postcard::to_stdvec(config).expect("encode general-access config"),
+        }
+    }
+
+    /// Decode this configuration as general-access, or `None`.
+    pub fn as_general_access(&self) -> Option<GeneralAccessConfig> {
+        (self.scheme == AuthorityScheme::GeneralAccess)
+            .then(|| postcard::from_bytes(&self.payload).ok())
+            .flatten()
+    }
+
     /// The content-address of this configuration.
     pub fn id(&self) -> AuthorityConfigurationId {
         let mut h = blake3::Hasher::new();
@@ -106,9 +122,14 @@ impl AuthorityConfiguration {
             AuthorityScheme::FrostThreshold => self
                 .as_frost_threshold()
                 .is_some_and(|c| c.is_well_formed()),
-            // Reserved: a node that does not implement a scheme must refuse it
-            // rather than treat an undecodable payload as acceptable.
-            AuthorityScheme::GeneralAccess => false,
+            // Structural well-formedness only: the payload decodes and its leaf
+            // set is nonempty and distinct. Whether the committed access
+            // structure actually implements the named policy is a *semantic*
+            // check that needs the policy tree — `compile::verify_compilation` at
+            // C4 acceptance — not something derivable from the config alone.
+            AuthorityScheme::GeneralAccess => self
+                .as_general_access()
+                .is_some_and(|c| c.is_structurally_well_formed()),
         }
     }
 }
@@ -165,6 +186,36 @@ impl FrostThresholdConfig {
             .iter()
             .position(|p| p == who)
             .map(|i| i as u16 + 1)
+    }
+}
+
+/// A general-access authority (§3.2): the ownership policy, the exact compiler
+/// output that realizes it, and the immutable leaf snapshot.
+///
+/// The three identities are all here, distinct: `policy` (the human rule),
+/// `access_structure` (the compiler output), and — via this whole config's id —
+/// the deployed arrangement. An acceptor recomputes the expansion from `policy`
+/// and `leaves`, recompiles, and requires the result to equal `access_structure`
+/// (`compile::verify_compilation`); only then is the arrangement trusted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeneralAccessConfig {
+    pub policy: crate::policy::PolicyId,
+    pub access_structure: crate::compile::AccessStructureCommitment,
+    /// The committed leaf snapshot, in the compiler's row order.
+    pub leaves: Vec<crate::expand::LeafDescriptor>,
+}
+
+impl GeneralAccessConfig {
+    /// Structural well-formedness: a nonempty, distinct leaf set. This is *not*
+    /// proof the access structure implements the policy — that is a semantic
+    /// check requiring recompilation of the policy tree.
+    pub fn is_structurally_well_formed(&self) -> bool {
+        if self.leaves.is_empty() {
+            return false;
+        }
+        let distinct: std::collections::BTreeSet<&LeafId> =
+            self.leaves.iter().map(|l| &l.leaf).collect();
+        distinct.len() == self.leaves.len()
     }
 }
 
