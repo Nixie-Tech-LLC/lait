@@ -202,11 +202,22 @@ impl Replica {
             }
             // `as_name` is a node-layer local-petname concern; the replica only
             // seals the ACL op, so it ignores it here.
-            Request::MemberAdd { who, admin, .. } => Ok(self.member_add_cmd(who, admin)),
-            Request::MemberRemove { who } => Ok(self.member_remove_cmd(who)),
+            Request::MemberAdd { who, admin, .. } => {
+                return Self::respond(self.member_add_cmd(who, admin), Self::admission_response)
+            }
+            Request::MemberRemove { who } => {
+                return Self::respond(self.member_remove_cmd(who), Self::member_removed_response)
+            }
             Request::AgentAdd { key } => Ok(self.agent_add_cmd(key)),
-            Request::KeyRotate => Ok(self.key_rotate_cmd()),
-            Request::InviteRevoke { invite } => Ok(self.invite_revoke_cmd(invite)),
+            Request::KeyRotate => {
+                return Self::respond(self.key_rotate_cmd(), Self::key_rotated_response)
+            }
+            Request::InviteRevoke { invite } => {
+                return Self::respond(
+                    self.invite_revoke_cmd(invite),
+                    Self::invite_revoked_response,
+                )
+            }
             Request::DeviceInvite => Ok(self.device_invite_cmd()),
             Request::DeviceAdd { consent } => Ok(self.device_add_cmd(consent)),
             Request::DeviceRevoke { device } => Ok(self.device_revoke_cmd(device)),
@@ -228,8 +239,18 @@ impl Replica {
             Request::SpaceRecoverApprove { session, expect } => {
                 Ok(self.space_recover_approve_cmd(session, expect))
             }
-            Request::Members => Ok((self.members_response(), None)),
-            Request::MemberLog => Ok((self.member_log_response(), None)),
+            Request::Members => Ok((
+                Response::Members {
+                    members: self.member_list(),
+                },
+                None,
+            )),
+            Request::MemberLog => Ok((
+                Response::MemberLog {
+                    entries: self.member_log(),
+                },
+                None,
+            )),
             other => Err(anyhow!("not a replica request: {other:?}")),
         };
         match r {
@@ -281,6 +302,62 @@ impl Replica {
         let verb = if d.restored { "restored" } else { "deleted" };
         Response::Ok {
             message: Some(format!("{verb} {}", d.reff)),
+        }
+    }
+
+    fn admission_response(a: Admission) -> Response {
+        let message = match a {
+            Admission::Added(actor) => format!("added member {}", actor.short()),
+            Admission::AutoApproved(actor) => {
+                format!("auto-approved {} via invite", actor.short())
+            }
+            Admission::AlreadyMember(actor) => format!("{} is already a member", actor.short()),
+        };
+        Response::Ok {
+            message: Some(message),
+        }
+    }
+
+    fn member_removed_response(r: MemberRemoved) -> Response {
+        Response::Ok {
+            message: Some(format!(
+                "removed member {} and rotated the key",
+                r.0.short()
+            )),
+        }
+    }
+
+    fn key_rotated_response(k: KeyRotated) -> Response {
+        Response::Ok {
+            message: Some(format!(
+                "rotated the space key (generation {})",
+                k.generation
+            )),
+        }
+    }
+
+    /// Never claim the invite was undone. A redemption that causally precedes
+    /// this revoke stands (it was legitimate); a concurrent one is evicted on
+    /// merge and the key rotates — but in both cases content already shared
+    /// stays readable by whoever was admitted. That is lazy revocation, and no
+    /// amount of re-keying closes it.
+    ///
+    /// `spent_nonces` is grow-only, so a spent nonce says an admission
+    /// *happened* — not that the actor is still a member. They may have been
+    /// removed since. Point at the member list rather than asserting a seat.
+    fn invite_revoked_response(r: InviteRevocation) -> Response {
+        let message = if r.already_spent {
+            "the invite had already been redeemed, so revoking it does not undo \
+             that admission. Check the member list and remove the actor if they \
+             should no longer have access."
+        } else {
+            "revoked the invite — it admits no one from here on. If it was \
+             redeemed elsewhere before this synced, that member is removed and \
+             the key rotates on merge, but content shared before then stays \
+             readable by them."
+        };
+        Response::Ok {
+            message: Some(message.into()),
         }
     }
 

@@ -87,6 +87,13 @@ pub enum NotFound {
     /// is the widest failure in this family, and every `Result` in the replica
     /// would otherwise carry its three strings by value.
     Link(Box<LinkRef>),
+    /// No actor answers to that `<who>`. `invite_hint` asks for the tail that
+    /// says how to fix it, which the add path wants and the remove path does
+    /// not — removing someone who was never here needs no invitation.
+    Actor {
+        named: String,
+        invite_hint: bool,
+    },
 }
 
 /// The three handles that name one edge of the issue graph.
@@ -126,6 +133,13 @@ pub enum Denied {
     SelfRemoval,
     /// This device has not established an actor identity yet.
     NoActorIdentity { in_this_space: bool },
+    /// The device that signed the invite grant does not currently speak for an
+    /// admin. Authority is evaluated now, not when the invite was written, so a
+    /// demoted issuer's outstanding invites stop admitting.
+    IssuerNotAdmin,
+    /// This node holds no admin standing, so it cannot seal a joiner in even
+    /// though the invite itself is good.
+    NodeNotAdmin,
 }
 
 /// The admin-gated operations, named so the message can say which was refused.
@@ -155,6 +169,12 @@ pub enum Invalid {
     /// `KEY` in `KEY-1` refs, which both alias parsing and git-branch inference
     /// scan as a single alphabetic run.
     ProjectKey { value: String },
+    /// An actor inception that does not cleanly incept for this space. A forged
+    /// one must never enter the actors container, so this is checked against a
+    /// candidate replay before admission.
+    ActorInception { in_join_request: bool },
+    /// Neither a ticket nor a bare nonce.
+    InviteRef,
 }
 
 /// The fields that must carry text. A closed set rather than a string: these
@@ -185,6 +205,12 @@ pub enum Conflict {
     },
     LabelExists {
         name: String,
+    },
+    /// The actor resolved, but no inception for it has reached this replica, so
+    /// there is nothing to seal a key to yet. A state gap, not a bad argument —
+    /// the same request succeeds once their identity syncs.
+    ActorUnknown {
+        short: String,
     },
 }
 
@@ -253,6 +279,13 @@ impl fmt::Display for NotFound {
             Self::Project { named } => write!(f, "no project matches '{named}'"),
             Self::Label { named } => write!(f, "no label matches '{named}'"),
             Self::Member { named } => write!(f, "no known member matches '{named}'"),
+            Self::Actor { named, invite_hint } => {
+                write!(f, "no known actor matches '{named}'")?;
+                if *invite_hint {
+                    f.write_str(" — invite them first so their identity arrives")?;
+                }
+                Ok(())
+            }
             Self::Link(link) => {
                 let LinkRef { reff, kind, target } = &**link;
                 write!(f, "no such link: {reff} {kind} {target}")
@@ -294,6 +327,8 @@ impl fmt::Display for Denied {
                 }
             },
             Self::NotHuman => f.write_str("only a human member can sponsor an agent"),
+            Self::IssuerNotAdmin => f.write_str("invite issuer is not a space admin"),
+            Self::NodeNotAdmin => f.write_str("this node is not an admin"),
             Self::SelfRemoval => f.write_str("refusing to remove yourself"),
             Self::NoActorIdentity { in_this_space } => {
                 if *in_this_space {
@@ -325,6 +360,16 @@ impl fmt::Display for Invalid {
                 "unknown link kind '{value}' — one of: {}",
                 super::LINK_KINDS.join(", ")
             ),
+            Self::ActorInception { in_join_request } => {
+                if *in_join_request {
+                    f.write_str("join request carried an invalid actor inception")
+                } else {
+                    f.write_str("invalid actor inception")
+                }
+            }
+            Self::InviteRef => {
+                f.write_str("not a valid invite — pass the ticket or its 32-hex nonce")
+            }
             Self::ProjectKey { value } => write!(
                 f,
                 "bad project key '{value}' — use 1-8 ASCII letters (it becomes the KEY in KEY-1 refs)"
@@ -352,6 +397,10 @@ impl fmt::Display for Conflict {
             ),
             Self::ProjectKeyExists { key } => write!(f, "project key '{key}' already exists"),
             Self::LabelExists { name } => write!(f, "label '{name}' already exists"),
+            Self::ActorUnknown { short } => write!(
+                f,
+                "unknown actor {short} — invite them so their identity arrives first"
+            ),
         }
     }
 }

@@ -51,12 +51,14 @@ pub use error::{
     NotFound, ProjectChoice, RefError, ReplicaError,
 };
 pub use lifecycle::{derive_project_key, found_space, join_space_store};
+pub use membership::{Admission, InviteRevocation, KeyRotated, MemberRemoved};
 pub use recovery::{
     ArtifactRead, DegradedRecoveryHolder, LocalCustodyState, RecoveryArtifactFailure,
     RecoveryStatus,
 };
 // private re-imports so `use super::*` in children keeps unqualified helper names working:
 use lifecycle::mint_recovery;
+
 use mutate::{Deletion, ResolvedRef, WorkAction};
 use recovery::{persist_recovery_key, persist_space_recovery};
 
