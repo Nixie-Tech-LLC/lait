@@ -62,6 +62,18 @@ use crate::{
     store::Store,
 };
 
+/// The transport id of a device key: the same 32 ed25519 bytes, hex-decoded.
+/// Fallible because a `DeviceId` read back off disk or the wire is only
+/// *asserted* to be a key, never validated on construction.
+fn endpoint_of(device: &DeviceId) -> Result<EndpointId> {
+    let raw = data_encoding::HEXLOWER_PERMISSIVE
+        .decode(device.as_str().as_bytes())
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+        .context("peer id is not a 32-byte key")?;
+    EndpointId::from_bytes(&raw).context("peer id is not a valid endpoint id")
+}
+
 /// Presence-probe ALPN. Moves in lockstep with [`crate::sync::SYNC_ALPN`] and
 /// the gossip topic tag, so a version skew that partitions sync/gossip also
 /// partitions the liveness probe rather than leaving cross-epoch peers
@@ -189,17 +201,17 @@ fn peers_path(home: &Path) -> PathBuf {
 /// from each `EndpointId`, so the ids alone are enough to reconnect — a fresh
 /// daemon no longer re-enters the mesh with an empty bootstrap set and waits
 /// passively to be re-announced to. Our own id is filtered out.
-fn load_bootstrap_peers(home: &Path, me: EndpointId) -> Vec<EndpointId> {
+fn load_bootstrap_peers(home: &Path, me: &DeviceId) -> Vec<DeviceId> {
     let Ok(data) = std::fs::read_to_string(peers_path(home)) else {
         return Vec::new();
     };
-    let ids: Vec<EndpointId> = serde_json::from_str(&data).unwrap_or_default();
-    ids.into_iter().filter(|id| *id != me).collect()
+    let ids: Vec<DeviceId> = serde_json::from_str(&data).unwrap_or_default();
+    ids.into_iter().filter(|id| id != me).collect()
 }
 
 /// Persist the set of currently-known peer endpoints (best-effort) so the next
 /// daemon start can bootstrap from them.
-fn save_known_peers(home: &Path, peers: &[EndpointId]) {
+fn save_known_peers(home: &Path, peers: &[DeviceId]) {
     if let Ok(data) = serde_json::to_string(peers) {
         let _ = std::fs::write(peers_path(home), data);
     }
@@ -214,7 +226,7 @@ fn save_known_peers(home: &Path, peers: &[EndpointId]) {
 /// against the genesis keys carried in the ticket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeedRecord {
-    pub id: EndpointId,
+    pub id: DeviceId,
     #[serde(default)]
     pub nick: String,
     #[serde(default)]
@@ -242,11 +254,11 @@ fn save_seeds(home: &Path, seeds: &[SeedRecord]) {
 
 /// The pinned seeds' endpoint ids, minus our own — the sticky half of the gossip
 /// bootstrap set. Our own id is filtered out (dialing ourselves is pointless).
-fn seed_ids(home: &Path, me: EndpointId) -> Vec<EndpointId> {
+fn seed_ids(home: &Path, me: &DeviceId) -> Vec<DeviceId> {
     load_seeds(home)
         .into_iter()
         .map(|s| s.id)
-        .filter(|id| *id != me)
+        .filter(|id| id != me)
         .collect()
 }
 
@@ -272,7 +284,7 @@ fn remove_seed(home: &Path, needle: &str) -> usize {
     let mut seeds = load_seeds(home);
     let before = seeds.len();
     seeds.retain(|s| {
-        let id = s.id.to_string();
+        let id = s.id.as_str();
         !(id == needle || (needle.len() >= 6 && id.starts_with(needle)) || s.nick == needle)
     });
     let removed = before - seeds.len();
@@ -501,8 +513,8 @@ pub struct Shared {
     /// user.nick`) applies live instead of waiting for a restart. There is no
     /// room here: the gossip topic is a pure function of the space id.
     pub nick: Arc<Mutex<String>>,
-    pub my_id: EndpointId,
-    pub presence: Arc<Mutex<HashMap<EndpointId, Peer>>>,
+    pub my_id: DeviceId,
+    pub presence: Arc<Mutex<HashMap<DeviceId, Peer>>>,
     pub events: Arc<Mutex<EventLog>>,
 }
 
@@ -544,7 +556,7 @@ pub struct Node {
     doorbell: Arc<Mutex<DoorbellRing>>,
     doorbell_notify: Arc<Notify>,
     /// Peers we currently have an in-flight sync pull to (dedupes announce storms).
-    syncing: Arc<Mutex<HashSet<EndpointId>>>,
+    syncing: Arc<Mutex<HashSet<DeviceId>>>,
     /// Ephemeral join-request actor inceptions, keyed by the requesting device.
     /// Bounded and NEVER persisted here — an inception only enters the synced
     /// membership doc when an admin actually admits (redeem/approve), so an
@@ -575,13 +587,15 @@ impl Node {
         tasks.spawn(fut);
     }
 
-    fn touch(&self, id: EndpointId, nick: Option<String>) -> String {
+    fn touch(&self, id: &DeviceId, nick: Option<String>) -> String {
         // A newly-seen peer must be reachable before we dial it back (Local).
-        self.peers.learn(id);
+        if let Ok(ep) = endpoint_of(id) {
+            self.peers.learn(ep);
+        }
         let now = Instant::now();
         let came_online = {
             let mut p = self.shared.presence.lock().unwrap();
-            match p.get_mut(&id) {
+            match p.get_mut(id) {
                 Some(entry) => {
                     entry.last_seen = now;
                     let came = entry.presence.seen(now);
@@ -593,11 +607,9 @@ impl Node {
                     came
                 }
                 None => {
-                    let nm = nick
-                        .filter(|n| !n.is_empty())
-                        .unwrap_or_else(|| id.fmt_short().to_string());
+                    let nm = nick.filter(|n| !n.is_empty()).unwrap_or_else(|| id.short());
                     p.insert(
-                        id,
+                        id.clone(),
                         Peer {
                             nick: nm,
                             last_seen: now,
@@ -609,11 +621,11 @@ impl Node {
                 }
             }
         };
-        let display = self.display_nick(&id);
-        if came_online && id != self.shared.my_id {
+        let display = self.display_nick(id);
+        if came_online && *id != self.shared.my_id {
             self.shared.events.lock().unwrap().push(
                 EventKind::Presence,
-                id.to_string(),
+                id.as_str().to_string(),
                 display.clone(),
                 format!("{display} is online"),
             );
@@ -622,10 +634,10 @@ impl Node {
         display
     }
 
-    fn mark_offline(&self, id: EndpointId, left: bool) {
+    fn mark_offline(&self, id: &DeviceId, left: bool) {
         let visible = {
             let mut p = self.shared.presence.lock().unwrap();
-            match p.get_mut(&id) {
+            match p.get_mut(id) {
                 Some(peer) => peer.presence.force_offline(),
                 None => false,
             }
@@ -635,7 +647,7 @@ impl Node {
         }
     }
 
-    fn on_neighbor_down(self: Arc<Self>, id: EndpointId) {
+    fn on_neighbor_down(self: Arc<Self>, id: DeviceId) {
         let became_suspect = {
             let mut p = self.shared.presence.lock().unwrap();
             match p.get_mut(&id) {
@@ -648,55 +660,53 @@ impl Node {
         }
     }
 
-    async fn probe_peer(self: Arc<Self>, id: EndpointId) {
-        let alive =
-            match tokio::time::timeout(PROBE_TIMEOUT, self.endpoint.connect(id, PRESENCE_ALPN))
-                .await
-            {
-                Ok(Ok(conn)) => {
-                    conn.close(0u32.into(), b"probe");
-                    true
-                }
-                _ => false,
-            };
+    async fn probe_peer(self: Arc<Self>, id: DeviceId) {
+        let alive = match endpoint_of(&id) {
+            Ok(ep) => matches!(
+                tokio::time::timeout(PROBE_TIMEOUT, self.endpoint.connect(ep, PRESENCE_ALPN)).await,
+                Ok(Ok(_))
+            ),
+            Err(_) => false,
+        };
         let transition = {
             let mut p = self.shared.presence.lock().unwrap();
             p.get_mut(&id)
                 .and_then(|peer| peer.presence.probe_result(alive, Instant::now()))
         };
         match transition {
-            Some(true) => self.announce_online(id),
-            Some(false) => self.announce_offline(id, false),
+            Some(true) => self.announce_online(&id),
+            Some(false) => self.announce_offline(&id, false),
             None => {}
         }
     }
 
-    fn announce_online(&self, id: EndpointId) {
-        if id == self.shared.my_id {
+    fn announce_online(&self, id: &DeviceId) {
+        if *id == self.shared.my_id {
             return;
         }
-        let display = self.display_nick(&id);
+        let display = self.display_nick(id);
         self.shared.events.lock().unwrap().push(
             EventKind::Presence,
-            id.to_string(),
+            id.as_str().to_string(),
             display.clone(),
             format!("{display} is online"),
         );
         self.ring_presence_doorbell();
     }
 
-    fn announce_offline(&self, id: EndpointId, left: bool) {
-        let display = self.display_nick(&id);
+    fn announce_offline(&self, id: &DeviceId, left: bool) {
+        let display = self.display_nick(id);
         let text = if left {
             format!("{display} left")
         } else {
             format!("{display} went offline")
         };
-        self.shared
-            .events
-            .lock()
-            .unwrap()
-            .push(EventKind::Presence, id.to_string(), display, text);
+        self.shared.events.lock().unwrap().push(
+            EventKind::Presence,
+            id.as_str().to_string(),
+            display,
+            text,
+        );
         self.ring_presence_doorbell();
     }
 
@@ -708,15 +718,15 @@ impl Node {
                 _ = self.cancel.cancelled() => break,
             }
             let now = Instant::now();
-            let stale: Vec<EndpointId> = {
+            let stale: Vec<DeviceId> = {
                 let p = self.shared.presence.lock().unwrap();
                 p.iter()
                     .filter(|(_, peer)| peer.presence.should_reap(now))
-                    .map(|(id, _)| *id)
+                    .map(|(id, _)| id.clone())
                     .collect()
             };
             for id in stale {
-                self.mark_offline(id, false);
+                self.mark_offline(&id, false);
             }
             self.shared.presence.lock().unwrap().retain(|_, peer| {
                 peer.presence.is_online() || peer.last_seen.elapsed() < PRUNE_WINDOW
@@ -724,42 +734,42 @@ impl Node {
         }
     }
 
-    fn display_nick(&self, id: &EndpointId) -> String {
+    fn display_nick(&self, id: &DeviceId) -> String {
         self.shared
             .presence
             .lock()
             .unwrap()
             .get(id)
             .map(|p| p.nick.clone())
-            .unwrap_or_else(|| id.fmt_short().to_string())
+            .unwrap_or_else(|| id.short())
     }
 
-    async fn handle_payload(self: &Arc<Self>, from: EndpointId, payload: Payload) {
+    async fn handle_payload(self: &Arc<Self>, from: DeviceId, payload: Payload) {
         match payload {
             Payload::Hello { nick } => {
-                self.touch(from, Some(nick));
+                self.touch(&from, Some(nick));
                 // A newly visible peer may have state we missed; pull to backfill.
                 self.clone().trigger_pull(from);
             }
             Payload::Presence { nick, state } => {
-                self.touch(from, Some(nick));
+                self.touch(&from, Some(nick));
                 if let Some(p) = self.shared.presence.lock().unwrap().get_mut(&from) {
                     p.away = matches!(state, crate::proto::PresenceState::Away);
                 }
             }
             Payload::Bye { nick } => {
-                self.touch(from, Some(nick));
-                self.mark_offline(from, true);
+                self.touch(&from, Some(nick));
+                self.mark_offline(&from, true);
             }
             Payload::JoinRequest {
                 nick,
                 invite,
                 incept,
             } => {
-                let display = self.touch(from, Some(nick.clone()));
+                let display = self.touch(&from, Some(nick.clone()));
                 self.shared.events.lock().unwrap().push(
                     EventKind::Join,
-                    from.to_string(),
+                    from.as_str().to_string(),
                     display.clone(),
                     format!("{display} joined the room"),
                 );
@@ -770,10 +780,9 @@ impl Node {
                 // unauthenticated peer cannot grow the container.
                 if let Some(incept) = &incept {
                     const MAX_PENDING_INCEPTS: usize = 256;
-                    let dev = DeviceId::from_key_string(from.to_string());
                     let mut pend = self.pending_incepts.lock().unwrap();
-                    if pend.contains_key(&dev) || pend.len() < MAX_PENDING_INCEPTS {
-                        pend.insert(dev, incept.clone());
+                    if pend.contains_key(&from) || pend.len() < MAX_PENDING_INCEPTS {
+                        pend.insert(from.clone(), incept.clone());
                     }
                 }
                 // Pattern A: if the joiner presented a valid pre-authorization and
@@ -781,7 +790,7 @@ impl Node {
                 // On any failure we simply leave the request pending (the event
                 // above already surfaces it to `members requests`).
                 if let Some(invite) = invite {
-                    self.clone().try_auto_approve(from, invite, incept);
+                    self.clone().try_auto_approve(&from, invite, incept);
                 }
                 // a joiner wants our state — and may have state we lack; pull.
                 self.clone().trigger_pull(from);
@@ -790,7 +799,7 @@ impl Node {
                 space,
                 catalog_head,
             } => {
-                self.touch(from, None);
+                self.touch(&from, None);
                 let (our_ws, our_head) = {
                     let t = self.replica.lock().unwrap();
                     (t.space_str(), t.sync_head_bytes())
@@ -807,22 +816,24 @@ impl Node {
     /// Spawn a deduplicated sync pull from a peer. At most one in-flight pull
     /// per peer; on success (something changed) ring a doorbell and re-announce
     /// so peers that are behind us pull in turn.
-    fn trigger_pull(self: Arc<Self>, peer: EndpointId) {
+    fn trigger_pull(self: Arc<Self>, peer: DeviceId) {
         if peer == self.shared.my_id {
             return;
         }
         // Ensure the sync dial can resolve the peer under Local.
-        self.peers.learn(peer);
+        if let Ok(ep) = endpoint_of(&peer) {
+            self.peers.learn(ep);
+        }
         let cancel = self.cancel.clone();
         let tracker = self.clone();
         tracker.spawn(async move {
-            if !self.syncing.lock().unwrap().insert(peer) {
+            if !self.syncing.lock().unwrap().insert(peer.clone()) {
                 return; // already syncing this peer
             }
             // A pull has no read deadline of its own (a stalled peer would park
             // the task forever), so teardown is what bounds it.
             let result = tokio::select! {
-                r = self.do_pull(peer) => r,
+                r = self.do_pull(&peer) => r,
                 _ = cancel.cancelled() => Err(anyhow!("daemon shutting down")),
             };
             self.syncing.lock().unwrap().remove(&peer);
@@ -842,10 +853,11 @@ impl Node {
         });
     }
 
-    async fn do_pull(&self, peer: EndpointId) -> Result<crate::replica::DirtySet> {
+    async fn do_pull(&self, peer: &DeviceId) -> Result<crate::replica::DirtySet> {
         let conn = tokio::time::timeout(
             Duration::from_secs(20),
-            self.endpoint.connect(peer, crate::sync::SYNC_ALPN),
+            self.endpoint
+                .connect(endpoint_of(peer)?, crate::sync::SYNC_ALPN),
         )
         .await
         .map_err(|_| anyhow!("connect to peer for sync timed out"))??;
@@ -870,11 +882,11 @@ impl Node {
     /// Snapshot the peers we currently know (excluding ourselves) and persist
     /// them as the next start's gossip bootstrap set. Best-effort.
     fn persist_known_peers(&self) {
-        let peers: Vec<EndpointId> = {
+        let peers: Vec<DeviceId> = {
             let p = self.shared.presence.lock().unwrap();
             p.keys()
-                .copied()
-                .filter(|id| *id != self.shared.my_id)
+                .filter(|id| **id != self.shared.my_id)
+                .cloned()
                 .collect()
         };
         if !peers.is_empty() {
@@ -904,15 +916,18 @@ impl Node {
         Ok(())
     }
 
-    async fn join_topic(self: &Arc<Self>, topic: TopicId, peers: Vec<EndpointId>) -> Result<()> {
+    async fn join_topic(self: &Arc<Self>, topic: TopicId, peers: Vec<DeviceId>) -> Result<()> {
         // Register the bootstrap peers (e.g. a ticket's host) before gossip dials
         // them, so bare-id resolution succeeds under Local.
+        let mut ids = Vec::with_capacity(peers.len());
         for id in &peers {
-            self.peers.learn(*id);
+            let ep = endpoint_of(id)?;
+            self.peers.learn(ep);
+            ids.push(ep);
         }
         let gtopic = tokio::time::timeout(
             Duration::from_secs(15),
-            self.gossip.subscribe_and_join(topic, peers),
+            self.gossip.subscribe_and_join(topic, ids),
         )
         .await
         .map_err(|_| anyhow!("timed out connecting to the room's peers"))?
@@ -943,8 +958,9 @@ impl Node {
         // Under Isolated the host is reachable only at the addresses the ticket
         // carries — register them so the bare-id dial below resolves. A no-op for
         // Public/Local tickets (which carry none and resolve by relay/discovery).
+        let host = DeviceId::from_key_string(ticket.host.to_string());
         self.peers.learn_direct(ticket.host, &ticket.host_addrs);
-        self.join_topic(ticket.topic(), vec![ticket.host]).await?;
+        self.join_topic(ticket.topic(), vec![host.clone()]).await?;
         // Mint (or recover) our actor inception so an admin can admit our actor.
         let incept = self.replica.lock().unwrap().self_inception().ok();
         // Seal the pre-authorization to the HOST and bind it to our actor, so the
@@ -954,8 +970,7 @@ impl Node {
         let sealed_invite = match (&ticket.invite, &incept) {
             (Some(inv), Some(ic)) => {
                 let redeemer = crate::ids::ActorId::from_incept_hash(&ic.hash());
-                let host_device = DeviceId::from_key_string(ticket.host.to_string());
-                seal_bound_invite(&host_device, inv, &redeemer)
+                seal_bound_invite(&host, inv, &redeemer)
             }
             _ => None,
         };
@@ -967,7 +982,7 @@ impl Node {
         .await
         .ok();
         let _ = self.broadcast_announce().await;
-        self.clone().trigger_pull(ticket.host);
+        self.clone().trigger_pull(host);
         Ok(())
     }
 
@@ -1011,7 +1026,7 @@ impl Node {
     async fn seed_add(self: &Arc<Self>, arg: &str) -> Result<Response> {
         // Try the ticket form first; a bare id will not decode as a ticket.
         if let Ok(ticket) = arg.parse::<SpaceTicket>() {
-            let id = ticket.host;
+            let id = DeviceId::from_key_string(ticket.host.to_string());
             if id == self.shared.my_id {
                 return Ok(Response::err("that ticket points at this node's own id"));
             }
@@ -1026,12 +1041,12 @@ impl Node {
             let newly = upsert_seed(
                 &self.home,
                 SeedRecord {
-                    id,
+                    id: id.clone(),
                     nick: ticket.host_nick.clone(),
                     space: ticket.space.clone(),
                 },
             );
-            self.clone().trigger_pull(id);
+            self.clone().trigger_pull(id.clone());
             return Ok(Response::Ok {
                 message: Some(format!(
                     "{} seed {id} \u{2014} backfilling",
@@ -1039,7 +1054,7 @@ impl Node {
                 )),
             });
         }
-        if let Ok(id) = arg.parse::<EndpointId>() {
+        if let Some(id) = DeviceId::parse(arg) {
             if id == self.shared.my_id {
                 return Ok(Response::err("that's this node's own id"));
             }
@@ -1047,12 +1062,12 @@ impl Node {
             let newly = upsert_seed(
                 &self.home,
                 SeedRecord {
-                    id,
+                    id: id.clone(),
                     nick: String::new(),
                     space,
                 },
             );
-            self.clone().trigger_pull(id);
+            self.clone().trigger_pull(id.clone());
             return Ok(Response::Ok {
                 message: Some(format!(
                     "{} seed {id}",
@@ -1065,7 +1080,7 @@ impl Node {
             });
         }
         Ok(Response::err(
-            "expected a room ticket (from `lait invite`) or an endpoint id",
+            "expected a room ticket (from `lait invite`) or a 64-character device id",
         ))
     }
 
@@ -1082,7 +1097,13 @@ impl Node {
                 Ok(Some(event)) => match event {
                     Event::Received(msg) => {
                         match SignedMessage::verify_and_decode(&self.space, &msg.content) {
-                            Ok((from, payload)) => self.handle_payload(from, payload).await,
+                            Ok((from, payload)) => {
+                                self.handle_payload(
+                                    DeviceId::from_key_string(from.to_string()),
+                                    payload,
+                                )
+                                .await
+                            }
                             // A decode failure here is almost always a version-skewed
                             // peer: postcard is not self-describing, so a payload whose
                             // shape changed across releases fails to deserialize (see
@@ -1099,14 +1120,16 @@ impl Node {
                         }
                     }
                     Event::NeighborUp(id) => {
-                        self.touch(id, None);
+                        let id = DeviceId::from_key_string(id.to_string());
+                        self.touch(&id, None);
                         // The mesh formed with this peer: pull to converge and
                         // persist it immediately for restart bootstrap.
                         self.clone().trigger_pull(id);
                         self.persist_known_peers();
                     }
                     Event::NeighborDown(id) => {
-                        self.clone().on_neighbor_down(id);
+                        self.clone()
+                            .on_neighbor_down(DeviceId::from_key_string(id.to_string()));
                     }
                     Event::Lagged => {}
                 },
@@ -1226,11 +1249,6 @@ impl Node {
         }
     }
 
-    /// Our key as a [`DeviceId`]; the endpoint ID is the Ed25519 key.
-    fn my_device_id(&self) -> DeviceId {
-        DeviceId::from_key_string(self.shared.my_id.to_string())
-    }
-
     /// Pattern A: try to auto-admit `joiner` against a presented invite. Verifies
     /// the issuer signature, the space binding, and expiry here (transport
     /// concerns), then hands the state-dependent checks + sealing to the replica's
@@ -1240,7 +1258,7 @@ impl Node {
     /// freshly-sealed joiner pulls and decrypts.
     fn try_auto_approve(
         self: Arc<Self>,
-        _joiner_id: EndpointId,
+        _joiner_id: &DeviceId,
         sealed: Vec<u8>,
         incept: Option<crate::actor::SignedEvent>,
     ) {
@@ -1250,7 +1268,7 @@ impl Node {
         // kept the nonce off the topic — and only for the actor it names, so a
         // blob copied off the wire cannot be re-paired with an eavesdropper's
         // inception.
-        let me = DeviceId::from_key_string(self.shared.my_id.to_string());
+        let me = self.shared.my_id.clone();
         let Some(invite) = open_bound_invite(&self.secret_key.to_bytes(), &me, &sealed, &incept)
         else {
             return;
@@ -1293,11 +1311,11 @@ impl Node {
     /// (after `--as bob`) and `assign ENG-1 c3ab21` into real keys.
     fn device_directory(&self) -> Vec<KnownDevice> {
         let mut keys: HashSet<DeviceId> = HashSet::new();
-        keys.insert(self.my_device_id());
+        keys.insert(self.shared.my_id.clone());
         {
             let presence = self.shared.presence.lock().unwrap();
             for id in presence.keys() {
-                keys.insert(DeviceId::from_key_string(id.to_string()));
+                keys.insert(id.clone());
             }
         }
         {
@@ -1376,7 +1394,7 @@ impl Node {
             return Ok(req);
         }
         let dir = self.device_directory();
-        let me = self.my_device_id();
+        let me = self.shared.my_id.clone();
         let resolve = |who: &str| -> std::result::Result<String, Response> {
             match resolve_device_dir(who, &me, &dir) {
                 DeviceResolution::One(u) => Ok(u.as_str().to_string()),
@@ -1612,7 +1630,7 @@ impl Node {
             // the name locally — never synced, never a signed op.
             Request::MemberAlias { who, name } => {
                 let dir = self.device_directory();
-                match resolve_device_dir(who.trim(), &self.my_device_id(), &dir) {
+                match resolve_device_dir(who.trim(), &self.shared.my_id.clone(), &dir) {
                     DeviceResolution::One(u) => {
                         let name = name.trim();
                         upsert_alias(&self.home, u.as_str(), name);
@@ -1654,7 +1672,7 @@ impl Node {
                         nick: String::new(),
                     })
                     .collect();
-                match resolve_device_dir(who.trim(), &self.my_device_id(), &dir) {
+                match resolve_device_dir(who.trim(), &self.shared.my_id.clone(), &dir) {
                     DeviceResolution::One(u) => {
                         let key = u.as_str().to_string();
                         // Import the joiner's stashed inception (from its join
@@ -1847,7 +1865,7 @@ impl Node {
                 let ticket = SpaceTicket {
                     space,
                     name,
-                    host: self.shared.my_id,
+                    host: endpoint_of(&self.shared.my_id)?,
                     host_nick: self.shared.nick(),
                     salt,
                     recovery_root,
@@ -1884,7 +1902,7 @@ impl Node {
                             _ => ("offline", false),
                         };
                         SeedDto {
-                            id: s.id.to_string(),
+                            id: s.id.as_str().to_string(),
                             nick: s.nick,
                             space: s.space,
                             state: state.to_string(),
@@ -1927,7 +1945,7 @@ impl Node {
                             "online"
                         };
                         PresenceEntry {
-                            id: id.to_string(),
+                            id: id.as_str().to_string(),
                             nick: p.nick.clone(),
                             state: state.to_string(),
                             online,
@@ -1957,7 +1975,7 @@ impl Node {
                         .filter(|n| !n.is_empty());
                     let pres = presence
                         .iter()
-                        .find(|(id, _)| id.to_string() == actor)
+                        .find(|(id, _)| id.as_str() == actor)
                         .map(|(_, p)| p.nick.clone())
                         .filter(|n| !n.is_empty());
                     let short: String = actor.chars().take(8).collect();
@@ -2054,7 +2072,7 @@ impl Node {
         {
             return true;
         }
-        !load_bootstrap_peers(&self.home, self.shared.my_id).is_empty()
+        !load_bootstrap_peers(&self.home, &self.shared.my_id).is_empty()
     }
 
     async fn idle_shutdown_loop(self: Arc<Self>) {
@@ -2271,13 +2289,13 @@ pub async fn run_daemon_with(home: PathBuf, seed: bool, identity_dir: PathBuf) -
         );
     }
     let (endpoint, peers) = crate::net::build_endpoint(&secret_key, &network).await?;
-    let my_id = endpoint.id();
+    let my_id = DeviceId::from_key_string(endpoint.id().to_string());
 
     let gossip = Gossip::builder().spawn(endpoint.clone());
 
     let shared = Shared {
         nick: Arc::new(Mutex::new(nick)),
-        my_id,
+        my_id: my_id.clone(),
         presence: Arc::new(Mutex::new(HashMap::new())),
         events: Arc::new(Mutex::new(EventLog::default())),
     };
@@ -2311,20 +2329,23 @@ pub async fn run_daemon_with(home: PathBuf, seed: bool, identity_dir: PathBuf) -
     // rejoins the mesh instead of waiting to be re-announced, unioned with the
     // explicit, sticky seed pins so a restart always dials its
     // always-on seeds even when no ordinary peer was seen last run.
-    let pinned_seeds = seed_ids(&home, my_id);
-    let mut bootstrap = load_bootstrap_peers(&home, my_id);
+    let pinned_seeds = seed_ids(&home, &my_id);
+    let mut bootstrap = load_bootstrap_peers(&home, &my_id);
     for id in &pinned_seeds {
         if !bootstrap.contains(id) {
-            bootstrap.push(*id);
+            bootstrap.push(id.clone());
         }
     }
     // Teach the endpoint how to reach each bootstrap peer before dialing them
     // (under Local this registers `{id, relay}`; under Public it is a no-op).
+    let mut bootstrap_ids = Vec::with_capacity(bootstrap.len());
     for id in &bootstrap {
-        peers.learn(*id);
+        let ep = endpoint_of(id)?;
+        peers.learn(ep);
+        bootstrap_ids.push(ep);
     }
     let gtopic = gossip
-        .subscribe(topic, bootstrap)
+        .subscribe(topic, bootstrap_ids)
         .await
         .map_err(|e| anyhow!("subscribe to room: {e}"))?;
     let (sender, receiver) = gtopic.split();
@@ -2477,8 +2498,7 @@ mod tests {
 
         let ws = SpaceId::mint(&SystemUlidSource);
         let host_seed = [10u8; 32];
-        let host_sk = SecretKey::from_bytes(&host_seed);
-        let host = DeviceId::from_key_string(host_sk.public().to_string());
+        let host = crate::crypto::device_from_seed(&host_seed);
 
         // The legit joiner and an eavesdropper, each with their own actor.
         let (j_incept, j_actor) = incept_single(&[11u8; 32], &ws, [1u8; 16], [2u8; 16], None);
@@ -2501,8 +2521,7 @@ mod tests {
             "a copied blob cannot admit a different actor"
         );
         // And a non-host cannot even read the blob — the nonce stays off the topic.
-        let atk_device =
-            DeviceId::from_key_string(SecretKey::from_bytes(&[12u8; 32]).public().to_string());
+        let atk_device = crate::crypto::device_from_seed(&[12u8; 32]);
         assert!(
             open_bound_invite(&[12u8; 32], &atk_device, &sealed, &j_incept).is_none(),
             "only the host can open the sealed invite"
@@ -2560,16 +2579,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let me = SecretKey::from_bytes(&[1u8; 32]).public();
-        let peer = SecretKey::from_bytes(&[2u8; 32]).public();
+        let me = crate::crypto::device_from_seed(&[1u8; 32]);
+        let peer = crate::crypto::device_from_seed(&[2u8; 32]);
 
         // Nothing persisted yet → empty bootstrap (the old always-empty case).
-        assert!(load_bootstrap_peers(&dir, me).is_empty());
+        assert!(load_bootstrap_peers(&dir, &me).is_empty());
 
         // Persist a set that includes ourselves; reload must drop self and keep
         // the real peer, so a restart bootstraps from the peer.
-        save_known_peers(&dir, &[me, peer]);
-        assert_eq!(load_bootstrap_peers(&dir, me), vec![peer]);
+        save_known_peers(&dir, &[me.clone(), peer.clone()]);
+        assert_eq!(load_bootstrap_peers(&dir, &me), vec![peer]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2582,8 +2601,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let a = SecretKey::from_bytes(&[2u8; 32]).public();
-        let b = SecretKey::from_bytes(&[3u8; 32]).public();
+        let a = crate::crypto::device_from_seed(&[2u8; 32]);
+        let b = crate::crypto::device_from_seed(&[3u8; 32]);
 
         assert!(load_seeds(&dir).is_empty());
 
@@ -2591,7 +2610,7 @@ mod tests {
         assert!(upsert_seed(
             &dir,
             SeedRecord {
-                id: a,
+                id: a.clone(),
                 nick: "nas".into(),
                 space: "ws".into()
             }
@@ -2599,7 +2618,7 @@ mod tests {
         assert!(!upsert_seed(
             &dir,
             SeedRecord {
-                id: a,
+                id: a.clone(),
                 nick: "nas2".into(),
                 space: "ws".into()
             }
@@ -2610,21 +2629,21 @@ mod tests {
         assert!(upsert_seed(
             &dir,
             SeedRecord {
-                id: b,
+                id: b.clone(),
                 nick: String::new(),
                 space: "ws".into()
             }
         ));
         // Bootstrap ids list both, but filter out our own id when we are `a`.
-        assert_eq!(seed_ids(&dir, b).len(), 1);
+        assert_eq!(seed_ids(&dir, &b).len(), 1);
         assert_eq!(
-            seed_ids(&dir, SecretKey::from_bytes(&[9u8; 32]).public()).len(),
+            seed_ids(&dir, &crate::crypto::device_from_seed(&[9u8; 32])).len(),
             2
         );
 
         // Remove by nick, then by full id.
         assert_eq!(remove_seed(&dir, "nas2"), 1);
-        assert_eq!(remove_seed(&dir, &b.to_string()), 1);
+        assert_eq!(remove_seed(&dir, b.as_str()), 1);
         assert!(load_seeds(&dir).is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
