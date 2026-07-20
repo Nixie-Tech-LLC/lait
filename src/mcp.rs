@@ -175,7 +175,7 @@ pub struct IssueMoveArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct AssignArgs {
     pub reff: String,
-    /// User refs to add/remove (`@me` or key).
+    /// Who-refs to add/remove (`@me` or key).
     pub who: Vec<String>,
     /// Remove instead of add.
     #[serde(default)]
@@ -261,7 +261,7 @@ pub struct ActivityArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MemberAddArgs {
-    /// A user ref: `@me`, a local alias, a key id-prefix, or a 64-hex ed25519 key.
+    /// A who-ref: `@me`, a local alias, a key id-prefix, or a 64-hex ed25519 key.
     pub who: String,
     /// Grant the admin role.
     #[serde(default)]
@@ -294,7 +294,7 @@ pub struct MemberApproveArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MemberAliasArgs {
-    /// A user ref: a key id-prefix, a full key, or an existing alias.
+    /// A who-ref: a key id-prefix, a full key, or an existing alias.
     pub who: String,
     /// The petname to assign (empty string clears it).
     pub name: String,

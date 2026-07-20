@@ -415,7 +415,7 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
             }
             Special::Id => {
                 let seed = load_or_create_identity(&config::identity_dir()?)?;
-                crate::cli::emit_text(crate::crypto::user_from_seed(&seed).as_str(), out);
+                crate::cli::emit_text(crate::crypto::device_from_seed(&seed).as_str(), out);
             }
             Special::Daemon => {
                 tracing_subscriber::fmt()
@@ -529,7 +529,7 @@ async fn run_init(m: &ArgMatches, out: Out) -> Result<()> {
         cfg.save(&p)?;
     }
     let seed = load_or_create_identity(&config::identity_dir()?)?;
-    let me = crate::crypto::user_from_seed(&seed);
+    let me = crate::crypto::device_from_seed(&seed);
     let store = Store::open(&home)?;
     let (ws, project) =
         crate::replica::found_workspace(&store, &me, &seed, &name, &SystemUlidSource)?;

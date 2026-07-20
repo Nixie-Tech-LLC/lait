@@ -19,8 +19,8 @@ use lait::transport::{Alpn, GossipEvent, Topic, Transport};
 const SYNC_ALPN: Alpn = b"lait/sync/1";
 const PRESENCE_ALPN: Alpn = b"lait/presence/1";
 
-fn user(seed: u8) -> lait::ids::UserId {
-    lait::crypto::user_from_seed(&[seed; 32])
+fn device(seed: u8) -> lait::ids::DeviceId {
+    lait::crypto::device_from_seed(&[seed; 32])
 }
 
 /// Two Isolated transports that can reach each other: build both, then cross-
@@ -67,14 +67,14 @@ async fn connect_accept_roundtrip_by_alpn() {
     });
 
     let run = tokio::time::timeout(Duration::from_secs(20), async {
-        let mut s = a.connect(user(2), SYNC_ALPN).await.expect("connect sync");
+        let mut s = a.connect(device(2), SYNC_ALPN).await.expect("connect sync");
         s.send(b"ping").await.unwrap();
         assert_eq!(s.recv().await.unwrap().as_deref(), Some(&b"pong"[..]));
         drop(s);
         // A presence dial: connecting alone is the signal; open the stream so the
         // accepter's lazy accept_bi has something to observe.
         let mut p = a
-            .connect(user(2), PRESENCE_ALPN)
+            .connect(device(2), PRESENCE_ALPN)
             .await
             .expect("connect presence");
         p.send(b"hi").await.ok();
@@ -140,13 +140,16 @@ async fn framing_interops_with_legacy_read_msg_bytes() {
         .await
         .expect("build dialer");
     dialer.learn(
-        lait::ids::UserId::from_key_string(raw_id.to_string()),
+        lait::ids::DeviceId::from_key_string(raw_id.to_string()),
         &raw_addrs,
     );
 
     tokio::time::timeout(Duration::from_secs(20), async {
         let mut s = dialer
-            .connect(lait::ids::UserId::from_key_string(raw_id.to_string()), ALPN)
+            .connect(
+                lait::ids::DeviceId::from_key_string(raw_id.to_string()),
+                ALPN,
+            )
             .await
             .expect("connect");
         s.send(b"alpha").await.unwrap();
@@ -192,7 +195,7 @@ async fn r1_trailing_frames_survive_accepter_finishing_first() {
     });
 
     tokio::time::timeout(Duration::from_secs(30), async {
-        let mut s = a.connect(user(4), ALPN).await.expect("connect");
+        let mut s = a.connect(device(4), ALPN).await.expect("connect");
         s.send(b"go").await.unwrap();
         // Delay before draining — this is what surfaces a missing wait_closed.
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -229,7 +232,7 @@ async fn wait_closed_parks_until_dialer_drops() {
     });
 
     tokio::time::timeout(Duration::from_secs(20), async {
-        let mut s = a.connect(user(6), ALPN).await.expect("connect");
+        let mut s = a.connect(device(6), ALPN).await.expect("connect");
         s.send(b"go").await.unwrap();
         assert_eq!(s.recv().await.unwrap().as_deref(), Some(&b"payload"[..]));
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -337,7 +340,8 @@ async fn probe_semantics_connect_fails_when_peer_down() {
     let (a, b) = isolated_pair(10, 11, &[SYNC_ALPN]).await;
     b.shutdown().await;
     // With the accepter's endpoint closed, the dial cannot complete.
-    let result = tokio::time::timeout(Duration::from_secs(8), a.connect(user(11), SYNC_ALPN)).await;
+    let result =
+        tokio::time::timeout(Duration::from_secs(8), a.connect(device(11), SYNC_ALPN)).await;
     match result {
         Ok(Err(_)) => {} // connect errored — the liveness signal
         Err(_) => {}     // or timed out — also "peer is down"

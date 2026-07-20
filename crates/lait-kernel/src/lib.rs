@@ -15,7 +15,7 @@
 //!
 //! What lives here is pure over identity + signed bytes:
 //!
-//! - [`ids`] — self-certifying identity types (a `UserId` *is* an ed25519 key).
+//! - [`ids`] — self-certifying identity types (a `DeviceId` *is* an ed25519 key).
 //! - [`crypto`] — sealing/identity primitives (pure RustCrypto/dalek).
 //! - [`sigdag`] — the signed hash-DAG envelope every trust plane rides.
 //! - [`genesis`] — the root of trust that seeds every replay.

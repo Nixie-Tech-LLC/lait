@@ -4,7 +4,7 @@
 //! carrying a **lait** ed25519 signature over a `Payload` — authored, signed, and
 //! verified by [`crate::sigdag`], lait's own signing plane. (This once mirrored
 //! iroh-gossip's `chat.rs` example and signed with the transport's key type; the
-//! authenticity is now lait's, so a message's author is a lait [`UserId`], not an
+//! authenticity is now lait's, so a message's author is a lait [`DeviceId`], not an
 //! iroh key, and the primitive is the same one the trust planes use.)
 //!
 //! iroh's own types appear here only where they *are* the transport: the gossip
@@ -20,7 +20,7 @@ use iroh_gossip::proto::TopicId;
 use serde::{Deserialize, Serialize};
 use serde_byte_array::ByteArray;
 
-use crate::ids::UserId;
+use crate::ids::DeviceId;
 
 /// An ed25519 signature is 64 bytes.
 const SIGNATURE_LENGTH: usize = 64;
@@ -32,11 +32,11 @@ type SignatureBytes = ByteArray<SIGNATURE_LENGTH>;
 const GOSSIP_DOMAIN: &[u8] = b"lait/gossip/1";
 const INVITE_DOMAIN: &[u8] = b"lait/invite/1";
 
-/// The `EndpointId` (transport id) of a lait `UserId` — the same 32 bytes, so a
+/// The `EndpointId` (transport id) of a lait `DeviceId` — the same 32 bytes, so a
 /// gossip message's lait-signed author resolves to the peer to dial back.
-fn endpoint_of(user: &UserId) -> Result<EndpointId> {
+fn endpoint_of(device: &DeviceId) -> Result<EndpointId> {
     let raw = data_encoding::HEXLOWER_PERMISSIVE
-        .decode(user.as_str().as_bytes())
+        .decode(device.as_str().as_bytes())
         .ok()
         .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
         .context("author is not a 32-byte key")?;
@@ -108,7 +108,7 @@ impl InviteGrant {
 /// *single-use* checks are enforced by the redeeming node against live state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedInvite {
-    issuer: UserId,
+    issuer: DeviceId,
     grant: Bytes,
     signature: SignatureBytes,
 }
@@ -130,10 +130,10 @@ impl SignedInvite {
     }
 
     /// Verify the issuer signature and decode the grant. Returns the issuer's
-    /// lait `UserId` (what membership is keyed on). The signature is bound to the
+    /// lait `DeviceId` (what membership is keyed on). The signature is bound to the
     /// invite domain and the grant's workspace, so it cannot be a lifted gossip
     /// signature nor replayed for a different workspace.
-    pub fn verify(&self) -> Result<(UserId, InviteGrant)> {
+    pub fn verify(&self) -> Result<(DeviceId, InviteGrant)> {
         let grant: InviteGrant =
             postcard::from_bytes(&self.grant).context("decode invite grant")?;
         if !crate::sigdag::verify_message(
@@ -215,11 +215,11 @@ pub enum PresenceState {
 }
 
 /// A signed, postcard-encoded envelope broadcast over gossip. The author is a
-/// lait [`UserId`], signed by [`crate::sigdag`] — the transport never sees a
+/// lait [`DeviceId`], signed by [`crate::sigdag`] — the transport never sees a
 /// key type of its own here.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SignedMessage {
-    from: UserId,
+    from: DeviceId,
     data: Bytes,
     signature: SignatureBytes,
 }
@@ -391,7 +391,7 @@ mod tests {
     use super::*;
 
     fn host_key() -> EndpointId {
-        endpoint_of(&crate::crypto::user_from_seed(&[7u8; 32])).unwrap()
+        endpoint_of(&crate::crypto::device_from_seed(&[7u8; 32])).unwrap()
     }
 
     /// A bad invite is the most likely thing to go wrong on a new joiner's very
@@ -520,7 +520,7 @@ mod tests {
         let grant = InviteGrant::mint("ws_1".into(), 1_000, 3_600, true);
         let signed = SignedInvite::sign(&seed, &grant).unwrap();
         let (issuer, back) = signed.verify().expect("valid signature verifies");
-        assert_eq!(issuer, crate::crypto::user_from_seed(&seed));
+        assert_eq!(issuer, crate::crypto::device_from_seed(&seed));
         assert_eq!(back, grant);
         assert!(!back.is_expired(4_599) && back.is_expired(4_600));
         // Flip a byte of the signed grant ⇒ verification must fail.
@@ -543,7 +543,7 @@ mod tests {
             .expect("invite survives roundtrip")
             .verify()
             .unwrap();
-        assert_eq!(issuer, crate::crypto::user_from_seed(&seed));
+        assert_eq!(issuer, crate::crypto::device_from_seed(&seed));
         assert_eq!(g, grant);
     }
 }

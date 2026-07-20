@@ -189,7 +189,7 @@ pub fn replay(
     // identically everywhere for a given `actor_asof`, so replay the actor plane
     // once per distinct frontier rather than once per op (the acl.rs shape).
     let mut actor_cache: HashMap<BTreeSet<String>, crate::actor::ActorPlane> = HashMap::new();
-    let mut speaks_for = |device: &crate::ids::UserId,
+    let mut speaks_for = |device: &crate::ids::DeviceId,
                           by: &crate::ids::ActorId,
                           asof: &[String]|
      -> bool {

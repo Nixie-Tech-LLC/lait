@@ -6,7 +6,7 @@
 //!
 //! This is an **imperative façade over a declarative CRDT**: a stable, versioned,
 //! hand-maintained projection of durable state, never an automatic dump. `Ref`s
-//! and `UserRef`s arrive as plain strings and are resolved **daemon-side**.
+//! and `who-ref`s arrive as plain strings and are resolved **daemon-side**.
 
 use std::collections::HashMap;
 use std::path::Path;

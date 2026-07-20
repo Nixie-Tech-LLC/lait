@@ -19,14 +19,14 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-use crate::ids::UserId;
+use crate::ids::DeviceId;
 
 /// A signed op with its causal parents. `op` is the plane's canonical op bytes
 /// (postcard); `parents` are op hashes within the same plane's DAG.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedNode {
     pub op: Vec<u8>,
-    pub author: UserId,
+    pub author: DeviceId,
     pub sig: Vec<u8>,
     pub parents: Vec<String>,
 }
@@ -37,7 +37,7 @@ pub struct SignedNode {
 pub fn payload_to_sign(
     domain: &[u8],
     op: &[u8],
-    author: &UserId,
+    author: &DeviceId,
     parents: &[String],
     workspace_id: &str,
 ) -> [u8; 32] {
@@ -48,7 +48,7 @@ pub fn payload_to_sign(
 /// group signature) over [`payload_to_sign`], with the group public key as author.
 pub fn assemble_signed(
     op: Vec<u8>,
-    author: UserId,
+    author: DeviceId,
     sig: Vec<u8>,
     parents: Vec<String>,
 ) -> SignedNode {
@@ -64,7 +64,7 @@ pub fn assemble_signed(
 fn signing_payload(
     domain: &[u8],
     op: &[u8],
-    author: &UserId,
+    author: &DeviceId,
     parents: &[String],
     workspace_id: &str,
 ) -> [u8; 32] {
@@ -126,7 +126,7 @@ pub fn sign_node(
 ) -> SignedNode {
     let sk = SigningKey::from_bytes(seed);
     let author =
-        UserId::from_key_string(data_encoding::HEXLOWER.encode(sk.verifying_key().as_bytes()));
+        DeviceId::from_key_string(data_encoding::HEXLOWER.encode(sk.verifying_key().as_bytes()));
     let payload = signing_payload(domain, &op_bytes, &author, &parents, workspace_id);
     let sig: Signature = sk.sign(&payload);
     SignedNode {
@@ -143,7 +143,7 @@ pub fn sign_node(
 /// unusable (a gossip signature can never verify as an invite, regardless of
 /// postcard layout), and `workspace_id` closes cross-workspace replay (a message
 /// signed for one topic fails verification on another).
-fn message_payload(domain: &[u8], workspace_id: &str, author: &UserId, msg: &[u8]) -> [u8; 32] {
+fn message_payload(domain: &[u8], workspace_id: &str, author: &DeviceId, msg: &[u8]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(domain);
     h.update(workspace_id.as_bytes());
@@ -162,10 +162,10 @@ pub fn sign_message(
     workspace_id: &str,
     seed: &[u8; 32],
     msg: &[u8],
-) -> (UserId, [u8; 64]) {
+) -> (DeviceId, [u8; 64]) {
     let sk = SigningKey::from_bytes(seed);
     let author =
-        UserId::from_key_string(data_encoding::HEXLOWER.encode(sk.verifying_key().as_bytes()));
+        DeviceId::from_key_string(data_encoding::HEXLOWER.encode(sk.verifying_key().as_bytes()));
     let payload = message_payload(domain, workspace_id, &author, msg);
     (author, sk.sign(&payload).to_bytes())
 }
@@ -176,7 +176,7 @@ pub fn sign_message(
 pub fn verify_message(
     domain: &[u8],
     workspace_id: &str,
-    author: &UserId,
+    author: &DeviceId,
     msg: &[u8],
     sig: &[u8; 64],
 ) -> bool {

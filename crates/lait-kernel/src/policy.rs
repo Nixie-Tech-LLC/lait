@@ -324,7 +324,7 @@ mod tests {
     use super::*;
 
     fn p(n: u8) -> PrincipalId {
-        PrincipalId::of_device(&crate::crypto::user_from_seed(&[n; 32]))
+        PrincipalId::of_device(&crate::crypto::device_from_seed(&[n; 32]))
     }
     fn key(n: u8) -> OwnershipPolicy {
         OwnershipPolicy::Key(p(n))
@@ -531,7 +531,7 @@ mod tests {
                     seed[0] = (i & 0xff) as u8;
                     seed[1] = (i >> 8) as u8;
                     seed[2] = 7;
-                    OwnershipPolicy::Key(PrincipalId::of_device(&crate::crypto::user_from_seed(
+                    OwnershipPolicy::Key(PrincipalId::of_device(&crate::crypto::device_from_seed(
                         &seed,
                     )))
                 })

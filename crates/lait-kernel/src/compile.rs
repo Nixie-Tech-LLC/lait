@@ -598,8 +598,8 @@ mod tests {
     use crate::policy::OwnershipPolicy;
     use std::collections::BTreeSet;
 
-    fn dev(n: u8) -> crate::ids::UserId {
-        crate::crypto::user_from_seed(&[n; 32])
+    fn dev(n: u8) -> crate::ids::DeviceId {
+        crate::crypto::device_from_seed(&[n; 32])
     }
     fn prin(n: u8) -> PrincipalId {
         PrincipalId::of_device(&dev(n))

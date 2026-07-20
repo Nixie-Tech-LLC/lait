@@ -156,7 +156,7 @@ impl Replica {
             return Ok(());
         }
         let plane = self.actor_plane();
-        let member_devices: Vec<UserId> = self
+        let member_devices: Vec<DeviceId> = self
             .acl_state()
             .members()
             .into_iter()

@@ -522,8 +522,8 @@ fn secret_key_path(home: &Path) -> PathBuf {
 ///
 /// lait's identity is the seed, not a transport keypair: it is stored as hex in
 /// `secret.key` and the transport layer constructs its `iroh::SecretKey` from
-/// these bytes ([`crate::crypto::user_from_seed`] maps the same seed to the
-/// `UserId`). The on-disk format is unchanged — 64 hex chars of the 32-byte
+/// these bytes ([`crate::crypto::device_from_seed`] maps the same seed to the
+/// `DeviceId`). The on-disk format is unchanged — 64 hex chars of the 32-byte
 /// seed — so existing keys load as-is.
 pub fn load_or_create_identity(home: &Path) -> Result<[u8; 32]> {
     let path = secret_key_path(home);

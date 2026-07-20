@@ -38,14 +38,14 @@ export function memberName(key: string, member: MemberDto | undefined): string {
  * inventing an identity the system does not have.
  */
 export function Avatar({
-  userKey,
+  deviceKey,
   alias,
   me,
   size = "md",
   className,
 }: {
   /** The ed25519 key — the thing colour is derived from. */
-  userKey: string;
+  deviceKey: string;
   /** Local petname. May be empty; then we draw a glyph, not a hex digit. */
   alias?: string;
   /** Renders the "you" ring. The one member you never have to identify by name. */
@@ -54,8 +54,8 @@ export function Avatar({
   className?: string;
 }) {
   const name = alias?.trim() ?? "";
-  const label = me ? "you" : name || `${userKey.slice(0, 8)}…`;
-  const color = avatarColor(userKey);
+  const label = me ? "you" : name || `${deviceKey.slice(0, 8)}…`;
+  const color = avatarColor(deviceKey);
 
   return (
     <span
@@ -125,7 +125,7 @@ export function AvatarStack({
       {shown.map((m, i) => (
         <Avatar
           key={m.key}
-          userKey={m.key}
+          deviceKey={m.key}
           {...(m.alias !== undefined ? { alias: m.alias } : {})}
           {...(m.me !== undefined ? { me: m.me } : {})}
           size="sm"

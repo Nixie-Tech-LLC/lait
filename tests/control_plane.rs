@@ -110,7 +110,7 @@ impl Drop for Daemon {
 /// uninitialized store — so every home is founded before its daemon spawns.
 fn found_home(home: &Path) {
     let key = lait::config::load_or_create_identity(home).expect("identity");
-    let me = lait::crypto::user_from_seed(&key);
+    let me = lait::crypto::device_from_seed(&key);
     let store = lait::store::Store::open(home).expect("store");
     lait::replica::found_workspace(&store, &me, &key, "test", &lait::ids::SystemUlidSource)
         .expect("found workspace");

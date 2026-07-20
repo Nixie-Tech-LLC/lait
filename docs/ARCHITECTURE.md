@@ -47,7 +47,7 @@ version together as lait's substrate.
 
 ## Identity
 
-A device has an ed25519 key represented by `UserId`. A person or agent is an
+A device has an ed25519 key represented by `DeviceId`. A person or agent is an
 `ActorId`, derived from the hash of an inception event. Actors are scoped to a
 space and therefore do not provide a global cross-space identifier.
 
@@ -114,7 +114,7 @@ until it can encrypt under the active epoch.
 
 ## Networking
 
-Each device's iroh endpoint key is its device `UserId`. Workspace identity comes
+Each device's iroh endpoint key is its `DeviceId`. Workspace identity comes
 from a `WorkspaceId` and genesis, not a display name. Tickets carry the workspace
 anchor, founder actor information, and optional invite authorization.
 

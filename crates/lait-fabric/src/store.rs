@@ -418,7 +418,7 @@ mod tests {
         let home = tmp_home();
         let store = Store::open(&home).unwrap();
         let ws = WorkspaceId::mint(&SystemUlidSource);
-        let me = crate::ids::UserId::from_key_string("a".repeat(64));
+        let me = crate::ids::DeviceId::from_key_string("a".repeat(64));
         let cat = CatalogDoc::create(&ws, "test", None, &me).unwrap();
         let p = ProjectId::mint(&SystemUlidSource);
         cat.add_project(&p, "Eng", "ENG", "blue").unwrap();
@@ -460,7 +460,7 @@ mod tests {
             &ws,
             "test",
             None,
-            &crate::ids::UserId::from_key_string("a".repeat(64)),
+            &crate::ids::DeviceId::from_key_string("a".repeat(64)),
         )
         .unwrap();
         store.save_catalog(&cat).unwrap();

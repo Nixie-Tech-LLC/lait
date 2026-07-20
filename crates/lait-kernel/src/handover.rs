@@ -35,7 +35,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::authority::{AuthorityConfigurationId, LeafId};
 use crate::gaccess::{self, KeyShares, Signature};
-use crate::ids::UserId;
+use crate::ids::DeviceId;
 use crate::transition::{CandidateAuthority, TransitionId, TransitionState};
 
 const INSTALL_DOMAIN: &[u8] = b"lait/space/1/handover/1/install";
@@ -52,7 +52,7 @@ const INSTALL_DOMAIN: &[u8] = b"lait/space/1/handover/1/install";
 pub struct InstallationTerms {
     transition: TransitionId,
     configuration: AuthorityConfigurationId,
-    new_public_key: UserId,
+    new_public_key: DeviceId,
     transcript_commitment: [u8; 32],
     /// The activation custody rule: leaves whose share must be attested. Kept
     /// sorted and deduped so the message is canonical.
@@ -65,7 +65,7 @@ impl InstallationTerms {
     pub fn new(
         transition: TransitionId,
         configuration: AuthorityConfigurationId,
-        new_public_key: UserId,
+        new_public_key: DeviceId,
         transcript_commitment: [u8; 32],
         required_leaves: Vec<LeafId>,
     ) -> Self {
@@ -94,7 +94,7 @@ impl InstallationTerms {
     }
 
     /// The new public key these terms install.
-    pub fn new_public_key(&self) -> &UserId {
+    pub fn new_public_key(&self) -> &DeviceId {
         &self.new_public_key
     }
 
@@ -305,7 +305,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn prin(n: u8) -> PrincipalId {
-        PrincipalId::of_device(&crate::crypto::user_from_seed(&[n; 32]))
+        PrincipalId::of_device(&crate::crypto::device_from_seed(&[n; 32]))
     }
     fn key(n: u8) -> OwnershipPolicy {
         OwnershipPolicy::Key(prin(n))
@@ -332,9 +332,9 @@ mod tests {
         let contribs: Vec<_> = leaves.iter().map(|l| contribute(c, l.clone())).collect();
         aggregate(c, &contribs).expect("aggregate")
     }
-    /// A UserId identity for a DKG public key.
-    fn user_of(group: &GroupKey) -> UserId {
-        UserId::from_key_string(data_encoding::HEXLOWER.encode(&group.public_key()))
+    /// A DeviceId identity for a DKG public key.
+    fn device_of(group: &GroupKey) -> DeviceId {
+        DeviceId::from_key_string(data_encoding::HEXLOWER.encode(&group.public_key()))
     }
     fn tid(byte: u8) -> TransitionId {
         TransitionId::parse_hex(&data_encoding::HEXLOWER.encode(&[byte; 32])).unwrap()
@@ -375,7 +375,7 @@ mod tests {
         let terms = InstallationTerms::new(
             tid(0xC1),
             AuthorityConfigurationId::single(), // stand-in id; identity is what's bound
-            user_of(&new_key),
+            device_of(&new_key),
             [7u8; 32],
             new_leaves.clone(),
         );
@@ -461,7 +461,7 @@ mod tests {
         let terms_a = InstallationTerms::new(
             tid(0xAA),
             AuthorityConfigurationId::single(),
-            user_of(&a_key),
+            device_of(&a_key),
             [1u8; 32],
             a_leaves.clone(),
         );
@@ -477,7 +477,7 @@ mod tests {
         let terms_b = InstallationTerms::new(
             tid(0xAA),
             AuthorityConfigurationId::single(),
-            user_of(&b_key),
+            device_of(&b_key),
             [1u8; 32],
             b_leaves.clone(),
         );
@@ -508,7 +508,7 @@ mod tests {
         let terms = InstallationTerms::new(
             transition,
             AuthorityConfigurationId::single(),
-            user_of(&cand_key),
+            device_of(&cand_key),
             [cand_seed; 32],
             cand_leaves,
         );

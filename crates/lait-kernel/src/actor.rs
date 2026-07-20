@@ -6,7 +6,7 @@
 //! **self-authorized**: an actor adds, revokes, and recovers its own devices;
 //! no admin signs a device event.
 //!
-//! **The split this plane creates.** A `UserId` (ed25519 device key) *signs*;
+//! **The split this plane creates.** A `DeviceId` (ed25519 device key) *signs*;
 //! an [`ActorId`] *is someone*. Every op on every plane is still signed by
 //! exactly one device (the [`SignedNode`] envelope binds the author key into
 //! both signature and content-address — that stays). Authority questions gain
@@ -80,7 +80,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ActorId, UserId, WorkspaceId};
+use crate::ids::{ActorId, DeviceId, WorkspaceId};
 use crate::sigdag::{self, SignedNode};
 
 /// The signing domain for actor key-events (see [`crate::sigdag`]).
@@ -104,7 +104,7 @@ pub type SignedEvent = SignedNode;
 /// signed preimage so it cannot be swapped on a captured consent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceBinding {
-    pub device: UserId,
+    pub device: DeviceId,
     pub nonce: [u8; 16],
     pub consent: Vec<u8>,
 }
@@ -133,7 +133,7 @@ pub enum ActorOp {
     },
     /// Unbind a device from `actor`. Author must be a current device (a
     /// device may revoke itself). Revoke-wins over concurrent adds.
-    RevokeDevice { actor: ActorId, device: UserId },
+    RevokeDevice { actor: ActorId, device: DeviceId },
     /// Recovery: authored by the **recovery key** (the envelope author), which
     /// must hash to the standing commitment. Wholesale-resets the device set
     /// and rolls the commitment. Recovery-wins over concurrent device events.
@@ -189,7 +189,7 @@ pub enum ConsentCtx<'a> {
     Incept {
         incept_nonce: &'a [u8; 16],
         /// The inception's device keys (any order — hashed sorted).
-        devices: &'a [UserId],
+        devices: &'a [DeviceId],
         recovery_commit: &'a Option<[u8; 32]>,
     },
     /// Consent to join an existing actor (`AddDevice` / `Recover`). Freshness
@@ -199,7 +199,7 @@ pub enum ConsentCtx<'a> {
 
 fn consent_payload(
     workspace: &str,
-    device: &UserId,
+    device: &DeviceId,
     binding_nonce: &[u8; 16],
     ctx: &ConsentCtx,
 ) -> [u8; 32] {
@@ -249,7 +249,7 @@ pub fn consent_sign(
 ) -> DeviceBinding {
     let sk = SigningKey::from_bytes(device_seed);
     let device =
-        UserId::from_key_string(data_encoding::HEXLOWER.encode(sk.verifying_key().as_bytes()));
+        DeviceId::from_key_string(data_encoding::HEXLOWER.encode(sk.verifying_key().as_bytes()));
     let payload = consent_payload(workspace, &device, &binding_nonce, ctx);
     let sig: Signature = sk.sign(&payload);
     DeviceBinding {
@@ -275,7 +275,7 @@ pub fn consent_verify(workspace: &str, binding: &DeviceBinding, ctx: &ConsentCtx
 }
 
 fn hex_key(s: &str) -> Option<[u8; 32]> {
-    // Reject any non-hex byte BEFORE slicing: a `UserId` is a bare validated-
+    // Reject any non-hex byte BEFORE slicing: a `DeviceId` is a bare validated-
     // nowhere String, so `s` is attacker-controlled UTF-8. Without this guard a
     // 64-*byte* string containing a multibyte char slices inside a char boundary
     // and panics — and because replay is a pure function every replica runs over
@@ -292,7 +292,7 @@ fn hex_key(s: &str) -> Option<[u8; 32]> {
 
 /// The blake3 hash of an ed25519 public key (the pre-rotation commitment
 /// shape): `blake3(raw 32 key bytes)`.
-pub fn recovery_commitment(recovery_pub: &UserId) -> Option<[u8; 32]> {
+pub fn recovery_commitment(recovery_pub: &DeviceId) -> Option<[u8; 32]> {
     let raw = hex_key(recovery_pub.as_str())?;
     Some(*blake3::hash(&raw).as_bytes())
 }
@@ -311,7 +311,7 @@ pub fn incept_single(
 ) -> (SignedEvent, ActorId) {
     let sk = SigningKey::from_bytes(device_seed);
     let device =
-        UserId::from_key_string(data_encoding::HEXLOWER.encode(sk.verifying_key().as_bytes()));
+        DeviceId::from_key_string(data_encoding::HEXLOWER.encode(sk.verifying_key().as_bytes()));
     let keys = [device];
     let binding = consent_sign(
         device_seed,
@@ -337,7 +337,7 @@ pub fn incept_single(
 /// The materialized state of one actor after replay.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ActorState {
-    pub devices: BTreeSet<UserId>,
+    pub devices: BTreeSet<DeviceId>,
     pub recovery_commit: Option<[u8; 32]>,
     /// Whether recovery has ever fired (renders as a visible identity event).
     pub recovered: bool,
@@ -358,12 +358,12 @@ impl ActorPlane {
         self.actors.contains_key(actor)
     }
     /// Whether `device` currently speaks for `actor`.
-    pub fn is_device_of(&self, actor: &ActorId, device: &UserId) -> bool {
+    pub fn is_device_of(&self, actor: &ActorId, device: &DeviceId) -> bool {
         self.actors
             .get(actor)
             .is_some_and(|s| s.devices.contains(device))
     }
-    pub fn devices_of(&self, actor: &ActorId) -> Vec<UserId> {
+    pub fn devices_of(&self, actor: &ActorId) -> Vec<DeviceId> {
         self.actors
             .get(actor)
             .map(|s| s.devices.iter().cloned().collect())
@@ -373,7 +373,7 @@ impl ActorPlane {
     /// bound ambiguously (a device that consented into two actors forfeits
     /// attribution; authorization is unaffected because ops declare their
     /// actor explicitly).
-    pub fn actor_of_device(&self, device: &UserId) -> Option<&ActorId> {
+    pub fn actor_of_device(&self, device: &DeviceId) -> Option<&ActorId> {
         let mut found = None;
         for (id, st) in &self.actors {
             if st.devices.contains(device) {
@@ -476,7 +476,7 @@ fn replay_inner(
                 continue;
             }
             let author = &nodes[h].author;
-            let keys: Vec<UserId> = devices.iter().map(|b| b.device.clone()).collect();
+            let keys: Vec<DeviceId> = devices.iter().map(|b| b.device.clone()).collect();
             if !keys.iter().any(|k| k == author) {
                 continue;
             }
@@ -596,11 +596,11 @@ fn replay_inner(
     // ---- pass 1 proper: evolve per-actor state in topo order.
     let mut states: BTreeMap<ActorId, ActorState> = BTreeMap::new();
     // Track authorized add/revoke events per (actor, device) for revoke-wins.
-    let mut adds: Vec<(ActorId, UserId, String)> = Vec::new();
-    let mut revokes: Vec<(ActorId, UserId, String)> = Vec::new();
+    let mut adds: Vec<(ActorId, DeviceId, String)> = Vec::new();
+    let mut revokes: Vec<(ActorId, DeviceId, String)> = Vec::new();
     // Single-use consent nonces per actor — a consent may authorize a binding
     // exactly once, so an old consent cannot re-add a device after revocation.
-    let mut consumed: BTreeSet<(ActorId, UserId, [u8; 16])> = BTreeSet::new();
+    let mut consumed: BTreeSet<(ActorId, DeviceId, [u8; 16])> = BTreeSet::new();
 
     for h in &order {
         if strikes.contains(h) {
@@ -719,9 +719,9 @@ mod tests {
     fn seed(n: u8) -> [u8; 32] {
         [n; 32]
     }
-    fn device(n: u8) -> UserId {
+    fn device(n: u8) -> DeviceId {
         let pk = SigningKey::from_bytes(&seed(n)).verifying_key();
-        UserId::from_key_string(data_encoding::HEXLOWER.encode(pk.as_bytes()))
+        DeviceId::from_key_string(data_encoding::HEXLOWER.encode(pk.as_bytes()))
     }
     fn ws() -> WorkspaceId {
         WorkspaceId::mint(&SystemUlidSource)
@@ -899,7 +899,7 @@ mod tests {
         // otherwise crash every replica's replay permanently.
         let w = ws();
         let poison = DeviceBinding {
-            device: UserId::from_key_string(format!("\u{20AC}{}", "a".repeat(61))),
+            device: DeviceId::from_key_string(format!("\u{20AC}{}", "a".repeat(61))),
             nonce: [1u8; 16],
             consent: vec![0u8; 64],
         };

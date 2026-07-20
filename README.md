@@ -272,7 +272,7 @@ lait edit --status in_progress
 | `show <ref>` | Full issue (lazily loads the issue doc) |
 | `edit <ref> [--title T] [--status S] [--priority P]` | Patch LWW fields (one activity row) |
 | `move <ref> [-p PROJ] [--top\|--bottom\|--before R\|--after R]` | Set project and/or board order |
-| `assign <ref> <userref…> [--remove]` | Add/remove assignees |
+| `assign <ref> <who…> [--remove]` | Add/remove assignees |
 | `label <ref> [+LABEL…] [-LABEL…]` | Add/remove labels |
 | `comment [ref] [BODY]` | Append a comment. One arg on a KEY-n branch = the body (ref inferred); no BODY → stdin |
 | `delete <ref>` | Tombstone an issue (stays in history) |

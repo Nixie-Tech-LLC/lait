@@ -301,7 +301,7 @@ mod tests {
     use crate::policy::OwnershipPolicy;
 
     fn prin(n: u8) -> PrincipalId {
-        PrincipalId::of_device(&crate::crypto::user_from_seed(&[n; 32]))
+        PrincipalId::of_device(&crate::crypto::device_from_seed(&[n; 32]))
     }
     fn key(n: u8) -> OwnershipPolicy {
         OwnershipPolicy::Key(prin(n))

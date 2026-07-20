@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::authority::{AuthorityId, AuthorityScheme, LeafId, PrincipalId};
 use crate::crypto::{self, WorkspaceKey};
-use crate::ids::{UserId, WorkspaceId};
+use crate::ids::{DeviceId, WorkspaceId};
 
 /// Current package format version.
 pub const PACKAGE_VERSION: u16 = 1;
@@ -72,7 +72,7 @@ pub enum KeySlot {
     /// Unwrapped by an x25519 keypair the custodian controls — a recovery key
     /// held offline, or another device.
     RecoveryKey {
-        recipient: UserId,
+        recipient: DeviceId,
         wrapped_dek: Vec<u8>,
     },
     /// Unwrapped by a passphrase the custodian remembers.
@@ -147,7 +147,7 @@ pub struct PackageExpectation<'a> {
     pub ceremony: &'a str,
     pub leaf: &'a LeafId,
     /// The group public key this holder expects to be part of.
-    pub group_key: &'a UserId,
+    pub group_key: &'a DeviceId,
     /// The participant index this holder expects to occupy.
     pub index: u16,
 }
@@ -282,7 +282,7 @@ pub enum SlotSpec {
         wrapped_dek: Vec<u8>,
     },
     RecoveryKey {
-        recipient: UserId,
+        recipient: DeviceId,
     },
     Passphrase {
         passphrase: String,
@@ -330,7 +330,7 @@ pub enum UnlockKey {
     },
     RecoveryKey {
         seed: [u8; 32],
-        me: UserId,
+        me: DeviceId,
     },
     Passphrase(String),
 }
@@ -407,12 +407,12 @@ mod tests {
         PrincipalId,
         LeafId,
         SharePayload,
-        UserId,
+        DeviceId,
     ) {
         let ws = WorkspaceId::mint(&SystemUlidSource);
         let (holders, group_key) = crate::dkg::tests_support::run_dkg(3, 2);
         let (share, pkp) = holders[&1].clone();
-        let device = crypto::user_from_seed(&[1u8; 32]);
+        let device = crypto::device_from_seed(&[1u8; 32]);
         let principal = PrincipalId::of_device(&device);
         let leaf = LeafId::of_principal(&principal);
         let config = AuthorityConfiguration::frost_threshold(&FrostThresholdConfig {
@@ -462,7 +462,7 @@ mod tests {
     #[test]
     fn any_single_slot_opens_the_same_package() {
         let (ws, authority, principal, leaf, payload, _) = fixture();
-        let device = crypto::user_from_seed(&[9u8; 32]);
+        let device = crypto::device_from_seed(&[9u8; 32]);
         let pkg = AuthoritySharePackage::seal(
             &ws,
             &authority,
@@ -589,7 +589,7 @@ mod tests {
                 }
             )
             .is_err());
-        let other_leaf = LeafId::of_principal(&PrincipalId::of_device(&crypto::user_from_seed(
+        let other_leaf = LeafId::of_principal(&PrincipalId::of_device(&crypto::device_from_seed(
             &[42u8; 32],
         )));
         assert!(pkg
@@ -603,7 +603,7 @@ mod tests {
             .is_err());
         // And the group key is checked by DERIVING it from the package's own
         // public-key package, not by trusting a field.
-        let other_key = crypto::user_from_seed(&[99u8; 32]);
+        let other_key = crypto::device_from_seed(&[99u8; 32]);
         assert!(pkg
             .verify_and_open(
                 &key,
@@ -625,7 +625,7 @@ mod tests {
     fn a_package_with_unusable_private_material_is_refused() {
         let ws = WorkspaceId::mint(&SystemUlidSource);
         let (forged, pkp, group_key) = crate::dkg::tests_support::share_with_foreign_secret();
-        let device = crypto::user_from_seed(&[1u8; 32]);
+        let device = crypto::device_from_seed(&[1u8; 32]);
         let principal = PrincipalId::of_device(&device);
         let leaf = LeafId::of_principal(&principal);
         let config = AuthorityConfiguration::frost_threshold(&FrostThresholdConfig {

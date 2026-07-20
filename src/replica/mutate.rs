@@ -437,10 +437,10 @@ impl Replica {
             Ok(id) => id,
             Err(resp) => return Ok((resp, None)),
         };
-        let mut users = Vec::new();
+        let mut actors = Vec::new();
         for w in &who {
             match self.resolve_actor(w) {
-                Some(a) => users.push(a),
+                Some(a) => actors.push(a),
                 None => {
                     return Ok((
                         Response::not_found(format!("no known member matches '{w}'")),
@@ -455,7 +455,7 @@ impl Replica {
             let issue = self
                 .issue(&doc_id)?
                 .ok_or_else(|| anyhow!("issue body not present"))?;
-            for u in &users {
+            for u in &actors {
                 if add {
                     issue.add_assignee(u)?;
                 } else {

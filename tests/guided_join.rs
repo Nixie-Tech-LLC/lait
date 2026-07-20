@@ -125,7 +125,7 @@ fn gate_state(v: &lait::diagnose::DiagnosisView, id: &str) -> GateState {
 /// uninitialized store — so every founder home goes through this first.
 fn found_home(home: &Path) {
     let key = lait::config::load_or_create_identity(home).expect("identity");
-    let me = lait::crypto::user_from_seed(&key);
+    let me = lait::crypto::device_from_seed(&key);
     let store = lait::store::Store::open(home).expect("store");
     lait::replica::found_workspace(&store, &me, &key, "test", &lait::ids::SystemUlidSource)
         .expect("found workspace");

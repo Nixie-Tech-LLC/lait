@@ -14,7 +14,7 @@ use std::ops::Bound::{Excluded, Unbounded};
 
 use crate::catalog::{CatalogDoc, RowMeta};
 use crate::dto::{Candidate, ProjectDto};
-use crate::ids::{DocId, ProjectId, UserId};
+use crate::ids::{DeviceId, DocId, ProjectId};
 
 /// Minimum ULID chars after the `iss_` prefix in a canonical short handle.
 const CANONICAL_MIN: usize = 7;
@@ -415,68 +415,68 @@ pub fn resolve_project(catalog: &CatalogDoc, input: &str) -> Option<ProjectDto> 
     catalog.project_by_key(input)
 }
 
-/// Resolve a `<userref>`: `@me`, or a full ed25519 key. (Alias/prefix resolution
-/// lives in [`resolve_user_dir`], which the daemon calls with a directory it
+/// Resolve a `<who>`: `@me`, or a full ed25519 key. (Alias/prefix resolution
+/// lives in [`resolve_device_dir`], which the daemon calls with a directory it
 /// assembles from members + presence + join requests, named by the local alias
 /// store. This 2-arg form is the directory-free fallback used inside the replica,
 /// where a ref has already been resolved to `@me`/a full key by the node layer.)
-pub fn resolve_user(input: &str, me: &UserId) -> Option<UserId> {
+pub fn resolve_device(input: &str, me: &DeviceId) -> Option<DeviceId> {
     let input = input.trim();
     if input == "@me" || input == "me" {
         return Some(me.clone());
     }
-    UserId::parse(input)
+    DeviceId::parse(input)
 }
 
-/// A known identity for user-ref resolution: an ed25519 key plus a locally-set
+/// A known identity for who-ref resolution: an ed25519 key plus a locally-set
 /// **alias** (petname), if any. The `nick` field carries that trusted local
 /// alias — never a self-asserted wire nick, which is deliberately kept out of
 /// resolution. It is empty when we know only the key (an ACL member we've never
 /// aliased); such an entry is still resolvable by key or id-prefix, just not by
 /// name.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KnownUser {
-    pub key: UserId,
+pub struct KnownDevice {
+    pub key: DeviceId,
     /// A locally-assigned alias (petname). Empty ⇒ resolvable only by key/prefix.
     pub nick: String,
 }
 
-/// Outcome of resolving a `<userref>` against the directory — the user-plane twin
+/// Outcome of resolving a `<who>` against the directory — the device-plane twin
 /// of [`RefResolution`]. Ambiguity is a first-class outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UserResolution {
-    One(UserId),
+pub enum DeviceResolution {
+    One(DeviceId),
     Zero,
-    Many(Vec<KnownUser>),
+    Many(Vec<KnownDevice>),
 }
 
 /// Minimum hex chars accepted as a key id-prefix (short enough to type, long
 /// enough to rarely collide across a workspace's handful of members).
-const USER_PREFIX_MIN: usize = 4;
+const DEVICE_PREFIX_MIN: usize = 4;
 
-/// Resolve a `<userref>` against a directory: `@me` or `me`; a full
+/// Resolve a `<who>` against a directory: `@me` or `me`; a full
 /// 64-hex ed25519 key; a locally-set **alias** (case-insensitive, exact); or a
-/// **key id-prefix** (at least `USER_PREFIX_MIN` hex chars). Alias and prefix are
+/// **key id-prefix** (at least `DEVICE_PREFIX_MIN` hex chars). Alias and prefix are
 /// matched against `dir`, whose names come only from the local alias store — a
 /// self-asserted wire nick is never a resolution input. A full key always
 /// resolves even when absent from `dir`. Multiple distinct hits return `Many` so
 /// the caller can show a candidate list. Alias is tried before
 /// prefix; the first stage to hit wins.
-pub fn resolve_user_dir(input: &str, me: &UserId, dir: &[KnownUser]) -> UserResolution {
+pub fn resolve_device_dir(input: &str, me: &DeviceId, dir: &[KnownDevice]) -> DeviceResolution {
     let input = input.trim();
     if input.is_empty() {
-        return UserResolution::Zero;
+        return DeviceResolution::Zero;
     }
     if input == "@me" || input == "me" {
-        return UserResolution::One(me.clone());
+        return DeviceResolution::One(me.clone());
     }
     // A full key is unambiguous and resolves without the directory.
-    if let Some(u) = UserId::parse(input) {
-        return UserResolution::One(u);
+    if let Some(u) = DeviceId::parse(input) {
+        return DeviceResolution::One(u);
     }
 
     // Exact nick match (case-insensitive), deduped by key.
-    let mut nick_hits: Vec<KnownUser> = Vec::new();
+    let mut nick_hits: Vec<KnownDevice> = Vec::new();
     for k in dir {
         if !k.nick.is_empty()
             && k.nick.eq_ignore_ascii_case(input)
@@ -486,17 +486,17 @@ pub fn resolve_user_dir(input: &str, me: &UserId, dir: &[KnownUser]) -> UserReso
         }
     }
     match nick_hits.len() {
-        1 => return UserResolution::One(nick_hits.remove(0).key),
-        n if n > 1 => return UserResolution::Many(nick_hits),
+        1 => return DeviceResolution::One(nick_hits.remove(0).key),
+        n if n > 1 => return DeviceResolution::Many(nick_hits),
         _ => {}
     }
 
-    // Key id-prefix (hex, ≥ USER_PREFIX_MIN chars) against known keys.
+    // Key id-prefix (hex, ≥ DEVICE_PREFIX_MIN chars) against known keys.
     let lower = input.to_ascii_lowercase();
     let is_hex_prefix =
-        lower.len() >= USER_PREFIX_MIN && lower.bytes().all(|b| b.is_ascii_hexdigit());
+        lower.len() >= DEVICE_PREFIX_MIN && lower.bytes().all(|b| b.is_ascii_hexdigit());
     if is_hex_prefix {
-        let mut pfx_hits: Vec<KnownUser> = Vec::new();
+        let mut pfx_hits: Vec<KnownDevice> = Vec::new();
         for k in dir {
             if k.key.as_str().to_ascii_lowercase().starts_with(&lower)
                 && !pfx_hits.iter().any(|h| h.key == k.key)
@@ -505,13 +505,13 @@ pub fn resolve_user_dir(input: &str, me: &UserId, dir: &[KnownUser]) -> UserReso
             }
         }
         match pfx_hits.len() {
-            1 => return UserResolution::One(pfx_hits.remove(0).key),
-            n if n > 1 => return UserResolution::Many(pfx_hits),
+            1 => return DeviceResolution::One(pfx_hits.remove(0).key),
+            n if n > 1 => return DeviceResolution::Many(pfx_hits),
             _ => {}
         }
     }
 
-    UserResolution::Zero
+    DeviceResolution::Zero
 }
 
 /// A `Row`-ready view: whether a row should be hidden by default (done or
@@ -533,16 +533,16 @@ mod tests {
     use crate::ids::{SystemUlidSource, WorkspaceId};
     use crate::issue::{IssueDoc, NewIssue};
 
-    fn test_user() -> UserId {
-        UserId::from_key_string("a".repeat(64))
+    fn test_device() -> DeviceId {
+        DeviceId::from_key_string("a".repeat(64))
     }
     fn commit(c: &CatalogDoc) {
-        c.apply(&crate::fabric::op::OpCtx::structure("test", &test_user()));
+        c.apply(&crate::fabric::op::OpCtx::structure("test", &test_device()));
     }
 
     fn setup() -> (CatalogDoc, ProjectId, WorkspaceId) {
         let ws = WorkspaceId::mint(&SystemUlidSource);
-        let c = CatalogDoc::create(&ws, "test", None, &test_user()).unwrap();
+        let c = CatalogDoc::create(&ws, "test", None, &test_device()).unwrap();
         let p = ProjectId::mint(&SystemUlidSource);
         c.add_project(&p, "Engineering", "ENG", "blue").unwrap();
         commit(&c);
@@ -563,7 +563,7 @@ mod tests {
             title: title.into(),
             priority: Priority::Medium,
             created_by: crate::ids::ActorId::from_incept_hash(&"a".repeat(64)),
-            committed_by: test_user(),
+            committed_by: test_device(),
             created_at: 1,
             body: None,
             peer: None,
@@ -798,89 +798,92 @@ mod tests {
     }
 
     #[test]
-    fn resolve_project_and_user() {
+    fn resolve_project_and_device() {
         let (c, p, _ws) = setup();
         assert_eq!(resolve_project(&c, "ENG").map(|x| x.id), Some(p.clone()));
         assert_eq!(resolve_project(&c, p.as_str()).map(|x| x.id), Some(p));
-        let me = UserId::from_key_string("a".repeat(64));
-        assert_eq!(resolve_user("@me", &me), Some(me.clone()));
+        let me = DeviceId::from_key_string("a".repeat(64));
+        assert_eq!(resolve_device("@me", &me), Some(me.clone()));
         assert_eq!(
-            resolve_user(&"b".repeat(64), &me),
-            Some(UserId::from_key_string("b".repeat(64)))
+            resolve_device(&"b".repeat(64), &me),
+            Some(DeviceId::from_key_string("b".repeat(64)))
         );
-        assert_eq!(resolve_user("nick", &me), None);
+        assert_eq!(resolve_device("nick", &me), None);
     }
 
-    fn ku(hex: char, nick: &str) -> KnownUser {
-        KnownUser {
-            key: UserId::from_key_string(hex.to_string().repeat(64)),
+    fn ku(hex: char, nick: &str) -> KnownDevice {
+        KnownDevice {
+            key: DeviceId::from_key_string(hex.to_string().repeat(64)),
             nick: nick.into(),
         }
     }
 
     #[test]
-    fn resolve_user_dir_by_me_and_full_key() {
-        let me = UserId::from_key_string("a".repeat(64));
+    fn resolve_device_dir_by_me_and_full_key() {
+        let me = DeviceId::from_key_string("a".repeat(64));
         let dir = vec![ku('b', "alice")];
         assert_eq!(
-            resolve_user_dir("@me", &me, &dir),
-            UserResolution::One(me.clone())
+            resolve_device_dir("@me", &me, &dir),
+            DeviceResolution::One(me.clone())
         );
         assert_eq!(
-            resolve_user_dir("me", &me, &dir),
-            UserResolution::One(me.clone())
+            resolve_device_dir("me", &me, &dir),
+            DeviceResolution::One(me.clone())
         );
         // a full key resolves even when not in the directory
-        let c = UserId::from_key_string("c".repeat(64));
+        let c = DeviceId::from_key_string("c".repeat(64));
         assert_eq!(
-            resolve_user_dir(&"c".repeat(64), &me, &dir),
-            UserResolution::One(c)
+            resolve_device_dir(&"c".repeat(64), &me, &dir),
+            DeviceResolution::One(c)
         );
     }
 
     #[test]
-    fn resolve_user_dir_by_nick_case_insensitive() {
-        let me = UserId::from_key_string("a".repeat(64));
+    fn resolve_device_dir_by_nick_case_insensitive() {
+        let me = DeviceId::from_key_string("a".repeat(64));
         let dir = vec![ku('b', "Alice"), ku('c', "bob")];
         assert_eq!(
-            resolve_user_dir("alice", &me, &dir),
-            UserResolution::One(UserId::from_key_string("b".repeat(64)))
+            resolve_device_dir("alice", &me, &dir),
+            DeviceResolution::One(DeviceId::from_key_string("b".repeat(64)))
         );
         assert_eq!(
-            resolve_user_dir("BOB", &me, &dir),
-            UserResolution::One(UserId::from_key_string("c".repeat(64)))
+            resolve_device_dir("BOB", &me, &dir),
+            DeviceResolution::One(DeviceId::from_key_string("c".repeat(64)))
         );
     }
 
     #[test]
-    fn resolve_user_dir_by_id_prefix() {
-        let me = UserId::from_key_string("a".repeat(64));
+    fn resolve_device_dir_by_id_prefix() {
+        let me = DeviceId::from_key_string("a".repeat(64));
         // one key starts with bbbb, another with cccc
         let dir = vec![ku('b', ""), ku('c', "carol")];
         assert_eq!(
-            resolve_user_dir("bbbb", &me, &dir),
-            UserResolution::One(UserId::from_key_string("b".repeat(64)))
+            resolve_device_dir("bbbb", &me, &dir),
+            DeviceResolution::One(DeviceId::from_key_string("b".repeat(64)))
         );
-        // too short (< USER_PREFIX_MIN) is not treated as a prefix
-        assert_eq!(resolve_user_dir("bb", &me, &dir), UserResolution::Zero);
+        // too short (< DEVICE_PREFIX_MIN) is not treated as a prefix
+        assert_eq!(resolve_device_dir("bb", &me, &dir), DeviceResolution::Zero);
     }
 
     #[test]
-    fn resolve_user_dir_ambiguous_nick_is_many() {
-        let me = UserId::from_key_string("a".repeat(64));
+    fn resolve_device_dir_ambiguous_nick_is_many() {
+        let me = DeviceId::from_key_string("a".repeat(64));
         let dir = vec![ku('b', "sam"), ku('c', "sam")];
-        match resolve_user_dir("sam", &me, &dir) {
-            UserResolution::Many(c) => assert_eq!(c.len(), 2),
+        match resolve_device_dir("sam", &me, &dir) {
+            DeviceResolution::Many(c) => assert_eq!(c.len(), 2),
             other => panic!("expected Many, got {other:?}"),
         }
     }
 
     #[test]
-    fn resolve_user_dir_unknown_is_zero() {
-        let me = UserId::from_key_string("a".repeat(64));
+    fn resolve_device_dir_unknown_is_zero() {
+        let me = DeviceId::from_key_string("a".repeat(64));
         let dir = vec![ku('b', "alice")];
-        assert_eq!(resolve_user_dir("nobody", &me, &dir), UserResolution::Zero);
-        assert_eq!(resolve_user_dir("", &me, &dir), UserResolution::Zero);
+        assert_eq!(
+            resolve_device_dir("nobody", &me, &dir),
+            DeviceResolution::Zero
+        );
+        assert_eq!(resolve_device_dir("", &me, &dir), DeviceResolution::Zero);
     }
 
     // ---- alias-spoofing defenses ----
@@ -895,10 +898,13 @@ mod tests {
     fn spoofed_name_without_a_local_alias_resolves_to_nobody() {
         // An impersonator announced nick "alice" but we never aliased their key —
         // so it arrives with an empty nick and the claimed name resolves to Zero.
-        let me = UserId::from_key_string("a".repeat(64));
+        let me = DeviceId::from_key_string("a".repeat(64));
         let impostor = ku('b', ""); // known key, no local alias
         let dir = vec![impostor];
-        assert_eq!(resolve_user_dir("alice", &me, &dir), UserResolution::Zero);
+        assert_eq!(
+            resolve_device_dir("alice", &me, &dir),
+            DeviceResolution::Zero
+        );
     }
 
     #[test]
@@ -906,13 +912,13 @@ mod tests {
         // We aliased the REAL alice's key -> "alice". A spoofer with a different key
         // and no alias also sits in the directory. Resolving "alice" must land on
         // the aliased key, never the spoofer.
-        let me = UserId::from_key_string("a".repeat(64));
+        let me = DeviceId::from_key_string("a".repeat(64));
         let real = ku('b', "alice");
         let spoofer = ku('c', ""); // different key, self-asserted nick was dropped
         let dir = vec![spoofer, real.clone()];
         assert_eq!(
-            resolve_user_dir("alice", &me, &dir),
-            UserResolution::One(real.key)
+            resolve_device_dir("alice", &me, &dir),
+            DeviceResolution::One(real.key)
         );
     }
 
@@ -921,10 +927,10 @@ mod tests {
         // Defense-in-depth: even if the operator later aliases a SECOND key to the
         // same name (e.g. tricked into re-using "alice"), resolution returns Many
         // rather than silently picking one — no wrong-key-by-default.
-        let me = UserId::from_key_string("a".repeat(64));
+        let me = DeviceId::from_key_string("a".repeat(64));
         let dir = vec![ku('b', "alice"), ku('c', "alice")];
-        match resolve_user_dir("alice", &me, &dir) {
-            UserResolution::Many(c) => assert_eq!(c.len(), 2),
+        match resolve_device_dir("alice", &me, &dir) {
+            DeviceResolution::Many(c) => assert_eq!(c.len(), 2),
             other => panic!("expected Many, got {other:?}"),
         }
     }

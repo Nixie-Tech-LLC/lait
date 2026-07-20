@@ -59,7 +59,7 @@ export function NewIssue({
   const [status, setStatus] = useState(defaultStatus ?? states[0]?.id ?? "backlog");
   /** Label **names** — `issue_new` resolves names, not ids, and creates on first use. */
   const [picked, setPicked] = useState<string[]>([]);
-  /** Assignee **keys** — `index::resolve_user` takes `me` or a full 64-hex key. */
+  /** Assignee **keys** — `index::resolve_device` takes `me` or a full 64-hex key. */
   const [assignees, setAssignees] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [again, setAgain] = useState(false);
@@ -212,7 +212,7 @@ export function NewIssue({
               options={members.map((m) => ({
                 id: m.key,
                 label: nameFor(m.key, members),
-                icon: <Avatar userKey={m.key} alias={m.alias} me={m.me} size="sm" />,
+                icon: <Avatar deviceKey={m.key} alias={m.alias} me={m.me} size="sm" />,
                 hint: m.key.slice(0, 6),
                 keywords: [m.key, m.alias],
               }))}

@@ -39,7 +39,7 @@ use super::{
     Alpn, GossipEvent, GossipReceiver, GossipSender, Incoming, PeerId, Stream, Topic, Transport,
     MAX_FRAME,
 };
-use crate::ids::UserId;
+use crate::ids::DeviceId;
 
 /// Inbound connections buffered between the Router's handlers and a slow
 /// [`Transport::accept`] loop before handlers start parking in their forward.
@@ -63,7 +63,7 @@ fn endpoint_id(peer: &PeerId) -> Result<EndpointId> {
 /// iroh `EndpointId` → [`PeerId`] — the reverse encoding (same as the daemon's
 /// own-identity construction from its endpoint key).
 fn peer_id(id: EndpointId) -> PeerId {
-    UserId::from_key_string(id.to_string())
+    DeviceId::from_key_string(id.to_string())
 }
 
 /// [`Topic`] → gossip `TopicId`: the same 32 bytes, renamed at the edge.
@@ -482,9 +482,9 @@ mod tests {
     /// conversions at this edge are exact inverses.
     #[test]
     fn id_topic_conversions() {
-        let user = crate::crypto::user_from_seed(&[7u8; 32]);
-        let ep = endpoint_id(&user).expect("a lait user id is a valid endpoint id");
-        assert_eq!(peer_id(ep), user, "peer_id ∘ endpoint_id = identity");
+        let device = crate::crypto::device_from_seed(&[7u8; 32]);
+        let ep = endpoint_id(&device).expect("a lait device id is a valid endpoint id");
+        assert_eq!(peer_id(ep), device, "peer_id ∘ endpoint_id = identity");
 
         let bytes = [42u8; 32];
         assert_eq!(topic_id(Topic(bytes)).as_bytes(), &bytes);
@@ -495,6 +495,6 @@ mod tests {
         assert_eq!(roundtrip, derived);
 
         // Garbage is a loud error, not a bogus id.
-        assert!(endpoint_id(&UserId::from_key_string("nope".into())).is_err());
+        assert!(endpoint_id(&DeviceId::from_key_string("nope".into())).is_err());
     }
 }

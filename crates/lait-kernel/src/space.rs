@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use crate::actor::{self, SignedEvent};
 use crate::authority::AuthorityConfigurationId;
 use crate::genesis::Genesis;
-use crate::ids::{ActorId, UserId, WorkspaceId};
+use crate::ids::{ActorId, DeviceId, WorkspaceId};
 use crate::sigdag::{self, SignedNode};
 
 /// Domain separator for the workspace-id derivation.
@@ -58,21 +58,21 @@ pub type SignedSpaceEvent = SignedNode;
 
 /// The commitment to a recovery public key: `blake3(pubkey bytes)`. This is what
 /// the workspace id binds at birth and what a `Rotate` installs for the next key.
-pub fn recovery_commit(recovery_pub: &UserId) -> Option<[u8; 32]> {
+pub fn recovery_commit(recovery_pub: &DeviceId) -> Option<[u8; 32]> {
     let raw = hex32(recovery_pub.as_str())?;
     Some(*blake3::hash(&raw).as_bytes())
 }
 
 /// The recovery public key a seed produces (for a plain solo recovery key).
-pub fn recovery_pub_of(seed: &[u8; 32]) -> UserId {
+pub fn recovery_pub_of(seed: &[u8; 32]) -> DeviceId {
     let sk = ed25519_dalek::SigningKey::from_bytes(seed);
-    UserId::from_key_string(data_encoding::HEXLOWER.encode(sk.verifying_key().as_bytes()))
+    DeviceId::from_key_string(data_encoding::HEXLOWER.encode(sk.verifying_key().as_bytes()))
 }
 
 /// Mint a fresh solo (1-of-1) recovery keypair: returns `(pubkey, secret seed)`.
 /// The secret is stored offline; a threshold group key is instead produced by a
 /// FROST DKG among the holders and installed via [`SpaceOp::Rotate`].
-pub fn mint_recovery_key() -> (UserId, [u8; 32]) {
+pub fn mint_recovery_key() -> (DeviceId, [u8; 32]) {
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).expect("getrandom");
     (recovery_pub_of(&seed), seed)
@@ -121,7 +121,7 @@ pub enum SpaceOp {
     /// a DKG group key). Signed by the current key; the new key's commitment
     /// becomes the authority for the next op.
     Rotate {
-        new_recovery_key: UserId,
+        new_recovery_key: DeviceId,
         gen: u32,
         /// The arrangement operating the new key. **Required.**
         ///
@@ -204,7 +204,7 @@ pub struct RootState {
 /// Derive the self-certifying workspace id from the founding device, salt, and
 /// recovery commitment. Pure and deterministic.
 pub fn derive_workspace_id(
-    founding_device: &UserId,
+    founding_device: &DeviceId,
     salt: &[u8; 16],
     recovery_commit: &[u8; 32],
 ) -> WorkspaceId {
@@ -256,7 +256,7 @@ pub fn replay(genesis: &Genesis, ws_id: &WorkspaceId, events: &[SignedSpaceEvent
 
     // Decode + signature-verify every op up front; carry the op bytes for a
     // deterministic tie-break among same-generation ops.
-    let mut ops: Vec<(u32, Vec<u8>, SpaceOp, UserId)> = events
+    let mut ops: Vec<(u32, Vec<u8>, SpaceOp, DeviceId)> = events
         .iter()
         .filter_map(|ev| {
             if !ev.verify_sig(SPACE_EVENT_DOMAIN, ws_id.as_str()) {
@@ -320,7 +320,7 @@ mod tests {
     use super::*;
     use crate::actor::incept_single;
 
-    fn device_of(seed: &[u8; 32]) -> UserId {
+    fn device_of(seed: &[u8; 32]) -> DeviceId {
         recovery_pub_of(seed)
     }
 
@@ -486,12 +486,9 @@ mod tests {
         #[derive(serde::Serialize)]
         enum OldSpaceOp {
             #[allow(dead_code)]
-            Recover {
-                new_root: Vec<ActorId>,
-                gen: u32,
-            },
+            Recover { new_root: Vec<ActorId>, gen: u32 },
             Rotate {
-                new_recovery_key: UserId,
+                new_recovery_key: DeviceId,
                 gen: u32,
             },
         }

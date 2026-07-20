@@ -53,8 +53,8 @@ use crate::{
         StatusInfo,
     },
     dto::{Candidate, JoinRequestDto, SeedDto},
-    ids::{SystemUlidSource, UserId},
-    index::{resolve_user_dir, KnownUser, UserResolution},
+    ids::{DeviceId, SystemUlidSource},
+    index::{resolve_device_dir, DeviceResolution, KnownDevice},
     presence::PeerState,
     proto::{InviteGrant, Payload, SignedInvite, SignedMessage, WorkspaceTicket},
     replica::{DirtySet, Replica},
@@ -279,11 +279,11 @@ fn upsert_alias(home: &Path, key: &str, name: &str) {
     save_aliases(home, &aliases);
 }
 
-/// Map ambiguous user matches into the shared [`Candidate`] shape so the CLI and
+/// Map ambiguous device matches into the shared [`Candidate`] shape so the CLI and
 /// `--json` render them through the same disambiguation path as issue refs
 /// `reff` is the short key, `key_alias` the optional nickname, and `title` the full
 /// key so the caller can copy an unambiguous value.
-fn user_candidates(cands: &[KnownUser]) -> Vec<Candidate> {
+fn device_candidates(cands: &[KnownDevice]) -> Vec<Candidate> {
     cands
         .iter()
         .map(|c| Candidate {
@@ -352,7 +352,7 @@ impl ProtocolHandler for SyncHandler {
 /// topic; binding the redeemer means a *copied* blob can only ever admit that
 /// actor, not an eavesdropper re-pairing it with its own inception.
 fn seal_bound_invite(
-    host: &UserId,
+    host: &DeviceId,
     invite: &SignedInvite,
     redeemer: &crate::ids::ActorId,
 ) -> Option<Vec<u8>> {
@@ -366,7 +366,7 @@ fn seal_bound_invite(
 /// inception is refused. `my_seed` is the host's identity seed.
 fn open_bound_invite(
     my_seed: &[u8; 32],
-    me: &UserId,
+    me: &DeviceId,
     sealed: &[u8],
     incept: &crate::actor::SignedEvent,
 ) -> Option<SignedInvite> {
@@ -494,7 +494,7 @@ pub struct Node {
     /// Bounded and NEVER persisted here — an inception only enters the synced
     /// membership doc when an admin actually admits (redeem/approve), so an
     /// unauthenticated peer cannot grow the shared container (amplification DoS).
-    pending_incepts: Arc<Mutex<HashMap<UserId, crate::actor::SignedEvent>>>,
+    pending_incepts: Arc<Mutex<HashMap<DeviceId, crate::actor::SignedEvent>>>,
     /// This node's home dir, used to persist the bootstrap peer set across restarts.
     home: PathBuf,
 }
@@ -692,7 +692,7 @@ impl Node {
                 // unauthenticated peer cannot grow the container.
                 if let Some(incept) = &incept {
                     const MAX_PENDING_INCEPTS: usize = 256;
-                    let dev = UserId::from_key_string(from.to_string());
+                    let dev = DeviceId::from_key_string(from.to_string());
                     let mut pend = self.pending_incepts.lock().unwrap();
                     if pend.contains_key(&dev) || pend.len() < MAX_PENDING_INCEPTS {
                         pend.insert(dev, incept.clone());
@@ -869,8 +869,8 @@ impl Node {
         let sealed_invite = match (&ticket.invite, &incept) {
             (Some(inv), Some(ic)) => {
                 let redeemer = crate::ids::ActorId::from_incept_hash(&ic.hash());
-                let host_user = UserId::from_key_string(ticket.host.to_string());
-                seal_bound_invite(&host_user, inv, &redeemer)
+                let host_device = DeviceId::from_key_string(ticket.host.to_string());
+                seal_bound_invite(&host_device, inv, &redeemer)
             }
             _ => None,
         };
@@ -1131,9 +1131,9 @@ impl Node {
         }
     }
 
-    /// Our key as a [`UserId`]; the endpoint ID is the Ed25519 key.
-    fn my_userid(&self) -> UserId {
-        UserId::from_key_string(self.shared.my_id.to_string())
+    /// Our key as a [`DeviceId`]; the endpoint ID is the Ed25519 key.
+    fn my_device_id(&self) -> DeviceId {
+        DeviceId::from_key_string(self.shared.my_id.to_string())
     }
 
     /// Pattern A: try to auto-admit `joiner` against a presented invite. Verifies
@@ -1155,7 +1155,7 @@ impl Node {
         // kept the nonce off the topic — and only for the actor it names, so a
         // blob copied off the wire cannot be re-paired with an eavesdropper's
         // inception.
-        let me = UserId::from_key_string(self.shared.my_id.to_string());
+        let me = DeviceId::from_key_string(self.shared.my_id.to_string());
         let Some(invite) = open_bound_invite(&self.secret_key.to_bytes(), &me, &sealed, &incept)
         else {
             return;
@@ -1188,7 +1188,7 @@ impl Node {
         }
     }
 
-    /// Assemble the user-reference resolution directory. Keys are gathered
+    /// Assemble the who-ref resolution directory. Keys are gathered
     /// from every place we've seen one — our own id, the live presence map, recent
     /// join requests, and the signed ACL members — so any of them resolves by
     /// `@me` / full key / id-prefix. **Names come only from the local alias store**
@@ -1196,20 +1196,20 @@ impl Node {
     /// unauthenticated name must never resolve to a key. A key with no alias is
     /// still resolvable, just not by name. This is what turns `members add bob`
     /// (after `--as bob`) and `assign ENG-1 c3ab21` into real keys.
-    fn user_directory(&self) -> Vec<KnownUser> {
-        let mut keys: HashSet<UserId> = HashSet::new();
-        keys.insert(self.my_userid());
+    fn device_directory(&self) -> Vec<KnownDevice> {
+        let mut keys: HashSet<DeviceId> = HashSet::new();
+        keys.insert(self.my_device_id());
         {
             let presence = self.shared.presence.lock().unwrap();
             for id in presence.keys() {
-                keys.insert(UserId::from_key_string(id.to_string()));
+                keys.insert(DeviceId::from_key_string(id.to_string()));
             }
         }
         {
             let (events, _) = self.shared.events.lock().unwrap().since(0);
             for e in &events {
                 if e.kind == EventKind::Join {
-                    keys.insert(UserId::from_key_string(e.id.clone()));
+                    keys.insert(DeviceId::from_key_string(e.id.clone()));
                 }
             }
         }
@@ -1226,7 +1226,7 @@ impl Node {
                     .find(|a| a.key == key.as_str())
                     .map(|a| a.name.clone())
                     .unwrap_or_default();
-                KnownUser { key, nick }
+                KnownDevice { key, nick }
             })
             .collect()
     }
@@ -1264,7 +1264,7 @@ impl Node {
         out
     }
 
-    /// Resolve the user-refs carried by a request (local-alias / id-prefix → full
+    /// Resolve the who-refs carried by a request (local-alias / id-prefix → full
     /// key) against the directory, before the replica sees them. Returns
     /// the rewritten request, or an early `Response` (not-found / ambiguous) to
     /// send back verbatim. Only the ref-bearing requests are touched; everything
@@ -1280,16 +1280,16 @@ impl Node {
         ) {
             return Ok(req);
         }
-        let dir = self.user_directory();
-        let me = self.my_userid();
+        let dir = self.device_directory();
+        let me = self.my_device_id();
         let resolve = |who: &str| -> std::result::Result<String, Response> {
-            match resolve_user_dir(who, &me, &dir) {
-                UserResolution::One(u) => Ok(u.as_str().to_string()),
-                UserResolution::Zero => {
+            match resolve_device_dir(who, &me, &dir) {
+                DeviceResolution::One(u) => Ok(u.as_str().to_string()),
+                DeviceResolution::Zero => {
                     Err(Response::not_found(format!("no user matches '{who}'")))
                 }
-                UserResolution::Many(c) => Err(Response::Candidates {
-                    candidates: user_candidates(&c),
+                DeviceResolution::Many(c) => Err(Response::Candidates {
+                    candidates: device_candidates(&c),
                     near_miss_for: None,
                 }),
             }
@@ -1371,7 +1371,7 @@ impl Node {
     }
 
     async fn dispatch(self: Arc<Self>, req: Request) -> Result<Response> {
-        // Resolve nick / id-prefix user-refs to full keys before the replica sees
+        // Resolve nick / id-prefix who-refs to full keys before the replica sees
         // them; a not-found / ambiguous ref short-circuits with its own response.
         let req = match self.resolve_refs_in(req) {
             Ok(r) => r,
@@ -1438,7 +1438,7 @@ impl Node {
                 // If this device's inception was stashed from a join request,
                 // make it known now — admin-gated persistence, only on this
                 // explicit approve action (not on the raw request).
-                if let Some(dev) = UserId::parse(&who) {
+                if let Some(dev) = DeviceId::parse(&who) {
                     let pending = self.pending_incepts.lock().unwrap().get(&dev).cloned();
                     if let Some(incept) = pending {
                         let _ = self.replica.lock().unwrap().import_inception(&incept);
@@ -1462,7 +1462,7 @@ impl Node {
             // Sponsor an agent: import its stashed inception (from the agent's
             // join) so the replica can resolve its actor, then dispatch.
             Request::AgentAdd { key } => {
-                if let Some(dev) = UserId::parse(&key) {
+                if let Some(dev) = DeviceId::parse(&key) {
                     let pending = self.pending_incepts.lock().unwrap().get(&dev).cloned();
                     if let Some(incept) = pending {
                         let _ = self.replica.lock().unwrap().import_inception(&incept);
@@ -1510,9 +1510,9 @@ impl Node {
             // against the full directory (alias / id-prefix / key), then records
             // the name locally — never synced, never a signed op.
             Request::MemberAlias { who, name } => {
-                let dir = self.user_directory();
-                match resolve_user_dir(who.trim(), &self.my_userid(), &dir) {
-                    UserResolution::One(u) => {
+                let dir = self.device_directory();
+                match resolve_device_dir(who.trim(), &self.my_device_id(), &dir) {
+                    DeviceResolution::One(u) => {
                         let name = name.trim();
                         upsert_alias(&self.home, u.as_str(), name);
                         let msg = if name.is_empty() {
@@ -1522,11 +1522,11 @@ impl Node {
                         };
                         Ok(Response::Ok { message: Some(msg) })
                     }
-                    UserResolution::Zero => {
+                    DeviceResolution::Zero => {
                         Ok(Response::not_found(format!("no user matches '{who}'")))
                     }
-                    UserResolution::Many(c) => Ok(Response::Candidates {
-                        candidates: user_candidates(&c),
+                    DeviceResolution::Many(c) => Ok(Response::Candidates {
+                        candidates: device_candidates(&c),
                         near_miss_for: None,
                     }),
                 }
@@ -1546,15 +1546,15 @@ impl Node {
                 // is NOT a resolution input — an unauthenticated nick must never
                 // select who gets sealed the workspace key. The approver attaches a
                 // *trusted* local petname via `as_name`.
-                let dir: Vec<KnownUser> = pending
+                let dir: Vec<KnownDevice> = pending
                     .iter()
-                    .map(|r| KnownUser {
-                        key: UserId::from_key_string(r.key.clone()),
+                    .map(|r| KnownDevice {
+                        key: DeviceId::from_key_string(r.key.clone()),
                         nick: String::new(),
                     })
                     .collect();
-                match resolve_user_dir(who.trim(), &self.my_userid(), &dir) {
-                    UserResolution::One(u) => {
+                match resolve_device_dir(who.trim(), &self.my_device_id(), &dir) {
+                    DeviceResolution::One(u) => {
                         let key = u.as_str().to_string();
                         // Import the joiner's stashed inception (from its join
                         // request) so the replica can resolve its actor — admin-
@@ -1577,12 +1577,12 @@ impl Node {
                         }
                         Ok(resp)
                     }
-                    UserResolution::Zero => Ok(Response::not_found(format!(
+                    DeviceResolution::Zero => Ok(Response::not_found(format!(
                         "no pending join request matches '{who}' — approve by key or \
                          id-prefix (see `lait members requests`)"
                     ))),
-                    UserResolution::Many(c) => Ok(Response::Candidates {
-                        candidates: user_candidates(&c),
+                    DeviceResolution::Many(c) => Ok(Response::Candidates {
+                        candidates: device_candidates(&c),
                         near_miss_for: None,
                     }),
                 }
@@ -2103,7 +2103,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     // The transport keypair is constructed from lait's identity seed here, at the
     // net edge — the seed itself is the identity (see config::load_or_create_identity).
     let secret_key = SecretKey::from_bytes(&identity_seed);
-    let me = UserId::from_key_string(secret_key.public().to_string());
+    let me = DeviceId::from_key_string(secret_key.public().to_string());
     let replica = Replica::open(
         store,
         me,
@@ -2333,7 +2333,7 @@ mod tests {
         let ws = WorkspaceId::mint(&SystemUlidSource);
         let host_seed = [10u8; 32];
         let host_sk = SecretKey::from_bytes(&host_seed);
-        let host = UserId::from_key_string(host_sk.public().to_string());
+        let host = DeviceId::from_key_string(host_sk.public().to_string());
 
         // The legit joiner and an eavesdropper, each with their own actor.
         let (j_incept, j_actor) = incept_single(&[11u8; 32], &ws, [1u8; 16], [2u8; 16], None);
@@ -2356,10 +2356,10 @@ mod tests {
             "a copied blob cannot admit a different actor"
         );
         // And a non-host cannot even read the blob — the nonce stays off the topic.
-        let atk_user =
-            UserId::from_key_string(SecretKey::from_bytes(&[12u8; 32]).public().to_string());
+        let atk_device =
+            DeviceId::from_key_string(SecretKey::from_bytes(&[12u8; 32]).public().to_string());
         assert!(
-            open_bound_invite(&[12u8; 32], &atk_user, &sealed, &j_incept).is_none(),
+            open_bound_invite(&[12u8; 32], &atk_device, &sealed, &j_incept).is_none(),
             "only the host can open the sealed invite"
         );
     }

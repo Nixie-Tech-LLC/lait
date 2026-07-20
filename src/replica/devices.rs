@@ -206,7 +206,7 @@ impl Replica {
         let Some(actor) = self.my_actor() else {
             return (Response::err("this device has no actor identity"), None);
         };
-        let Some(device) = UserId::parse(&device) else {
+        let Some(device) = DeviceId::parse(&device) else {
             return (Response::err("a device is a 64-hex ed25519 key"), None);
         };
         let devices = self.actor_plane().devices_of(&actor);
@@ -289,7 +289,7 @@ impl Replica {
         // current device set (a genuine recovery runs from a fresh device that is
         // not in the set). The actor whose standing commitment matches our
         // recovery key is the one we can recover.
-        let recovery_pub = crypto::user_from_seed(&seed);
+        let recovery_pub = crypto::device_from_seed(&seed);
         let commit = actor::recovery_commitment(&recovery_pub);
         let plane = self.actor_plane();
         let Some(actor) = plane

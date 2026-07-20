@@ -23,7 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::UserId;
+use crate::ids::DeviceId;
 
 /// Domain separating configuration-id hashing from every other hash in the
 /// system, so a configuration id can never collide with a transcript id or an
@@ -230,12 +230,12 @@ impl GeneralAccessConfig {
 pub struct PrincipalId(String);
 
 impl PrincipalId {
-    pub fn of_device(user: &UserId) -> Self {
-        PrincipalId(user.as_str().to_string())
+    pub fn of_device(device: &DeviceId) -> Self {
+        PrincipalId(device.as_str().to_string())
     }
     /// The device this principal is, when it is a direct device principal.
-    pub fn as_device(&self) -> Option<UserId> {
-        UserId::parse(&self.0)
+    pub fn as_device(&self) -> Option<DeviceId> {
+        DeviceId::parse(&self.0)
     }
     pub fn as_str(&self) -> &str {
         &self.0
@@ -270,19 +270,19 @@ impl LeafId {
 /// configuration change could be replayed after one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorityId {
-    pub public_key: UserId,
+    pub public_key: DeviceId,
     pub configuration: AuthorityConfigurationId,
 }
 
 impl AuthorityId {
-    pub fn new(public_key: UserId, configuration: &AuthorityConfiguration) -> Self {
+    pub fn new(public_key: DeviceId, configuration: &AuthorityConfiguration) -> Self {
         AuthorityId {
             public_key,
             configuration: configuration.id(),
         }
     }
     /// The bootstrap authority for a solo recovery key.
-    pub fn single(public_key: UserId) -> Self {
+    pub fn single(public_key: DeviceId) -> Self {
         Self::new(public_key, &AuthorityConfiguration::single())
     }
 }
@@ -300,7 +300,7 @@ pub enum AuthorityTransition {
     RotateKey {
         from: AuthorityId,
         next_configuration: AuthorityConfigurationId,
-        next_public_key: UserId,
+        next_public_key: DeviceId,
     },
     /// Reserved until proactive same-key resharing is implemented.
     Reshare {
@@ -316,7 +316,7 @@ mod tests {
     fn principals(seeds: &[u8]) -> Vec<PrincipalId> {
         let mut v: Vec<PrincipalId> = seeds
             .iter()
-            .map(|n| PrincipalId::of_device(&crate::crypto::user_from_seed(&[*n; 32])))
+            .map(|n| PrincipalId::of_device(&crate::crypto::device_from_seed(&[*n; 32])))
             .collect();
         v.sort();
         v.dedup();
@@ -421,7 +421,7 @@ mod tests {
         assert_eq!(c.index_of(&ps[0]), Some(1));
         assert_eq!(c.index_of(&ps[2]), Some(3));
         assert_eq!(
-            c.index_of(&PrincipalId::of_device(&crate::crypto::user_from_seed(
+            c.index_of(&PrincipalId::of_device(&crate::crypto::device_from_seed(
                 &[9u8; 32]
             ))),
             None
@@ -430,7 +430,7 @@ mod tests {
 
     #[test]
     fn an_authority_id_distinguishes_key_from_arrangement() {
-        let key = crate::crypto::user_from_seed(&[1u8; 32]);
+        let key = crate::crypto::device_from_seed(&[1u8; 32]);
         let two_of_three = AuthorityConfiguration::frost_threshold(&FrostThresholdConfig {
             k: 2,
             participants: principals(&[1, 2, 3]),

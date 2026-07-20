@@ -15,7 +15,7 @@
 //! swaps *nothing* in the daemon — which is the whole point: the thing under test
 //! is the actual daemon, over a network we control.
 //!
-//! Identity note: [`PeerId`] is a lait [`UserId`] — a peer *is* its ed25519 key,
+//! Identity note: [`PeerId`] is a lait [`DeviceId`] — a peer *is* its ed25519 key,
 //! the same bytes iroh calls an `EndpointId` (the T0 identity agreement). The
 //! iroh impl converts at its own edge; nothing above this seam names an iroh id.
 
@@ -25,11 +25,11 @@ pub mod mem;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::ids::UserId;
+use crate::ids::DeviceId;
 
 /// A peer's stable identity — its ed25519 public key. Same 32 bytes iroh calls an
-/// `EndpointId`; lait names it a `UserId` everywhere above the transport edge.
-pub type PeerId = UserId;
+/// `EndpointId`; lait names it a `DeviceId` everywhere above the transport edge.
+pub type PeerId = DeviceId;
 
 /// A protocol selector for a direct connection (lait's ALPNs: sync, presence).
 pub type Alpn = &'static [u8];

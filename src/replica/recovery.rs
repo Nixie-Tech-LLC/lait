@@ -770,9 +770,9 @@ impl Replica {
         // Assemble the sorted participant set (co-founders + me). Sorted and
         // deduped here AND re-checked by every acceptor: a hostile proposer must
         // not be able to hand honest nodes a malformed participant list.
-        let mut set: std::collections::BTreeSet<UserId> = std::collections::BTreeSet::new();
+        let mut set: std::collections::BTreeSet<DeviceId> = std::collections::BTreeSet::new();
         for c in cofounders {
-            match UserId::parse(&c) {
+            match DeviceId::parse(&c) {
                 Some(u) => {
                     set.insert(u);
                 }
@@ -785,7 +785,7 @@ impl Replica {
             }
         }
         set.insert(self.me.clone());
-        let participants: Vec<UserId> = set.into_iter().collect();
+        let participants: Vec<DeviceId> = set.into_iter().collect();
         let n = participants.len() as u16;
         // k == 0 means "all holders" (N-of-N) — the safe default.
         let k = if k == 0 { n } else { k };
@@ -1063,7 +1063,7 @@ impl Replica {
         // A holder must not authorize a ceremony that cannot be installed. The
         // proposer checks this too, but a hostile or stale proposer does not, and
         // the cost of being wrong is a permanently stalled rotation.
-        let proposed: Vec<UserId> = cfg
+        let proposed: Vec<DeviceId> = cfg
             .participants
             .iter()
             .filter_map(|p| p.as_device())
@@ -1212,7 +1212,7 @@ impl Replica {
     /// terminal: a ceremony with too little overlap authorizes cleanly, runs the
     /// whole DKG, collects custody attestations, and then stalls forever at
     /// installation with every participant believing it succeeded.
-    fn rotation_can_complete(&self, proposed: &[UserId]) -> bool {
+    fn rotation_can_complete(&self, proposed: &[DeviceId]) -> bool {
         let Some(current) = self.standing_dkg_session() else {
             // A solo authority signs the rotation by itself; no overlap needed.
             return true;
@@ -1250,8 +1250,8 @@ impl Replica {
         &self,
         dkg: &crate::dkg::TranscriptId,
         t: &crate::dkg::DkgTranscript,
-        participants: &[UserId],
-    ) -> Vec<UserId> {
+        participants: &[DeviceId],
+    ) -> Vec<DeviceId> {
         if !self.is_indispensable(dkg) {
             return Vec::new();
         }
@@ -1828,7 +1828,7 @@ impl Replica {
         &self,
         dkg: &crate::dkg::TranscriptId,
         t: &crate::dkg::DkgTranscript,
-    ) -> Option<(u16, u16, Vec<UserId>)> {
+    ) -> Option<(u16, u16, Vec<DeviceId>)> {
         let proposal = t.proposal.as_ref()?;
         let crate::dkg::CeremonyOp::DkgPropose(p) = &proposal.op else {
             return None;
@@ -1926,7 +1926,7 @@ impl Replica {
     /// This transcript's group key, recomputed from the stored public-key
     /// package. Never read from a `-group` file: a plaintext artifact naming the
     /// rotation target is a swap target, and the value is derivable.
-    pub(super) fn group_key_of_transcript(&self, t: &crate::dkg::TranscriptId) -> Option<UserId> {
+    pub(super) fn group_key_of_transcript(&self, t: &crate::dkg::TranscriptId) -> Option<DeviceId> {
         crate::dkg::group_key_of_package(&self.dkg_read(t, "pkp")?).ok()
     }
 
@@ -1980,7 +1980,7 @@ impl Replica {
         let Ok(group_key) = crate::dkg::group_key_of_package(&pkp) else {
             return Ok(false);
         };
-        let index_of = |dev: &UserId| {
+        let index_of = |dev: &DeviceId| {
             participants
                 .iter()
                 .position(|p| p == dev)
@@ -2260,7 +2260,7 @@ impl Replica {
                 self.dkg_write(dkg, "manifest", &postcard::to_stdvec(&manifest)?)?;
             }
         }
-        let index_of = |dev: &UserId| {
+        let index_of = |dev: &DeviceId| {
             participants
                 .iter()
                 .position(|p| p == dev)
@@ -2473,7 +2473,7 @@ impl Replica {
     /// attested candidate key rather than a locally derived one.
     fn open_rotation_request(
         &mut self,
-        new_key: &UserId,
+        new_key: &DeviceId,
         next_configuration: crate::authority::AuthorityConfigurationId,
         gen: u32,
     ) -> Result<(crate::dkg::TranscriptId, bool)> {

@@ -21,7 +21,7 @@ use crate::dto::{
 use crate::fabric::history;
 use crate::fabric::op::OpCtx;
 use crate::genesis::Genesis;
-use crate::ids::{ActorId, DocId, LabelId, ProjectId, UlidSource, UserId, WorkspaceId};
+use crate::ids::{ActorId, DeviceId, DocId, LabelId, ProjectId, UlidSource, WorkspaceId};
 use crate::index::{self, AliasTable, RefResolution};
 use crate::issue::{IssueDoc, NewIssue};
 use crate::membership::MembershipDoc;
@@ -137,7 +137,7 @@ pub struct Replica {
     catalog: CatalogDoc,
     issues: HashMap<DocId, IssueDoc>,
     aliases: AliasTable,
-    me: UserId,
+    me: DeviceId,
     my_nick: String,
     workspace_id: WorkspaceId,
     activity: VecDeque<ActivityEvent>,

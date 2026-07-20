@@ -104,8 +104,8 @@ impl Replica {
             .is_some_and(|a| self.acl_state().is_admin(&a))
     }
     /// Every device key belonging to a current member actor — the resolvable
-    /// identities for the local user directory.
-    pub fn member_device_keys(&self) -> Vec<UserId> {
+    /// identities for the local device directory.
+    pub fn member_device_keys(&self) -> Vec<DeviceId> {
         let plane = self.actor_plane();
         self.acl_state()
             .members()
@@ -114,7 +114,7 @@ impl Replica {
             .collect()
     }
     /// Whether a device key currently speaks for a member actor.
-    pub fn is_member_device(&self, dev: &UserId) -> bool {
+    pub fn is_member_device(&self, dev: &DeviceId) -> bool {
         self.actor_plane()
             .actor_of_device(dev)
             .is_some_and(|a| self.acl_state().is_member(a))
@@ -311,7 +311,7 @@ impl Replica {
     /// [`member_add`]: Self::member_add
     pub fn redeem_invite(
         &mut self,
-        issuer_device: &UserId,
+        issuer_device: &DeviceId,
         joiner_incept: &actor::SignedEvent,
         nonce: &[u8; 16],
         single_use: bool,
@@ -545,7 +545,7 @@ impl Replica {
             // assign a phantom that no inception backs.
             return self.actor_plane().exists(&a).then_some(a);
         }
-        let dev = index::resolve_user(who, &self.me)?;
+        let dev = index::resolve_device(who, &self.me)?;
         self.actor_plane().actor_of_device(&dev).cloned()
     }
 

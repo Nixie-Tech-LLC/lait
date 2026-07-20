@@ -11,7 +11,7 @@ versioned JSON DTO the CLI `--json` emits.
 
 ## Refs
 An issue `<ref>` is a short `iss_` handle (canonical, collision-free) or a `KEY-n`
-alias like `ENG-142`. A project ref is its key (`ENG`) or a `prj_` id. A user ref
+alias like `ENG-142`. A project ref is its key (`ENG`) or a `prj_` id. A who-ref
 is `@me` or a 64-hex key. If a ref is ambiguous the tool returns a candidate list —
 re-issue with a more specific handle.
 

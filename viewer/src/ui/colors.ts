@@ -68,10 +68,10 @@ const AVATAR: readonly string[] = [
  * and would have drawn the same colour. Hashing the full key puts the collision
  * somewhere it does not correlate with what the eye is comparing.
  */
-export function avatarColor(userKey: string): string {
+export function avatarColor(deviceKey: string): string {
   let h = 0x811c9dc5;
-  for (let i = 0; i < userKey.length; i++) {
-    h ^= userKey.charCodeAt(i);
+  for (let i = 0; i < deviceKey.length; i++) {
+    h ^= deviceKey.charCodeAt(i);
     // `Math.imul` keeps this a 32-bit multiply; `h * 16777619` loses the low bits
     // to float precision and collapses the distribution.
     h = Math.imul(h, 0x01000193);

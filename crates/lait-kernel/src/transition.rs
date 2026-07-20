@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::authority::{AuthorityConfigurationId, LeafId};
 use crate::dkg::{SigningPlan, TranscriptId};
-use crate::ids::UserId;
+use crate::ids::DeviceId;
 use crate::sigdag::SignedNode;
 
 /// A transition's identity: the content-address of the signed node that **opens**
@@ -76,7 +76,7 @@ pub struct CandidateAuthority {
     /// The DKG that produced the candidate.
     pub proposal: TranscriptId,
     pub configuration: AuthorityConfigurationId,
-    pub public_key: UserId,
+    pub public_key: DeviceId,
     /// Commitment to the ceremony transcript the candidate came from.
     pub transcript_commitment: [u8; 32],
     /// A group signature under `public_key` proving possession/operability.
@@ -382,7 +382,7 @@ mod tests {
             transition: t,
             proposal: TranscriptId::parse_hex(&"a".repeat(64)).unwrap(),
             configuration: c,
-            public_key: crate::crypto::user_from_seed(&[1u8; 32]),
+            public_key: crate::crypto::device_from_seed(&[1u8; 32]),
             transcript_commitment: [0u8; 32],
             possession_signature: vec![],
             signing_plan: dummy_plan(),
@@ -392,7 +392,7 @@ mod tests {
     fn dummy_plan() -> SigningPlan {
         SigningPlan {
             signing: TranscriptId::parse_hex(&"b".repeat(64)).unwrap(),
-            authority: crate::authority::AuthorityId::single(crate::crypto::user_from_seed(
+            authority: crate::authority::AuthorityId::single(crate::crypto::device_from_seed(
                 &[2u8; 32],
             )),
             message_commitment: [0u8; 32],

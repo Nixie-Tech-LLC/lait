@@ -1016,7 +1016,7 @@ pub fn specs() -> Vec<Spec> {
                 Spec::req(
                     "remove",
                     "Remove a member (admin-only) and rotate the space key.",
-                    vec![A::pos("who", "A user ref.")],
+                    vec![A::pos("who", "A who-ref.")],
                     |m| {
                         Ok(Request::MemberRemove {
                             who: req_str(m, "who"),

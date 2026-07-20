@@ -33,7 +33,7 @@ fn test_proposal(
     t: &Replica,
     nonce: [u8; 16],
     k: u16,
-    participants: Vec<UserId>,
+    participants: Vec<DeviceId>,
 ) -> crate::dkg::KeyCeremonyProposal {
     let principals: Vec<crate::authority::PrincipalId> = participants
         .iter()
@@ -62,9 +62,9 @@ fn attest_custody(node: &mut TestNode, tag: &str) {
     );
 }
 
-fn me() -> UserId {
+fn me() -> DeviceId {
     // A real ed25519 key (so the founder can seal the workspace key to itself).
-    crypto::user_from_seed(&ME_SEED)
+    crypto::device_from_seed(&ME_SEED)
 }
 
 struct TestNode {
@@ -81,8 +81,8 @@ fn new_node() -> TestNode {
     new_node_as(me(), ME_SEED)
 }
 
-fn user_from_seed(seed: [u8; 32]) -> UserId {
-    crypto::user_from_seed(&seed)
+fn device_from_seed(seed: [u8; 32]) -> DeviceId {
+    crypto::device_from_seed(&seed)
 }
 
 /// A single-device actor inception for `seed` in `t`'s workspace (a joiner's
@@ -101,7 +101,7 @@ fn actor_of(ev: &actor::SignedEvent) -> ActorId {
     ActorId::from_incept_hash(&ev.hash())
 }
 
-fn new_node_as(user: UserId, seed: [u8; 32]) -> TestNode {
+fn new_node_as(device: DeviceId, seed: [u8; 32]) -> TestNode {
     let home = std::env::temp_dir().join(format!(
         "gc-trk-{}-{}",
         std::process::id(),
@@ -114,8 +114,8 @@ fn new_node_as(user: UserId, seed: [u8; 32]) -> TestNode {
     let clock = FakeClock::new(1_000_000 + seed[0] as u64 * 100_000);
     // Explicit founding (no lazy mint): seeds the "Testbed" workspace with
     // its default TEST project, so replicas open like real founder stores.
-    found_workspace(&store, &user, &seed, "Testbed", &clock).unwrap();
-    let replica = Replica::open(store, user, "tester".into(), seed, Box::new(clock)).unwrap();
+    found_workspace(&store, &device, &seed, "Testbed", &clock).unwrap();
+    let replica = Replica::open(store, device, "tester".into(), seed, Box::new(clock)).unwrap();
     TestNode { replica, home }
 }
 
@@ -124,7 +124,7 @@ fn new_node_as(user: UserId, seed: [u8; 32]) -> TestNode {
 /// empty catalog/membership awaiting sync. Obtain the proof from the founder
 /// node via `founding_proof()`.
 fn new_joiner_node_as(
-    user: UserId,
+    device: DeviceId,
     seed: [u8; 32],
     ws: &str,
     proof: &([u8; 16], [u8; 32], actor::SignedEvent),
@@ -138,7 +138,7 @@ fn new_joiner_node_as(
     let store = Store::open(&home).unwrap();
     join_workspace_store(&store, ws, &proof.0, &proof.1, &proof.2).unwrap();
     let clock = FakeClock::new(1_000_000 + seed[0] as u64 * 100_000);
-    let replica = Replica::open(store, user, "tester".into(), seed, Box::new(clock)).unwrap();
+    let replica = Replica::open(store, device, "tester".into(), seed, Box::new(clock)).unwrap();
     TestNode { replica, home }
 }
 
@@ -564,7 +564,7 @@ fn recover_resets_device_set_with_the_offline_key() {
 
     // Add a second device dB.
     let db_seed = [60u8; 32];
-    let db = user_from_seed(db_seed);
+    let db = device_from_seed(db_seed);
     let binding = actor::consent_sign(
         &db_seed,
         &a.replica.workspace_str(),
@@ -598,9 +598,9 @@ fn fresh_device_recovers_and_decrypts_after_peer_reseal() {
     // A fresh device dC bootstraps on X's workspace from a ticket. It is not a
     // device of any actor and holds no key.
     let c_seed = [70u8; 32];
-    let c_user = user_from_seed(c_seed);
+    let c_device = device_from_seed(c_seed);
     let mut c = new_joiner_node_as(
-        c_user.clone(),
+        c_device.clone(),
         c_seed,
         &a_ws,
         &a.replica.founding_proof().unwrap(),
@@ -631,7 +631,7 @@ fn fresh_device_recovers_and_decrypts_after_peer_reseal() {
     assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
     assert_eq!(
         c.replica.actor_plane().devices_of(&x),
-        vec![c_user.clone()],
+        vec![c_device.clone()],
         "recovery reset X's device set to the fresh device"
     );
     assert_eq!(
@@ -666,7 +666,7 @@ fn second_device_decrypts_then_revocation_fences_it() {
 
     // dB (seed 50) consents into actor X (as `device accept` would).
     let db_seed = [50u8; 32];
-    let db_user = user_from_seed(db_seed);
+    let db_device = device_from_seed(db_seed);
     let binding = actor::consent_sign(
         &db_seed,
         &a_ws,
@@ -679,14 +679,14 @@ fn second_device_decrypts_then_revocation_fences_it() {
     let (resp, _) = a.replica.device_add_cmd(consent_hex);
     assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
     assert!(
-        a.replica.actor_plane().is_device_of(&x, &db_user),
+        a.replica.actor_plane().is_device_of(&x, &db_device),
         "dB is now a device of X"
     );
 
     // dB bootstraps its own store on X's workspace and syncs — it is the SAME
     // actor (the founder), so it unseals the key and decrypts.
     let mut b = new_joiner_node_as(
-        db_user.clone(),
+        db_device.clone(),
         db_seed,
         &a_ws,
         &a.replica.founding_proof().unwrap(),
@@ -703,10 +703,10 @@ fn second_device_decrypts_then_revocation_fences_it() {
     );
 
     // A revokes dB and rotates; dB loses future content.
-    let (resp, _) = a.replica.device_revoke_cmd(db_user.as_str().to_string());
+    let (resp, _) = a.replica.device_revoke_cmd(db_device.as_str().to_string());
     assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
     assert!(
-        !a.replica.actor_plane().is_device_of(&x, &db_user),
+        !a.replica.actor_plane().is_device_of(&x, &db_device),
         "dB revoked from X"
     );
     new_issue(&mut a.replica, "after-revoke");
@@ -726,7 +726,7 @@ fn single_use_invite_admits_exactly_one_actor_under_concurrency() {
     let a_ws = a.replica.workspace_str();
 
     let mut b = new_joiner_node_as(
-        user_from_seed([2; 32]),
+        device_from_seed([2; 32]),
         [2; 32],
         &a_ws,
         &a.replica.founding_proof().unwrap(),
@@ -770,19 +770,19 @@ fn concurrent_rotations_converge_and_fence() {
     let a_ws = a.replica.workspace_str();
 
     let mut b = new_joiner_node_as(
-        user_from_seed([2; 32]),
+        device_from_seed([2; 32]),
         [2; 32],
         &a_ws,
         &a.replica.founding_proof().unwrap(),
     );
     let mut c = new_joiner_node_as(
-        user_from_seed([3; 32]),
+        device_from_seed([3; 32]),
         [3; 32],
         &a_ws,
         &a.replica.founding_proof().unwrap(),
     );
     let mut d = new_joiner_node_as(
-        user_from_seed([4; 32]),
+        device_from_seed([4; 32]),
         [4; 32],
         &a_ws,
         &a.replica.founding_proof().unwrap(),
@@ -852,11 +852,11 @@ fn e2ee_membership_gates_decryption() {
     new_issue(&mut a.replica, "secret issue");
 
     let b_seed = [8u8; 32];
-    let b_user = user_from_seed(b_seed);
+    let b_device = device_from_seed(b_seed);
     let a_ws = a.replica.workspace_str();
     // B's store is bootstrapped from the ticket (the `lait join` path).
     let mut b = new_joiner_node_as(
-        b_user.clone(),
+        b_device.clone(),
         b_seed,
         &a_ws,
         &a.replica.founding_proof().unwrap(),
@@ -911,8 +911,13 @@ fn a_viewer_reads_but_is_refused_writes_until_granted() {
     let a_ws = a.replica.workspace_str();
 
     let b_seed = [12u8; 32];
-    let b_user = user_from_seed(b_seed);
-    let mut b = new_joiner_node_as(b_user, b_seed, &a_ws, &a.replica.founding_proof().unwrap());
+    let b_device = device_from_seed(b_seed);
+    let mut b = new_joiner_node_as(
+        b_device,
+        b_seed,
+        &a_ws,
+        &a.replica.founding_proof().unwrap(),
+    );
     let b_incept = b.replica.self_inception().unwrap();
     let b_actor = actor_of(&b_incept);
 
@@ -985,7 +990,7 @@ fn injected_epoch_without_an_authorized_mint_is_never_adopted() {
 
     // Attacker self-incepts an actor that never joined, then forges the mint.
     let atk_seed = [0x33u8; 32];
-    let atk_dev = user_from_seed(atk_seed);
+    let atk_dev = device_from_seed(atk_seed);
     let (atk_incept, atk_actor) =
         actor::incept_single(&atk_seed, &ws, [0x44u8; 16], [0x45u8; 16], None);
     let attacker_key = crate::crypto::random_key(); // the attacker knows this
@@ -1051,9 +1056,9 @@ fn heal_supersedes_the_epoch_of_a_removed_minter() {
 
     // B joins, is admitted as an ADMIN, and syncs.
     let b_seed = [21u8; 32];
-    let b_user = user_from_seed(b_seed);
+    let b_device = device_from_seed(b_seed);
     let mut b = new_joiner_node_as(
-        b_user.clone(),
+        b_device.clone(),
         b_seed,
         &a_ws,
         &a.replica.founding_proof().unwrap(),
@@ -1103,7 +1108,7 @@ fn heal_supersedes_the_epoch_of_a_removed_minter() {
         !a.replica
             .membership
             .sealed_devices(&healed.id)
-            .contains(&b_user),
+            .contains(&b_device),
         "the healed epoch is not sealed to the removed member's device"
     );
 }
@@ -1118,8 +1123,13 @@ fn a_non_admin_device_revoke_is_honest_about_pending_rotation() {
 
     // B joins as a plain WRITER (no admin).
     let b_seed = [41u8; 32];
-    let b_user = user_from_seed(b_seed);
-    let mut b = new_joiner_node_as(b_user, b_seed, &a_ws, &a.replica.founding_proof().unwrap());
+    let b_device = device_from_seed(b_seed);
+    let mut b = new_joiner_node_as(
+        b_device,
+        b_seed,
+        &a_ws,
+        &a.replica.founding_proof().unwrap(),
+    );
     let b_incept = b.replica.self_inception().unwrap();
     let b_actor = actor_of(&b_incept);
     a.replica.admit_member(&b_incept, vec![Grant::Write]); // writer, not admin
@@ -1127,7 +1137,7 @@ fn a_non_admin_device_revoke_is_honest_about_pending_rotation() {
 
     // B adds a second device so it has one to revoke.
     let b2_seed = [42u8; 32];
-    let b2_user = user_from_seed(b2_seed);
+    let b2_device = device_from_seed(b2_seed);
     let binding = actor::consent_sign(
         &b2_seed,
         &a_ws,
@@ -1140,7 +1150,7 @@ fn a_non_admin_device_revoke_is_honest_about_pending_rotation() {
 
     let gen_before = b.replica.active_epoch().map(|e| e.gen);
     // B (non-admin) revokes its second device.
-    let (resp, _) = b.replica.device_revoke_cmd(b2_user.as_str().to_string());
+    let (resp, _) = b.replica.device_revoke_cmd(b2_device.as_str().to_string());
     match resp {
         Response::Ok { message: Some(m) } => {
             assert!(
@@ -1152,7 +1162,7 @@ fn a_non_admin_device_revoke_is_honest_about_pending_rotation() {
     }
     // The device is de-listed, but a non-admin's mint is inert: no rotation.
     assert!(
-        !b.replica.actor_plane().is_device_of(&b_actor, &b2_user),
+        !b.replica.actor_plane().is_device_of(&b_actor, &b2_device),
         "the second device is de-listed"
     );
     assert_eq!(
@@ -1176,8 +1186,13 @@ fn a_non_founder_invite_roots_the_joiner_on_the_true_founder() {
 
     // B joins rooted on A (as A's ticket would), admitted admin, and syncs.
     let b_seed = [51u8; 32];
-    let b_user = user_from_seed(b_seed);
-    let mut b = new_joiner_node_as(b_user, b_seed, &a_ws, &a.replica.founding_proof().unwrap());
+    let b_device = device_from_seed(b_seed);
+    let mut b = new_joiner_node_as(
+        b_device,
+        b_seed,
+        &a_ws,
+        &a.replica.founding_proof().unwrap(),
+    );
     let b_incept = b.replica.self_inception().unwrap();
     let b_actor = actor_of(&b_incept);
     a.replica
@@ -1200,8 +1215,13 @@ fn a_non_founder_invite_roots_the_joiner_on_the_true_founder() {
     // admitted by B, and syncs through B. Rooted on A, C converges — sees the
     // founder's authority AND adopts the founder's key-epoch to read content.
     let c_seed = [52u8; 32];
-    let c_user = user_from_seed(c_seed);
-    let mut c = new_joiner_node_as(c_user, c_seed, &a_ws, &b.replica.founding_proof().unwrap());
+    let c_device = device_from_seed(c_seed);
+    let mut c = new_joiner_node_as(
+        c_device,
+        c_seed,
+        &a_ws,
+        &b.replica.founding_proof().unwrap(),
+    );
     let c_incept = c.replica.self_inception().unwrap();
     b.replica.admit_member(&c_incept, vec![Grant::Write]);
     sync_all(&mut b.replica, &mut c.replica);
@@ -1250,8 +1270,13 @@ fn break_glass_recovery_re_roots_the_workspace() {
     // syncs the state from a survivor (here A) — the realistic break-glass
     // flow: pull the workspace, then re-root.
     let c_seed = [71u8; 32];
-    let c_user = user_from_seed(c_seed);
-    let mut c = new_joiner_node_as(c_user, c_seed, &a_ws, &a.replica.founding_proof().unwrap());
+    let c_device = device_from_seed(c_seed);
+    let mut c = new_joiner_node_as(
+        c_device,
+        c_seed,
+        &a_ws,
+        &a.replica.founding_proof().unwrap(),
+    );
     sync_all(&mut a.replica, &mut c.replica);
 
     // The offline recovery key is restored beside C's store.
@@ -1300,9 +1325,9 @@ fn elevate_solo_recovery_to_a_2_of_2_dkg_group_key() {
 
     // Co-founder B joins and is admitted; both sync.
     let b_seed = [81u8; 32];
-    let b_user = user_from_seed(b_seed);
+    let b_device = device_from_seed(b_seed);
     let mut b = new_joiner_node_as(
-        b_user.clone(),
+        b_device.clone(),
         b_seed,
         &a_ws,
         &a.replica.founding_proof().unwrap(),
@@ -1315,7 +1340,7 @@ fn elevate_solo_recovery_to_a_2_of_2_dkg_group_key() {
     // A elevates to a 2-of-2 over {A, B}.
     let (resp, _) = a
         .replica
-        .space_elevate_cmd(vec![b_user.as_str().to_string()], 2);
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
     assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
 
     // Drive the DKG to a fixpoint via sync round-trips (each import advances).
@@ -1497,9 +1522,9 @@ fn a_nonce_bound_to_another_package_refuses_to_sign() {
     let mut a = new_node();
     let a_ws = a.replica.workspace_str();
     let b_seed = [21u8; 32];
-    let b_user = user_from_seed(b_seed);
+    let b_device = device_from_seed(b_seed);
     let mut b = new_joiner_node_as(
-        b_user.clone(),
+        b_device.clone(),
         b_seed,
         &a_ws,
         &a.replica.founding_proof().unwrap(),
@@ -1512,7 +1537,7 @@ fn a_nonce_bound_to_another_package_refuses_to_sign() {
     // Elevate {A, B} to a 2-of-2 group recovery key.
     let (resp, _) = a
         .replica
-        .space_elevate_cmd(vec![b_user.as_str().to_string()], 2);
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
     assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
     for _ in 0..6 {
         sync_all(&mut a.replica, &mut b.replica);
@@ -1592,9 +1617,9 @@ fn an_unreadable_share_is_reported_as_degraded_not_absent() {
     let mut a = new_node();
     let a_ws = a.replica.workspace_str();
     let b_seed = [21u8; 32];
-    let b_user = user_from_seed(b_seed);
+    let b_device = device_from_seed(b_seed);
     let mut b = new_joiner_node_as(
-        b_user.clone(),
+        b_device.clone(),
         b_seed,
         &a_ws,
         &a.replica.founding_proof().unwrap(),
@@ -1605,7 +1630,7 @@ fn an_unreadable_share_is_reported_as_degraded_not_absent() {
     sync_all(&mut a.replica, &mut b.replica);
     let (resp, _) = a
         .replica
-        .space_elevate_cmd(vec![b_user.as_str().to_string()], 2);
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
     assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
     for _ in 0..6 {
         sync_all(&mut a.replica, &mut b.replica);
@@ -1726,7 +1751,7 @@ fn an_unreadable_share_for_another_group_is_not_reported() {
         &a.replica,
         [5u8; 16],
         2,
-        vec![a.replica.me.clone(), user_from_seed([31u8; 32])],
+        vec![a.replica.me.clone(), device_from_seed([31u8; 32])],
     ));
     let ev = crate::dkg::sign_ceremony(&[31u8; 32], &propose, &a.replica.workspace_id);
     let id = crate::dkg::TranscriptId::of(&ev).unwrap();
@@ -1792,10 +1817,10 @@ fn a_non_admin_is_told_a_rekey_is_pending() {
 
     // B is a second ADMIN (so it can redeem), C a plain writer.
     let b_seed = [21u8; 32];
-    let b_user = user_from_seed(b_seed);
-    let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, &proof);
+    let b_device = device_from_seed(b_seed);
+    let mut b = new_joiner_node_as(b_device.clone(), b_seed, &a_ws, &proof);
     let c_seed = [31u8; 32];
-    let mut c = new_joiner_node_as(user_from_seed(c_seed), c_seed, &a_ws, &proof);
+    let mut c = new_joiner_node_as(device_from_seed(c_seed), c_seed, &a_ws, &proof);
     let b_incept = b.replica.self_inception().unwrap();
     let c_incept = c.replica.self_inception().unwrap();
     a.replica
@@ -1813,7 +1838,7 @@ fn a_non_admin_is_told_a_rekey_is_pending() {
     let nonce = [7u8; 16];
     let x_incept = incept_for([61u8; 32], &b.replica);
     let x_actor = actor_of(&x_incept);
-    let (resp, _) = b.replica.redeem_invite(&b_user, &x_incept, &nonce, true);
+    let (resp, _) = b.replica.redeem_invite(&b_device, &x_incept, &nonce, true);
     assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
     let (resp, _) = a
         .replica
@@ -1864,10 +1889,10 @@ fn a_proposal_naming_the_wrong_authority_is_rejected() {
     let secret = a.replica.read_space_recovery_key().expect("solo key");
 
     // A well-formed proposal whose `current` is some other authority.
-    let stranger = crate::authority::AuthorityId::single(user_from_seed([123u8; 32]));
+    let stranger = crate::authority::AuthorityId::single(device_from_seed([123u8; 32]));
     let principals = {
         let mut v: Vec<crate::authority::PrincipalId> =
-            [a.replica.me.clone(), user_from_seed([44u8; 32])]
+            [a.replica.me.clone(), device_from_seed([44u8; 32])]
                 .iter()
                 .map(crate::authority::PrincipalId::of_device)
                 .collect();
@@ -1910,7 +1935,7 @@ fn a_proposal_with_the_right_key_but_wrong_configuration_is_rejected() {
     // Same key (the real standing solo key), but claim it is operated by a
     // group arrangement it is not.
     let mut members: Vec<crate::authority::PrincipalId> =
-        [a.replica.me.clone(), user_from_seed([44u8; 32])]
+        [a.replica.me.clone(), device_from_seed([44u8; 32])]
             .iter()
             .map(crate::authority::PrincipalId::of_device)
             .collect();
@@ -1964,7 +1989,7 @@ fn a_reshare_proposal_is_refused_until_the_protocol_exists() {
     let secret = a.replica.read_space_recovery_key().expect("solo key");
     let current = a.replica.current_authority().expect("solo authority");
     let mut principals: Vec<crate::authority::PrincipalId> =
-        [a.replica.me.clone(), user_from_seed([45u8; 32])]
+        [a.replica.me.clone(), device_from_seed([45u8; 32])]
             .iter()
             .map(crate::authority::PrincipalId::of_device)
             .collect();
@@ -2023,11 +2048,11 @@ fn a_group_authorizes_and_installs_its_own_replacement() {
     let proof = a.replica.founding_proof().unwrap();
 
     let b_seed = [21u8; 32];
-    let b_user = user_from_seed(b_seed);
-    let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, &proof);
+    let b_device = device_from_seed(b_seed);
+    let mut b = new_joiner_node_as(b_device.clone(), b_seed, &a_ws, &proof);
     let c_seed = [31u8; 32];
-    let c_user = user_from_seed(c_seed);
-    let mut c = new_joiner_node_as(c_user.clone(), c_seed, &a_ws, &proof);
+    let c_device = device_from_seed(c_seed);
+    let mut c = new_joiner_node_as(c_device.clone(), c_seed, &a_ws, &proof);
     for incept in [
         b.replica.self_inception().unwrap(),
         c.replica.self_inception().unwrap(),
@@ -2041,7 +2066,7 @@ fn a_group_authorizes_and_installs_its_own_replacement() {
     // ---- solo → group: {A, B} 2-of-2.
     let (resp, _) = a
         .replica
-        .space_elevate_cmd(vec![b_user.as_str().to_string()], 2);
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
     assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
     for _ in 0..8 {
         sync_all(&mut a.replica, &mut b.replica);
@@ -2077,7 +2102,7 @@ fn a_group_authorizes_and_installs_its_own_replacement() {
     // A no longer has a usable solo key, so this can only proceed by
     // threshold authorization.
     let (resp, _) = a.replica.space_elevate_cmd(
-        vec![b_user.as_str().to_string(), c_user.as_str().to_string()],
+        vec![b_device.as_str().to_string(), c_device.as_str().to_string()],
         2,
     );
     let msg = match resp {
@@ -2190,11 +2215,11 @@ fn any_k_of_n_can_sign_without_the_lowest_index_holder() {
     let a_ws = a.replica.workspace_str();
     let proof = a.replica.founding_proof().unwrap();
     let b_seed = [21u8; 32];
-    let b_user = user_from_seed(b_seed);
-    let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, &proof);
+    let b_device = device_from_seed(b_seed);
+    let mut b = new_joiner_node_as(b_device.clone(), b_seed, &a_ws, &proof);
     let c_seed = [31u8; 32];
-    let c_user = user_from_seed(c_seed);
-    let mut c = new_joiner_node_as(c_user.clone(), c_seed, &a_ws, &proof);
+    let c_device = device_from_seed(c_seed);
+    let mut c = new_joiner_node_as(c_device.clone(), c_seed, &a_ws, &proof);
     for incept in [
         b.replica.self_inception().unwrap(),
         c.replica.self_inception().unwrap(),
@@ -2207,7 +2232,7 @@ fn any_k_of_n_can_sign_without_the_lowest_index_holder() {
 
     // A 2-of-3 group over {A, B, C}.
     let (resp, _) = a.replica.space_elevate_cmd(
-        vec![b_user.as_str().to_string(), c_user.as_str().to_string()],
+        vec![b_device.as_str().to_string(), c_device.as_str().to_string()],
         2,
     );
     assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
@@ -2296,9 +2321,9 @@ fn an_indispensable_arrangement_waits_for_verified_custody() {
     let mut a = new_node();
     let a_ws = a.replica.workspace_str();
     let b_seed = [21u8; 32];
-    let b_user = user_from_seed(b_seed);
+    let b_device = device_from_seed(b_seed);
     let mut b = new_joiner_node_as(
-        b_user.clone(),
+        b_device.clone(),
         b_seed,
         &a_ws,
         &a.replica.founding_proof().unwrap(),
@@ -2317,7 +2342,7 @@ fn an_indispensable_arrangement_waits_for_verified_custody() {
 
     let (resp, _) = a
         .replica
-        .space_elevate_cmd(vec![b_user.as_str().to_string()], 2);
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
     assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
     for _ in 0..8 {
         sync_all(&mut a.replica, &mut b.replica);
@@ -2404,11 +2429,11 @@ fn a_redundant_arrangement_installs_without_universal_attestation() {
     let a_ws = a.replica.workspace_str();
     let proof = a.replica.founding_proof().unwrap();
     let b_seed = [21u8; 32];
-    let b_user = user_from_seed(b_seed);
-    let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, &proof);
+    let b_device = device_from_seed(b_seed);
+    let mut b = new_joiner_node_as(b_device.clone(), b_seed, &a_ws, &proof);
     let c_seed = [31u8; 32];
-    let c_user = user_from_seed(c_seed);
-    let mut c = new_joiner_node_as(c_user.clone(), c_seed, &a_ws, &proof);
+    let c_device = device_from_seed(c_seed);
+    let mut c = new_joiner_node_as(c_device.clone(), c_seed, &a_ws, &proof);
     for incept in [
         b.replica.self_inception().unwrap(),
         c.replica.self_inception().unwrap(),
@@ -2420,7 +2445,7 @@ fn a_redundant_arrangement_installs_without_universal_attestation() {
     sync_all(&mut a.replica, &mut c.replica);
 
     let (resp, _) = a.replica.space_elevate_cmd(
-        vec![b_user.as_str().to_string(), c_user.as_str().to_string()],
+        vec![b_device.as_str().to_string(), c_device.as_str().to_string()],
         2, // 2-of-3: one holder may be lost
     );
     assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
@@ -2454,9 +2479,9 @@ fn a_lost_share_is_restored_from_its_portable_package() {
     let mut a = new_node();
     let a_ws = a.replica.workspace_str();
     let b_seed = [21u8; 32];
-    let b_user = user_from_seed(b_seed);
+    let b_device = device_from_seed(b_seed);
     let mut b = new_joiner_node_as(
-        b_user.clone(),
+        b_device.clone(),
         b_seed,
         &a_ws,
         &a.replica.founding_proof().unwrap(),
@@ -2467,7 +2492,7 @@ fn a_lost_share_is_restored_from_its_portable_package() {
     sync_all(&mut a.replica, &mut b.replica);
     let (resp, _) = a
         .replica
-        .space_elevate_cmd(vec![b_user.as_str().to_string()], 2);
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
     assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
     for _ in 0..6 {
         sync_all(&mut a.replica, &mut b.replica);
@@ -2591,14 +2616,14 @@ fn a_rotation_that_could_never_install_is_refused_up_front() {
     let a_ws = a.replica.workspace_str();
     let proof = a.replica.founding_proof().unwrap();
     let b_seed = [21u8; 32];
-    let b_user = user_from_seed(b_seed);
-    let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, &proof);
+    let b_device = device_from_seed(b_seed);
+    let mut b = new_joiner_node_as(b_device.clone(), b_seed, &a_ws, &proof);
     let c_seed = [31u8; 32];
-    let c_user = user_from_seed(c_seed);
-    let mut c = new_joiner_node_as(c_user.clone(), c_seed, &a_ws, &proof);
+    let c_device = device_from_seed(c_seed);
+    let mut c = new_joiner_node_as(c_device.clone(), c_seed, &a_ws, &proof);
     let d_seed = [41u8; 32];
-    let d_user = user_from_seed(d_seed);
-    let mut d = new_joiner_node_as(d_user.clone(), d_seed, &a_ws, &proof);
+    let d_device = device_from_seed(d_seed);
+    let mut d = new_joiner_node_as(d_device.clone(), d_seed, &a_ws, &proof);
     for incept in [
         b.replica.self_inception().unwrap(),
         c.replica.self_inception().unwrap(),
@@ -2614,7 +2639,7 @@ fn a_rotation_that_could_never_install_is_refused_up_front() {
     // A 2-of-2 group over {A, B}.
     let (resp, _) = a
         .replica
-        .space_elevate_cmd(vec![b_user.as_str().to_string()], 2);
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
     assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
     for _ in 0..6 {
         sync_all(&mut a.replica, &mut b.replica);
@@ -2635,7 +2660,7 @@ fn a_rotation_that_could_never_install_is_refused_up_front() {
     // The current group is 2-of-2, so it needs BOTH of {A, B} to sign the
     // rotation, and neither would be able to derive the new key.
     let (resp, _) = a.replica.space_elevate_cmd(
-        vec![c_user.as_str().to_string(), d_user.as_str().to_string()],
+        vec![c_device.as_str().to_string(), d_device.as_str().to_string()],
         2,
     );
     match resp {
@@ -2649,7 +2674,7 @@ fn a_rotation_that_could_never_install_is_refused_up_front() {
     // Keeping one current holder is still not enough for a 2-of-2: two
     // signatures are needed and only one signer could derive the key.
     let (resp, _) = a.replica.space_elevate_cmd(
-        vec![b_user.as_str().to_string(), c_user.as_str().to_string()],
+        vec![b_device.as_str().to_string(), c_device.as_str().to_string()],
         2,
     );
     // {A, B, C}: both current holders are present, so this one CAN install.
@@ -2669,7 +2694,7 @@ fn an_unauthorized_proposal_moves_no_honest_node() {
     let mut a = new_node(); // founder; holds the solo recovery key
     let a_ws = a.replica.workspace_str();
     let rogue_seed = [77u8; 32];
-    let rogue = user_from_seed(rogue_seed);
+    let rogue = device_from_seed(rogue_seed);
 
     // The attacker names A as a participant, with a threshold they control.
     let propose = crate::dkg::CeremonyOp::DkgPropose(test_proposal(&a.replica, [1u8; 16], 2, {
@@ -2712,7 +2737,7 @@ fn an_unauthorized_proposal_moves_no_honest_node() {
 fn an_authorization_cannot_be_lifted_to_another_proposal() {
     let mut a = new_node();
     let rogue_seed = [78u8; 32];
-    let rogue = user_from_seed(rogue_seed);
+    let rogue = device_from_seed(rogue_seed);
     let secret = a.replica.read_space_recovery_key().expect("solo key");
 
     let propose = crate::dkg::CeremonyOp::DkgPropose(test_proposal(&a.replica, [2u8; 16], 2, {
@@ -2756,7 +2781,7 @@ fn an_authorization_cannot_be_lifted_to_another_proposal() {
 fn a_proposal_authorized_by_a_superseded_authority_is_rejected() {
     let mut a = new_node();
     let stale_seed = [66u8; 32]; // never the workspace's recovery key
-    let rogue = user_from_seed([79u8; 32]);
+    let rogue = device_from_seed([79u8; 32]);
 
     let propose = crate::dkg::CeremonyOp::DkgPropose(test_proposal(&a.replica, [3u8; 16], 2, {
         let mut v = vec![a.replica.me.clone(), rogue];
@@ -2831,9 +2856,9 @@ fn a_swapped_public_key_package_cannot_redirect_the_rotation() {
     let mut a = new_node();
     let a_ws = a.replica.workspace_str();
     let b_seed = [21u8; 32];
-    let b_user = user_from_seed(b_seed);
+    let b_device = device_from_seed(b_seed);
     let mut b = new_joiner_node_as(
-        b_user.clone(),
+        b_device.clone(),
         b_seed,
         &a_ws,
         &a.replica.founding_proof().unwrap(),
@@ -2845,7 +2870,7 @@ fn a_swapped_public_key_package_cannot_redirect_the_rotation() {
 
     let (resp, _) = a
         .replica
-        .space_elevate_cmd(vec![b_user.as_str().to_string()], 2);
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
     assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
     for _ in 0..6 {
         sync_all(&mut a.replica, &mut b.replica);
@@ -2891,9 +2916,9 @@ fn group_break_glass_recovery_needs_the_threshold_and_re_roots() {
     let a_actor = a.replica.my_actor().unwrap();
 
     let b_seed = [82u8; 32];
-    let b_user = user_from_seed(b_seed);
+    let b_device = device_from_seed(b_seed);
     let mut b = new_joiner_node_as(
-        b_user.clone(),
+        b_device.clone(),
         b_seed,
         &a_ws,
         &a.replica.founding_proof().unwrap(),
@@ -2906,7 +2931,7 @@ fn group_break_glass_recovery_needs_the_threshold_and_re_roots() {
     // Elevate {A, B} to a 2-of-2 group recovery key.
     let (resp, _) = a
         .replica
-        .space_elevate_cmd(vec![b_user.as_str().to_string()], 2);
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
     assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
     for _ in 0..6 {
         sync_all(&mut a.replica, &mut b.replica);
@@ -3082,10 +3107,10 @@ fn concurrent_fence_repairs_converge_and_then_stop() {
 
     // B and C join as admins.
     let b_seed = [21u8; 32];
-    let b_user = user_from_seed(b_seed);
-    let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, &proof);
+    let b_device = device_from_seed(b_seed);
+    let mut b = new_joiner_node_as(b_device.clone(), b_seed, &a_ws, &proof);
     let c_seed = [31u8; 32];
-    let mut c = new_joiner_node_as(user_from_seed(c_seed), c_seed, &a_ws, &proof);
+    let mut c = new_joiner_node_as(device_from_seed(c_seed), c_seed, &a_ws, &proof);
     for incept in [
         b.replica.self_inception().unwrap(),
         c.replica.self_inception().unwrap(),
@@ -3102,10 +3127,10 @@ fn concurrent_fence_repairs_converge_and_then_stop() {
     // ---- PARTITION: B redeems, A revokes ----
     let nonce = [7u8; 16];
     let x_seed = [61u8; 32];
-    let x_user = user_from_seed(x_seed);
+    let x_device = device_from_seed(x_seed);
     let x_incept = incept_for(x_seed, &b.replica);
     let x_actor = actor_of(&x_incept);
-    let (resp, _) = b.replica.redeem_invite(&b_user, &x_incept, &nonce, true);
+    let (resp, _) = b.replica.redeem_invite(&b_device, &x_incept, &nonce, true);
     assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
     let (resp, _) = a
         .replica
@@ -3177,7 +3202,7 @@ fn concurrent_fence_repairs_converge_and_then_stop() {
                 .replica
                 .membership
                 .sealed_devices(&winner.id)
-                .contains(&x_user),
+                .contains(&x_device),
             "X holds no key for the converged tip"
         );
     }
@@ -3202,9 +3227,9 @@ fn a_concurrently_revoked_invite_is_fenced_by_an_automatic_rekey() {
 
     // B joins as a second ADMIN and syncs.
     let b_seed = [21u8; 32];
-    let b_user = user_from_seed(b_seed);
+    let b_device = device_from_seed(b_seed);
     let mut b = new_joiner_node_as(
-        b_user.clone(),
+        b_device.clone(),
         b_seed,
         &a_ws,
         &a.replica.founding_proof().unwrap(),
@@ -3228,16 +3253,16 @@ fn a_concurrently_revoked_invite_is_fenced_by_an_automatic_rekey() {
     // B, not having seen the revoke, redeems it for X — sealing X the epochs
     // live at that moment.
     let x_seed = [61u8; 32];
-    let x_user = user_from_seed(x_seed);
+    let x_device = device_from_seed(x_seed);
     let x_incept = incept_for(x_seed, &b.replica);
     let x_actor = actor_of(&x_incept);
-    let (resp, _) = b.replica.redeem_invite(&b_user, &x_incept, &nonce, true);
+    let (resp, _) = b.replica.redeem_invite(&b_device, &x_incept, &nonce, true);
     assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
     assert!(
         b.replica
             .membership
             .sealed_devices(&epoch_before.id)
-            .contains(&x_user),
+            .contains(&x_device),
         "X holds the live epoch's key"
     );
     assert!(
@@ -3268,7 +3293,7 @@ fn a_concurrently_revoked_invite_is_fenced_by_an_automatic_rekey() {
         !a.replica
             .membership
             .sealed_devices(&active.id)
-            .contains(&x_user),
+            .contains(&x_device),
         "the evicted actor holds no key for the fenced epoch"
     );
 
@@ -3285,7 +3310,7 @@ fn a_concurrently_revoked_invite_is_fenced_by_an_automatic_rekey() {
 #[test]
 fn redeem_invite_rejects_a_non_admin_issuer() {
     let mut a = new_node(); // only me() is an admin
-    let issuer = user_from_seed([5u8; 32]); // never added to the ACL
+    let issuer = device_from_seed([5u8; 32]); // never added to the ACL
     let j_incept = incept_for([8u8; 32], &a.replica);
 
     let (resp, dirty) = a
@@ -3640,10 +3665,10 @@ fn inbox_derives_addressed_to_me_from_imports() {
     let mut a = new_node(); // founder
     with_project(&mut a.replica);
     let b_seed = [8u8; 32];
-    let b_user = user_from_seed(b_seed);
+    let b_device = device_from_seed(b_seed);
     let a_ws = a.replica.workspace_str();
     let mut b = new_joiner_node_as(
-        b_user.clone(),
+        b_device.clone(),
         b_seed,
         &a_ws,
         &a.replica.founding_proof().unwrap(),
@@ -3658,7 +3683,7 @@ fn inbox_derives_addressed_to_me_from_imports() {
         title: "for bob".into(),
         project: Some("ENG".into()),
         project_hint: None,
-        assignees: vec![b_user.as_str().to_string()],
+        assignees: vec![b_device.as_str().to_string()],
         priority: None,
         labels: vec![],
         body: None,
@@ -3774,10 +3799,10 @@ fn synced_rows_carry_field_changes_actor_and_collision() {
     let mut a = new_node();
     with_project(&mut a.replica);
     let b_seed = [9u8; 32];
-    let b_user = user_from_seed(b_seed);
+    let b_device = device_from_seed(b_seed);
     let a_ws = a.replica.workspace_str();
     let mut b = new_joiner_node_as(
-        b_user.clone(),
+        b_device.clone(),
         b_seed,
         &a_ws,
         &a.replica.founding_proof().unwrap(),
@@ -3965,10 +3990,10 @@ fn signed_delete_syncs_agents_cannot_delete_and_restore_wins() {
     let mut a = new_node(); // founder/admin
     with_project(&mut a.replica);
     let b_seed = [21u8; 32];
-    let b_user = user_from_seed(b_seed);
+    let b_device = device_from_seed(b_seed);
     let a_ws = a.replica.workspace_str();
     let mut b = new_joiner_node_as(
-        b_user.clone(),
+        b_device.clone(),
         b_seed,
         &a_ws,
         &a.replica.founding_proof().unwrap(),

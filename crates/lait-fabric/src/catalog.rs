@@ -40,7 +40,7 @@ use loro::{
 use crate::dto::{
     default_workflow, LabelDto, Priority, ProjectDto, StatusCategory, WorkflowState, SCHEMA_VERSION,
 };
-use crate::ids::{ActorId, DocId, LabelId, ProjectId, UserId, WorkspaceId};
+use crate::ids::{ActorId, DeviceId, DocId, LabelId, ProjectId, WorkspaceId};
 
 use crate::issue::IssueDoc;
 use crate::loro_ext as lx;
@@ -107,7 +107,7 @@ impl CatalogDoc {
         workspace_id: &WorkspaceId,
         name: &str,
         peer: Option<u64>,
-        founder: &UserId,
+        founder: &DeviceId,
     ) -> Result<Self> {
         let doc = LoroDoc::new();
         op::configure(&doc, peer);
@@ -848,19 +848,19 @@ mod tests {
     fn ws() -> WorkspaceId {
         WorkspaceId::mint(&SystemUlidSource)
     }
-    fn user() -> UserId {
-        UserId::from_key_string("a".repeat(64))
+    fn device() -> DeviceId {
+        DeviceId::from_key_string("a".repeat(64))
     }
     fn actor() -> ActorId {
         ActorId::from_incept_hash(&"a".repeat(64))
     }
     fn ctx(kind: &str) -> OpCtx {
-        OpCtx::structure(kind, &user())
+        OpCtx::structure(kind, &device())
     }
 
     fn cat() -> (CatalogDoc, WorkspaceId, ProjectId) {
         let w = ws();
-        let c = CatalogDoc::create(&w, "test", None, &user()).unwrap();
+        let c = CatalogDoc::create(&w, "test", None, &device()).unwrap();
         let p = ProjectId::mint(&SystemUlidSource);
         c.add_project(&p, "Engineering", "ENG", "blue").unwrap();
         c.apply(&ctx("project_new"));
@@ -875,7 +875,7 @@ mod tests {
             title: title.into(),
             priority: Priority::Medium,
             created_by: actor(),
-            committed_by: user(),
+            committed_by: device(),
             created_at: 42,
             body: None,
             peer: None,
@@ -923,7 +923,7 @@ mod tests {
         // edit the issue → recompute → row follows
         issue.set_title("fix login race").unwrap();
         issue.set_status("done").unwrap();
-        issue.apply(&OpCtx::content("edited", &user()));
+        issue.apply(&OpCtx::content("edited", &device()));
         c.upsert_row(&issue).unwrap();
         c.apply(&ctx("row"));
         let row = c.row(&issue.doc_id().unwrap()).unwrap();

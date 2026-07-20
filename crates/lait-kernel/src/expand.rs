@@ -28,7 +28,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::authority::{LeafId, PrincipalId};
-use crate::ids::UserId;
+use crate::ids::DeviceId;
 use crate::policy::{CanonicalPolicy, OwnershipPolicy, PolicyError, PolicyId};
 
 /// Domain for leaf-id derivation, separate from policy hashing.
@@ -55,7 +55,7 @@ pub enum PrincipalCustody {
     /// One leaf, operated by `device`. For a plain device-principal this is the
     /// principal's own key; it is carried explicitly so an organizational
     /// principal can name the device that acts for it.
-    Direct { device: UserId },
+    Direct { device: DeviceId },
     /// The principal is itself a group: expand this sub-policy in place.
     Federated(OwnershipPolicy),
 }
@@ -74,7 +74,7 @@ pub struct PrincipalDescriptor {
 pub struct LeafDescriptor {
     pub leaf: LeafId,
     pub principal: PrincipalId,
-    pub device: UserId,
+    pub device: DeviceId,
     /// Child-index path from the expanded root to this leaf. Unique per leaf.
     pub path: Vec<u32>,
 }
@@ -240,7 +240,7 @@ fn expand_rec(
 /// A leaf id bound to its occurrence path and provenance. The path makes it
 /// distinct per occurrence; principal and device bind provenance into the id so
 /// a descriptor cannot be swapped without changing the leaf it names.
-fn leaf_id(path: &[u32], principal: &PrincipalId, device: &UserId) -> LeafId {
+fn leaf_id(path: &[u32], principal: &PrincipalId, device: &DeviceId) -> LeafId {
     let mut h = blake3::Hasher::new();
     h.update(LEAF_DOMAIN);
     h.update(&(path.len() as u64).to_le_bytes());
@@ -276,8 +276,8 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    fn dev(n: u8) -> UserId {
-        crate::crypto::user_from_seed(&[n; 32])
+    fn dev(n: u8) -> DeviceId {
+        crate::crypto::device_from_seed(&[n; 32])
     }
     fn prin(n: u8) -> PrincipalId {
         PrincipalId::of_device(&dev(n))
@@ -428,7 +428,7 @@ mod tests {
                         seed[2] = (i & 0xff) as u8;
                         seed[3] = (i >> 8) as u8;
                         OwnershipPolicy::Key(PrincipalId::of_device(
-                            &crate::crypto::user_from_seed(&seed),
+                            &crate::crypto::device_from_seed(&seed),
                         ))
                     })
                     .collect(),

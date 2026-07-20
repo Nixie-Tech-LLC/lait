@@ -21,7 +21,7 @@ use anyhow::{anyhow, Result};
 use loro::{ExportMode, Frontiers, LoroDoc};
 
 use crate::dto::{CommentDto, CorruptRecord, Priority, Projected, DEFAULT_STATUS};
-use crate::ids::{ActorId, DocId, LabelId, ProjectId, UserId, WorkspaceId};
+use crate::ids::{ActorId, DeviceId, DocId, LabelId, ProjectId, WorkspaceId};
 
 use crate::loro_ext as lx;
 use crate::op::{self, OpCtx};
@@ -86,7 +86,7 @@ pub struct NewIssue {
     /// The authoring **actor** (identity), stable across the author's devices.
     pub created_by: ActorId,
     /// The device that committed, recorded as an advisory stamp.
-    pub committed_by: UserId,
+    pub committed_by: DeviceId,
     pub created_at: u64,
     pub body: Option<String>,
     /// The store's stable peer id: one version-vector entry per
@@ -401,14 +401,14 @@ mod tests {
     fn doc() -> DocId {
         DocId::mint(&SystemUlidSource)
     }
-    fn user() -> UserId {
-        UserId::from_key_string("a".repeat(64))
+    fn device() -> DeviceId {
+        DeviceId::from_key_string("a".repeat(64))
     }
     fn actor(c: char) -> ActorId {
         ActorId::from_incept_hash(&c.to_string().repeat(64))
     }
     fn ctx(kind: &str) -> OpCtx {
-        OpCtx::content(kind, &user())
+        OpCtx::content(kind, &device())
     }
 
     fn sample() -> IssueDoc {
@@ -419,7 +419,7 @@ mod tests {
             title: "fix login".into(),
             priority: Priority::High,
             created_by: actor('a'),
-            committed_by: user(),
+            committed_by: device(),
             created_at: 1000,
             body: Some("the token refresh races".into()),
             peer: None,
@@ -606,7 +606,7 @@ mod tests {
         assert_eq!(hist[0].kind.as_deref(), Some("created"));
         assert_eq!(hist[1].kind.as_deref(), Some("started"));
         assert_eq!(hist[2].kind.as_deref(), Some("finished"));
-        assert_eq!(hist[2].actor, Some(user()));
+        assert_eq!(hist[2].actor, Some(device()));
         assert!(hist[2].ts > 0, "real wall-clock on every change");
         let status_change = hist[2]
             .changes

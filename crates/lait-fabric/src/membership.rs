@@ -15,7 +15,7 @@ use anyhow::{anyhow, Result};
 use loro::{Container, ExportMode, Frontiers, LoroDoc, LoroList, LoroMap, ValueOrContainer};
 
 use crate::acl::SignedOp;
-use crate::ids::{UserId, WorkspaceId};
+use crate::ids::{DeviceId, WorkspaceId};
 
 use crate::loro_ext as lx;
 use crate::op::{self, OpCtx};
@@ -32,7 +32,7 @@ const C_CEREMONY: &str = "ceremony"; // FROST DKG/signing round packages (grow-o
                                      // adopts a key only when a valid writer-signed mint authorizes its epoch. These
                                      // envelopes are unsigned ciphertext, but each is bound to its mint by
                                      // `blake3(key) == mint.key_commit`, so a forged envelope is inert.
-const C_KEYS: &str = "keys"; // epoch_id(hex) -> Map<device UserId, sealed bytes>
+const C_KEYS: &str = "keys"; // epoch_id(hex) -> Map<device DeviceId, sealed bytes>
 
 fn epoch_hex(id: &[u8; 16]) -> String {
     data_encoding::HEXLOWER.encode(id)
@@ -44,7 +44,11 @@ pub struct MembershipDoc {
 }
 
 impl MembershipDoc {
-    pub fn create(workspace_id: &WorkspaceId, peer: Option<u64>, founder: &UserId) -> Result<Self> {
+    pub fn create(
+        workspace_id: &WorkspaceId,
+        peer: Option<u64>,
+        founder: &DeviceId,
+    ) -> Result<Self> {
         let doc = LoroDoc::new();
         op::configure(&doc, peer);
         let root = doc.get_map(ROOT);
@@ -349,24 +353,24 @@ impl MembershipDoc {
     }
 
     /// Store the workspace key sealed to `device` for `epoch`.
-    pub fn put_sealed(&self, epoch: &[u8; 16], device: &UserId, sealed: &[u8]) -> Result<()> {
+    pub fn put_sealed(&self, epoch: &[u8; 16], device: &DeviceId, sealed: &[u8]) -> Result<()> {
         let m = self.epoch_keymap(epoch, true)?.unwrap();
         m.insert(device.as_str(), sealed)?;
         Ok(())
     }
 
     /// Retrieve the sealed key envelope addressed to `device` for `epoch`.
-    pub fn get_sealed(&self, epoch: &[u8; 16], device: &UserId) -> Option<Vec<u8>> {
+    pub fn get_sealed(&self, epoch: &[u8; 16], device: &DeviceId) -> Option<Vec<u8>> {
         let m = self.epoch_keymap(epoch, false).ok().flatten()?;
         lx::get_bytes(&m, device.as_str())
     }
 
     /// The devices with a sealed envelope for `epoch` (for self-heal).
-    pub fn sealed_devices(&self, epoch: &[u8; 16]) -> Vec<UserId> {
+    pub fn sealed_devices(&self, epoch: &[u8; 16]) -> Vec<DeviceId> {
         match self.epoch_keymap(epoch, false) {
             Ok(Some(m)) => lx::map_keys(&m)
                 .into_iter()
-                .map(UserId::from_key_string)
+                .map(DeviceId::from_key_string)
                 .collect(),
             _ => Vec::new(),
         }
@@ -384,10 +388,10 @@ mod tests {
     fn ws() -> WorkspaceId {
         WorkspaceId::mint(&SystemUlidSource)
     }
-    fn user(n: u8) -> UserId {
+    fn device(n: u8) -> DeviceId {
         use ed25519_dalek::SigningKey;
         let pk = SigningKey::from_bytes(&[n; 32]).verifying_key();
-        UserId::from_key_string(data_encoding::HEXLOWER.encode(pk.as_bytes()))
+        DeviceId::from_key_string(data_encoding::HEXLOWER.encode(pk.as_bytes()))
     }
     fn actor(n: u8) -> ActorId {
         ActorId::from_incept_hash(&format!("{:064x}", n))
@@ -409,10 +413,10 @@ mod tests {
         )
     }
     fn ctx(kind: &str) -> OpCtx {
-        OpCtx::authority(kind, &user(1))
+        OpCtx::authority(kind, &device(1))
     }
     fn fresh(w: &WorkspaceId) -> MembershipDoc {
-        MembershipDoc::create(w, None, &user(1)).unwrap()
+        MembershipDoc::create(w, None, &device(1)).unwrap()
     }
 
     #[test]
@@ -448,21 +452,21 @@ mod tests {
         let m = fresh(&ws());
         let e0 = [0u8; 16];
         let e1 = [1u8; 16];
-        m.put_sealed(&e0, &user(1), b"sealed-for-1").unwrap();
-        m.put_sealed(&e0, &user(2), b"sealed-for-2").unwrap();
+        m.put_sealed(&e0, &device(1), b"sealed-for-1").unwrap();
+        m.put_sealed(&e0, &device(2), b"sealed-for-2").unwrap();
         m.apply(&ctx("seal"));
         assert_eq!(
-            m.get_sealed(&e0, &user(1)).as_deref(),
+            m.get_sealed(&e0, &device(1)).as_deref(),
             Some(&b"sealed-for-1"[..])
         );
         assert_eq!(
-            m.get_sealed(&e1, &user(1)),
+            m.get_sealed(&e1, &device(1)),
             None,
             "no envelope for an unknown epoch"
         );
         let mut devs = m.sealed_devices(&e0);
         devs.sort();
-        let mut expect = vec![user(1), user(2)];
+        let mut expect = vec![device(1), device(2)];
         expect.sort();
         assert_eq!(devs, expect);
     }
@@ -474,11 +478,14 @@ mod tests {
         let op = add_op(2, vec![Grant::Admin], vec![], &w);
         m.add_op(&op).unwrap();
         let e0 = [9u8; 16];
-        m.put_sealed(&e0, &user(2), b"k").unwrap();
+        m.put_sealed(&e0, &device(2), b"k").unwrap();
         m.apply(&ctx("member_add"));
         let snap = m.snapshot().unwrap();
         let loaded = MembershipDoc::from_snapshot(&snap, None).unwrap();
         assert_eq!(loaded.ops().len(), 1);
-        assert_eq!(loaded.get_sealed(&e0, &user(2)).as_deref(), Some(&b"k"[..]));
+        assert_eq!(
+            loaded.get_sealed(&e0, &device(2)).as_deref(),
+            Some(&b"k"[..])
+        );
     }
 }

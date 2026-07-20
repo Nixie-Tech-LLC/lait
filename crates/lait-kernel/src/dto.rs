@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ActorId, DocId, LabelId, ProjectId, UserId, WorkspaceId};
+use crate::ids::{ActorId, DeviceId, DocId, LabelId, ProjectId, WorkspaceId};
 
 /// Schema version gate. Every top-level DTO carries it so a reader
 /// can detect drift; bump on any additive change.
@@ -289,7 +289,7 @@ pub struct Row {
     /// The assignee keys behind that summary.
     ///
     /// Both, not one. `assignee_summary` is *rendered* — it resolves "you" against
-    /// the local `UserId` and collapses the tail into `+2`, which is exactly right
+    /// the local `DeviceId` and collapses the tail into `+2`, which is exactly right
     /// for a CLI row and useless to a client that wants to draw faces. The keys are
     /// already in `RowMeta` (cached viewer-neutrally, precisely so the summary can
     /// be computed per-viewer), so this projects them rather than making every
@@ -376,7 +376,7 @@ pub struct ActivityEvent {
     pub reff: String,
     pub kind: String,
     pub changes: Vec<FieldChange>,
-    pub actor: Option<UserId>,
+    pub actor: Option<DeviceId>,
     pub actor_nick: String,
     pub text: String,
     pub ts: u64,

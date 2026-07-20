@@ -258,7 +258,7 @@ mod tests {
     use super::*;
 
     fn id(seed: u8) -> PeerId {
-        crate::crypto::user_from_seed(&[seed; 32])
+        crate::crypto::device_from_seed(&[seed; 32])
     }
 
     #[tokio::test]

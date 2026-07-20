@@ -31,7 +31,7 @@ pub fn derive_project_key(name: &str) -> String {
 /// already holds a workspace. Returns the workspace id and the seeded project.
 pub fn found_workspace(
     store: &Store,
-    me: &UserId,
+    me: &DeviceId,
     device_seed: &[u8; 32],
     name: &str,
     clock: &dyn UlidSource,
@@ -45,7 +45,7 @@ pub fn found_workspace(
     // workspace id, so the id cannot itself depend on the inception. Derive from
     // the SEED's public key (the inception's author), so the id commits to
     // exactly the key that signs the founding inception.
-    let founding_device = crypto::user_from_seed(device_seed);
+    let founding_device = crypto::device_from_seed(device_seed);
     let salt = rand16();
     // Mint the workspace's break-glass recovery key (a solo bootstrap key the
     // founder holds — later elevated to a FROST group key via Rotate) and fold its
@@ -127,7 +127,7 @@ pub fn found_workspace(
 pub(super) fn mint_recovery() -> ([u8; 32], [u8; 32]) {
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).expect("getrandom");
-    let recovery_pub = crypto::user_from_seed(&seed);
+    let recovery_pub = crypto::device_from_seed(&seed);
     let commit = actor::recovery_commitment(&recovery_pub).expect("valid recovery pubkey");
     (commit, seed)
 }
@@ -189,7 +189,7 @@ impl Replica {
     /// commit and its row mirror self-heals.
     pub fn open(
         store: Store,
-        me: UserId,
+        me: DeviceId,
         my_nick: String,
         seed: [u8; 32],
         clock: Box<dyn UlidSource + Send + Sync>,

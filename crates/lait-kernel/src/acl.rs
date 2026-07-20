@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::actor::{self, ActorPlane, SignedEvent};
 use crate::genesis::Genesis;
-use crate::ids::{ActorId, UserId, WorkspaceId};
+use crate::ids::{ActorId, DeviceId, WorkspaceId};
 use crate::sigdag::{self, SignedNode};
 
 pub const ACL_DOMAIN: &[u8] = b"lait/aclop/1";
@@ -345,7 +345,7 @@ impl AclState {
 pub struct AuditEntry {
     pub hash: String,
     /// The signing device key (verified — the signature covers the op).
-    pub author: UserId,
+    pub author: DeviceId,
     /// The actor the author claimed (its device→actor binding is part of the
     /// verdict).
     pub by: Option<ActorId>,
@@ -395,7 +395,7 @@ pub fn replay_with_audit(
     // Memoized at-frontier actor resolution: the same (device, actor, asof)
     // claim resolves identically everywhere, so cache by (actor, sorted asof).
     let mut planes: HashMap<Vec<String>, ActorPlane> = HashMap::new();
-    let mut device_speaks_for = |device: &UserId, by: &ActorId, asof: &[String]| -> bool {
+    let mut device_speaks_for = |device: &DeviceId, by: &ActorId, asof: &[String]| -> bool {
         let mut key: Vec<String> = asof.to_vec();
         key.sort();
         let plane = planes

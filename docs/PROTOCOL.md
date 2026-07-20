@@ -8,7 +8,7 @@ types are not themselves the wire specification.
 
 - `WorkspaceId` identifies a space.
 - `ActorId` identifies a member within that space.
-- `UserId` is an ed25519 device key and equals the device's iroh endpoint id.
+- `DeviceId` is an ed25519 device key and equals the device's iroh endpoint id.
 - Loro peer ids are internal operation-addressing values and are never user
   identities.
 - Workspace tickets carry the genesis trust anchor and founding actor material.

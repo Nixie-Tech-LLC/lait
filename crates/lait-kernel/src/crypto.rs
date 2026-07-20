@@ -6,7 +6,7 @@
 //!   blind relay or a non-member sees only ciphertext (the "encryption *is* the
 //!   access control" posture).
 //! - **Sealed box**: an anonymous X25519 + AEAD box that distributes the
-//!   workspace key to a member addressed by their ed25519 `UserId`. The member's
+//!   workspace key to a member addressed by their ed25519 `DeviceId`. The member's
 //!   ed25519 identity is converted to X25519 (libsodium's `*_to_curve25519`).
 //!
 //! # Security status
@@ -23,7 +23,7 @@ use curve25519_dalek::edwards::CompressedEdwardsY;
 use sha2::{Digest, Sha512};
 use x25519_dalek::{PublicKey as XPublic, StaticSecret};
 
-use crate::ids::UserId;
+use crate::ids::DeviceId;
 
 /// The workspace symmetric key length (ChaCha20-Poly1305).
 pub const KEY_LEN: usize = 32;
@@ -39,20 +39,20 @@ pub fn random_key() -> WorkspaceKey {
 }
 
 /// A fresh random 32-byte identity seed. A lait identity is just this seed; the
-/// transport constructs its keypair from it (see [`user_from_seed`]).
+/// transport constructs its keypair from it (see [`device_from_seed`]).
 pub fn random_seed() -> [u8; 32] {
     let mut s = [0u8; 32];
     getrandom::fill(&mut s).expect("getrandom");
     s
 }
 
-/// The lait [`UserId`] (device key) of an identity seed: the ed25519 public key
-/// of the 32-byte seed, hex-encoded. A `UserId` *is* this public key,
+/// The lait [`DeviceId`] (device key) of an identity seed: the ed25519 public key
+/// of the 32-byte seed, hex-encoded. A `DeviceId` *is* this public key,
 /// and it equals the transport's node id for the same seed (see [`crate::ids`]) —
 /// so identity is defined here, in lait's own terms, with no transport type.
-pub fn user_from_seed(seed: &[u8; 32]) -> UserId {
+pub fn device_from_seed(seed: &[u8; 32]) -> DeviceId {
     let pk = ed25519_dalek::SigningKey::from_bytes(seed).verifying_key();
-    UserId::from_key_string(data_encoding::HEXLOWER.encode(pk.as_bytes()))
+    DeviceId::from_key_string(data_encoding::HEXLOWER.encode(pk.as_bytes()))
 }
 
 fn random_nonce() -> [u8; NONCE_LEN] {
@@ -85,9 +85,9 @@ pub fn aead_decrypt(key: &WorkspaceKey, blob: &[u8]) -> Option<Vec<u8>> {
     cipher.decrypt(Nonce::from_slice(nonce), ct).ok()
 }
 
-/// Parse a hex `UserId` into raw ed25519 public-key bytes.
-fn ed_pubkey_bytes(user: &UserId) -> Option<[u8; 32]> {
-    let s = user.as_str();
+/// Parse a hex `DeviceId` into raw ed25519 public-key bytes.
+fn ed_pubkey_bytes(device: &DeviceId) -> Option<[u8; 32]> {
+    let s = device.as_str();
     if s.len() != 64 {
         return None;
     }
@@ -115,10 +115,10 @@ fn ed_seed_to_x(seed: &[u8; 32]) -> StaticSecret {
     StaticSecret::from(s)
 }
 
-/// Seal `msg` to a member addressed by their ed25519 `UserId` (an anonymous
+/// Seal `msg` to a member addressed by their ed25519 `DeviceId` (an anonymous
 /// sealed box). Output = `eph_x_pub(32) || nonce(12) || ciphertext`. Used to
 /// distribute the workspace key. Returns `None` if the recipient key is invalid.
-pub fn seal_to(recipient: &UserId, msg: &[u8]) -> Option<Vec<u8>> {
+pub fn seal_to(recipient: &DeviceId, msg: &[u8]) -> Option<Vec<u8>> {
     let recip_ed = ed_pubkey_bytes(recipient)?;
     let recip_x = ed_pk_to_x(&recip_ed)?;
     let mut eph_seed = [0u8; 32];
@@ -137,8 +137,8 @@ pub fn seal_to(recipient: &UserId, msg: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Open a sealed box addressed to us, given our ed25519 seed + `UserId`.
-pub fn open_sealed(my_seed: &[u8; 32], me: &UserId, sealed: &[u8]) -> Option<Vec<u8>> {
+/// Open a sealed box addressed to us, given our ed25519 seed + `DeviceId`.
+pub fn open_sealed(my_seed: &[u8; 32], me: &DeviceId, sealed: &[u8]) -> Option<Vec<u8>> {
     if sealed.len() < 32 + NONCE_LEN {
         return None;
     }
@@ -182,13 +182,13 @@ mod tests {
     }
 
     #[test]
-    fn seals_to_a_seed_derived_user_and_opens() {
-        // A member is addressed by their seed-derived UserId; the ed25519↔x25519
+    fn seals_to_a_seed_derived_device_and_opens() {
+        // A member is addressed by their seed-derived DeviceId; the ed25519↔x25519
         // conversion must let a box sealed to it open with the seed. (The
         // agreement that the transport's key IS this ed25519 pair lives at the
         // net seam — see tests/identity_interop.rs.)
         let seed = [5u8; 32];
-        let uid = user_from_seed(&seed);
+        let uid = device_from_seed(&seed);
         let key = random_key();
         let sealed = seal_to(&uid, &key).expect("seal to seed-derived key");
         assert_eq!(
@@ -201,13 +201,13 @@ mod tests {
     #[test]
     fn sealed_box_only_opens_for_recipient() {
         let seed = [7u8; 32];
-        let me = user_from_seed(&seed);
+        let me = device_from_seed(&seed);
         let key = random_key();
         let sealed = seal_to(&me, &key).expect("seal");
         assert_eq!(open_sealed(&seed, &me, &sealed).as_deref(), Some(&key[..]));
         // a different member cannot open it.
         let other_seed = [9u8; 32];
-        let other = user_from_seed(&other_seed);
+        let other = device_from_seed(&other_seed);
         assert!(open_sealed(&other_seed, &other, &sealed).is_none());
     }
 }

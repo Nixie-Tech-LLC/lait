@@ -27,15 +27,15 @@ use proptest::prelude::*;
 use lait::catalog::CatalogDoc;
 use lait::dto::Priority;
 use lait::fabric::op::OpCtx;
-use lait::ids::{ActorId, DocId, LabelId, ProjectId, SystemUlidSource, UserId, WorkspaceId};
+use lait::ids::{ActorId, DeviceId, DocId, LabelId, ProjectId, SystemUlidSource, WorkspaceId};
 use lait::issue::{IssueDoc, NewIssue};
 
 /// A fixed creation timestamp — never varied, so it can never be the reason two
 /// replicas differ.
 const CREATED_AT: u64 = 1_000;
 
-fn tester() -> UserId {
-    UserId::from_key_string("a".repeat(64))
+fn tester() -> DeviceId {
+    DeviceId::from_key_string("a".repeat(64))
 }
 fn ctx() -> OpCtx {
     OpCtx::content("test", &tester())
@@ -251,9 +251,9 @@ proptest! {
         n_replicas in 2usize..=3,
         ops in prop::collection::vec((0u8..3, set_op_strategy()), 0..40),
     ) {
-        // Fixed pools of 4 users and 4 labels, minted once and shared by every
+        // Fixed pools of 4 actors and 4 labels, minted once and shared by every
         // replica (so add/remove target the same keys across replicas).
-        let users: Vec<ActorId> =
+        let actors: Vec<ActorId> =
             (0..4).map(|i| ActorId::from_incept_hash(&format!("{:064x}", i + 1))).collect();
         let labels: Vec<LabelId> = (0..4).map(|_| LabelId::mint(&SystemUlidSource)).collect();
 
@@ -263,8 +263,8 @@ proptest! {
         for (who, op) in &ops {
             let r = &replicas[(*who as usize) % n_replicas];
             match op {
-                SetOp::AddAssignee(i) => r.add_assignee(&users[*i]).unwrap(),
-                SetOp::RemoveAssignee(i) => r.remove_assignee(&users[*i]).unwrap(),
+                SetOp::AddAssignee(i) => r.add_assignee(&actors[*i]).unwrap(),
+                SetOp::RemoveAssignee(i) => r.remove_assignee(&actors[*i]).unwrap(),
                 SetOp::AddLabel(i) => r.add_label(&labels[*i]).unwrap(),
                 SetOp::RemoveLabel(i) => r.remove_label(&labels[*i]).unwrap(),
             }
