@@ -305,7 +305,10 @@ impl Replica {
             }
             if changes.is_empty() {
                 // Already exactly there — idempotent: no commit, no activity.
-                return self.issue_view(reff).map(|r| (r, None));
+                return Ok(match self.issue_view(reff) {
+                    Ok(view) => (Response::Issue(Box::new(view)), None),
+                    Err(e) => (Self::error_response(e), None),
+                });
             }
             issue.apply(&ctx);
         }
@@ -328,7 +331,14 @@ impl Replica {
         let dirty = DirtySet::issue(&project_id, &doc_id).with_scope(CatalogScope::Boards {
             project: project_id.as_str().to_string(),
         });
-        self.issue_view(canonical).map(|r| (r, Some(dirty)))
+        Ok(match self.issue_view(canonical) {
+            Ok(view) => (Response::Issue(Box::new(view)), Some(dirty)),
+            // The commit already landed. Failing to render its snapshot is a
+            // reporting failure, not a rejected write, so the doorbell still
+            // rings — otherwise subscribers never learn about a change that is
+            // durably on disk.
+            Err(e) => (Self::error_response(e), Some(dirty)),
+        })
     }
 
     pub(super) fn issue_move(
