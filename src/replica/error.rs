@@ -121,8 +121,6 @@ pub enum AdminAction {
 pub enum Invalid {
     /// A field that must carry text was empty.
     Empty { field: &'static str },
-    /// A value was not the shape it must take (an id, a key, a blob).
-    Malformed { what: &'static str },
     /// An edit that names no change.
     NothingToEdit,
 }
@@ -259,7 +257,6 @@ impl fmt::Display for Invalid {
                 "project" => f.write_str("project name and key are required"),
                 other => write!(f, "{other} must not be empty"),
             },
-            Self::Malformed { what } => f.write_str(what),
             Self::NothingToEdit => f.write_str("nothing to edit"),
         }
     }
