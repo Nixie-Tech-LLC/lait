@@ -43,7 +43,8 @@ use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    sync::Notify,
+    sync::{watch, Notify},
+    task::JoinSet,
 };
 
 use crate::{
@@ -84,6 +85,50 @@ const IDLE_SHUTDOWN: Duration = Duration::from_secs(30 * 60);
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// Bound on the doorbell ring: the last ~1000 batches.
 const DOORBELL_RING: usize = 1000;
+
+/// How long teardown may spend cancelling and draining the daemon's tasks. The
+/// daemon must not return before its tasks have ended — returning releases the
+/// daemon lock and legalizes a same-home restart — but a wedged task must not
+/// hold the lock forever either, so anything still running past this deadline is
+/// aborted. All state is already durable by the time the deadline starts.
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(3);
+/// Grace for a `Bye` to reach the room before the transport closes under it.
+const BYE_GRACE: Duration = Duration::from_millis(500);
+
+/// Daemon-wide cancellation. Every long-lived task selects on
+/// [`Cancel::cancelled`], so teardown ends them deterministically: the daemon
+/// spawns loops (gossip receive, heartbeat, reaper, checkpoint, idle, accept)
+/// and per-connection tasks that each hold an `Arc<Node>`, and a detached one
+/// would keep broadcasting and checkpointing after the home directory it writes
+/// to is gone and another daemon owns the lock.
+#[derive(Clone)]
+pub struct Cancel(Arc<watch::Sender<bool>>);
+
+impl Cancel {
+    fn new() -> Self {
+        Self(Arc::new(watch::Sender::new(false)))
+    }
+
+    /// Signal every task to wind down. Idempotent.
+    fn cancel(&self) {
+        let _ = self.0.send(true);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    /// Resolve once cancellation has been signalled (immediately if it already
+    /// has). Holding the sender in the daemon keeps this from ever resolving by
+    /// channel closure instead of by an actual cancel.
+    async fn cancelled(&self) {
+        let mut rx = self.0.subscribe();
+        if *rx.borrow() {
+            return;
+        }
+        let _ = rx.wait_for(|c| *c).await;
+    }
+}
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -483,6 +528,12 @@ pub struct Node {
     router: Router,
     shared: Shared,
     shutdown: Arc<Notify>,
+    /// Teardown signal for every long-lived task (see [`Cancel`]).
+    cancel: Cancel,
+    /// Every task the daemon spawns, so teardown can join them before the
+    /// injectable entry returns and releases the daemon lock. Held behind a
+    /// `std::sync::Mutex` that is never locked across an `.await`.
+    tasks: Arc<Mutex<JoinSet<()>>>,
     recv_gen: AtomicU64,
     active_conns: AtomicU64,
     last_active: Mutex<Instant>,
@@ -504,6 +555,26 @@ pub struct Node {
 }
 
 impl Node {
+    /// Spawn a daemon-owned task. Every `tokio::spawn` in the daemon goes
+    /// through here: an untracked task outlives teardown holding an `Arc<Node>`,
+    /// which is only invisible in production because the process exits. Finished
+    /// tasks are reaped on the way in so the set does not grow with the number
+    /// of control connections served.
+    fn spawn<F>(&self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        // Past cancellation the set has already been drained for joining, so a
+        // task admitted here would be exactly the untracked straggler this
+        // exists to prevent. Teardown is under way; drop the work.
+        if self.cancel.is_cancelled() {
+            return;
+        }
+        let mut tasks = self.tasks.lock().unwrap();
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(fut);
+    }
+
     fn touch(&self, id: EndpointId, nick: Option<String>) -> String {
         // A newly-seen peer must be reachable before we dial it back (Local).
         self.peers.learn(id);
@@ -573,7 +644,7 @@ impl Node {
             }
         };
         if became_suspect {
-            tokio::spawn(self.probe_peer(id));
+            self.spawn(self.clone().probe_peer(id));
         }
     }
 
@@ -632,7 +703,10 @@ impl Node {
     async fn reaper_loop(self: Arc<Self>) {
         let mut interval = tokio::time::interval(REAP_INTERVAL);
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = self.cancel.cancelled() => break,
+            }
             let now = Instant::now();
             let stale: Vec<EndpointId> = {
                 let p = self.shared.presence.lock().unwrap();
@@ -739,11 +813,18 @@ impl Node {
         }
         // Ensure the sync dial can resolve the peer under Local.
         self.peers.learn(peer);
-        tokio::spawn(async move {
+        let cancel = self.cancel.clone();
+        let tracker = self.clone();
+        tracker.spawn(async move {
             if !self.syncing.lock().unwrap().insert(peer) {
                 return; // already syncing this peer
             }
-            let result = self.do_pull(peer).await;
+            // A pull has no read deadline of its own (a stalled peer would park
+            // the task forever), so teardown is what bounds it.
+            let result = tokio::select! {
+                r = self.do_pull(peer) => r,
+                _ = cancel.cancelled() => Err(anyhow!("daemon shutting down")),
+            };
             self.syncing.lock().unwrap().remove(&peer);
             match result {
                 Ok(dirty) => {
@@ -839,7 +920,7 @@ impl Node {
         let (sender, receiver) = gtopic.split();
         *self.sender.lock().unwrap() = sender;
         let gen = self.recv_gen.fetch_add(1, Ordering::SeqCst) + 1;
-        tokio::spawn(self.clone().recv_loop(receiver, gen));
+        self.spawn(self.clone().recv_loop(receiver, gen));
         Ok(())
     }
 
@@ -993,7 +1074,11 @@ impl Node {
             if self.recv_gen.load(Ordering::SeqCst) != gen {
                 break;
             }
-            match receiver.try_next().await {
+            let next = tokio::select! {
+                next = receiver.try_next() => next,
+                _ = self.cancel.cancelled() => break,
+            };
+            match next {
                 Ok(Some(event)) => match event {
                     Event::Received(msg) => {
                         match SignedMessage::verify_and_decode(&self.space, &msg.content) {
@@ -1034,7 +1119,10 @@ impl Node {
     async fn heartbeat_loop(self: Arc<Self>) {
         let mut interval = tokio::time::interval(heartbeat_from_env());
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = self.cancel.cancelled() => break,
+            }
             if let Err(e) = self
                 .broadcast(Payload::Presence {
                     nick: self.shared.nick(),
@@ -1063,7 +1151,10 @@ impl Node {
         let mut interval = tokio::time::interval(CHECKPOINT_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = self.cancel.cancelled() => break,
+            }
             if self.replica.lock().unwrap().checkpoint() {
                 tracing::debug!("store checkpoint committed");
             }
@@ -1186,7 +1277,7 @@ impl Node {
         }
         if changed {
             let me = self.clone();
-            tokio::spawn(async move {
+            self.spawn(async move {
                 me.broadcast_announce().await.ok();
             });
         }
@@ -1426,7 +1517,9 @@ impl Node {
                 if changed {
                     // Announce a changed catalog head so peers pull.
                     let me = self.clone();
-                    tokio::spawn(async move { me.broadcast_announce().await.ok() });
+                    self.spawn(async move {
+                        me.broadcast_announce().await.ok();
+                    });
                 }
                 Ok(resp)
             }
@@ -1458,7 +1551,9 @@ impl Node {
                         upsert_alias(&self.home, &who, name.trim());
                     }
                     let me = self.clone();
-                    tokio::spawn(async move { me.broadcast_announce().await.ok() });
+                    self.spawn(async move {
+                        me.broadcast_announce().await.ok();
+                    });
                 }
                 Ok(resp)
             }
@@ -1475,7 +1570,9 @@ impl Node {
                 let (resp, changed) = self.dispatch_replica(Request::AgentAdd { key });
                 if changed {
                     let me = self.clone();
-                    tokio::spawn(async move { me.broadcast_announce().await.ok() });
+                    self.spawn(async move {
+                        me.broadcast_announce().await.ok();
+                    });
                 }
                 Ok(resp)
             }
@@ -1577,7 +1674,9 @@ impl Node {
                                 upsert_alias(&self.home, &key, name.trim());
                             }
                             let me = self.clone();
-                            tokio::spawn(async move { me.broadcast_announce().await.ok() });
+                            self.spawn(async move {
+                                me.broadcast_announce().await.ok();
+                            });
                         }
                         Ok(resp)
                     }
@@ -1877,7 +1976,7 @@ impl Node {
                 // Broadcast the new nick right away so peers don't wait a
                 // heartbeat to see it.
                 let me = self.clone();
-                tokio::spawn(async move {
+                self.spawn(async move {
                     me.broadcast(Payload::Hello {
                         nick: me.shared.nick(),
                     })
@@ -1890,7 +1989,7 @@ impl Node {
             }
             Request::Stop => {
                 let me = self.clone();
-                tokio::spawn(async move {
+                self.spawn(async move {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     me.signal_shutdown();
                 });
@@ -1964,7 +2063,10 @@ impl Node {
         }
         let mut interval = tokio::time::interval(IDLE_CHECK_INTERVAL);
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = self.cancel.cancelled() => break,
+            }
             let active = self.active_conns.load(Ordering::SeqCst);
             let idle_for = self.last_active.lock().unwrap().elapsed();
             if should_idle_shutdown(active, idle_for, self.idle_window, self.is_mesh_member()) {
@@ -2064,6 +2166,10 @@ impl Node {
             tokio::select! {
                 _ = &mut notified => continue,
                 _ = shutdown.notified() => return,
+                // A stream that outlived the stop signal (it parked between the
+                // notify and its re-park) still has to end, or teardown waits on
+                // a client that will never disconnect.
+                _ = self.cancel.cancelled() => return,
             }
         }
     }
@@ -2088,14 +2194,34 @@ async fn write_line_half<T: serde::Serialize>(
     write_half.flush().await
 }
 
-/// Build and run the daemon until a Stop request arrives. When `seed` is set the
-/// node runs as an always-on seed and never idle-shuts-down (DUR-4).
+/// The production daemon entry: run until a Stop request arrives, then exit the
+/// process. When `seed` is set the node runs as an always-on seed and never
+/// idle-shuts-down (DUR-4).
+///
+/// Exiting is a hard guarantee of the *process* form of the daemon: "stop" means
+/// the process is gone, so nothing left running (a wedged endpoint task, a
+/// non-tokio thread) can leave a zombie whose half-dead control channel hangs
+/// every later client. It lives here and not in [`run_daemon_with`] because an
+/// in-process daemon that exited would take its host down with it.
 pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
-    let _daemon_lock = acquire_daemon_lock(&home)?;
-
     // Identity is global by default (DUR-5); store (repo/lock/socket/config) is
     // this per-repo home. `$LAIT_HOME` collapses both back into `home`.
-    let identity_seed = load_or_create_identity(&crate::config::identity_dir()?)?;
+    run_daemon_with(home, seed, crate::config::identity_dir()?).await?;
+    std::process::exit(0);
+}
+
+/// The injectable daemon: everything [`run_daemon`] does, but it **returns**
+/// after teardown instead of exiting, and takes its identity directory rather
+/// than reading the process-global one — so several daemons can run in one
+/// process, each with its own identity, without sharing anything but the runtime.
+///
+/// Returning is a stronger contract than exiting: by the time it returns, every
+/// task the daemon spawned has ended or been aborted, because returning drops the
+/// daemon lock and legalizes a restart on the same home.
+pub async fn run_daemon_with(home: PathBuf, seed: bool, identity_dir: PathBuf) -> Result<()> {
+    let _daemon_lock = acquire_daemon_lock(&home)?;
+
+    let identity_seed = load_or_create_identity(&identity_dir)?;
     let settings = Settings::load(Some(&home));
     let nick = settings.nick();
 
@@ -2226,6 +2352,8 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         router,
         shared,
         shutdown: Arc::new(Notify::new()),
+        cancel: Cancel::new(),
+        tasks: Arc::new(Mutex::new(JoinSet::new())),
         recv_gen: AtomicU64::new(1),
         active_conns: AtomicU64::new(0),
         last_active: Mutex::new(Instant::now()),
@@ -2238,11 +2366,11 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         home: home.clone(),
     });
 
-    tokio::spawn(node.clone().recv_loop(receiver, 1));
-    tokio::spawn(node.clone().heartbeat_loop());
-    tokio::spawn(node.clone().reaper_loop());
-    tokio::spawn(node.clone().checkpoint_loop());
-    tokio::spawn(node.clone().idle_shutdown_loop());
+    node.spawn(node.clone().recv_loop(receiver, 1));
+    node.spawn(node.clone().heartbeat_loop());
+    node.spawn(node.clone().reaper_loop());
+    node.spawn(node.clone().checkpoint_loop());
+    node.spawn(node.clone().idle_shutdown_loop());
 
     node.broadcast(Payload::Hello {
         nick: node.shared.nick(),
@@ -2282,7 +2410,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
                 match accept {
                     Ok(stream) => {
                         let n = node.clone();
-                        tokio::spawn(async move { n.handle_conn(stream).await; });
+                        node.spawn(async move { n.handle_conn(stream).await; });
                     }
                     Err(e) => tracing::warn!("control accept error: {e}"),
                 }
@@ -2301,26 +2429,40 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     // seconds behind (the data itself is already fsync-durable regardless).
     node.replica.lock().unwrap().checkpoint();
 
-    // The rest of the teardown is courtesy (Bye broadcast, router close) — it
-    // must never keep a "shutting down" daemon alive. A gossip/endpoint close
-    // that hangs past the deadline gets abandoned; state is already durable.
-    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+    // Teardown order is load-bearing: `Bye` must reach the room while gossip is
+    // still up, so peers mark us offline immediately instead of waiting out a
+    // heartbeat lapse. Only then does cancellation go out, and only then does
+    // the network close under the tasks that were using it.
+    let _ = tokio::time::timeout(SHUTDOWN_DEADLINE, async {
         node.broadcast(Payload::Bye {
             nick: node.shared.nick(),
         })
         .await
         .ok();
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(BYE_GRACE).await;
+    })
+    .await;
+    node.cancel.cancel();
+
+    // Take the task set out from under its lock: joining is an await, and the
+    // lock must never be held across one.
+    let mut tasks = std::mem::take(&mut *node.tasks.lock().unwrap());
+    let _ = tokio::time::timeout(SHUTDOWN_DEADLINE, async {
         node.router.shutdown().await.ok();
+        while tasks.join_next().await.is_some() {}
+    })
+    .await;
+    // Whatever is still running past the deadline is wedged, not slow. Abort it
+    // and reap the handles so nothing is left running behind our return.
+    tasks.abort_all();
+    let _ = tokio::time::timeout(SHUTDOWN_DEADLINE, async {
+        while tasks.join_next().await.is_some() {}
     })
     .await;
 
     #[cfg(unix)]
     let _ = std::fs::remove_file(crate::config::socket_path(&home));
-    // Hard guarantee: "stop" means the process exits. Anything still running
-    // (a wedged endpoint task, a non-tokio thread) would otherwise leave a
-    // zombie whose half-dead control channel hangs every later client.
-    std::process::exit(0);
+    Ok(())
 }
 
 #[cfg(test)]
