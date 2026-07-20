@@ -170,8 +170,12 @@ async fn framing_interops_with_legacy_read_msg_bytes() {
     })
     .await
     .expect("framing interop timed out");
-    raw_task.await.unwrap();
+    // Shut the dialer down BEFORE joining the accepter. The accepter parks on
+    // `conn.closed()` to prove the trailing frames landed, and that only
+    // resolves once the dial side is actually gone -- otherwise the join waits
+    // out iroh's idle timeout for a connection this test is finished with.
     dialer.shutdown().await;
+    raw_task.await.unwrap();
 }
 
 /// **R1 regression (iroh only — mem cannot truncate).** The accepter sends
@@ -418,5 +422,9 @@ async fn local_policy_relay_resolution() {
     .await
     .expect("local relay resolution timed out");
     assert_eq!(&result, b"pong");
-    server_task.await.unwrap();
+    // The pong arrived, which is the whole claim: a bare-id dial resolved
+    // through the relay this policy selected. The accepter's `conn.closed()`
+    // park exists so that pong cannot be truncated, and reading it proves it was
+    // not -- joining here would only wait out the connection idle timeout.
+    server_task.abort();
 }

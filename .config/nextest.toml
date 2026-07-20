@@ -13,15 +13,19 @@
 network = { max-threads = 4 }
 
 [profile.default]
-# The multi-node tests do real P2P over iroh; a relay/discovery hiccup can fail a
-# run that a retry clears. One retry trades a little time on a rare flake for a
-# stable pipeline (a test that fails deterministically still fails).
-retries = 1
+# No blanket retry. A retry is a statement that a test has a known, tolerated
+# source of nondeterminism — true of the real-network suites, false of
+# everything else. Applied globally it costs double time on every deterministic
+# failure and, worse, quietly launders a newly flaky unit test into a green run.
+# The network group opts in below.
+retries = 0
 
 # Surface a wedged test (e.g. a daemon that never bound its control channel)
-# instead of hanging the job: warn at 30s, terminate after 3 periods (90s). The
-# slowest real tests are the ~30s hermetic_net convergence pair, so this is a
-# margin, not a tuning knob.
+# instead of hanging the job: warn at 30s, terminate after 3 periods (90s). No
+# real test comes close now — the slowest are the ~11s liveness probe and the
+# ~7s two-node convergence — so this is a margin, not a tuning knob. A test that
+# trips the 30s warning is almost certainly parked on a peer that will never
+# answer, which is the condition this is here to surface.
 #
 # This budget assumes DEPENDENCIES ARE BUILT OPTIMIZED — see
 # `[profile.dev.package."*"]` in Cargo.toml. Tests inherit the `dev` profile, and
@@ -30,9 +34,29 @@ retries = 1
 # timing out, check that profile before reaching for a larger budget.
 slow-timeout = { period = "30s", terminate-after = 3 }
 
-# All integration tests (the `tests/` dir, target kind `test`) spawn daemons, so
-# cap their concurrency via the `network` group; the lib/unit tests are CPU-bound
-# and stay unbounded. New integration tests join the cap automatically.
+# Only the suites that put real traffic on a real relay belong in the network
+# cap. Listing them by name rather than taking all of `kind(test)` matters: most
+# integration binaries here are CPU-bound (argument parsing, DTO parity,
+# property-based convergence, threshold crypto) or drive the daemon over an
+# in-memory transport, and putting them in a four-slot group made them queue
+# behind network tests for no reason. That mis-grouping gets worse with every
+# integration binary added, so the cost of naming these explicitly — a new
+# network suite must be added here — is the point rather than the drawback.
+#
+# `retries` rides with the group: these are the tests whose nondeterminism is
+# real and tolerated (a relay or discovery hiccup), so they are the only ones
+# that earn a second attempt.
 [[profile.default.overrides]]
-filter = 'kind(test)'
+filter = '''
+    binary(two_node_sync)
+    + binary(restart_reconnect)
+    + binary(guided_join)
+    + binary(invite_ergonomics)
+    + binary(invite_autoapprove)
+    + binary(seed_registry)
+    + binary(control_plane)
+    + binary(cli_safety)
+    + (package(lait-net) & kind(test))
+'''
 test-group = 'network'
+retries = 1

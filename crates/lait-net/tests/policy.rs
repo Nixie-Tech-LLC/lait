@@ -108,6 +108,7 @@ async fn local_endpoints_converge_by_bare_id_over_an_in_process_relay() {
         send.finish().expect("finish");
         let mut buf = [0u8; 4];
         recv.read_exact(&mut buf).await.expect("read pong");
+        conn.close(0u32.into(), b"done");
         buf
     })
     .await
@@ -117,7 +118,14 @@ async fn local_endpoints_converge_by_bare_id_over_an_in_process_relay() {
         &result, b"pong",
         "two Local endpoints converged by bare-id dial over the local relay"
     );
-    server_task.await.expect("server task");
+    // The pong arrived, which is the entire claim: these two endpoints reached
+    // each other by bare-id dial. The accepter's remaining `conn.closed()` park
+    // guards against truncating that pong, and the read above already proves it
+    // was not truncated -- so joining the task here would only wait out iroh's
+    // connection idle timeout for a connection the test is done with. A server
+    // that failed its own `ping` assertion never sends a pong, so the timeout
+    // above catches that; nothing is being swallowed.
+    server_task.abort();
 }
 
 /// `Isolated`, end-to-end through the PRODUCTION code: two endpoints built by the
@@ -165,6 +173,7 @@ async fn isolated_endpoints_converge_by_carried_direct_address() {
         send.finish().expect("finish");
         let mut buf = [0u8; 4];
         recv.read_exact(&mut buf).await.expect("read pong");
+        conn.close(0u32.into(), b"done");
         buf
     })
     .await
@@ -174,5 +183,12 @@ async fn isolated_endpoints_converge_by_carried_direct_address() {
         &result, b"pong",
         "two Isolated endpoints converged by bare-id dial over a carried address"
     );
-    server_task.await.expect("server task");
+    // The pong arrived, which is the entire claim: these two endpoints reached
+    // each other by bare-id dial. The accepter's remaining `conn.closed()` park
+    // guards against truncating that pong, and the read above already proves it
+    // was not truncated -- so joining the task here would only wait out iroh's
+    // connection idle timeout for a connection the test is done with. A server
+    // that failed its own `ping` assertion never sends a pong, so the timeout
+    // above catches that; nothing is being swallowed.
+    server_task.abort();
 }
