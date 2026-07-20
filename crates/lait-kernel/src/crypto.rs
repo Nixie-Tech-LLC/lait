@@ -1,12 +1,12 @@
 //! End-to-end encryption primitives. All pure Rust (RustCrypto/dalek), no C toolchain,
 //! no `aws-lc` — respecting the portability + supply-chain bans.
 //!
-//! - **AEAD**: ChaCha20-Poly1305 with the 32-byte workspace symmetric key. Sync
+//! - **AEAD**: ChaCha20-Poly1305 with the 32-byte space symmetric key. Sync
 //!   payloads (catalog + issue-doc `export()` bytes) are sealed with this, so a
 //!   blind relay or a non-member sees only ciphertext (the "encryption *is* the
 //!   access control" posture).
 //! - **Sealed box**: an anonymous X25519 + AEAD box that distributes the
-//!   workspace key to a member addressed by their ed25519 `DeviceId`. The member's
+//!   space key to a member addressed by their ed25519 `DeviceId`. The member's
 //!   ed25519 identity is converted to X25519 (libsodium's `*_to_curve25519`).
 //!
 //! # Security status
@@ -25,14 +25,14 @@ use x25519_dalek::{PublicKey as XPublic, StaticSecret};
 
 use crate::ids::DeviceId;
 
-/// The workspace symmetric key length (ChaCha20-Poly1305).
+/// The space symmetric key length (ChaCha20-Poly1305).
 pub const KEY_LEN: usize = 32;
-/// A workspace symmetric key.
-pub type WorkspaceKey = [u8; KEY_LEN];
+/// A space symmetric key.
+pub type SpaceKey = [u8; KEY_LEN];
 const NONCE_LEN: usize = 12;
 
-/// A fresh random 32-byte workspace key.
-pub fn random_key() -> WorkspaceKey {
+/// A fresh random 32-byte space key.
+pub fn random_key() -> SpaceKey {
     let mut k = [0u8; KEY_LEN];
     getrandom::fill(&mut k).expect("getrandom");
     k
@@ -61,8 +61,8 @@ fn random_nonce() -> [u8; NONCE_LEN] {
     n
 }
 
-/// AEAD-seal a payload with the workspace key. Output = `nonce(12) || ciphertext`.
-pub fn aead_encrypt(key: &WorkspaceKey, plaintext: &[u8]) -> Vec<u8> {
+/// AEAD-seal a payload with the space key. Output = `nonce(12) || ciphertext`.
+pub fn aead_encrypt(key: &SpaceKey, plaintext: &[u8]) -> Vec<u8> {
     let cipher = ChaCha20Poly1305::new(key.into());
     let nonce = random_nonce();
     let ct = cipher
@@ -76,7 +76,7 @@ pub fn aead_encrypt(key: &WorkspaceKey, plaintext: &[u8]) -> Vec<u8> {
 
 /// AEAD-open a payload; `None` if the key is wrong or the blob is malformed (the
 /// blind-relay property: without the key you get nothing).
-pub fn aead_decrypt(key: &WorkspaceKey, blob: &[u8]) -> Option<Vec<u8>> {
+pub fn aead_decrypt(key: &SpaceKey, blob: &[u8]) -> Option<Vec<u8>> {
     if blob.len() < NONCE_LEN {
         return None;
     }
@@ -117,7 +117,7 @@ fn ed_seed_to_x(seed: &[u8; 32]) -> StaticSecret {
 
 /// Seal `msg` to a member addressed by their ed25519 `DeviceId` (an anonymous
 /// sealed box). Output = `eph_x_pub(32) || nonce(12) || ciphertext`. Used to
-/// distribute the workspace key. Returns `None` if the recipient key is invalid.
+/// distribute the space key. Returns `None` if the recipient key is invalid.
 pub fn seal_to(recipient: &DeviceId, msg: &[u8]) -> Option<Vec<u8>> {
     let recip_ed = ed_pubkey_bytes(recipient)?;
     let recip_x = ed_pk_to_x(&recip_ed)?;

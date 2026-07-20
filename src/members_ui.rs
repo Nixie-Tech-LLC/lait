@@ -47,7 +47,7 @@ use crate::cli::ensure_daemon;
 use crate::control::{request, Request, Response};
 use crate::dto::{JoinRequestDto, MemberDto};
 use crate::list_picker::{row_line, window, Cell};
-use crate::proto::WorkspaceTicket;
+use crate::proto::SpaceTicket;
 
 /// One selectable row: a pending request (approvable) or an existing member.
 #[derive(Clone)]
@@ -251,7 +251,7 @@ impl App {
             Ok(Response::Text { text }) => {
                 let token = text.trim().to_string();
                 let link = token
-                    .parse::<WorkspaceTicket>()
+                    .parse::<SpaceTicket>()
                     .map(|t| t.link())
                     .unwrap_or_else(|_| token.clone());
                 self.status = Some(if crate::cli::copy_to_clipboard(&link) {

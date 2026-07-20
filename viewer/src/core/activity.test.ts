@@ -3,7 +3,7 @@
  *
  * Two invariants, both load-bearing, both burned by a real bug:
  *
- * 1. **`synced` never carries a name — even with a resolver.** In the workspace
+ * 1. **`synced` never carries a name — even with a resolver.** In the space
  *    Activity feed a remote change is one synthetic event stamped with the *local*
  *    node's key, so resolving that key would credit you with a teammate's edit.
  * 2. **History attribution reads `actor`, not `actor_nick`.** The durable history

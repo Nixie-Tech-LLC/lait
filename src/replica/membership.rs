@@ -11,7 +11,7 @@ impl Replica {
     pub(super) fn effective_genesis(&self) -> Genesis {
         let root = crate::space::replay(
             &self.genesis,
-            &self.workspace_id,
+            &self.space_id,
             &self.membership.space_events(),
         );
         Genesis {
@@ -33,7 +33,7 @@ impl Replica {
     }
     /// The actor plane materialized from the membership doc's key-events.
     pub fn actor_plane(&self) -> ActorPlane {
-        actor::replay(&self.workspace_id, &self.membership.actor_events())
+        actor::replay(&self.space_id, &self.membership.actor_events())
     }
 
     /// Ensure this device has an actor identity in this space, returning its
@@ -57,7 +57,7 @@ impl Replica {
         persist_recovery_key(&self.store, &recovery_seed)?;
         let (ev, _id) = actor::incept_single(
             &self.seed,
-            &self.workspace_id,
+            &self.space_id,
             rand16(),
             rand16(),
             Some(recovery_commit),
@@ -70,7 +70,7 @@ impl Replica {
     pub fn my_actor(&self) -> Option<ActorId> {
         self.actor_plane().actor_of_device(&self.me).cloned()
     }
-    /// The workspace's founding actor — the genesis trust root every replica
+    /// The space's founding actor — the genesis trust root every replica
     /// must share. An invite ticket MUST carry THIS (not the inviter's own
     /// actor): a joiner roots `acl::replay` on the ticket's founder, so anchoring
     /// on anyone but the true founder forks the joiner onto a genesis where the
@@ -79,7 +79,7 @@ impl Replica {
         self.genesis.founding_actors.first().cloned()
     }
     /// The verifiable founding proof to put in a ticket (`lait/space/1`): the
-    /// `(salt, founder_inception)` a joiner checks the workspace id against. Any
+    /// `(salt, founder_inception)` a joiner checks the space id against. Any
     /// correctly-joined node holds both — the salt in genesis, the founder's
     /// inception in the membership actor log.
     pub fn founding_proof(&self) -> Option<([u8; 16], [u8; 32], actor::SignedEvent)> {
@@ -94,7 +94,7 @@ impl Replica {
     pub fn is_member_actor(&self, actor: &ActorId) -> bool {
         self.acl_state().is_member(actor)
     }
-    /// Whether this device's actor is a member / admin of the workspace.
+    /// Whether this device's actor is a member / admin of the space.
     pub fn am_i_member(&self) -> bool {
         self.my_actor()
             .is_some_and(|a| self.acl_state().is_member(&a))
@@ -157,7 +157,7 @@ impl Replica {
                 nonce,
             },
             self.membership.heads(),
-            &self.workspace_id,
+            &self.space_id,
         ))
     }
 
@@ -168,8 +168,7 @@ impl Replica {
     /// be present (callers import it first).
     pub(super) fn seal_epochs_to_actor(t: &mut Self, actor: &ActorId) -> Result<()> {
         let devices = t.actor_plane().devices_of(actor);
-        let epochs: Vec<([u8; 16], WorkspaceKey)> =
-            t.keyring.iter().map(|(e, k)| (*e, *k)).collect();
+        let epochs: Vec<([u8; 16], SpaceKey)> = t.keyring.iter().map(|(e, k)| (*e, *k)).collect();
         for (epoch, key) in epochs {
             for d in &devices {
                 if let Some(sealed) = crypto::seal_to(d, &key) {
@@ -180,7 +179,7 @@ impl Replica {
         Ok(())
     }
 
-    /// Add (or re-grant) a member by actor and seal them the workspace key
+    /// Add (or re-grant) a member by actor and seal them the space key
     /// Administrator-only. The target actor's inception must already be
     /// known locally (the enrollment path imports it first via `redeem_invite`).
     pub fn member_add(
@@ -236,7 +235,7 @@ impl Replica {
         }
         let mut candidate = self.membership.actor_events();
         candidate.push(incept.clone());
-        if !actor::replay(&self.workspace_id, &candidate).exists(&actor) {
+        if !actor::replay(&self.space_id, &candidate).exists(&actor) {
             return Ok(false); // invalid inception — never enters the container
         }
         self.membership.add_actor_event(incept)?;
@@ -263,7 +262,7 @@ impl Replica {
         let actor = ActorId::from_incept_hash(&incept.hash());
         let mut candidate = self.membership.actor_events();
         candidate.push(incept.clone());
-        if !actor::replay(&self.workspace_id, &candidate).exists(&actor) {
+        if !actor::replay(&self.space_id, &candidate).exists(&actor) {
             return (Response::err("invalid actor inception"), None);
         }
         if acl.is_member(&actor) {
@@ -301,7 +300,7 @@ impl Replica {
     /// **Pattern A auto-approval.** Admit a joiner who presented a valid,
     /// admin-signed invite grant, sealing them the key exactly like [`member_add`]
     /// but with no human `approve` step. The transport layer has already verified
-    /// the issuer signature, workspace binding, and expiry; here we enforce the
+    /// the issuer signature, space binding, and expiry; here we enforce the
     /// remaining, state-dependent checks: the issuer must be a *current* admin, we
     /// must be an admin able to seal, and a single-use nonce must be unspent. The
     /// nonce is burned inside the same commit as the AddMember op (atomic — no
@@ -317,12 +316,12 @@ impl Replica {
         single_use: bool,
     ) -> (Response, Option<DirtySet>) {
         // The joiner's self-certifying actor id is its inception's hash. Validate
-        // the inception cleanly incepts for THIS workspace before admitting it —
+        // the inception cleanly incepts for THIS space before admitting it —
         // a forged inception must never enter the actors container.
         let joiner_actor = ActorId::from_incept_hash(&joiner_incept.hash());
         let mut candidate = self.membership.actor_events();
         candidate.push(joiner_incept.clone());
-        if !actor::replay(&self.workspace_id, &candidate).exists(&joiner_actor) {
+        if !actor::replay(&self.space_id, &candidate).exists(&joiner_actor) {
             return (
                 Response::err("join request carried an invalid actor inception"),
                 None,
@@ -336,10 +335,7 @@ impl Replica {
             .actor_of_device(issuer_device)
             .is_some_and(|a| acl.is_admin(a));
         if !issuer_ok {
-            return (
-                Response::err("invite issuer is not a workspace admin"),
-                None,
-            );
+            return (Response::err("invite issuer is not a space admin"), None);
         }
         // We can only seal if we ourselves are an admin holding the key.
         match self.my_actor() {
@@ -407,7 +403,7 @@ impl Replica {
         )
     }
 
-    /// Remove a member (signed RemoveMember op) and **rotate the workspace key**
+    /// Remove a member (signed RemoveMember op) and **rotate the space key**
     /// using lazy revocation: a new epoch is sealed only to the remaining
     /// members' devices, so the removed actor cannot read *future* content.
     /// Admin-only.
@@ -447,7 +443,7 @@ impl Replica {
         )
     }
 
-    /// Rotate the workspace key without a membership change (key hygiene).
+    /// Rotate the space key without a membership change (key hygiene).
     pub fn key_rotate_cmd(&mut self) -> (Response, Option<DirtySet>) {
         let is_admin = self
             .my_actor()
@@ -463,7 +459,7 @@ impl Replica {
                 let gen = self.active_epoch().map(|e| e.gen).unwrap_or(0);
                 (
                     Response::Ok {
-                        message: Some(format!("rotated the workspace key (generation {gen})")),
+                        message: Some(format!("rotated the space key (generation {gen})")),
                     },
                     Some(DirtySet::catalog(CatalogScope::Acl)),
                 )
@@ -525,7 +521,7 @@ impl Replica {
     /// or a raw 32-hex string.
     fn parse_invite_nonce(input: &str) -> Option<[u8; 16]> {
         let s = input.trim();
-        if let Ok(ticket) = s.parse::<crate::proto::WorkspaceTicket>() {
+        if let Ok(ticket) = s.parse::<crate::proto::SpaceTicket>() {
             // A ticket only carries a nonce if it embeds a signed invite.
             let (_pk, grant) = ticket.invite?.verify().ok()?;
             return Some(grant.nonce);

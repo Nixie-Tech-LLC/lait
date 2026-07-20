@@ -2,7 +2,7 @@
 
 lait ships one self-contained binary. Prebuilt archives (macOS/Linux `.tar.gz`,
 Windows `.zip`) plus the shell/PowerShell installers and the Homebrew formula are
-produced for every tag by **cargo-dist** (`dist-workspace.toml` →
+produced for every tag by **cargo-dist** (`dist-space.toml` →
 `.github/workflows/release.yml`). Archive layout is per-OS: the unix `.tar.gz`
 archives nest the binary under a `lait-<target-triple>/` directory, while the
 Windows `.zip` is flat with `lait.exe` at the root (the self-updater and
@@ -19,14 +19,14 @@ This directory holds the packaging definitions cargo-dist does **not** generate.
 | Shell / PowerShell installer | — | cargo-dist | none |
 | `cargo install lait` | `[package]` in `Cargo.toml` | crates.io | `cargo publish` (needs a crates.io token) |
 | `cargo binstall lait` | `[package.metadata.binstall]` in `Cargo.toml` | cargo-binstall | none — reads the GitHub release |
-| Homebrew | `dist-workspace.toml` (`homebrew` installer) + `publish-homebrew.yml` | cargo-dist builds `lait.rb`; our workflow pushes it | `homebrew-tap` repo + app creds (below) |
+| Homebrew | `dist-space.toml` (`homebrew` installer) + `publish-homebrew.yml` | cargo-dist builds `lait.rb`; our workflow pushes it | `homebrew-tap` repo + app creds (below) |
 | Scoop (Windows) | `packaging/scoop/lait.json` + `publish-scoop.yml` | this repo | `scoop-bucket` repo + app creds (below) |
 | winget (Windows) | `packaging/winget/*.yaml` + `publish-winget.yml` | this repo | PR to `microsoft/winget-pkgs` (below) |
 | Docker seed node | `Dockerfile`, `docker-compose.yml` | this repo | optional: push to a registry |
 
 ## Homebrew
 
-`dist-workspace.toml` sets the `homebrew` installer, so cargo-dist generates
+`dist-space.toml` sets the `homebrew` installer, so cargo-dist generates
 `lait.rb` (targeting `tap = "Nixie-Tech-LLC/homebrew-tap"`) and uploads it as a
 release asset. It does **not** push — `publish-homebrew.yml` does, minting a
 tap-scoped token from the `integration-runners` app and committing the formula to

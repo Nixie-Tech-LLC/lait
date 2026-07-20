@@ -87,7 +87,7 @@ export function Avatar({
  * Assignee keys → what `AvatarStack` needs, resolved against the ACL.
  *
  * A key with no matching member is kept, not dropped: someone removed from the
- * workspace is still the person the issue says is assigned, and silently vanishing
+ * space is still the person the issue says is assigned, and silently vanishing
  * them would make the row disagree with the document. They get a colour and a glyph,
  * which is exactly as much as we honestly know about them.
  */

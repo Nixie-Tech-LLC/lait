@@ -55,7 +55,7 @@ pub enum Network {
     Local(LocalNet),
     /// No relay, no discovery — direct reach only. Wired for the host-star case:
     /// an Isolated ticket carries the host's direct addresses, and the joiner
-    /// registers them via [`PeerBook::learn_direct`], so a LAN/offline workspace
+    /// registers them via [`PeerBook::learn_direct`], so a LAN/offline space
     /// connects with zero infrastructure. A wider mesh beyond the ticket host is
     /// out of scope (peers past the host aren't resolved).
     Isolated,

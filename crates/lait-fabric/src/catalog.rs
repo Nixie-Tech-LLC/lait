@@ -1,4 +1,4 @@
-//! The catalog document stores workspace structure in one Loro document: the
+//! The catalog document stores space structure in one Loro document: the
 //! registry of issue documents, project and label configuration, board
 //! ordering, workflow columns, the sub-issue hierarchy, the issue-link edge
 //! set, and the `DocMeta`
@@ -40,7 +40,7 @@ use loro::{
 use crate::dto::{
     default_workflow, LabelDto, Priority, ProjectDto, StatusCategory, WorkflowState, SCHEMA_VERSION,
 };
-use crate::ids::{ActorId, DeviceId, DocId, LabelId, ProjectId, WorkspaceId};
+use crate::ids::{ActorId, DeviceId, DocId, LabelId, ProjectId, SpaceId};
 
 use crate::issue::IssueDoc;
 use crate::loro_ext as lx;
@@ -48,7 +48,6 @@ use crate::op::{self, OpCtx};
 
 const ROOT: &str = "catalog";
 const K_SCHEMA: &str = "schemaVersion";
-const K_WORKSPACE: &str = "workspaceId";
 const K_NAME: &str = "name";
 const C_DOCS: &str = "docs";
 const C_PROJECTS: &str = "projects";
@@ -95,16 +94,16 @@ pub struct Edge {
     pub to: DocId,
 }
 
-/// A wrapper around the workspace's Catalog `LoroDoc`.
+/// A wrapper around the space's Catalog `LoroDoc`.
 pub struct CatalogDoc {
     doc: LoroDoc,
 }
 
 impl CatalogDoc {
-    /// Create a fresh Catalog for a workspace, seeding schema + display name +
+    /// Create a fresh Catalog for a space, seeding schema + display name +
     /// default workflow + the structure containers.
     pub fn create(
-        workspace_id: &WorkspaceId,
+        space_id: &SpaceId,
         name: &str,
         peer: Option<u64>,
         founder: &DeviceId,
@@ -113,7 +112,7 @@ impl CatalogDoc {
         op::configure(&doc, peer);
         let root = doc.get_map(ROOT);
         root.insert(K_SCHEMA, SCHEMA_VERSION as i64)?;
-        root.insert(K_WORKSPACE, workspace_id.as_str())?;
+        root.insert(lx::K_SPACE, space_id.as_str())?;
         root.insert(K_NAME, name)?;
         root.insert_container(C_DOCS, LoroMap::new())?;
         root.insert_container(C_PROJECTS, LoroMap::new())?;
@@ -307,17 +306,17 @@ impl CatalogDoc {
             .collect()
     }
 
-    pub fn workspace_id(&self) -> Option<WorkspaceId> {
-        lx::get_str(&self.root(), K_WORKSPACE).and_then(|s| WorkspaceId::parse(&s))
+    pub fn space_id(&self) -> Option<SpaceId> {
+        lx::get_str(&self.root(), lx::K_SPACE).and_then(|s| SpaceId::parse(&s))
     }
-    /// The workspace's human display name — a synced LWW register, purely
+    /// The space's human display name — a synced LWW register, purely
     /// cosmetic: renaming never re-topics (the gossip topic derives from the
-    /// workspace id) and never invalidates tickets. Empty until the founder's
+    /// space id) and never invalidates tickets. Empty until the founder's
     /// catalog arrives on a fresh joiner.
-    pub fn workspace_name(&self) -> String {
+    pub fn space_name(&self) -> String {
         lx::get_str(&self.root(), K_NAME).unwrap_or_default()
     }
-    pub fn set_workspace_name(&self, name: &str) -> Result<()> {
+    pub fn set_space_name(&self, name: &str) -> Result<()> {
         self.root().insert(K_NAME, name)?;
         Ok(())
     }
@@ -796,7 +795,7 @@ impl CatalogDoc {
         Ok(false)
     }
 
-    /// Every link in the workspace. Referential integrity (tombstoned/unknown
+    /// Every link in the space. Referential integrity (tombstoned/unknown
     /// endpoints) is the *caller's* read-time filter — the set itself is honest.
     pub fn edges(&self) -> Vec<Edge> {
         let Some(m) = self.edges_map(false) else {
@@ -845,8 +844,8 @@ mod tests {
     use crate::ids::SystemUlidSource;
     use crate::issue::{IssueDoc, NewIssue};
 
-    fn ws() -> WorkspaceId {
-        WorkspaceId::mint(&SystemUlidSource)
+    fn ws() -> SpaceId {
+        SpaceId::mint(&SystemUlidSource)
     }
     fn device() -> DeviceId {
         DeviceId::from_key_string("a".repeat(64))
@@ -858,7 +857,7 @@ mod tests {
         OpCtx::structure(kind, &device())
     }
 
-    fn cat() -> (CatalogDoc, WorkspaceId, ProjectId) {
+    fn cat() -> (CatalogDoc, SpaceId, ProjectId) {
         let w = ws();
         let c = CatalogDoc::create(&w, "test", None, &device()).unwrap();
         let p = ProjectId::mint(&SystemUlidSource);
@@ -867,10 +866,10 @@ mod tests {
         (c, w, p)
     }
 
-    fn make_issue(w: &WorkspaceId, p: &ProjectId, title: &str) -> IssueDoc {
+    fn make_issue(w: &SpaceId, p: &ProjectId, title: &str) -> IssueDoc {
         IssueDoc::create(NewIssue {
             doc_id: DocId::mint(&SystemUlidSource),
-            workspace_id: w.clone(),
+            space_id: w.clone(),
             project_id: p.clone(),
             title: title.into(),
             priority: Priority::Medium,
@@ -887,7 +886,7 @@ mod tests {
     fn create_seeds_schema_and_workflow() {
         let (c, w, _p) = cat();
         assert_eq!(c.schema_version(), SCHEMA_VERSION);
-        assert_eq!(c.workspace_id(), Some(w));
+        assert_eq!(c.space_id(), Some(w));
         let wf = c.workflow();
         assert_eq!(wf.len(), 4);
         assert!(wf.iter().any(|s| s.category == StatusCategory::Done));

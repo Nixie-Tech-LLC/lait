@@ -42,9 +42,9 @@ pub mod registry;
 pub mod replica;
 pub mod secretfs;
 pub mod serve;
+pub mod spaces;
 pub mod sync;
 pub mod transport;
-pub mod workspaces;
 
 // The **kernel** (`lait-kernel`) holds lait's roots — identity, the trust
 // planes, derivation rules — in a crate that lists no scaffold, so a `loro::`

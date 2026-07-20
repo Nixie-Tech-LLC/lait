@@ -8,7 +8,7 @@ import { memberName } from "./Avatar";
 import { when } from "./time";
 
 /**
- * The workspace feed.
+ * The space feed.
  *
  * Pulled, never pushed: the doorbell only sets `activity_advanced` — it carries no
  * rows — so this re-reads when it rings (S§7.5). That is the same discipline as

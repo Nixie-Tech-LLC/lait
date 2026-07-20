@@ -334,7 +334,7 @@ function Invite({
   useEffect(() => {
     if (!link) return setQr(null);
     // Rendered locally. A remote QR service would mean handing an invite ticket —
-    // which admits someone to an E2EE workspace — to a third party.
+    // which admits someone to an E2EE space — to a third party.
     void QRCode.toDataURL(link, { margin: 1, width: 220, errorCorrectionLevel: "L" })
       .then(setQr)
       .catch(() => setQr(null));

@@ -12,7 +12,7 @@ import type { ActivityEvent } from "../types";
  *   *teammate's* change to the teammate. `actor_nick` is **empty** here — the daemon
  *   no longer resolves it, so the client must resolve `actor` itself. There is no
  *   `synced` event in this feed; you see the actual ops.
- * - **Workspace activity** (`Request::Activity`) is still the per-session ring. A
+ * - **Space activity** (`Request::Activity`) is still the per-session ring. A
  *   remote change arrives as one synthetic `synced` event stamped with the *local*
  *   node's key. That key is not the author, so `synced` must be rendered **without a
  *   name** — the exact non-goal-6 trap (in-doc attribution is advisory), which the

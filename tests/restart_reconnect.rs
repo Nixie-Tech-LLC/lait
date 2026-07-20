@@ -92,8 +92,8 @@ fn spawn(home: &Path) -> Proc {
     let child = Command::new(bin())
         .arg("daemon")
         .env("LAIT_HOME", home)
-        // Isolate the workspace registry per node: the daemon-boot upsert must land
-        // in a scratch config root, never the developer's real workspaces.json.
+        // Isolate the space registry per node: the daemon-boot upsert must land
+        // in a scratch config root, never the developer's real spaces.json.
         .env("LAIT_CONFIG_ROOT", home.join("cfgroot"))
         // Disable idle shutdown so the restart, not a timer, is what we test.
         .env("LAIT_IDLE_SECS", "0")
@@ -163,28 +163,28 @@ fn poll_peer_persisted(home: &Path, id: &str, timeout: Duration) -> bool {
     .is_some()
 }
 
-/// Found a workspace in `home` in-process, using the SAME identity the daemon
+/// Found a space in `home` in-process, using the SAME identity the daemon
 /// will load (`<home>/secret.key`, since the daemon runs with `LAIT_HOME=home`).
-/// Workspaces are never minted lazily anymore — a daemon errors on an
+/// Spaces are never minted lazily anymore — a daemon errors on an
 /// uninitialized store — so every founder home goes through this first.
 fn found_home(home: &Path) {
     let key = lait::config::load_or_create_identity(home).expect("identity");
     let me = lait::crypto::device_from_seed(&key);
     let store = lait::store::Store::open(home).expect("store");
-    lait::replica::found_workspace(&store, &me, &key, "test", &lait::ids::SystemUlidSource)
-        .expect("found workspace");
+    lait::replica::found_space(&store, &me, &key, "test", &lait::ids::SystemUlidSource)
+        .expect("found space");
 }
 
 /// Bootstrap a joiner store from a ticket (the client half of `lait join`), so
-/// its daemon boots already bound to the host's workspace — the daemon-side
-/// Connect/Join no longer adopts a foreign workspace. Restarts are unaffected:
+/// its daemon boots already bound to the host's space — the daemon-side
+/// Connect/Join no longer adopts a foreign space. Restarts are unaffected:
 /// the store stays initialized.
 fn join_home(home: &Path, ticket: &str) {
-    let t: lait::proto::WorkspaceTicket = ticket.parse().expect("parse ticket");
+    let t: lait::proto::SpaceTicket = ticket.parse().expect("parse ticket");
     let store = lait::store::Store::open(home).expect("store");
-    lait::replica::join_workspace_store(
+    lait::replica::join_space_store(
         &store,
-        &t.workspace,
+        &t.space,
         &t.salt,
         &t.recovery_root,
         t.founder_inception

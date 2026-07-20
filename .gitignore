@@ -1,6 +1,6 @@
 target
 
-# Local node state (per-repo workspace stores) — never commit.
+# Local node state (per-repo space stores) — never commit.
 .lait/
 .groupchat/
 

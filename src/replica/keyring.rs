@@ -1,4 +1,4 @@
-//! Workspace-key epochs: keyring refresh, payload sealing, rotation, and healing.
+//! Space-key epochs: keyring refresh, payload sealing, rotation, and healing.
 
 use super::*;
 
@@ -36,7 +36,7 @@ impl Replica {
             }
             if let Some(sealed) = self.membership.get_sealed(&e.id, &self.me) {
                 if let Some(raw) = crypto::open_sealed(&self.seed, &self.me, &sealed) {
-                    if let Ok(key) = <WorkspaceKey>::try_from(raw.as_slice()) {
+                    if let Ok(key) = <SpaceKey>::try_from(raw.as_slice()) {
                         // Bind the envelope to the signed mint: reject a key whose
                         // hash does not match the committed value.
                         if *blake3::hash(&key).as_bytes() == e.key_commit {
@@ -62,7 +62,7 @@ impl Replica {
     /// Encrypt a sync payload with the active-epoch key (id-tagged).
     ///
     /// Two distinct "no key" cases, and only ONE may pass through in clear:
-    /// - **No epochs exist at all** — a genuine keyless single-node workspace
+    /// - **No epochs exist at all** — a genuine keyless single-node space
     ///   that holds no protected content: pass through.
     /// - **An active epoch exists but we lack its key** — the mid-seal window
     ///   (a freshly added or recovered device awaiting self-heal). We may hold
@@ -141,7 +141,7 @@ impl Replica {
     /// epoch key we hold to any device of any *current member actor* that still
     /// lacks an envelope. Admin-ungated and safe — we only ever re-seal keys we
     /// already hold, and only to devices of actors who are entitled to the
-    /// workspace key (present in the ACL). A removed actor is not in the member
+    /// space key (present in the ACL). A removed actor is not in the member
     /// set, so lazy revocation is preserved.
     ///
     /// This is the backstop that lets any key-holding peer re-provision:
@@ -150,8 +150,7 @@ impl Replica {
     /// - a *fresh recovery device* that reset an actor's key set and therefore
     ///   holds no key of its own; the first synced key-holder re-seals to it.
     pub(super) fn heal_member_device_envelopes(&mut self) -> Result<()> {
-        let held: Vec<([u8; 16], WorkspaceKey)> =
-            self.keyring.iter().map(|(e, k)| (*e, *k)).collect();
+        let held: Vec<([u8; 16], SpaceKey)> = self.keyring.iter().map(|(e, k)| (*e, *k)).collect();
         if held.is_empty() {
             return Ok(());
         }
@@ -252,7 +251,7 @@ impl Replica {
     /// The wording says *may* hold *a* key, not *the current* key: which epoch
     /// is the active tip is decided by `(gen, id)` selection, and a concurrent
     /// mint the evicted actor was never sealed can win it. What we can state is
-    /// that they hold a workspace key able to encrypt new content until an admin
+    /// that they hold a space key able to encrypt new content until an admin
     /// rotates past the fence.
     pub fn rekey_pending_notice(&self) -> Option<String> {
         if self.am_i_admin() {
@@ -265,9 +264,9 @@ impl Replica {
         }
         let who: Vec<String> = fences.iter().map(|f| f.evicted.short()).collect();
         let (subject, verb, key) = if who.len() == 1 {
-            ("was", "has", "a workspace key")
+            ("was", "has", "a space key")
         } else {
-            ("were", "have", "workspace keys")
+            ("were", "have", "space keys")
         };
         Some(format!(
             "revoked invite: {} {subject} admitted concurrently and {verb} been \

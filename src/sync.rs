@@ -12,7 +12,7 @@
 //! IO happens outside the lock.
 //!
 //! For forward compatibility, frames are per-document `export(updates)` blobs
-//! keyed by `DocId`, so encrypted workspace data wraps them in ciphertext chunks
+//! keyed by `DocId`, so encrypted space data wraps them in ciphertext chunks
 //! without reshaping this protocol.
 
 use std::sync::Mutex;
@@ -27,7 +27,7 @@ use crate::replica::{DirtySet, Replica};
 /// protocol **epoch** — bump it for a change so breaking that peers of the old
 /// epoch must not even connect (QUIC's ALPN negotiation refuses them at the
 /// transport, before any frame is exchanged). Epoch 1 covers the
-/// workspace-identity rewrite (topic-from-workspace-id, WorkspaceTicket) AND the
+/// space-identity rewrite (topic-from-space-id, SpaceTicket) AND the
 /// in-band `protocol_version` handshake below; epoch 0 had neither.
 pub const SYNC_ALPN: &[u8] = b"lait/sync/1";
 
@@ -80,7 +80,7 @@ enum Msg {
         /// field so the accepter can reject an out-of-window peer with a clear
         /// error before touching the rest of the frame.
         protocol_version: u32,
-        workspace: String,
+        space: String,
         membership_vv: Vec<u8>,
         catalog_vv: Vec<u8>,
     },
@@ -137,19 +137,15 @@ pub async fn pull(conn: &Connection, replica: &Mutex<Replica>) -> Result<DirtySe
     let (mut send, mut recv) = conn.open_bi().await.context("open sync stream")?;
 
     // 1. send our membership + catalog VVs.
-    let (workspace, membership_vv, catalog_vv) = {
+    let (space, membership_vv, catalog_vv) = {
         let t = replica.lock().unwrap();
-        (
-            t.workspace_str(),
-            t.membership_vv_bytes(),
-            t.catalog_vv_bytes(),
-        )
+        (t.space_str(), t.membership_vv_bytes(), t.catalog_vv_bytes())
     };
     write_msg(
         &mut send,
         &Msg::Pull {
             protocol_version: PROTOCOL_VERSION,
-            workspace,
+            space,
             membership_vv,
             catalog_vv,
         },
@@ -226,20 +222,20 @@ pub async fn pull(conn: &Connection, replica: &Mutex<Replica>) -> Result<DirtySe
 pub async fn serve(conn: Connection, replica: &Mutex<Replica>) -> Result<()> {
     let (mut send, mut recv) = conn.accept_bi().await.context("accept sync stream")?;
 
-    // 1. read the Pull; guard the workspace.
+    // 1. read the Pull; guard the space.
     let (membership_vv, catalog_vv) = match read_msg(&mut recv).await? {
         Some(Msg::Pull {
             protocol_version,
-            workspace,
+            space,
             membership_vv,
             catalog_vv,
         }) => {
-            // Version before workspace: an out-of-window peer gets a clear
+            // Version before space: an out-of-window peer gets a clear
             // "upgrade" error rather than a confusing downstream failure.
             check_sync_protocol(protocol_version)?;
-            let mine = replica.lock().unwrap().workspace_str();
-            if workspace != mine {
-                return Err(anyhow!("workspace mismatch: {workspace} != {mine}"));
+            let mine = replica.lock().unwrap().space_str();
+            if space != mine {
+                return Err(anyhow!("space mismatch: {space} != {mine}"));
             }
             (membership_vv, catalog_vv)
         }

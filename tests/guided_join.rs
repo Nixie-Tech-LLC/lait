@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use lait::control::{request, Request, Response};
 use lait::diagnose::GateState;
-use lait::workspaces::{Origin, WorkspaceEntry};
+use lait::spaces::{Origin, SpaceEntry};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_lait")
@@ -41,7 +41,7 @@ fn unique(tag: &str) -> PathBuf {
 struct Daemon {
     child: Child,
     home: PathBuf,
-    /// The isolated config root for this node (holds its workspaces.json).
+    /// The isolated config root for this node (holds its spaces.json).
     config_root: PathBuf,
 }
 
@@ -59,7 +59,7 @@ fn spawn_daemon(home: &Path, config_root: &Path) -> Daemon {
     let mut child = Command::new(bin())
         .arg("daemon")
         .env("LAIT_HOME", home)
-        // Isolate the joined-workspace registry per node so one test's registry
+        // Isolate the joined-space registry per node so one test's registry
         // never bleeds into another's (it lives under config_root).
         .env("LAIT_CONFIG_ROOT", config_root)
         .env("LAIT_IDLE_SECS", "0")
@@ -104,8 +104,8 @@ fn req(home: &Path, r: Request) -> Response {
         .unwrap_or_else(|e| Response::err(format!("{e:#}")))
 }
 
-fn diagnose(home: &Path, expected_workspace: Option<String>) -> lait::diagnose::DiagnosisView {
-    match req(home, Request::Diagnose { expected_workspace }) {
+fn diagnose(home: &Path, expected_space: Option<String>) -> lait::diagnose::DiagnosisView {
+    match req(home, Request::Diagnose { expected_space }) {
         Response::Diagnosis(v) => *v,
         other => panic!("expected Diagnosis, got {other:?}"),
     }
@@ -119,27 +119,27 @@ fn gate_state(v: &lait::diagnose::DiagnosisView, id: &str) -> GateState {
         .state
 }
 
-/// Found a workspace in `home` in-process, using the SAME identity the daemon
+/// Found a space in `home` in-process, using the SAME identity the daemon
 /// will load (`<home>/secret.key`, since the daemon runs with `LAIT_HOME=home`).
-/// Workspaces are never minted lazily anymore — a daemon errors on an
+/// Spaces are never minted lazily anymore — a daemon errors on an
 /// uninitialized store — so every founder home goes through this first.
 fn found_home(home: &Path) {
     let key = lait::config::load_or_create_identity(home).expect("identity");
     let me = lait::crypto::device_from_seed(&key);
     let store = lait::store::Store::open(home).expect("store");
-    lait::replica::found_workspace(&store, &me, &key, "test", &lait::ids::SystemUlidSource)
-        .expect("found workspace");
+    lait::replica::found_space(&store, &me, &key, "test", &lait::ids::SystemUlidSource)
+        .expect("found space");
 }
 
 /// Bootstrap a joiner store from a ticket (the client half of `lait join`), so
-/// its daemon boots already bound to the host's workspace — the daemon-side
-/// Connect/Join no longer adopts a foreign workspace.
+/// its daemon boots already bound to the host's space — the daemon-side
+/// Connect/Join no longer adopts a foreign space.
 fn join_home(home: &Path, ticket: &str) {
-    let t: lait::proto::WorkspaceTicket = ticket.parse().expect("parse ticket");
+    let t: lait::proto::SpaceTicket = ticket.parse().expect("parse ticket");
     let store = lait::store::Store::open(home).expect("store");
-    lait::replica::join_workspace_store(
+    lait::replica::join_space_store(
         &store,
-        &t.workspace,
+        &t.space,
         &t.salt,
         &t.recovery_root,
         t.founder_inception
@@ -169,7 +169,7 @@ fn ticket_for(home: &Path, require_approval: bool) -> String {
 /// work" arc the whole change exists to make honest.
 #[test]
 fn diagnose_tracks_join_lifecycle_from_pending_to_all_pass() {
-    // A founds a workspace (in-process, same identity as its daemon), then its
+    // A founds a space (in-process, same identity as its daemon), then its
     // daemon adds a project (so the synced gate has something to converge once
     // B is in).
     let a_home = unique("life-a");
@@ -253,46 +253,46 @@ fn diagnose_tracks_join_lifecycle_from_pending_to_all_pass() {
     drop(b);
 }
 
-/// The directory trap, made legible: `Diagnose { expected_workspace }` with a
-/// workspace that isn't the one this store is bound to fails the `workspace` gate,
+/// The directory trap, made legible: `Diagnose { expected_space }` with a
+/// space that isn't the one this store is bound to fails the `space` gate,
 /// and that mismatch wins over every downstream gate — exactly the "you ran the
 /// command in the wrong folder" case the `join` tail catches.
 #[test]
-fn diagnose_flags_expected_workspace_mismatch() {
+fn diagnose_flags_expected_space_mismatch() {
     let a_home = unique("mm-a");
     found_home(&a_home);
     let a = spawn_daemon(&a_home, &unique("mm-cfg-a"));
 
-    // A real workspace exists (A is admin), but we assert we expected a different
+    // A real space exists (A is admin), but we assert we expected a different
     // one — as the join tail would if the cwd bound the wrong store.
     let v = diagnose(&a.home, Some("ws_not_the_one_you_joined".into()));
     assert_eq!(
-        gate_state(&v, "workspace"),
+        gate_state(&v, "space"),
         GateState::Fail,
-        "a wrong expected workspace must fail the workspace gate"
+        "a wrong expected space must fail the space gate"
     );
     assert_eq!(
         v.blocked_on.as_deref(),
-        Some("workspace"),
+        Some("space"),
         "the store mismatch must be the first/actionable blocker"
     );
     assert!(v.summary.contains("wrong directory"));
 
-    // Sanity: with the *correct* workspace the gate passes.
+    // Sanity: with the *correct* space the gate passes.
     let ws = match req(&a.home, Request::Status) {
-        Response::Status(s) => s.workspace.expect("A has a workspace"),
+        Response::Status(s) => s.space.expect("A has a space"),
         other => panic!("status returned {other:?}"),
     };
     let ok = diagnose(&a.home, Some(ws));
-    assert_eq!(gate_state(&ok, "workspace"), GateState::Pass);
+    assert_eq!(gate_state(&ok, "space"), GateState::Pass);
 
     drop(a);
 }
 
-/// A successful join records the workspace in the registry (store path → workspace)
+/// A successful join records the space in the registry (store path → space)
 /// so the CLI can later route a lost joiner back to the right directory.
 #[test]
-fn join_records_the_workspace_registry_entry() {
+fn join_records_the_space_registry_entry() {
     let a_home = unique("reg-a");
     found_home(&a_home);
     let a = spawn_daemon(&a_home, &unique("reg-cfg-a"));
@@ -307,22 +307,19 @@ fn join_records_the_workspace_registry_entry() {
         Response::Ok { .. }
     ));
 
-    // Every daemon boot upserts its store into workspaces.json under its config
+    // Every daemon boot upserts its store into spaces.json under its config
     // root — so B's row exists as soon as its daemon is up (origin defaults to
     // joined; the CLI-side `lait join` would have stamped host_nick too).
-    let reg_file = b_cfg.join("workspaces.json");
+    let reg_file = b_cfg.join("spaces.json");
     let found = poll_until(Duration::from_secs(10), || {
         let txt = std::fs::read_to_string(&reg_file).ok()?;
-        let entries: Vec<WorkspaceEntry> = serde_json::from_str(&txt).ok()?;
+        let entries: Vec<SpaceEntry> = serde_json::from_str(&txt).ok()?;
         entries
             .into_iter()
             .find(|e| e.path == b_home.display().to_string())
     });
     let entry = found.expect("join must record a registry entry pointing at B's store");
-    assert!(
-        entry.workspace.starts_with("ws_"),
-        "entry carries the workspace id"
-    );
+    assert!(entry.space.starts_with("ws_"), "entry carries the space id");
     assert_eq!(
         entry.origin,
         Origin::Joined,
@@ -334,7 +331,7 @@ fn join_records_the_workspace_registry_entry() {
 }
 
 /// The decoy-store guard: a read-only command run in a directory with no `.lait/`,
-/// when the registry knows of joined workspaces, must refuse to create an empty
+/// when the registry knows of joined spaces, must refuse to create an empty
 /// store and instead point the user at the real one — exit non-zero, no `.lait/`
 /// left behind. This is the direct fix for "joined, but `lait projects` shows
 /// nothing" caused by running from the wrong folder.
@@ -343,9 +340,9 @@ fn read_command_in_empty_dir_refuses_to_create_a_decoy_store() {
     let cfg = unique("guard-cfg");
     let cwd = unique("guard-cwd");
 
-    // Seed the registry with a workspace the user "joined" elsewhere.
-    let entry = WorkspaceEntry {
-        workspace: "ws_01JGUARDTESTWORKSPACEID".into(),
+    // Seed the registry with a space the user "joined" elsewhere.
+    let entry = SpaceEntry {
+        space: "ws_01JGUARDTESTSPACEIDXXX".into(),
         name: "guardws".into(),
         path: "/some/other/place/.lait".into(),
         origin: Origin::Joined,
@@ -354,7 +351,7 @@ fn read_command_in_empty_dir_refuses_to_create_a_decoy_store() {
         projects: vec![],
     };
     std::fs::write(
-        cfg.join("workspaces.json"),
+        cfg.join("spaces.json"),
         serde_json::to_string(&vec![entry]).unwrap(),
     )
     .unwrap();
@@ -372,7 +369,7 @@ fn read_command_in_empty_dir_refuses_to_create_a_decoy_store() {
 
     assert!(
         !out.status.success(),
-        "a read command with no local workspace must exit non-zero, got {:?}",
+        "a read command with no local space must exit non-zero, got {:?}",
         out.status.code()
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -380,11 +377,11 @@ fn read_command_in_empty_dir_refuses_to_create_a_decoy_store() {
         stderr.contains("no lait space in this directory"),
         "guard must explain why, got stderr: {stderr}"
     );
-    // The listing is human navigation state: the workspace NAME and its path
+    // The listing is human navigation state: the space NAME and its path
     // (not the raw ws id).
     assert!(
         stderr.contains("guardws"),
-        "guard must list the registered workspace by name, got stderr: {stderr}"
+        "guard must list the registered space by name, got stderr: {stderr}"
     );
     assert!(
         stderr.contains("/some/other/place/.lait"),
@@ -418,7 +415,7 @@ fn read_command_with_empty_registry_still_refuses_and_suggests_creation_verbs() 
 
     assert!(
         !out.status.success(),
-        "a read command with no workspace anywhere must exit non-zero, got {:?}",
+        "a read command with no space anywhere must exit non-zero, got {:?}",
         out.status.code()
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -439,18 +436,18 @@ fn read_command_with_empty_registry_still_refuses_and_suggests_creation_verbs() 
     let _ = std::fs::remove_dir_all(&cwd);
 }
 
-/// `lait join` in a directory already bound to a DIFFERENT workspace is a hard
+/// `lait join` in a directory already bound to a DIFFERENT space is a hard
 /// error (exit 2) — never adopt, never wipe. This shells the real binary because
 /// it is the pre-daemon store-resolution path.
 #[test]
-fn join_binary_refuses_a_directory_bound_to_another_workspace() {
-    // A real host to mint a ticket for workspace A…
+fn join_binary_refuses_a_directory_bound_to_another_space() {
+    // A real host to mint a ticket for space A…
     let a_home = unique("bind-a");
     found_home(&a_home);
     let a = spawn_daemon(&a_home, &unique("bind-cfg-a"));
     let ticket = ticket_for(&a.home, false);
 
-    // …and a directory already bound to a different workspace C.
+    // …and a directory already bound to a different space C.
     let c_home = unique("bind-c");
     found_home(&c_home);
 
@@ -465,7 +462,7 @@ fn join_binary_refuses_a_directory_bound_to_another_workspace() {
     assert_eq!(
         out.status.code(),
         Some(2),
-        "joining into a store bound to another workspace must exit 2, stderr: {}",
+        "joining into a store bound to another space must exit 2, stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     let stderr = String::from_utf8_lossy(&out.stderr);

@@ -80,7 +80,7 @@ impl Replica {
         let doc_id = DocId::mint(&*self.clock);
         let issue = IssueDoc::create(NewIssue {
             doc_id: doc_id.clone(),
-            workspace_id: self.workspace_id.clone(),
+            space_id: self.space_id.clone(),
             project_id: project.id.clone(),
             title: title.clone(),
             priority,
@@ -620,12 +620,7 @@ impl Replica {
             by: me_actor.clone(),
             actor_asof: self.membership.actor_heads(&me_actor),
         };
-        let signed = authz::sign_authz(
-            &self.seed,
-            &op,
-            self.catalog.authz_heads(),
-            &self.workspace_id,
-        );
+        let signed = authz::sign_authz(&self.seed, &op, self.catalog.authz_heads(), &self.space_id);
         self.catalog.add_authz_op(&signed)?;
         // The tombstone flag + board membership are a cache of the replay.
         let tombstoned = self.authz_state().is_tombstoned(&doc_id);

@@ -13,7 +13,7 @@ use crate::actor::{self, ActorPlane};
 use crate::authz;
 use crate::catalog::{CatalogDoc, RowMeta};
 use crate::control::{BoardPos, CatalogScope, Filter, Request, Response};
-use crate::crypto::{self, WorkspaceKey};
+use crate::crypto::{self, SpaceKey};
 use crate::dto::{
     ActivityEvent, BoardColumn, BoardView, FieldChange, GraphView, IssueView, LabelDto, LinkDto,
     Priority, ProjectDto, Row, StatusCategory, SCHEMA_VERSION,
@@ -21,7 +21,7 @@ use crate::dto::{
 use crate::fabric::history;
 use crate::fabric::op::OpCtx;
 use crate::genesis::Genesis;
-use crate::ids::{ActorId, DeviceId, DocId, LabelId, ProjectId, UlidSource, WorkspaceId};
+use crate::ids::{ActorId, DeviceId, DocId, LabelId, ProjectId, SpaceId, UlidSource};
 use crate::index::{self, AliasTable, RefResolution};
 use crate::issue::{IssueDoc, NewIssue};
 use crate::membership::MembershipDoc;
@@ -43,7 +43,7 @@ mod sync;
 #[cfg(test)]
 mod tests;
 
-pub use lifecycle::{derive_project_key, found_workspace, join_workspace_store};
+pub use lifecycle::{derive_project_key, found_space, join_space_store};
 pub use recovery::{
     ArtifactRead, DegradedRecoveryHolder, LocalCustodyState, RecoveryArtifactFailure,
     RecoveryStatus,
@@ -139,20 +139,20 @@ pub struct Replica {
     aliases: AliasTable,
     me: DeviceId,
     my_nick: String,
-    workspace_id: WorkspaceId,
+    space_id: SpaceId,
     activity: VecDeque<ActivityEvent>,
     activity_seq: u64,
     clock: Box<dyn UlidSource + Send + Sync>,
-    // ---- workspace encryption ----
+    // ---- space encryption ----
     /// The plaintext membership layer (signed ACL + sealed key envelopes).
     membership: MembershipDoc,
-    /// The genesis trust root: workspace ID and founding administrator keys.
+    /// The genesis trust root: space ID and founding administrator keys.
     genesis: Genesis,
     /// Our ed25519 secret seed — signs ACL ops and unseals key envelopes.
     seed: [u8; 32],
     /// Every key-epoch we can unseal (a keyring; older epochs stay decryptable —
     /// lazy revocation). Empty ⇒ we are not a member and see only ciphertext.
-    keyring: BTreeMap<[u8; 16], WorkspaceKey>,
+    keyring: BTreeMap<[u8; 16], SpaceKey>,
 }
 
 /// 16 random bytes (an actor inception / consent nonce). Non-deterministic by
@@ -192,24 +192,24 @@ impl Replica {
     }
 
     // Test/inspection accessors.
-    pub fn workspace_id(&self) -> &WorkspaceId {
-        &self.workspace_id
+    pub fn space_id(&self) -> &SpaceId {
+        &self.space_id
     }
     /// The synced display name (empty on a joiner until the catalog arrives).
-    pub fn workspace_name(&self) -> String {
-        self.catalog.workspace_name()
+    pub fn space_name(&self) -> String {
+        self.catalog.space_name()
     }
     /// Update the display nick (a `ConfigReload` applying `user.nick` live).
     /// Affects future activity attribution; nothing durable to rewrite.
     pub fn set_nick(&mut self, nick: String) {
         self.my_nick = nick;
     }
-    /// Advisory project snapshot for the machine-level workspace registry.
-    pub fn project_briefs(&self) -> Vec<crate::workspaces::ProjectBrief> {
+    /// Advisory project snapshot for the machine-level space registry.
+    pub fn project_briefs(&self) -> Vec<crate::spaces::ProjectBrief> {
         self.catalog
             .projects_list()
             .into_iter()
-            .map(|p| crate::workspaces::ProjectBrief {
+            .map(|p| crate::spaces::ProjectBrief {
                 key: p.key,
                 name: p.name,
             })

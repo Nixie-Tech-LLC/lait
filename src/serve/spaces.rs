@@ -27,7 +27,7 @@ use serde::Serialize;
 use tokio::sync::{broadcast, Mutex};
 
 use crate::control::{self, Doorbell, Request};
-use crate::workspaces::{self, StorePresence, WorkspaceEntry};
+use crate::spaces::{self, SpaceEntry, StorePresence};
 
 /// A doorbell, tagged with the space it rang for.
 ///
@@ -62,10 +62,10 @@ pub enum SpaceIdentity {
 /// One row of the spaces picker.
 #[derive(Debug, Clone, Serialize)]
 pub struct SpaceRow {
-    /// Stable, opaque handle for URLs — see [`space_id`].
+    /// Stable, opaque handle for URLs — see [`store_handle`].
     pub id: String,
-    /// The `ws_…` workspace id.
-    pub workspace: String,
+    /// The `ws_…` space id.
+    pub space: String,
     /// Display name at last open (advisory — the catalog is authoritative).
     pub name: String,
     pub path: String,
@@ -74,26 +74,26 @@ pub struct SpaceRow {
     /// `up` | `idle` | `missing`, exactly as `lait spaces` reports it.
     pub status: &'static str,
     pub identity: SpaceIdentity,
-    pub projects: Vec<workspaces::ProjectBrief>,
+    pub projects: Vec<spaces::ProjectBrief>,
 }
 
 /// A registry entry, plus whose identity it runs under.
 #[derive(Debug, Clone)]
 pub struct Scoped<'a> {
-    pub entry: &'a WorkspaceEntry,
+    pub entry: &'a SpaceEntry,
     pub identity: SpaceIdentity,
 }
 
 /// A stable public id for a store path.
 ///
 /// Derived rather than borrowed: the `ws_` id is not unique per *store* (the same
-/// workspace can legitimately be bound at two paths), and the store path itself
+/// space can legitimately be bound at two paths), and the store path itself
 /// is both unwieldy and a filesystem disclosure in a URL. blake3 is already in
 /// the tree, and unlike [`crate::config::home_hash`] — whose `DefaultHasher` is
 /// explicitly not stable across Rust releases, which is fine for the socket name
 /// it exists for — this stays put across builds, so a bookmarked space URL keeps
 /// resolving.
-pub fn space_id(path: &str) -> String {
+pub fn store_handle(path: &str) -> String {
     let hash = blake3::hash(path.as_bytes());
     hash.to_hex()[..16].to_string()
 }
@@ -112,7 +112,7 @@ pub fn space_id(path: &str) -> String {
 /// agents are exactly that shape, living under [`crate::registry::agents_base`],
 /// and [`crate::registry`] isolates them so one agent cannot read another.
 ///
-/// `workspaces.json` is a single global file that every daemon open upserts into
+/// `spaces.json` is a single global file that every daemon open upserts into
 /// (`node.rs`), so it holds both kinds. The policy is deliberately **asymmetric**,
 /// and the asymmetry is the point:
 ///
@@ -135,7 +135,7 @@ pub fn space_id(path: &str) -> String {
 /// here and nowhere else, so the switcher never threads through the router, the
 /// supervisor, or the endpoints.
 pub fn scope<'a>(
-    entries: &'a [WorkspaceEntry],
+    entries: &'a [SpaceEntry],
     identity: &Path,
     agents_base: &Path,
     self_contained: bool,
@@ -214,12 +214,12 @@ fn normalize(p: &Path) -> String {
 
 /// Probe a store's daemon without starting one.
 ///
-/// Mirrors `cli::workspace_status` — deliberately, so the browser and `lait
+/// Mirrors `cli::space_status` — deliberately, so the browser and `lait
 /// spaces` cannot disagree about what "up" means. The short timeout fails closed
 /// to `idle`: a picker that hangs on a wedged daemon is worse than one that
 /// under-reports it, and selecting the space will start it anyway.
-async fn status(entry: &WorkspaceEntry) -> &'static str {
-    if workspaces::presence(entry) == StorePresence::Missing {
+async fn status(entry: &SpaceEntry) -> &'static str {
+    if spaces::presence(entry) == StorePresence::Missing {
         return "missing";
     }
     let up = tokio::time::timeout(
@@ -292,7 +292,7 @@ impl Supervisor {
     /// latency the *sum* of every idle space, which is exactly the case a user
     /// with a dozen registered spaces hits.
     pub async fn list(&self) -> Vec<SpaceRow> {
-        let entries = workspaces::list();
+        let entries = spaces::list();
         let scoped = scope(
             &entries,
             &self.identity,
@@ -305,8 +305,8 @@ impl Supervisor {
             let identity = s.identity.clone();
             set.spawn(async move {
                 SpaceRow {
-                    id: space_id(&e.path),
-                    workspace: e.workspace.clone(),
+                    id: store_handle(&e.path),
+                    space: e.space.clone(),
                     name: e.name.clone(),
                     path: e.path.clone(),
                     origin: e.origin.to_string(),
@@ -330,7 +330,7 @@ impl Supervisor {
     /// indistinguishable from one that does not exist — an agent-scoped `serve`
     /// cannot address your spaces by guessing an id.
     pub fn resolve(&self, id: &str) -> Result<(PathBuf, SpaceIdentity)> {
-        let entries = workspaces::list();
+        let entries = spaces::list();
         let scoped = scope(
             &entries,
             &self.identity,
@@ -339,7 +339,7 @@ impl Supervisor {
         );
         scoped
             .into_iter()
-            .find(|s| space_id(&s.entry.path) == id)
+            .find(|s| store_handle(&s.entry.path) == id)
             .map(|s| (PathBuf::from(&s.entry.path), s.identity))
             .ok_or_else(|| anyhow!("no such space"))
     }
@@ -354,15 +354,15 @@ impl Supervisor {
     /// **The identity must be pinned, not inherited.** `identity_dir` reads
     /// `$LAIT_HOME` and never `$LAIT_STORE`, so spawning a daemon at an agent's
     /// store from a globally-scoped `serve` would open it under *your* key —
-    /// which cannot unwrap a workspace key sealed to the agent, and would put
-    /// your identity on the wire in the agent's workspace. Hence
+    /// which cannot unwrap a space key sealed to the agent, and would put
+    /// your identity on the wire in the agent's space. Hence
     /// [`crate::cli::ensure_daemon_as`] and the explicit home below.
     ///
     /// **Attaching is not free the way listing is.** [`list`](Self::list) only
     /// probes, so enumerating agents has no effect on anything. Starting a
     /// daemon brings that identity *online* — it binds an endpoint and announces
     /// presence — so watching an idle agent is what makes it visible to its
-    /// workspace. That is usually what you want when you went looking for it, but
+    /// space. That is usually what you want when you went looking for it, but
     /// it is a real consequence of a click, not a read.
     pub async fn attach(&self, id: &str) -> Result<PathBuf> {
         let (home, identity) = self.resolve(id)?;
@@ -498,12 +498,12 @@ impl Supervisor {
 mod tests {
     use super::*;
 
-    fn entry(path: &str) -> WorkspaceEntry {
-        WorkspaceEntry {
-            workspace: "ws_test".into(),
+    fn entry(path: &str) -> SpaceEntry {
+        SpaceEntry {
+            space: "ws_test".into(),
             name: "Test".into(),
             path: path.into(),
-            origin: workspaces::Origin::Founded,
+            origin: spaces::Origin::Founded,
             host_nick: String::new(),
             last_opened: 0,
             projects: Vec::new(),
@@ -642,9 +642,15 @@ mod tests {
     }
 
     #[test]
-    fn space_ids_are_stable_and_path_distinct() {
-        assert_eq!(space_id("/home/u/a/.lait"), space_id("/home/u/a/.lait"));
-        assert_ne!(space_id("/home/u/a/.lait"), space_id("/home/u/b/.lait"));
-        assert_eq!(space_id("/home/u/a/.lait").len(), 16);
+    fn store_handles_are_stable_and_path_distinct() {
+        assert_eq!(
+            store_handle("/home/u/a/.lait"),
+            store_handle("/home/u/a/.lait")
+        );
+        assert_ne!(
+            store_handle("/home/u/a/.lait"),
+            store_handle("/home/u/b/.lait")
+        );
+        assert_eq!(store_handle("/home/u/a/.lait").len(), 16);
     }
 }

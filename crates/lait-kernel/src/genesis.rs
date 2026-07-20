@@ -1,4 +1,4 @@
-//! The workspace **genesis** — lait's root of trust, represented as pure data.
+//! The space **genesis** — lait's root of trust, represented as pure data.
 //!
 //! This lives in the kernel, not the store: it is the seed that seeds every
 //! trust-plane replay ([`crate::acl`], [`crate::actor`], [`crate::space`],
@@ -8,9 +8,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ActorId, WorkspaceId};
+use crate::ids::{ActorId, SpaceId};
 
-/// The workspace genesis — the root of trust. Distributed in the
+/// The space genesis — the root of trust. Distributed in the
 /// invite ticket; persisted as public data.
 ///
 /// Founding principals are **actors** (self-certifying identities), not raw
@@ -21,14 +21,14 @@ use crate::ids::{ActorId, WorkspaceId};
 /// rehashing to the genesis [`ActorId`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Genesis {
-    pub workspace_id: WorkspaceId,
+    pub space_id: SpaceId,
     pub founding_actors: Vec<ActorId>,
-    /// The salt that, with the founding device key, derives `workspace_id`
+    /// The salt that, with the founding device key, derives `space_id`
     /// (`lait/space/1`). Retained so this node can re-mint verifiable tickets and
     /// so a replica can confirm the id commits to its founder.
     #[serde(default)]
     pub salt: [u8; 16],
-    /// The break-glass recovery commitment folded into `workspace_id`
+    /// The break-glass recovery commitment folded into `space_id`
     /// (`H(threshold ‖ sorted[H(recovery_pubkey_i)])`). Seeds the space plane's
     /// recovery authority; rotatable only by a threshold `Recover`.
     #[serde(default)]

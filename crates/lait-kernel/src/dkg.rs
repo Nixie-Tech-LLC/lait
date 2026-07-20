@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::authority::{
     AuthorityConfiguration, AuthorityId, AuthorityScheme, FrostThresholdConfig, PrincipalId,
 };
-use crate::ids::{DeviceId, WorkspaceId};
+use crate::ids::{DeviceId, SpaceId};
 use crate::sigdag::{self, SignedNode};
 
 /// Signing domain for FROST ceremony contributions (bulletin-board packages).
@@ -44,7 +44,7 @@ pub const CEREMONY_DOMAIN: &[u8] = b"lait/space/1/ceremony/2";
 ///   which is what we want — Ed25519 signature bytes are not a canonical
 ///   function of the message across implementations, so hashing the envelope
 ///   could yield two ids for one proposal;
-/// - it is deliberately **not** domain- or workspace-bound (see its docs), so a
+/// - it is deliberately **not** domain- or space-bound (see its docs), so a
 ///   `TranscriptId` is only meaningful within the plane that produced it. Never
 ///   use one as a key in anything shared across planes, and keep the explicit
 ///   `nonce` on both openers: Ed25519 signing is deterministic (RFC 8032), so
@@ -163,7 +163,7 @@ pub enum CeremonyOp {
     /// Required before an indispensable arrangement (every holder needed) may be
     /// installed. Without it, an N-of-N authority can be created in a state where
     /// one holder's share exists only behind a Windows profile — and the
-    /// workspace discovers this on the day it needs to recover, which is the day
+    /// space discovers this on the day it needs to recover, which is the day
     /// it is too late. The attestation is a signed board event rather than local
     /// state so that no *other* node can install the rotation before every
     /// custodian has actually made the check.
@@ -212,7 +212,7 @@ impl CeremonyOp {
 /// The proposal's signed-node hash is its transcript identity, and that hash
 /// therefore commits to everything above: scheme, configuration payload,
 /// transition kind, the authority being replaced, the nonce, and the
-/// workspace-scoped envelope. An [`AuthorityGrant`] needs only the id because
+/// space-scoped envelope. An [`AuthorityGrant`] needs only the id because
 /// the id already covers the whole decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyCeremonyProposal {
@@ -284,7 +284,7 @@ pub const AUTHORITY_GRANT_DOMAIN: &[u8] = b"lait/space/1/ceremony/2/authority-gr
 /// The recovery authority's statement that one exact key ceremony may run.
 ///
 /// The proposal's hash already commits to the whole configuration — scheme,
-/// threshold, participants, transition, nonce, workspace envelope — so naming it
+/// threshold, participants, transition, nonce, space envelope — so naming it
 /// is the entire content of the decision. A struct rather than bare bytes so a
 /// later field (a policy commitment, say) can ride the same object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,7 +323,7 @@ pub fn frost_rotation_proposal(
 /// Author an authority grant with a solo recovery secret.
 pub fn sign_authority_grant(
     recovery_seed: &[u8; 32],
-    ws: &WorkspaceId,
+    ws: &SpaceId,
     proposal: &TranscriptId,
 ) -> SignedAuthorityGrant {
     let grant = AuthorityGrant {
@@ -342,7 +342,7 @@ pub fn sign_authority_grant(
 /// `group_key`. The aggregated signature assembles into a node identical in
 /// shape to [`sign_authority_grant`]'s output.
 pub fn authority_grant_payload(
-    ws: &WorkspaceId,
+    ws: &SpaceId,
     group_key: &DeviceId,
     proposal: &TranscriptId,
 ) -> (Vec<u8>, [u8; 32]) {
@@ -355,10 +355,10 @@ pub fn authority_grant_payload(
 }
 
 /// The proposal a grant authorizes, if it is a well-formed grant for this
-/// workspace. `None` otherwise.
+/// space. `None` otherwise.
 ///
 /// Checks, in order: the signature verifies under the grant domain for this
-/// workspace; the payload decodes as an [`AuthorityGrant`]; and the node has no
+/// space; the payload decodes as an [`AuthorityGrant`]; and the node has no
 /// parents. Parents are rejected because a grant is a standalone statement — an
 /// unconstrained parent list is signed-over data with no defined meaning, and
 /// leaving it free would let two grants for one decision differ in their hash
@@ -366,7 +366,7 @@ pub fn authority_grant_payload(
 ///
 /// Says nothing about *whose* key signed it: the caller must still check the
 /// author against the standing recovery authority.
-pub fn authority_grant_of(node: &SignedAuthorityGrant, ws: &WorkspaceId) -> Option<AuthorityGrant> {
+pub fn authority_grant_of(node: &SignedAuthorityGrant, ws: &SpaceId) -> Option<AuthorityGrant> {
     if !node.verify_sig(AUTHORITY_GRANT_DOMAIN, ws.as_str()) || !node.parents.is_empty() {
         return None;
     }
@@ -374,7 +374,7 @@ pub fn authority_grant_of(node: &SignedAuthorityGrant, ws: &WorkspaceId) -> Opti
 }
 
 /// Sign a [`CeremonyOp`] with the contributing device's seed.
-pub fn sign_ceremony(seed: &[u8; 32], op: &CeremonyOp, ws: &WorkspaceId) -> SignedNode {
+pub fn sign_ceremony(seed: &[u8; 32], op: &CeremonyOp, ws: &SpaceId) -> SignedNode {
     sigdag::sign_node(
         CEREMONY_DOMAIN,
         seed,
@@ -475,7 +475,7 @@ thread_local! {
 /// Note this establishes *authenticity*, not *authorization*: a validly signed
 /// proposal from any device still lands here. Accepting it is
 /// the caller's proposal-authorization check, applied before acting on the board.
-pub fn parse_board(events: &[SignedNode], ws: &WorkspaceId) -> CeremonyBoard {
+pub fn parse_board(events: &[SignedNode], ws: &SpaceId) -> CeremonyBoard {
     let mut board = CeremonyBoard::default();
     for ev in events {
         #[cfg(test)]
@@ -1225,8 +1225,8 @@ mod tests {
 
     // ---- transcript identity ----
 
-    fn ws() -> WorkspaceId {
-        WorkspaceId::mint(&crate::ids::SystemUlidSource)
+    fn ws() -> SpaceId {
+        SpaceId::mint(&crate::ids::SystemUlidSource)
     }
 
     /// A transcript id only ever reaches the filesystem as `to_hex`, so the
@@ -1298,7 +1298,7 @@ mod tests {
         assert_eq!(parse_board(std::slice::from_ref(&ev), &w).dkg.len(), 1);
         ev.sig = vec![0u8; 64];
         assert!(parse_board(&[ev.clone()], &w).dkg.is_empty());
-        // Nor can it be lifted into a different workspace.
+        // Nor can it be lifted into a different space.
         assert!(parse_board(std::slice::from_ref(&ev), &ws()).dkg.is_empty());
     }
 
@@ -1330,17 +1330,17 @@ mod tests {
 
     // ---- proposal authorization ----
 
-    /// A grant is bound to one proposal in one workspace: it cannot be replayed
-    /// against a different proposal, nor lifted to another workspace.
+    /// A grant is bound to one proposal in one space: it cannot be replayed
+    /// against a different proposal, nor lifted to another space.
     #[test]
-    fn a_grant_binds_to_its_proposal_and_workspace() {
+    fn a_grant_binds_to_its_proposal_and_space() {
         let w = ws();
         let seed = [3u8; 32];
         let a = TranscriptId::parse_hex(&"a".repeat(64)).unwrap();
 
         let grant = sign_authority_grant(&seed, &w, &a);
         assert_eq!(authority_grant_of(&grant, &w).unwrap().proposal, a);
-        // Same signature, different workspace.
+        // Same signature, different space.
         assert!(authority_grant_of(&grant, &ws()).is_none());
         // Tampered payload: the signature no longer covers it.
         let mut swapped = grant.clone();
@@ -1467,10 +1467,7 @@ mod tests {
     }
 
     // ---- signing plans and retention ----
-    fn request_with_coordinator(
-        w: &WorkspaceId,
-        coordinator: DeviceId,
-    ) -> (TranscriptId, SignedNode) {
+    fn request_with_coordinator(w: &SpaceId, coordinator: DeviceId) -> (TranscriptId, SignedNode) {
         let authority = TranscriptId::parse_hex(&"a".repeat(64)).unwrap();
         let req = CeremonyOp::SignRequest {
             nonce: [3u8; 16],

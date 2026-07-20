@@ -10,7 +10,7 @@ impl Replica {
         let Some(actor) = self.resolve_actor(&who) else {
             return (
                 Response::not_found(format!(
-                    "no known actor for '{who}' — start the agent so it joins the workspace, then sponsor it"
+                    "no known actor for '{who}' — start the agent so it joins the space, then sponsor it"
                 )),
                 None,
             );
@@ -27,7 +27,7 @@ impl Replica {
         let agent_actor = ActorId::from_incept_hash(&agent_incept.hash());
         let mut candidate = self.membership.actor_events();
         candidate.push(agent_incept.clone());
-        if !actor::replay(&self.workspace_id, &candidate).exists(&agent_actor) {
+        if !actor::replay(&self.space_id, &candidate).exists(&agent_actor) {
             return (Response::err("invalid agent inception"), None);
         }
         if let Err(e) = self.import_inception(agent_incept) {
@@ -37,7 +37,7 @@ impl Replica {
     }
 
     /// Sponsor an already-known agent actor: sign `AddAgent` and
-    /// seal it the workspace key. Any human member may sponsor; the agent holds
+    /// seal it the space key. Any human member may sponsor; the agent holds
     /// no membership or content authority, and its standing dies with the
     /// sponsor. The agent's inception must already be present (it self-incepts
     /// on join). Delegation, not elevation.
@@ -64,7 +64,7 @@ impl Replica {
         if acl.is_member(agent_actor) {
             return (
                 Response::err(format!(
-                    "{} is already a workspace principal",
+                    "{} is already a space principal",
                     agent_actor.short()
                 )),
                 None,
@@ -102,13 +102,13 @@ impl Replica {
     // ---- multi-device (lait/actor/1 device management) ----
 
     /// A device-enrollment token for adding another device to *this* actor:
-    /// `<actor_id> <workspace_id>`. The new machine consumes it with
+    /// `<actor_id> <space_id>`. The new machine consumes it with
     /// `device accept`, which produces a consent blob for `device add`.
     pub(super) fn device_invite_cmd(&self) -> (Response, Option<DirtySet>) {
         match self.my_actor() {
             Some(a) => (
                 Response::Text {
-                    text: format!("{} {}", a, self.workspace_id),
+                    text: format!("{} {}", a, self.space_id),
                 },
                 None,
             ),
@@ -155,7 +155,7 @@ impl Replica {
             None => return (Response::err("could not decode device consent blob"), None),
         };
         if !actor::consent_verify(
-            self.workspace_id.as_str(),
+            self.space_id.as_str(),
             &binding,
             &actor::ConsentCtx::Member { actor: &actor },
         ) {
@@ -172,11 +172,11 @@ impl Replica {
                 binding,
             },
             self.membership.actor_heads(&actor),
-            &self.workspace_id,
+            &self.space_id,
         );
         let res = (|| -> Result<()> {
             self.membership.add_actor_event(&ev)?;
-            let held: Vec<([u8; 16], WorkspaceKey)> =
+            let held: Vec<([u8; 16], SpaceKey)> =
                 self.keyring.iter().map(|(e, k)| (*e, *k)).collect();
             for (id, key) in held {
                 if let Some(sealed) = crypto::seal_to(&new_device, &key) {
@@ -226,7 +226,7 @@ impl Replica {
                 device: device.clone(),
             },
             self.membership.actor_heads(&actor),
-            &self.workspace_id,
+            &self.space_id,
         );
         // De-listing the device is self-authored and always applies. Fully
         // fencing it, though, requires a **key rotation**, which only an admin
@@ -249,7 +249,7 @@ impl Replica {
             format!("revoked device {} and rotated the key", device.short())
         } else {
             format!(
-                "revoked device {} from your identity — ask an admin to rotate the workspace key to fence its access to existing content",
+                "revoked device {} from your identity — ask an admin to rotate the space key to fence its access to existing content",
                 device.short()
             )
         };
@@ -274,7 +274,7 @@ impl Replica {
     /// Recover our actor with the offline recovery key: authored by the recovery
     /// key (which must match the standing pre-rotation commitment), it resets the
     /// device set to *this* device. **Lazy** (design): identity/standing is
-    /// restored immediately, but this fresh device holds no workspace key until
+    /// restored immediately, but this fresh device holds no space key until
     /// an admin or surviving peer re-seals it (self-heal on their next sync).
     pub fn recover(&mut self) -> (Response, Option<DirtySet>) {
         let Some(seed) = self.read_recovery_key() else {
@@ -304,7 +304,7 @@ impl Replica {
         };
         let binding = actor::consent_sign(
             &self.seed,
-            self.workspace_id.as_str(),
+            self.space_id.as_str(),
             rand16(),
             &actor::ConsentCtx::Member { actor: &actor },
         );
@@ -316,12 +316,12 @@ impl Replica {
                 next_commit: None,
             },
             self.membership.actor_heads(&actor),
-            &self.workspace_id,
+            &self.space_id,
         );
         // Validate the recovery actually took (commitment match) before persisting.
         let mut candidate = self.membership.actor_events();
         candidate.push(ev.clone());
-        let recovered = actor::replay(&self.workspace_id, &candidate)
+        let recovered = actor::replay(&self.space_id, &candidate)
             .state(&actor)
             .map(|s| s.recovered)
             .unwrap_or(false);

@@ -1,10 +1,10 @@
 //! Seed-registry end-to-end: a node already
-//! bound to a workspace that pins an always-on seed with `seed add <ticket>`
-//! must (1) connect and backfill the workspace's history via the pin, and
+//! bound to a space that pins an always-on seed with `seed add <ticket>`
+//! must (1) connect and backfill the space's history via the pin, and
 //! (2) on a later cold restart — with the opportunistic `peers.json` bootstrap
 //! set wiped — redial the seed purely from the sticky `seeds.json` pin and
-//! reconverge. (`seed add` never adopts a foreign workspace anymore — the store
-//! is bootstrapped via `lait join` first, and a foreign-workspace ticket is an
+//! reconverge. (`seed add` never adopts a foreign space anymore — the store
+//! is bootstrapped via `lait join` first, and a foreign-space ticket is an
 //! error, covered below.)
 //!
 //! This distinguishes an explicit seed pin from the learned restart
@@ -96,8 +96,8 @@ fn spawn(home: &Path, seed: bool) -> Proc {
     }
     let child = cmd
         .env("LAIT_HOME", home)
-        // Isolate the workspace registry per node: the daemon-boot upsert must land
-        // in a scratch config root, never the developer's real workspaces.json.
+        // Isolate the space registry per node: the daemon-boot upsert must land
+        // in a scratch config root, never the developer's real spaces.json.
         .env("LAIT_CONFIG_ROOT", home.join("cfgroot"))
         .env("LAIT_IDLE_SECS", "0")
         // Run the protocol on a fast heartbeat so catch-up/absence windows are
@@ -165,27 +165,27 @@ fn poll_seed_persisted(home: &Path, id: &str, timeout: Duration) -> bool {
     .is_some()
 }
 
-/// Found a workspace in `home` in-process, using the SAME identity the daemon
+/// Found a space in `home` in-process, using the SAME identity the daemon
 /// will load (`<home>/secret.key`, since the daemon runs with `LAIT_HOME=home`).
-/// Workspaces are never minted lazily anymore — a daemon errors on an
+/// Spaces are never minted lazily anymore — a daemon errors on an
 /// uninitialized store — so every founder home goes through this first.
 fn found_home(home: &Path) {
     let key = lait::config::load_or_create_identity(home).expect("identity");
     let me = lait::crypto::device_from_seed(&key);
     let store = lait::store::Store::open(home).expect("store");
-    lait::replica::found_workspace(&store, &me, &key, "test", &lait::ids::SystemUlidSource)
-        .expect("found workspace");
+    lait::replica::found_space(&store, &me, &key, "test", &lait::ids::SystemUlidSource)
+        .expect("found space");
 }
 
 /// Bootstrap a joiner store from a ticket (the client half of `lait join`), so
-/// its daemon boots already bound to the host's workspace — `seed add` requires
-/// the ticket's workspace to match the bound one.
+/// its daemon boots already bound to the host's space — `seed add` requires
+/// the ticket's space to match the bound one.
 fn join_home(home: &Path, ticket: &str) {
-    let t: lait::proto::WorkspaceTicket = ticket.parse().expect("parse ticket");
+    let t: lait::proto::SpaceTicket = ticket.parse().expect("parse ticket");
     let store = lait::store::Store::open(home).expect("store");
-    lait::replica::join_workspace_store(
+    lait::replica::join_space_store(
         &store,
-        &t.workspace,
+        &t.space,
         &t.salt,
         &t.recovery_root,
         t.founder_inception
@@ -237,7 +237,7 @@ fn seed_pin_backfills_then_survives_restart() {
     );
 
     // B bootstraps its store from the seed's ticket BEFORE its daemon first
-    // starts (SeedAdd requires the ticket's workspace to match the bound one),
+    // starts (SeedAdd requires the ticket's space to match the bound one),
     // then pins the seed — this should connect AND backfill, so B converges to
     // the pre-existing issue with no other peer and no prior peers.json.
     let ticket = match req(
@@ -315,19 +315,19 @@ fn seed_pin_backfills_then_survives_restart() {
     let _ = std::fs::remove_dir_all(&b_home);
 }
 
-/// `seed add` with a ticket for a FOREIGN workspace is an error, not an adopt:
-/// a node bound to its own workspace must be told to `lait join` the other one
+/// `seed add` with a ticket for a FOREIGN space is an error, not an adopt:
+/// a node bound to its own space must be told to `lait join` the other one
 /// first instead of silently splitting its brain.
 #[test]
-fn seed_add_with_foreign_workspace_ticket_errors() {
+fn seed_add_with_foreign_space_ticket_errors() {
     let a_home = tmp_home("foreign-a");
     let c_home = tmp_home("foreign-c");
-    found_home(&a_home); // workspace A
-    found_home(&c_home); // a DIFFERENT workspace C
+    found_home(&a_home); // space A
+    found_home(&c_home); // a DIFFERENT space C
     let a = spawn(&a_home, false);
     let c = spawn(&c_home, false);
 
-    // A ticket for A's workspace, pinned on C (bound elsewhere) → error.
+    // A ticket for A's space, pinned on C (bound elsewhere) → error.
     let ticket = match req(
         &a_home,
         Request::Invite {

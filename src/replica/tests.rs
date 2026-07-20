@@ -63,7 +63,7 @@ fn attest_custody(node: &mut TestNode, tag: &str) {
 }
 
 fn me() -> DeviceId {
-    // A real ed25519 key (so the founder can seal the workspace key to itself).
+    // A real ed25519 key (so the founder can seal the space key to itself).
     crypto::device_from_seed(&ME_SEED)
 }
 
@@ -85,12 +85,12 @@ fn device_from_seed(seed: [u8; 32]) -> DeviceId {
     crypto::device_from_seed(&seed)
 }
 
-/// A single-device actor inception for `seed` in `t`'s workspace (a joiner's
+/// A single-device actor inception for `seed` in `t`'s space (a joiner's
 /// identity, as it would ride in a JoinRequest).
 fn incept_for(seed: [u8; 32], t: &Replica) -> actor::SignedEvent {
     let (ev, _) = actor::incept_single(
         &seed,
-        &t.workspace_id,
+        &t.space_id,
         [seed[0]; 16],
         [seed[0] ^ 0x33; 16],
         None,
@@ -110,11 +110,11 @@ fn new_node_as(device: DeviceId, seed: [u8; 32]) -> TestNode {
     std::fs::create_dir_all(&home).unwrap();
     let store = Store::open(&home).unwrap();
     // Distinct clock per node (seed-derived ms) so two nodes mint DIFFERENT
-    // workspace ids — otherwise the deterministic clock collides them.
+    // space ids — otherwise the deterministic clock collides them.
     let clock = FakeClock::new(1_000_000 + seed[0] as u64 * 100_000);
-    // Explicit founding (no lazy mint): seeds the "Testbed" workspace with
+    // Explicit founding (no lazy mint): seeds the "Testbed" space with
     // its default TEST project, so replicas open like real founder stores.
-    found_workspace(&store, &device, &seed, "Testbed", &clock).unwrap();
+    found_space(&store, &device, &seed, "Testbed", &clock).unwrap();
     let replica = Replica::open(store, device, "tester".into(), seed, Box::new(clock)).unwrap();
     TestNode { replica, home }
 }
@@ -136,7 +136,7 @@ fn new_joiner_node_as(
     ));
     std::fs::create_dir_all(&home).unwrap();
     let store = Store::open(&home).unwrap();
-    join_workspace_store(&store, ws, &proof.0, &proof.1, &proof.2).unwrap();
+    join_space_store(&store, ws, &proof.0, &proof.1, &proof.2).unwrap();
     let clock = FakeClock::new(1_000_000 + seed[0] as u64 * 100_000);
     let replica = Replica::open(store, device, "tester".into(), seed, Box::new(clock)).unwrap();
     TestNode { replica, home }
@@ -567,7 +567,7 @@ fn recover_resets_device_set_with_the_offline_key() {
     let db = device_from_seed(db_seed);
     let binding = actor::consent_sign(
         &db_seed,
-        &a.replica.workspace_str(),
+        &a.replica.space_str(),
         [61u8; 16],
         &actor::ConsentCtx::Member { actor: &x },
     );
@@ -593,9 +593,9 @@ fn fresh_device_recovers_and_decrypts_after_peer_reseal() {
     with_project(&mut a.replica);
     new_issue(&mut a.replica, "secret");
     let x = a.replica.my_actor().unwrap();
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
 
-    // A fresh device dC bootstraps on X's workspace from a ticket. It is not a
+    // A fresh device dC bootstraps on X's space from a ticket. It is not a
     // device of any actor and holds no key.
     let c_seed = [70u8; 32];
     let c_device = device_from_seed(c_seed);
@@ -612,7 +612,7 @@ fn fresh_device_recovers_and_decrypts_after_peer_reseal() {
     assert_eq!(c.replica.my_actor(), None, "dC is not yet any actor");
     assert!(
         !titles(&mut c.replica).contains(&"secret".to_string()),
-        "a keyless fresh device cannot read the workspace"
+        "a keyless fresh device cannot read the space"
     );
 
     // A keyless device with an active epoch must NEVER serve cleartext.
@@ -656,13 +656,13 @@ fn fresh_device_recovers_and_decrypts_after_peer_reseal() {
 #[test]
 fn second_device_decrypts_then_revocation_fences_it() {
     // Multi-device end to end: A adds a second device dB to its actor (seal-
-    // on-add), dB decrypts the workspace; A then revokes dB and rotates, and
+    // on-add), dB decrypts the space; A then revokes dB and rotates, and
     // dB is fenced from post-revocation content.
     let mut a = new_node(); // founder, device dA
     with_project(&mut a.replica);
     new_issue(&mut a.replica, "secret");
     let x = a.replica.my_actor().unwrap(); // the founder actor
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
 
     // dB (seed 50) consents into actor X (as `device accept` would).
     let db_seed = [50u8; 32];
@@ -683,7 +683,7 @@ fn second_device_decrypts_then_revocation_fences_it() {
         "dB is now a device of X"
     );
 
-    // dB bootstraps its own store on X's workspace and syncs — it is the SAME
+    // dB bootstraps its own store on X's space and syncs — it is the SAME
     // actor (the founder), so it unseals the key and decrypts.
     let mut b = new_joiner_node_as(
         db_device.clone(),
@@ -699,7 +699,7 @@ fn second_device_decrypts_then_revocation_fences_it() {
     );
     assert!(
         titles(&mut b.replica).contains(&"secret".to_string()),
-        "second device decrypts the workspace (seal-on-add)"
+        "second device decrypts the space (seal-on-add)"
     );
 
     // A revokes dB and rotates; dB loses future content.
@@ -723,7 +723,7 @@ fn single_use_invite_admits_exactly_one_actor_under_concurrency() {
     // invite for different actors; after merge exactly one is admitted, and
     // both replicas agree (nonce bound into the op + deterministic dedup).
     let mut a = new_node(); // founder/admin
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
 
     let mut b = new_joiner_node_as(
         device_from_seed([2; 32]),
@@ -767,7 +767,7 @@ fn concurrent_rotations_converge_and_fence() {
     // members — no split-brain undecryptable key.
     let mut a = new_node(); // founder/admin
     with_project(&mut a.replica);
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
 
     let mut b = new_joiner_node_as(
         device_from_seed([2; 32]),
@@ -853,7 +853,7 @@ fn e2ee_membership_gates_decryption() {
 
     let b_seed = [8u8; 32];
     let b_device = device_from_seed(b_seed);
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
     // B's store is bootstrapped from the ticket (the `lait join` path).
     let mut b = new_joiner_node_as(
         b_device.clone(),
@@ -861,11 +861,7 @@ fn e2ee_membership_gates_decryption() {
         &a_ws,
         &a.replica.founding_proof().unwrap(),
     );
-    assert_eq!(
-        b.replica.workspace_str(),
-        a_ws,
-        "B is rooted on A's workspace"
-    );
+    assert_eq!(b.replica.space_str(), a_ws, "B is rooted on A's space");
 
     // Before add: B syncs but cannot decrypt — sees only ciphertext.
     sync_all(&mut a.replica, &mut b.replica);
@@ -908,7 +904,7 @@ fn a_viewer_reads_but_is_refused_writes_until_granted() {
     let mut a = new_node(); // founder/admin
     let proj = with_project(&mut a.replica);
     new_issue(&mut a.replica, "existing");
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
 
     let b_seed = [12u8; 32];
     let b_device = device_from_seed(b_seed);
@@ -934,7 +930,7 @@ fn a_viewer_reads_but_is_refused_writes_until_granted() {
     // Reads work: the viewer decrypts existing content.
     assert!(
         titles(&mut b.replica).contains(&"existing".to_string()),
-        "a viewer decrypts and reads the workspace"
+        "a viewer decrypts and reads the space"
     );
 
     // Writes are refused, and nothing is committed (no dirty-set).
@@ -972,7 +968,7 @@ fn a_viewer_reads_but_is_refused_writes_until_granted() {
 #[test]
 fn injected_epoch_without_an_authorized_mint_is_never_adopted() {
     // Regression for the unauthenticated-epoch hijack. An attacker on the
-    // workspace topic pushes a membership diff that injects a HIGHER-gen epoch
+    // space topic pushes a membership diff that injects a HIGHER-gen epoch
     // — a FORGED MintEpoch signed by an actor it self-incepted (so the
     // device→actor binding resolves) but that is NOT a member/writer, plus a
     // sealed envelope carrying an attacker-chosen key. Because the mint fails
@@ -984,7 +980,7 @@ fn injected_epoch_without_an_authorized_mint_is_never_adopted() {
     new_issue(&mut a.replica, "secret");
     let victim_dev = a.replica.me.clone();
     let victim_actor = a.replica.my_actor().unwrap();
-    let ws = a.replica.workspace_id().clone();
+    let ws = a.replica.space_id().clone();
     let legit_epoch = a.replica.active_epoch().unwrap().id;
     let a_vv = a.replica.membership_vv_bytes();
 
@@ -1052,7 +1048,7 @@ fn heal_supersedes_the_epoch_of_a_removed_minter() {
     with_project(&mut a.replica);
     new_issue(&mut a.replica, "secret");
     let a_actor = a.replica.my_actor().unwrap();
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
 
     // B joins, is admitted as an ADMIN, and syncs.
     let b_seed = [21u8; 32];
@@ -1119,7 +1115,7 @@ fn a_non_admin_device_revoke_is_honest_about_pending_rotation() {
     // that fences it, so the command says the rotation is pending an admin
     // rather than claiming a rotation that would be inert.
     let mut a = new_node(); // founder/admin
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
 
     // B joins as a plain WRITER (no admin).
     let b_seed = [41u8; 32];
@@ -1174,7 +1170,7 @@ fn a_non_admin_device_revoke_is_honest_about_pending_rotation() {
 
 #[test]
 fn a_non_founder_invite_roots_the_joiner_on_the_true_founder() {
-    // Fork guard: a ticket must anchor on the workspace's founding actor, not
+    // Fork guard: a ticket must anchor on the space's founding actor, not
     // the inviter. A joiner roots acl::replay on the ticket's founder, so an
     // inviter-anchored ticket would fork the joiner onto a genesis where the
     // real founder — and the founding key-epoch — carry no authority.
@@ -1182,7 +1178,7 @@ fn a_non_founder_invite_roots_the_joiner_on_the_true_founder() {
     with_project(&mut a.replica);
     new_issue(&mut a.replica, "founders-secret");
     let a_actor = a.replica.my_actor().unwrap();
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
 
     // B joins rooted on A (as A's ticket would), admitted admin, and syncs.
     let b_seed = [51u8; 32];
@@ -1237,7 +1233,7 @@ fn a_non_founder_invite_roots_the_joiner_on_the_true_founder() {
 
     // Negative control — the fork is now CRYPTOGRAPHICALLY impossible. A
     // forged ticket that presents the inviter's own inception as the founder
-    // for A's workspace is rejected at join: the self-certifying id does not
+    // for A's space is rejected at join: the self-certifying id does not
     // commit to B's device (lait/space/1), so verify_founding fails.
     let (a_salt, a_rr, _a_incept) = a.replica.founding_proof().unwrap();
     let forged_home = std::env::temp_dir().join(format!(
@@ -1247,7 +1243,7 @@ fn a_non_founder_invite_roots_the_joiner_on_the_true_founder() {
     ));
     std::fs::create_dir_all(&forged_home).unwrap();
     let forged_store = Store::open(&forged_home).unwrap();
-    let err = join_workspace_store(&forged_store, &a_ws, &a_salt, &a_rr, &b_incept);
+    let err = join_space_store(&forged_store, &a_ws, &a_salt, &a_rr, &b_incept);
     assert!(
         err.is_err(),
         "a ticket rooting on the inviter's inception is rejected, not forked"
@@ -1256,19 +1252,19 @@ fn a_non_founder_invite_roots_the_joiner_on_the_true_founder() {
 }
 
 #[test]
-fn break_glass_recovery_re_roots_the_workspace() {
+fn break_glass_recovery_re_roots_the_space() {
     // W5: the live admin (A) is lost/compromised. A holder restores the
-    // offline workspace recovery key on a FRESH device C and recovers —
-    // re-rooting the workspace to C, evicting A, convergently for all peers.
+    // offline space recovery key on a FRESH device C and recovers —
+    // re-rooting the space to C, evicting A, convergently for all peers.
     let mut a = new_node(); // founder A; 1-of-1 space recovery key beside its store
     with_project(&mut a.replica);
     new_issue(&mut a.replica, "old");
     let a_actor = a.replica.my_actor().unwrap();
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
 
-    // Fresh device C bootstraps on A's workspace (verifies the founding), then
+    // Fresh device C bootstraps on A's space (verifies the founding), then
     // syncs the state from a survivor (here A) — the realistic break-glass
-    // flow: pull the workspace, then re-root.
+    // flow: pull the space, then re-root.
     let c_seed = [71u8; 32];
     let c_device = device_from_seed(c_seed);
     let mut c = new_joiner_node_as(
@@ -1315,10 +1311,10 @@ fn elevate_solo_recovery_to_a_2_of_2_dkg_group_key() {
     // board — no dealer, no secret ever leaves its holder.
     let mut a = new_node(); // founder A, holds solo space-recovery.key
     with_project(&mut a.replica);
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
     let commit0 = crate::space::replay(
         &a.replica.genesis,
-        &a.replica.workspace_id,
+        &a.replica.space_id,
         &a.replica.membership.space_events(),
     )
     .recovery_commit;
@@ -1360,7 +1356,7 @@ fn elevate_solo_recovery_to_a_2_of_2_dkg_group_key() {
     // The recovery authority is now the DKG group key, not A's solo key.
     let after = crate::space::replay(
         &a.replica.genesis,
-        &a.replica.workspace_id,
+        &a.replica.space_id,
         &a.replica.membership.space_events(),
     );
     assert!(!after.recovered); // no re-root happened, only a Rotate
@@ -1371,7 +1367,7 @@ fn elevate_solo_recovery_to_a_2_of_2_dkg_group_key() {
     // Both replicas converge on the same new authority.
     let b_after = crate::space::replay(
         &b.replica.genesis,
-        &b.replica.workspace_id,
+        &b.replica.space_id,
         &b.replica.membership.space_events(),
     );
     assert_eq!(after.recovery_commit, b_after.recovery_commit);
@@ -1384,7 +1380,7 @@ fn elevate_solo_recovery_to_a_2_of_2_dkg_group_key() {
     assert_ne!(
         after.configuration,
         crate::authority::AuthorityConfigurationId::single(),
-        "the workspace is no longer a solo authority"
+        "the space is no longer a solo authority"
     );
     let dkg = a.replica.standing_dkg_session().expect("standing group");
     let expected = a
@@ -1404,7 +1400,7 @@ fn elevate_solo_recovery_to_a_2_of_2_dkg_group_key() {
     assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
     let still = crate::space::replay(
         &a.replica.genesis,
-        &a.replica.workspace_id,
+        &a.replica.space_id,
         &a.replica.membership.space_events(),
     );
     assert!(
@@ -1429,8 +1425,8 @@ fn concurrent_signing_requests_converge_on_the_lowest_transcript() {
         coordinator: a.replica.me.clone(),
         op: op_bytes.clone(),
     };
-    let e1 = crate::dkg::sign_ceremony(&[1u8; 32], &mk([1u8; 16]), &a.replica.workspace_id);
-    let e2 = crate::dkg::sign_ceremony(&[2u8; 32], &mk([2u8; 16]), &a.replica.workspace_id);
+    let e1 = crate::dkg::sign_ceremony(&[1u8; 32], &mk([1u8; 16]), &a.replica.space_id);
+    let e2 = crate::dkg::sign_ceremony(&[2u8; 32], &mk([2u8; 16]), &a.replica.space_id);
     let (id1, id2) = (
         crate::dkg::TranscriptId::of(&e1).unwrap(),
         crate::dkg::TranscriptId::of(&e2).unwrap(),
@@ -1440,7 +1436,7 @@ fn concurrent_signing_requests_converge_on_the_lowest_transcript() {
     a.replica.membership.add_ceremony_event(&e2).unwrap();
 
     let events = a.replica.membership.ceremony_events();
-    let board = crate::dkg::parse_board(&events, &a.replica.workspace_id);
+    let board = crate::dkg::parse_board(&events, &a.replica.space_id);
     let chosen = a
         .replica
         .canonical_signing_session(
@@ -1471,8 +1467,8 @@ fn a_signing_transcript_at_threshold_beats_a_lower_incomplete_one() {
         coordinator: a.replica.me.clone(),
         op: op_bytes.clone(),
     };
-    let e1 = crate::dkg::sign_ceremony(&[1u8; 32], &mk([1u8; 16]), &a.replica.workspace_id);
-    let e2 = crate::dkg::sign_ceremony(&[2u8; 32], &mk([2u8; 16]), &a.replica.workspace_id);
+    let e1 = crate::dkg::sign_ceremony(&[1u8; 32], &mk([1u8; 16]), &a.replica.space_id);
+    let e2 = crate::dkg::sign_ceremony(&[2u8; 32], &mk([2u8; 16]), &a.replica.space_id);
     let (id1, id2) = (
         crate::dkg::TranscriptId::of(&e1).unwrap(),
         crate::dkg::TranscriptId::of(&e2).unwrap(),
@@ -1488,13 +1484,13 @@ fn a_signing_transcript_at_threshold_beats_a_lower_incomplete_one() {
                 signing: high,
                 share: vec![0u8; 32],
             },
-            &a.replica.workspace_id,
+            &a.replica.space_id,
         );
         a.replica.membership.add_ceremony_event(&ev).unwrap();
     }
 
     let events = a.replica.membership.ceremony_events();
-    let board = crate::dkg::parse_board(&events, &a.replica.workspace_id);
+    let board = crate::dkg::parse_board(&events, &a.replica.space_id);
     let chosen = a
         .replica
         .canonical_signing_session(
@@ -1520,7 +1516,7 @@ fn a_signing_transcript_at_threshold_beats_a_lower_incomplete_one() {
 #[test]
 fn a_nonce_bound_to_another_package_refuses_to_sign() {
     let mut a = new_node();
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
     let b_seed = [21u8; 32];
     let b_device = device_from_seed(b_seed);
     let mut b = new_joiner_node_as(
@@ -1556,7 +1552,7 @@ fn a_nonce_bound_to_another_package_refuses_to_sign() {
     let (resp, _) = b.replica.space_recover_cmd();
     assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
     let events = b.replica.membership.ceremony_events();
-    let board = crate::dkg::parse_board(&events, &b.replica.workspace_id);
+    let board = crate::dkg::parse_board(&events, &b.replica.space_id);
     let signing = *board.signing.keys().next().expect("B opened a request");
     let raw = b
         .replica
@@ -1590,7 +1586,7 @@ fn a_nonce_bound_to_another_package_refuses_to_sign() {
     // the comparison, not the deletion, precisely so a crash between
     // publishing and deleting cannot re-open the door.
     let events = b.replica.membership.ceremony_events();
-    let board = crate::dkg::parse_board(&events, &b.replica.workspace_id);
+    let board = crate::dkg::parse_board(&events, &b.replica.space_id);
     let b_shares = board.signing[&signing]
         .rounds
         .iter()
@@ -1611,11 +1607,11 @@ fn a_nonce_bound_to_another_package_refuses_to_sign() {
 /// A share protected under a different Windows account is *present*, not
 /// absent — the holder exists and cannot act. Break-glass recovery must say
 /// which of those it is, because for an N-of-N group it is the difference
-/// between a degraded holder and an unrecoverable workspace.
+/// between a degraded holder and an unrecoverable space.
 #[test]
 fn an_unreadable_share_is_reported_as_degraded_not_absent() {
     let mut a = new_node();
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
     let b_seed = [21u8; 32];
     let b_device = device_from_seed(b_seed);
     let mut b = new_joiner_node_as(
@@ -1704,7 +1700,7 @@ fn an_unreadable_share_is_reported_as_degraded_not_absent() {
                 "must say what THIS device can do: {message}"
             );
             assert!(
-                !message.contains("can still recover the workspace"),
+                !message.contains("can still recover the space"),
                 "must not claim other holders can recover — this device cannot know that: {message}"
             );
         }
@@ -1712,16 +1708,16 @@ fn an_unreadable_share_is_reported_as_degraded_not_absent() {
     }
 }
 
-/// A share belonging to a group that is **not** the workspace's recovery
-/// authority is not a recovery problem: it could not recover this workspace
-/// even if it were readable. Announcing it as "a share for the workspace
+/// A share belonging to a group that is **not** the space's recovery
+/// authority is not a recovery problem: it could not recover this space
+/// even if it were readable. Announcing it as "a share for the space
 /// recovery key" would be false, so currency is established from the
 /// public-key package before anything is reported.
 #[test]
 fn an_unreadable_share_for_another_group_is_not_reported() {
     let mut a = new_node();
 
-    // A real 2-of-2 DKG for a group unrelated to this workspace, so its
+    // A real 2-of-2 DKG for a group unrelated to this space, so its
     // public-key package parses and derives a group key that is genuinely
     // not the standing recovery authority.
     let (s1_a, p1_a) = crate::dkg::dkg_round1(1, 2, 2).unwrap();
@@ -1738,12 +1734,12 @@ fn an_unreadable_share_for_another_group_is_not_reported() {
         Some(
             crate::space::replay(
                 &a.replica.genesis,
-                &a.replica.workspace_id,
+                &a.replica.space_id,
                 &a.replica.membership.space_events(),
             )
             .recovery_commit
         ),
-        "the fixture group is not this workspace's authority"
+        "the fixture group is not this space's authority"
     );
 
     // Put a transcript for it on the board so it is a candidate at all.
@@ -1753,7 +1749,7 @@ fn an_unreadable_share_for_another_group_is_not_reported() {
         2,
         vec![a.replica.me.clone(), device_from_seed([31u8; 32])],
     ));
-    let ev = crate::dkg::sign_ceremony(&[31u8; 32], &propose, &a.replica.workspace_id);
+    let ev = crate::dkg::sign_ceremony(&[31u8; 32], &propose, &a.replica.space_id);
     let id = crate::dkg::TranscriptId::of(&ev).unwrap();
     a.replica.membership.add_ceremony_event(&ev).unwrap();
     a.replica.persist_membership("foreign").unwrap();
@@ -1770,7 +1766,7 @@ fn an_unreadable_share_for_another_group_is_not_reported() {
 
     assert!(
         a.replica.degraded_recovery_holders().is_empty(),
-        "a share for another group must not be announced as the workspace recovery key"
+        "a share for another group must not be announced as the space recovery key"
     );
 
     // But if the package itself cannot be read, currency is UNKNOWN — and an
@@ -1812,7 +1808,7 @@ fn an_io_failure_is_not_diagnosed_as_an_account_mismatch() {
 fn a_non_admin_is_told_a_rekey_is_pending() {
     let mut a = new_node(); // founder/admin A
     with_project(&mut a.replica);
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
     let proof = a.replica.founding_proof().unwrap();
 
     // B is a second ADMIN (so it can redeem), C a plain writer.
@@ -1902,14 +1898,14 @@ fn a_proposal_naming_the_wrong_authority_is_rejected() {
     let propose = crate::dkg::CeremonyOp::DkgPropose(crate::dkg::frost_rotation_proposal(
         [6u8; 16], 2, principals, stranger,
     ));
-    let ev = crate::dkg::sign_ceremony(&[44u8; 32], &propose, &a.replica.workspace_id);
+    let ev = crate::dkg::sign_ceremony(&[44u8; 32], &propose, &a.replica.space_id);
     let id = crate::dkg::TranscriptId::of(&ev).unwrap();
     // Authorized by the REAL recovery key: only the named authority is wrong.
-    let grant = crate::dkg::sign_authority_grant(&secret, &a.replica.workspace_id, &id);
+    let grant = crate::dkg::sign_authority_grant(&secret, &a.replica.space_id, &id);
     let aev = crate::dkg::sign_ceremony(
         &[44u8; 32],
         &crate::dkg::CeremonyOp::DkgAuthorize(grant),
-        &a.replica.workspace_id,
+        &a.replica.space_id,
     );
     a.replica.membership.add_ceremony_event(&ev).unwrap();
     a.replica.membership.add_ceremony_event(&aev).unwrap();
@@ -1960,13 +1956,13 @@ fn a_proposal_with_the_right_key_but_wrong_configuration_is_rejected() {
     let propose = crate::dkg::CeremonyOp::DkgPropose(crate::dkg::frost_rotation_proposal(
         [6u8; 16], 2, members, lie,
     ));
-    let ev = crate::dkg::sign_ceremony(&[44u8; 32], &propose, &a.replica.workspace_id);
+    let ev = crate::dkg::sign_ceremony(&[44u8; 32], &propose, &a.replica.space_id);
     let id = crate::dkg::TranscriptId::of(&ev).unwrap();
-    let grant = crate::dkg::sign_authority_grant(&secret, &a.replica.workspace_id, &id);
+    let grant = crate::dkg::sign_authority_grant(&secret, &a.replica.space_id, &id);
     let aev = crate::dkg::sign_ceremony(
         &[44u8; 32],
         &crate::dkg::CeremonyOp::DkgAuthorize(grant),
-        &a.replica.workspace_id,
+        &a.replica.space_id,
     );
     a.replica.membership.add_ceremony_event(&ev).unwrap();
     a.replica.membership.add_ceremony_event(&aev).unwrap();
@@ -2015,14 +2011,14 @@ fn a_reshare_proposal_is_refused_until_the_protocol_exists() {
     let ev = crate::dkg::sign_ceremony(
         &[45u8; 32],
         &crate::dkg::CeremonyOp::DkgPropose(proposal),
-        &a.replica.workspace_id,
+        &a.replica.space_id,
     );
     let id = crate::dkg::TranscriptId::of(&ev).unwrap();
-    let grant = crate::dkg::sign_authority_grant(&secret, &a.replica.workspace_id, &id);
+    let grant = crate::dkg::sign_authority_grant(&secret, &a.replica.space_id, &id);
     let aev = crate::dkg::sign_ceremony(
         &[45u8; 32],
         &crate::dkg::CeremonyOp::DkgAuthorize(grant),
-        &a.replica.workspace_id,
+        &a.replica.space_id,
     );
     a.replica.membership.add_ceremony_event(&ev).unwrap();
     a.replica.membership.add_ceremony_event(&aev).unwrap();
@@ -2044,7 +2040,7 @@ fn a_reshare_proposal_is_refused_until_the_protocol_exists() {
 #[test]
 fn a_group_authorizes_and_installs_its_own_replacement() {
     let mut a = new_node(); // founder, holds the bootstrap solo key
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
     let proof = a.replica.founding_proof().unwrap();
 
     let b_seed = [21u8; 32];
@@ -2082,7 +2078,7 @@ fn a_group_authorizes_and_installs_its_own_replacement() {
     }
     let after_first = crate::space::replay(
         &a.replica.genesis,
-        &a.replica.workspace_id,
+        &a.replica.space_id,
         &a.replica.membership.space_events(),
     );
     assert_eq!(after_first.gen, 1, "the 2-of-2 group key is installed");
@@ -2116,7 +2112,7 @@ fn a_group_authorizes_and_installs_its_own_replacement() {
 
     // Pull the request and the proposal ids off the verified board.
     let events = a.replica.membership.ceremony_events();
-    let board = crate::dkg::parse_board(&events, &a.replica.workspace_id);
+    let board = crate::dkg::parse_board(&events, &a.replica.space_id);
     let (signing, proposal) = board
         .signing
         .iter()
@@ -2164,7 +2160,7 @@ fn a_group_authorizes_and_installs_its_own_replacement() {
 
     let after_second = crate::space::replay(
         &a.replica.genesis,
-        &a.replica.workspace_id,
+        &a.replica.space_id,
         &a.replica.membership.space_events(),
     );
     assert_eq!(
@@ -2212,7 +2208,7 @@ fn a_group_authorizes_and_installs_its_own_replacement() {
 #[test]
 fn any_k_of_n_can_sign_without_the_lowest_index_holder() {
     let mut a = new_node();
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
     let proof = a.replica.founding_proof().unwrap();
     let b_seed = [21u8; 32];
     let b_device = device_from_seed(b_seed);
@@ -2241,7 +2237,7 @@ fn any_k_of_n_can_sign_without_the_lowest_index_holder() {
     assert_eq!(
         crate::space::replay(
             &nodes[0].replica.genesis,
-            &nodes[0].replica.workspace_id,
+            &nodes[0].replica.space_id,
             &nodes[0].replica.membership.space_events(),
         )
         .gen,
@@ -2262,7 +2258,7 @@ fn any_k_of_n_can_sign_without_the_lowest_index_holder() {
     sync_mesh(&mut nodes, 3);
 
     let events = nodes[1].replica.membership.ceremony_events();
-    let board = crate::dkg::parse_board(&events, &nodes[1].replica.workspace_id);
+    let board = crate::dkg::parse_board(&events, &nodes[1].replica.space_id);
     let session = *board
         .signing
         .keys()
@@ -2276,7 +2272,7 @@ fn any_k_of_n_can_sign_without_the_lowest_index_holder() {
 
     let after = crate::space::replay(
         &nodes[0].replica.genesis,
-        &nodes[0].replica.workspace_id,
+        &nodes[0].replica.space_id,
         &nodes[0].replica.membership.space_events(),
     );
     assert!(
@@ -2286,7 +2282,7 @@ fn any_k_of_n_can_sign_without_the_lowest_index_holder() {
 
     // And the plan says so: the chosen signers are indices 2 and 3.
     let events = nodes[0].replica.membership.ceremony_events();
-    let board = crate::dkg::parse_board(&events, &nodes[0].replica.workspace_id);
+    let board = crate::dkg::parse_board(&events, &nodes[0].replica.space_id);
     let plan = board
         .signing
         .values()
@@ -2313,13 +2309,13 @@ fn any_k_of_n_can_sign_without_the_lowest_index_holder() {
 ///
 /// The failure this prevents is silent and delayed: an N-of-N group created
 /// while one holder's share exists only behind a Windows profile looks
-/// perfectly healthy, and the workspace finds out on the day it needs to
+/// perfectly healthy, and the space finds out on the day it needs to
 /// recover. So the gate reads signed attestations from the board — local
 /// state would let another node install ahead of the checks.
 #[test]
 fn an_indispensable_arrangement_waits_for_verified_custody() {
     let mut a = new_node();
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
     let b_seed = [21u8; 32];
     let b_device = device_from_seed(b_seed);
     let mut b = new_joiner_node_as(
@@ -2335,7 +2331,7 @@ fn an_indispensable_arrangement_waits_for_verified_custody() {
 
     let commit0 = crate::space::replay(
         &a.replica.genesis,
-        &a.replica.workspace_id,
+        &a.replica.space_id,
         &a.replica.membership.space_events(),
     )
     .recovery_commit;
@@ -2350,20 +2346,18 @@ fn an_indispensable_arrangement_waits_for_verified_custody() {
     }
 
     // The DKG is complete — both hold shares — but nothing has installed.
-    let dkg = *crate::dkg::parse_board(
-        &a.replica.membership.ceremony_events(),
-        &a.replica.workspace_id,
-    )
-    .dkg
-    .keys()
-    .next()
-    .unwrap();
+    let dkg =
+        *crate::dkg::parse_board(&a.replica.membership.ceremony_events(), &a.replica.space_id)
+            .dkg
+            .keys()
+            .next()
+            .unwrap();
     assert!(a.replica.dkg_read(&dkg, "share").is_some());
     assert!(b.replica.dkg_read(&dkg, "share").is_some());
     assert_eq!(
         crate::space::replay(
             &a.replica.genesis,
-            &a.replica.workspace_id,
+            &a.replica.space_id,
             &a.replica.membership.space_events(),
         )
         .recovery_commit,
@@ -2387,7 +2381,7 @@ fn an_indispensable_arrangement_waits_for_verified_custody() {
     assert_eq!(
         crate::space::replay(
             &a.replica.genesis,
-            &a.replica.workspace_id,
+            &a.replica.space_id,
             &a.replica.membership.space_events(),
         )
         .recovery_commit,
@@ -2404,7 +2398,7 @@ fn an_indispensable_arrangement_waits_for_verified_custody() {
     assert_ne!(
         crate::space::replay(
             &a.replica.genesis,
-            &a.replica.workspace_id,
+            &a.replica.space_id,
             &a.replica.membership.space_events(),
         )
         .recovery_commit,
@@ -2426,7 +2420,7 @@ fn an_indispensable_arrangement_waits_for_verified_custody() {
 #[test]
 fn a_redundant_arrangement_installs_without_universal_attestation() {
     let mut a = new_node();
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
     let proof = a.replica.founding_proof().unwrap();
     let b_seed = [21u8; 32];
     let b_device = device_from_seed(b_seed);
@@ -2454,7 +2448,7 @@ fn a_redundant_arrangement_installs_without_universal_attestation() {
     assert_eq!(
         crate::space::replay(
             &nodes[0].replica.genesis,
-            &nodes[0].replica.workspace_id,
+            &nodes[0].replica.space_id,
             &nodes[0].replica.membership.space_events(),
         )
         .gen,
@@ -2477,7 +2471,7 @@ fn a_redundant_arrangement_installs_without_universal_attestation() {
 #[test]
 fn a_lost_share_is_restored_from_its_portable_package() {
     let mut a = new_node();
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
     let b_seed = [21u8; 32];
     let b_device = device_from_seed(b_seed);
     let mut b = new_joiner_node_as(
@@ -2613,7 +2607,7 @@ fn a_lost_share_is_restored_from_its_portable_package() {
 #[test]
 fn a_rotation_that_could_never_install_is_refused_up_front() {
     let mut a = new_node();
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
     let proof = a.replica.founding_proof().unwrap();
     let b_seed = [21u8; 32];
     let b_device = device_from_seed(b_seed);
@@ -2692,7 +2686,7 @@ fn a_rotation_that_could_never_install_is_refused_up_front() {
 #[test]
 fn an_unauthorized_proposal_moves_no_honest_node() {
     let mut a = new_node(); // founder; holds the solo recovery key
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
     let rogue_seed = [77u8; 32];
     let rogue = device_from_seed(rogue_seed);
 
@@ -2702,7 +2696,7 @@ fn an_unauthorized_proposal_moves_no_honest_node() {
         v.sort();
         v
     }));
-    let ev = crate::dkg::sign_ceremony(&rogue_seed, &propose, &a.replica.workspace_id);
+    let ev = crate::dkg::sign_ceremony(&rogue_seed, &propose, &a.replica.space_id);
     assert!(
         ev.verify_sig(crate::dkg::CEREMONY_DOMAIN, &a_ws),
         "the rogue proposal is genuinely signature-valid"
@@ -2724,7 +2718,7 @@ fn an_unauthorized_proposal_moves_no_honest_node() {
     // Nothing reached the space plane either.
     let cur = crate::space::replay(
         &a.replica.genesis,
-        &a.replica.workspace_id,
+        &a.replica.space_id,
         &a.replica.membership.space_events(),
     );
     assert_eq!(cur.gen, 0, "the recovery authority is untouched");
@@ -2745,7 +2739,7 @@ fn an_authorization_cannot_be_lifted_to_another_proposal() {
         v.sort();
         v
     }));
-    let ev = crate::dkg::sign_ceremony(&rogue_seed, &propose, &a.replica.workspace_id);
+    let ev = crate::dkg::sign_ceremony(&rogue_seed, &propose, &a.replica.space_id);
     let rogue_id = crate::dkg::TranscriptId::of(&ev).unwrap();
 
     // A real authorization, by the real recovery key — but for a DIFFERENT
@@ -2754,13 +2748,13 @@ fn an_authorization_cannot_be_lifted_to_another_proposal() {
     // A real grant, by the real recovery key — but for a DIFFERENT proposal.
     // Re-pointing it at the rogue proposal breaks the signature, because the
     // proposal id is inside the signed payload rather than beside it.
-    let real = crate::dkg::sign_authority_grant(&secret, &a.replica.workspace_id, &other);
+    let real = crate::dkg::sign_authority_grant(&secret, &a.replica.space_id, &other);
     let mut lifted = real.clone();
     lifted.op = postcard::to_stdvec(&crate::dkg::AuthorityGrant { proposal: rogue_id }).unwrap();
     let aev = crate::dkg::sign_ceremony(
         &rogue_seed,
         &crate::dkg::CeremonyOp::DkgAuthorize(lifted),
-        &a.replica.workspace_id,
+        &a.replica.space_id,
     );
     a.replica.membership.add_ceremony_event(&ev).unwrap();
     a.replica.membership.add_ceremony_event(&aev).unwrap();
@@ -2780,7 +2774,7 @@ fn an_authorization_cannot_be_lifted_to_another_proposal() {
 #[test]
 fn a_proposal_authorized_by_a_superseded_authority_is_rejected() {
     let mut a = new_node();
-    let stale_seed = [66u8; 32]; // never the workspace's recovery key
+    let stale_seed = [66u8; 32]; // never the space's recovery key
     let rogue = device_from_seed([79u8; 32]);
 
     let propose = crate::dkg::CeremonyOp::DkgPropose(test_proposal(&a.replica, [3u8; 16], 2, {
@@ -2788,18 +2782,18 @@ fn a_proposal_authorized_by_a_superseded_authority_is_rejected() {
         v.sort();
         v
     }));
-    let ev = crate::dkg::sign_ceremony(&stale_seed, &propose, &a.replica.workspace_id);
+    let ev = crate::dkg::sign_ceremony(&stale_seed, &propose, &a.replica.space_id);
     let id = crate::dkg::TranscriptId::of(&ev).unwrap();
     // Well-formed authorization, signed by a key that is not the authority.
-    let grant = crate::dkg::sign_authority_grant(&stale_seed, &a.replica.workspace_id, &id);
+    let grant = crate::dkg::sign_authority_grant(&stale_seed, &a.replica.space_id, &id);
     assert!(
-        crate::dkg::authority_grant_of(&grant, &a.replica.workspace_id).is_some(),
+        crate::dkg::authority_grant_of(&grant, &a.replica.space_id).is_some(),
         "the grant itself is well formed — only the signer is wrong"
     );
     let aev = crate::dkg::sign_ceremony(
         &stale_seed,
         &crate::dkg::CeremonyOp::DkgAuthorize(grant),
-        &a.replica.workspace_id,
+        &a.replica.space_id,
     );
     a.replica.membership.add_ceremony_event(&ev).unwrap();
     a.replica.membership.add_ceremony_event(&aev).unwrap();
@@ -2828,14 +2822,14 @@ fn a_malformed_participant_list_is_rejected_by_the_acceptor() {
         2,
         vec![me.clone(), me.clone()],
     ));
-    let ev = crate::dkg::sign_ceremony(&[80u8; 32], &propose, &a.replica.workspace_id);
+    let ev = crate::dkg::sign_ceremony(&[80u8; 32], &propose, &a.replica.space_id);
     let id = crate::dkg::TranscriptId::of(&ev).unwrap();
     // Authorized by the REAL recovery key — only the shape is wrong.
-    let grant = crate::dkg::sign_authority_grant(&secret, &a.replica.workspace_id, &id);
+    let grant = crate::dkg::sign_authority_grant(&secret, &a.replica.space_id, &id);
     let aev = crate::dkg::sign_ceremony(
         &[80u8; 32],
         &crate::dkg::CeremonyOp::DkgAuthorize(grant),
-        &a.replica.workspace_id,
+        &a.replica.space_id,
     );
     a.replica.membership.add_ceremony_event(&ev).unwrap();
     a.replica.membership.add_ceremony_event(&aev).unwrap();
@@ -2854,7 +2848,7 @@ fn a_malformed_participant_list_is_rejected_by_the_acceptor() {
 #[test]
 fn a_swapped_public_key_package_cannot_redirect_the_rotation() {
     let mut a = new_node();
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
     let b_seed = [21u8; 32];
     let b_device = device_from_seed(b_seed);
     let mut b = new_joiner_node_as(
@@ -2886,7 +2880,7 @@ fn a_swapped_public_key_package_cannot_redirect_the_rotation() {
     }
     let installed = crate::space::replay(
         &a.replica.genesis,
-        &a.replica.workspace_id,
+        &a.replica.space_id,
         &a.replica.membership.space_events(),
     );
     assert_eq!(installed.gen, 1, "the group key was installed");
@@ -2909,10 +2903,10 @@ fn group_break_glass_recovery_needs_the_threshold_and_re_roots() {
     // After elevation to a 2-of-2 group key, break-glass recovery is a FROST
     // signing ceremony: a holder (B) requests a Recover, both holders co-sign
     // over the synced bulletin board, and the aggregated group signature
-    // re-roots the workspace — convergently, with no solo key anywhere.
+    // re-roots the space — convergently, with no solo key anywhere.
     let mut a = new_node();
     with_project(&mut a.replica);
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
     let a_actor = a.replica.my_actor().unwrap();
 
     let b_seed = [82u8; 32];
@@ -2947,7 +2941,7 @@ fn group_break_glass_recovery_needs_the_threshold_and_re_roots() {
     }
     let elevated = crate::space::replay(
         &b.replica.genesis,
-        &b.replica.workspace_id,
+        &b.replica.space_id,
         &b.replica.membership.space_events(),
     );
     assert!(!elevated.recovered);
@@ -2959,7 +2953,7 @@ fn group_break_glass_recovery_needs_the_threshold_and_re_roots() {
     // The transcript id B posted its request under — the hash of the signed
     // request node, read off the verified board.
     let events = b.replica.membership.ceremony_events();
-    let board = crate::dkg::parse_board(&events, &b.replica.workspace_id);
+    let board = crate::dkg::parse_board(&events, &b.replica.space_id);
     let session_hex = board
         .signing
         .keys()
@@ -2970,7 +2964,7 @@ fn group_break_glass_recovery_needs_the_threshold_and_re_roots() {
     // SECURITY: ceremony automation runs on every import, but it must not
     // co-sign B's UNSOLICITED request. Sync the request to A and spin the
     // ceremony; nothing recovers, because A has given no local consent. Were
-    // this to auto-sign, any member could re-root the workspace to itself.
+    // this to auto-sign, any member could re-root the space to itself.
     for _ in 0..6 {
         sync_all(&mut b.replica, &mut a.replica);
         sync_all(&mut a.replica, &mut b.replica);
@@ -2978,7 +2972,7 @@ fn group_break_glass_recovery_needs_the_threshold_and_re_roots() {
     assert!(
         !crate::space::replay(
             &b.replica.genesis,
-            &b.replica.workspace_id,
+            &b.replica.space_id,
             &b.replica.membership.space_events(),
         )
         .recovered,
@@ -3006,7 +3000,7 @@ fn group_break_glass_recovery_needs_the_threshold_and_re_roots() {
         sync_all(&mut b.replica, &mut a.replica);
     }
 
-    // The workspace is re-rooted to B, evicting A, convergently on both.
+    // The space is re-rooted to B, evicting A, convergently on both.
     for t in [&b.replica, &a.replica] {
         let acl = t.acl_state();
         assert!(acl.is_admin(&b_actor), "recovered root is the new admin");
@@ -3014,7 +3008,7 @@ fn group_break_glass_recovery_needs_the_threshold_and_re_roots() {
     }
     let rb = crate::space::replay(
         &b.replica.genesis,
-        &b.replica.workspace_id,
+        &b.replica.space_id,
         &b.replica.membership.space_events(),
     );
     assert!(rb.recovered && rb.root == vec![b_actor]);
@@ -3102,7 +3096,7 @@ fn concurrent_fence_repairs_converge_and_then_stop() {
     let mut a = new_node(); // founder + admin A
     with_project(&mut a.replica);
     new_issue(&mut a.replica, "secret");
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
     let proof = a.replica.founding_proof().unwrap();
 
     // B and C join as admins.
@@ -3223,7 +3217,7 @@ fn a_concurrently_revoked_invite_is_fenced_by_an_automatic_rekey() {
     let mut a = new_node(); // founder + admin A
     with_project(&mut a.replica);
     new_issue(&mut a.replica, "secret");
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
 
     // B joins as a second ADMIN and syncs.
     let b_seed = [21u8; 32];
@@ -3423,7 +3417,7 @@ fn derive_project_key_shapes() {
 }
 
 #[test]
-fn founding_seeds_a_usable_workspace() {
+fn founding_seeds_a_usable_space() {
     let mut n = new_node();
     // The founder can create an issue immediately — no `projects new` first.
     let (resp, dirty) = n.replica.handle(Request::IssueNew {
@@ -3438,16 +3432,16 @@ fn founding_seeds_a_usable_workspace() {
     assert!(matches!(resp, Response::Ref { .. }), "{resp:?}");
     assert!(dirty.is_some());
     assert_eq!(n.replica.project_count(), 1, "exactly the seeded project");
-    assert_eq!(n.replica.workspace_name(), "Testbed");
+    assert_eq!(n.replica.space_name(), "Testbed");
     let seeded = &n.replica.catalog().projects_list()[0];
-    assert_eq!(seeded.key, "TEST", "key derived from the workspace name");
+    assert_eq!(seeded.key, "TEST", "key derived from the space name");
 }
 
 #[test]
 fn founding_twice_errors() {
     let n = new_node();
     let store = Store::open(&n.home).unwrap();
-    let err = found_workspace(&store, &me(), &[1u8; 32], "Again", &FakeClock::new(1)).unwrap_err();
+    let err = found_space(&store, &me(), &[1u8; 32], "Again", &FakeClock::new(1)).unwrap_err();
     assert!(
         format!("{err:#}").contains("already initialized"),
         "{err:#}"
@@ -3470,7 +3464,7 @@ fn open_errors_on_an_uninitialized_store() {
         ME_SEED,
         Box::new(FakeClock::new(1)),
     ) {
-        Ok(_) => panic!("open must not lazily found a workspace"),
+        Ok(_) => panic!("open must not lazily found a space"),
         Err(e) => e,
     };
     assert!(
@@ -3666,7 +3660,7 @@ fn inbox_derives_addressed_to_me_from_imports() {
     with_project(&mut a.replica);
     let b_seed = [8u8; 32];
     let b_device = device_from_seed(b_seed);
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
     let mut b = new_joiner_node_as(
         b_device.clone(),
         b_seed,
@@ -3800,7 +3794,7 @@ fn synced_rows_carry_field_changes_actor_and_collision() {
     with_project(&mut a.replica);
     let b_seed = [9u8; 32];
     let b_device = device_from_seed(b_seed);
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
     let mut b = new_joiner_node_as(
         b_device.clone(),
         b_seed,
@@ -3991,7 +3985,7 @@ fn signed_delete_syncs_agents_cannot_delete_and_restore_wins() {
     with_project(&mut a.replica);
     let b_seed = [21u8; 32];
     let b_device = device_from_seed(b_seed);
-    let a_ws = a.replica.workspace_str();
+    let a_ws = a.replica.space_str();
     let mut b = new_joiner_node_as(
         b_device.clone(),
         b_seed,
@@ -4154,7 +4148,7 @@ fn history_is_the_contract_the_viewer_reads() {
         );
 
         // 3. No synthetic `synced` in per-issue history. The viewer's
-        //    synced->no-name special case is for the workspace Activity feed
+        //    synced->no-name special case is for the space Activity feed
         //    only; a `synced` here would make it drop a real author.
         assert_ne!(
             e.kind, "synced",

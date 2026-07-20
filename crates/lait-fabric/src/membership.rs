@@ -6,7 +6,7 @@
 //! before encrypted catalog and issue documents so an authorized device can
 //! obtain the content key needed to decrypt them.
 //!
-//! Plaintext means routable without the workspace content key, not trusted.
+//! Plaintext means routable without the space content key, not trusted.
 //! Loro only transports records; kernel replay validates signed inputs, and
 //! malformed or unauthorized inputs remain inert. Commit metadata is likewise
 //! visible to peers that receive this document.
@@ -15,13 +15,12 @@ use anyhow::{anyhow, Result};
 use loro::{Container, ExportMode, Frontiers, LoroDoc, LoroList, LoroMap, ValueOrContainer};
 
 use crate::acl::SignedOp;
-use crate::ids::{DeviceId, WorkspaceId};
+use crate::ids::{DeviceId, SpaceId};
 
 use crate::loro_ext as lx;
 use crate::op::{self, OpCtx};
 
 const ROOT: &str = "membership";
-const K_WORKSPACE: &str = "workspaceId";
 const C_ACL: &str = "acl";
 const C_ACTORS: &str = "actors"; // the lait/actor/1 key-event log (flat, grow-only)
 const C_SPACE: &str = "space"; // the lait/space/1 event log (break-glass recovery, grow-only)
@@ -38,21 +37,17 @@ fn epoch_hex(id: &[u8; 16]) -> String {
     data_encoding::HEXLOWER.encode(id)
 }
 
-/// A wrapper around the workspace's membership `LoroDoc`.
+/// A wrapper around the space's membership `LoroDoc`.
 pub struct MembershipDoc {
     doc: LoroDoc,
 }
 
 impl MembershipDoc {
-    pub fn create(
-        workspace_id: &WorkspaceId,
-        peer: Option<u64>,
-        founder: &DeviceId,
-    ) -> Result<Self> {
+    pub fn create(space_id: &SpaceId, peer: Option<u64>, founder: &DeviceId) -> Result<Self> {
         let doc = LoroDoc::new();
         op::configure(&doc, peer);
         let root = doc.get_map(ROOT);
-        root.insert(K_WORKSPACE, workspace_id.as_str())?;
+        root.insert(lx::K_SPACE, space_id.as_str())?;
         root.insert_container(C_ACL, LoroList::new())?;
         root.insert_container(C_ACTORS, LoroList::new())?;
         root.insert_container(C_SPACE, LoroList::new())?;
@@ -137,8 +132,8 @@ impl MembershipDoc {
         }
     }
 
-    pub fn workspace_id(&self) -> Option<WorkspaceId> {
-        lx::get_str(&self.root(), K_WORKSPACE).and_then(|s| WorkspaceId::parse(&s))
+    pub fn space_id(&self) -> Option<SpaceId> {
+        lx::get_str(&self.root(), lx::K_SPACE).and_then(|s| SpaceId::parse(&s))
     }
 
     // ---- ACL ops (grow-only) ----
@@ -247,7 +242,7 @@ impl MembershipDoc {
         let bytes = postcard::to_stdvec(ev).map_err(|e| anyhow!("encode space event: {e}"))?;
         let list = self
             .space_list()
-            .ok_or_else(|| anyhow!("space container missing — sync the workspace first"))?;
+            .ok_or_else(|| anyhow!("space container missing — sync the space first"))?;
         list.insert(list.len(), bytes.as_slice())?;
         Ok(())
     }
@@ -272,7 +267,7 @@ impl MembershipDoc {
         let bytes = postcard::to_stdvec(ev).map_err(|e| anyhow!("encode ceremony event: {e}"))?;
         let list = self
             .ceremony_list()
-            .ok_or_else(|| anyhow!("ceremony container missing — sync the workspace first"))?;
+            .ok_or_else(|| anyhow!("ceremony container missing — sync the space first"))?;
         list.insert(list.len(), bytes.as_slice())?;
         Ok(())
     }
@@ -352,7 +347,7 @@ impl MembershipDoc {
         }
     }
 
-    /// Store the workspace key sealed to `device` for `epoch`.
+    /// Store the space key sealed to `device` for `epoch`.
     pub fn put_sealed(&self, epoch: &[u8; 16], device: &DeviceId, sealed: &[u8]) -> Result<()> {
         let m = self.epoch_keymap(epoch, true)?.unwrap();
         m.insert(device.as_str(), sealed)?;
@@ -385,8 +380,8 @@ mod tests {
     use crate::acl::{sign_op, AclAction, AclOp, Grant};
     use crate::ids::{ActorId, SystemUlidSource};
 
-    fn ws() -> WorkspaceId {
-        WorkspaceId::mint(&SystemUlidSource)
+    fn ws() -> SpaceId {
+        SpaceId::mint(&SystemUlidSource)
     }
     fn device(n: u8) -> DeviceId {
         use ed25519_dalek::SigningKey;
@@ -396,7 +391,7 @@ mod tests {
     fn actor(n: u8) -> ActorId {
         ActorId::from_incept_hash(&format!("{:064x}", n))
     }
-    fn add_op(subject: u8, grants: Vec<Grant>, parents: Vec<String>, w: &WorkspaceId) -> SignedOp {
+    fn add_op(subject: u8, grants: Vec<Grant>, parents: Vec<String>, w: &SpaceId) -> SignedOp {
         sign_op(
             &[1; 32],
             &AclOp {
@@ -415,7 +410,7 @@ mod tests {
     fn ctx(kind: &str) -> OpCtx {
         OpCtx::authority(kind, &device(1))
     }
-    fn fresh(w: &WorkspaceId) -> MembershipDoc {
+    fn fresh(w: &SpaceId) -> MembershipDoc {
         MembershipDoc::create(w, None, &device(1)).unwrap()
     }
 

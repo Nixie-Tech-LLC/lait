@@ -4,6 +4,16 @@
 
 use loro::{Container, LoroMap, LoroMovableList, ValueOrContainer};
 
+/// The root-map key every document stamps its owning space id under.
+///
+/// Defined once, and only here. Four containers write or read it — the catalog,
+/// each issue, the membership document, and history projection's identity-key
+/// filter — and a copy that drifts out of step with the others does not fail to
+/// compile and does not fail a test: history would simply stop recognising the
+/// space id as identity and start reporting it as a changed field on every
+/// document. The literal exists in one place so that desync is unrepresentable.
+pub const K_SPACE: &str = "spaceId";
+
 /// Read a string leaf from a map key.
 pub fn get_str(m: &LoroMap, key: &str) -> Option<String> {
     m.get(key)

@@ -5,11 +5,11 @@
 //! * content authority ([`crate::authz`], domain `lait/authz/1`, encrypted).
 //!
 //! One node = one signed op: ed25519 by `author` over
-//! `blake3(domain ‖ op-bytes ‖ author ‖ sorted(parents) ‖ workspace-id)`.
+//! `blake3(domain ‖ op-bytes ‖ author ‖ sorted(parents) ‖ space-id)`.
 //! Binding `parents` closes the re-parent revocation bypass; binding the
-//! workspace id closes cross-workspace replay; the domain string keeps the two
+//! space id closes cross-space replay; the domain string keeps the two
 //! planes' signatures mutually unusable. The content-address (`hash`) is
-//! deliberately domain- and workspace-free so it stays stable for DAG linking.
+//! deliberately domain- and space-free so it stays stable for DAG linking.
 //!
 //! Wire compatibility: [`SignedNode`] is field-for-field the shape `acl.rs`
 //! shipped as `SignedOp` (postcard positional), and the `lait/aclop/1` payload
@@ -39,9 +39,9 @@ pub fn payload_to_sign(
     op: &[u8],
     author: &DeviceId,
     parents: &[String],
-    workspace_id: &str,
+    space_id: &str,
 ) -> [u8; 32] {
-    signing_payload(domain, op, author, parents, workspace_id)
+    signing_payload(domain, op, author, parents, space_id)
 }
 
 /// Assemble a [`SignedNode`] from an externally produced signature (e.g. a FROST
@@ -66,7 +66,7 @@ fn signing_payload(
     op: &[u8],
     author: &DeviceId,
     parents: &[String],
-    workspace_id: &str,
+    space_id: &str,
 ) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(domain);
@@ -77,13 +77,13 @@ fn signing_payload(
     for p in &ps {
         h.update(p.as_bytes());
     }
-    h.update(workspace_id.as_bytes());
+    h.update(space_id.as_bytes());
     *h.finalize().as_bytes()
 }
 
 impl SignedNode {
     /// The content-address of this node (its hash-DAG id): op ‖ author ‖
-    /// sorted(parents). Stable across domains/workspaces by design — the
+    /// sorted(parents). Stable across domains/spaces by design — the
     /// signature, not the address, carries those bindings.
     pub fn hash(&self) -> String {
         let mut h = blake3::Hasher::new();
@@ -97,10 +97,10 @@ impl SignedNode {
         h.finalize().to_hex().to_string()
     }
 
-    /// Verify the signature under `domain` for `workspace_id`. Fails if the op
-    /// was re-parented, re-authored, lifted from another workspace, or moved
+    /// Verify the signature under `domain` for `space_id`. Fails if the op
+    /// was re-parented, re-authored, lifted from another space, or moved
     /// between planes.
-    pub fn verify_sig(&self, domain: &[u8], workspace_id: &str) -> bool {
+    pub fn verify_sig(&self, domain: &[u8], space_id: &str) -> bool {
         let Some(pk_bytes) = hex32(self.author.as_str()) else {
             return false;
         };
@@ -110,7 +110,7 @@ impl SignedNode {
         let Ok(sig) = Signature::from_slice(&self.sig) else {
             return false;
         };
-        let payload = signing_payload(domain, &self.op, &self.author, &self.parents, workspace_id);
+        let payload = signing_payload(domain, &self.op, &self.author, &self.parents, space_id);
         vk.verify(&payload, &sig).is_ok()
     }
 }
@@ -122,12 +122,12 @@ pub fn sign_node(
     seed: &[u8; 32],
     op_bytes: Vec<u8>,
     parents: Vec<String>,
-    workspace_id: &str,
+    space_id: &str,
 ) -> SignedNode {
     let sk = SigningKey::from_bytes(seed);
     let author =
         DeviceId::from_key_string(data_encoding::HEXLOWER.encode(sk.verifying_key().as_bytes()));
-    let payload = signing_payload(domain, &op_bytes, &author, &parents, workspace_id);
+    let payload = signing_payload(domain, &op_bytes, &author, &parents, space_id);
     let sig: Signature = sk.sign(&payload);
     SignedNode {
         op: op_bytes,
@@ -138,15 +138,15 @@ pub fn sign_node(
 }
 
 /// The preimage a detached message signature covers:
-/// `blake3(domain ‖ workspace_id ‖ author ‖ msg)`. Same discipline as
+/// `blake3(domain ‖ space_id ‖ author ‖ msg)`. Same discipline as
 /// [`signing_payload`]: the `domain` makes each use-site's signatures mutually
 /// unusable (a gossip signature can never verify as an invite, regardless of
-/// postcard layout), and `workspace_id` closes cross-workspace replay (a message
+/// postcard layout), and `space_id` closes cross-space replay (a message
 /// signed for one topic fails verification on another).
-fn message_payload(domain: &[u8], workspace_id: &str, author: &DeviceId, msg: &[u8]) -> [u8; 32] {
+fn message_payload(domain: &[u8], space_id: &str, author: &DeviceId, msg: &[u8]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(domain);
-    h.update(workspace_id.as_bytes());
+    h.update(space_id.as_bytes());
     h.update(author.as_str().as_bytes());
     h.update(msg);
     *h.finalize().as_bytes()
@@ -154,28 +154,28 @@ fn message_payload(domain: &[u8], workspace_id: &str, author: &DeviceId, msg: &[
 
 /// Sign arbitrary bytes with an ed25519 seed — a **detached** signature for the
 /// transport-authenticity plane (signed gossip, invite grants) that does not ride
-/// the hash-DAG. `domain` separates use-sites and `workspace_id` binds the message
+/// the hash-DAG. `domain` separates use-sites and `space_id` binds the message
 /// to its topic (see the private `message_payload` helper). Returns the seed's `author` and the
 /// 64-byte signature. lait's own primitive — no scaffold signing type involved.
 pub fn sign_message(
     domain: &[u8],
-    workspace_id: &str,
+    space_id: &str,
     seed: &[u8; 32],
     msg: &[u8],
 ) -> (DeviceId, [u8; 64]) {
     let sk = SigningKey::from_bytes(seed);
     let author =
         DeviceId::from_key_string(data_encoding::HEXLOWER.encode(sk.verifying_key().as_bytes()));
-    let payload = message_payload(domain, workspace_id, &author, msg);
+    let payload = message_payload(domain, space_id, &author, msg);
     (author, sk.sign(&payload).to_bytes())
 }
 
 /// Verify a [`sign_message`] detached signature under the same `domain` and
-/// `workspace_id`: `sig` covers `msg` by `author`. Rejects a malformed author or
-/// signature without panicking, and any mismatch of domain or workspace.
+/// `space_id`: `sig` covers `msg` by `author`. Rejects a malformed author or
+/// signature without panicking, and any mismatch of domain or space.
 pub fn verify_message(
     domain: &[u8],
-    workspace_id: &str,
+    space_id: &str,
     author: &DeviceId,
     msg: &[u8],
     sig: &[u8; 64],
@@ -186,7 +186,7 @@ pub fn verify_message(
     let Ok(vk) = VerifyingKey::from_bytes(&pk) else {
         return false;
     };
-    let payload = message_payload(domain, workspace_id, author, msg);
+    let payload = message_payload(domain, space_id, author, msg);
     vk.verify(&payload, &Signature::from_bytes(sig)).is_ok()
 }
 
@@ -288,7 +288,7 @@ mod tests {
     fn sign_verify_roundtrip_and_bindings() {
         let node = sign_node(DOMAIN, &seed(1), b"op".to_vec(), vec!["p1".into()], "ws_a");
         assert!(node.verify_sig(DOMAIN, "ws_a"));
-        assert!(!node.verify_sig(DOMAIN, "ws_b"), "workspace-bound");
+        assert!(!node.verify_sig(DOMAIN, "ws_b"), "space-bound");
         assert!(!node.verify_sig(b"lait/other/1", "ws_a"), "domain-bound");
         let mut reparented = node.clone();
         reparented.parents = vec!["p2".into()];
@@ -310,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn detached_message_signing_roundtrips_and_binds_domain_and_workspace() {
+    fn detached_message_signing_roundtrips_and_binds_domain_and_space() {
         const G: &[u8] = b"lait/gossip/1";
         const I: &[u8] = b"lait/invite/1";
         let msg = b"announce: head moved";
@@ -325,7 +325,7 @@ mod tests {
         assert!(!verify_message(G, "ws_a", &author, msg, &bad));
         // Domain separation: a gossip signature is not usable as an invite …
         assert!(!verify_message(I, "ws_a", &author, msg, &sig));
-        // … and cross-workspace replay fails: same bytes, different topic.
+        // … and cross-space replay fails: same bytes, different topic.
         assert!(!verify_message(G, "ws_b", &author, msg, &sig));
     }
 

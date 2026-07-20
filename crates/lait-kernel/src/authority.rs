@@ -145,7 +145,7 @@ impl AuthorityConfigurationId {
     }
     /// The configuration id of the bootstrap single-holder authority.
     ///
-    /// Every workspace is born `Single` (the founder mints one solo recovery
+    /// Every space is born `Single` (the founder mints one solo recovery
     /// key), so this is the standing configuration at genesis and the value an
     /// old key-only `Rotate` — which never named a configuration — replays to.
     /// Content-addressed like any other, just from a fixed input.

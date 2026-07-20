@@ -294,7 +294,7 @@ export function App() {
         // `members` carries no alias for **you**: a petname is something you assign
         // to other people, so `replica.rs::members` reports `alias: ""` for `me`.
         // Your own name lives in `user.nick`, which only `status` reports — and
-        // without it yours is the one avatar in the workspace with no letter on it,
+        // without it yours is the one avatar in the space with no letter on it,
         // which is a strange way to meet yourself. Patched here rather than in the
         // avatar, so every surface agrees on what you are called.
         const nick = s?.kind === "status" ? s.nick.trim() : "";

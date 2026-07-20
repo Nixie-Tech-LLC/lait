@@ -1,4 +1,4 @@
-//! Workspace lifecycle: founding, joining, and opening.
+//! Space lifecycle: founding, joining, and opening.
 
 use super::*;
 
@@ -22,41 +22,41 @@ pub fn derive_project_key(name: &str) -> String {
     key.to_ascii_uppercase()
 }
 
-/// Found a fresh workspace in `store` — the `lait init` path, and the ONLY
-/// place a workspace comes into existence on this machine besides
-/// [`join_workspace_store`]. Mints the genesis with `me` as founding admin
+/// Found a fresh space in `store` — the `lait init` path, and the ONLY
+/// place a space comes into existence on this machine besides
+/// [`join_space_store`]. Mints the genesis with `me` as founding admin
 /// creates the catalog carrying the display `name`, seals the epoch-0
-/// workspace key to ourselves, and seeds the first project (named after the
-/// workspace, key derived) so `lait new` works immediately. Errors if the store
-/// already holds a workspace. Returns the workspace id and the seeded project.
-pub fn found_workspace(
+/// space key to ourselves, and seeds the first project (named after the
+/// space, key derived) so `lait new` works immediately. Errors if the store
+/// already holds a space. Returns the space id and the seeded project.
+pub fn found_space(
     store: &Store,
     me: &DeviceId,
     device_seed: &[u8; 32],
     name: &str,
     clock: &dyn UlidSource,
-) -> Result<(WorkspaceId, ProjectDto)> {
+) -> Result<(SpaceId, ProjectDto)> {
     if store.is_initialized() {
-        anyhow::bail!("store already initialized — this directory already holds a workspace");
+        anyhow::bail!("store already initialized — this directory already holds a space");
     }
-    // Self-certifying workspace id (lait/space/1): derive it from the founding
+    // Self-certifying space id (lait/space/1): derive it from the founding
     // device + a random salt so the id commits to its trust root. The salt is
     // chosen BEFORE the founding actor is incepted — an inception is scoped to a
-    // workspace id, so the id cannot itself depend on the inception. Derive from
+    // space id, so the id cannot itself depend on the inception. Derive from
     // the SEED's public key (the inception's author), so the id commits to
     // exactly the key that signs the founding inception.
     let founding_device = crypto::device_from_seed(device_seed);
     let salt = rand16();
-    // Mint the workspace's break-glass recovery key (a solo bootstrap key the
+    // Mint the space's break-glass recovery key (a solo bootstrap key the
     // founder holds — later elevated to a FROST group key via Rotate) and fold its
     // commitment into the id, so root recovery is authorized offline against a
     // value bound at birth, never a compromised current admin (lait/space/1 W5).
     let (recovery_pub, recovery_secret) = crate::space::mint_recovery_key();
     let recovery_root = crate::space::recovery_commit(&recovery_pub).expect("valid recovery key");
-    let ws = crate::space::derive_workspace_id(&founding_device, &salt, &recovery_root);
+    let ws = crate::space::derive_space_id(&founding_device, &salt, &recovery_root);
     persist_space_recovery(store, &recovery_secret)?;
     let cat = CatalogDoc::create(&ws, name, Some(store.peer_id()), me)?;
-    // Seed the first project so a fresh workspace is usable on the very next
+    // Seed the first project so a fresh space is usable on the very next
     // command. Plain catalog data — a joiner never hits this path.
     let project_name = if name.trim().is_empty() {
         "Main"
@@ -77,7 +77,7 @@ pub fn found_workspace(
         actor::incept_single(device_seed, &ws, rand16(), rand16(), Some(recovery_commit));
 
     let genesis = Genesis {
-        workspace_id: ws.clone(),
+        space_id: ws.clone(),
         founding_actors: vec![actor_id.clone()],
         salt,
         recovery_root,
@@ -114,7 +114,7 @@ pub fn found_workspace(
     }
     membership.apply(&OpCtx::authority("found", me));
     store.save_membership(&membership)?;
-    store.commit("init workspace");
+    store.commit("init space");
     let project = cat
         .project(&project_id)
         .ok_or_else(|| anyhow!("seeded project vanished"))?;
@@ -137,28 +137,28 @@ pub(super) fn mint_recovery() -> ([u8; 32], [u8; 32]) {
 /// the joiner validates against) and **empty** catalog/membership docs, so
 /// importing the founder's ops adopts identical container ids (see
 /// [`CatalogDoc::empty`] — `create()` would mint conflicting containers).
-/// Errors if the store already holds a workspace; the CLI guarantees it doesn't.
-pub fn join_workspace_store(
+/// Errors if the store already holds a space; the CLI guarantees it doesn't.
+pub fn join_space_store(
     store: &Store,
-    workspace: &str,
+    space: &str,
     salt: &[u8; 16],
     recovery_root: &[u8; 32],
     founder_inception: &actor::SignedEvent,
-) -> Result<WorkspaceId> {
+) -> Result<SpaceId> {
     if store.is_initialized() {
-        anyhow::bail!("store already initialized — this directory already holds a workspace");
+        anyhow::bail!("store already initialized — this directory already holds a space");
     }
-    let ws_id = WorkspaceId::parse(workspace)
-        .ok_or_else(|| anyhow!("invalid workspace id in ticket: {workspace}"))?;
+    let ws_id =
+        SpaceId::parse(space).ok_or_else(|| anyhow!("invalid space id in ticket: {space}"))?;
     // Verify the trust root offline: the id must commit to the founder AND the
     // recovery set, and the founding inception must validly incept for THIS
-    // workspace. A tampered anchor fails here rather than silently forking the
+    // space. A tampered anchor fails here rather than silently forking the
     // joiner (lait/space/1).
     let founder_actor =
         crate::space::verify_founding(&ws_id, salt, recovery_root, founder_inception)
-            .context("verify workspace founding — ask for a fresh invite")?;
+            .context("verify space founding — ask for a fresh invite")?;
     let genesis = Genesis {
-        workspace_id: ws_id.clone(),
+        space_id: ws_id.clone(),
         founding_actors: vec![founder_actor],
         salt: *salt,
         recovery_root: *recovery_root,
@@ -176,14 +176,14 @@ pub fn join_workspace_store(
     membership.add_actor_event(founder_inception)?;
     membership.apply(&OpCtx::authority("join_seed", &founder_inception.author));
     store.save_membership(&membership)?;
-    store.commit("join workspace from ticket");
+    store.commit("join space from ticket");
     Ok(ws_id)
 }
 
 impl Replica {
     /// Open the replica over an **initialized** store — a missing catalog or
-    /// genesis is an error, never a founding event (workspaces are born only in
-    /// [`found_workspace`] / [`join_workspace_store`]). Performs the **load-time
+    /// genesis is an error, never a founding event (spaces are born only in
+    /// [`found_space`] / [`join_space_store`]). Performs the **load-time
     /// head recompute**: heads and rows are recomputed from the real
     /// issue-doc frontiers, never trusted from disk, so a crash between an issue
     /// commit and its row mirror self-heals.
@@ -195,9 +195,7 @@ impl Replica {
         clock: Box<dyn UlidSource + Send + Sync>,
     ) -> Result<Self> {
         let catalog = store.load_catalog()?.ok_or_else(|| {
-            anyhow!(
-                "store not initialized — found no workspace here (run `lait init` or `lait join`)"
-            )
+            anyhow!("store not initialized — found no space here (run `lait init` or `lait join`)")
         })?;
         let genesis = store.genesis()?.ok_or_else(|| {
             anyhow!("store missing genesis.json — corrupt or pre-rewrite store; re-init or re-join")
@@ -205,15 +203,15 @@ impl Replica {
         // A joiner's catalog is empty (no workspaceId) until the founder's ops
         // arrive over sync; the genesis is the local root of truth. A catalog
         // that DOES carry an id must agree with it.
-        let workspace_id = match catalog.workspace_id() {
-            Some(ws) if ws != genesis.workspace_id => {
+        let space_id = match catalog.space_id() {
+            Some(ws) if ws != genesis.space_id => {
                 anyhow::bail!(
-                    "catalog workspace {ws} does not match genesis {} — corrupt store",
-                    genesis.workspace_id
+                    "catalog space {ws} does not match genesis {} — corrupt store",
+                    genesis.space_id
                 )
             }
             Some(ws) => ws,
-            None => genesis.workspace_id.clone(),
+            None => genesis.space_id.clone(),
         };
         let membership = match store.load_membership()? {
             Some(m) => m,
@@ -232,7 +230,7 @@ impl Replica {
             aliases: AliasTable::default(),
             me,
             my_nick,
-            workspace_id,
+            space_id,
             activity: VecDeque::new(),
             activity_seq: 0,
             clock,

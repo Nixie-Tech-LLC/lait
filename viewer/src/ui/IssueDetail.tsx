@@ -620,7 +620,7 @@ type Entry =
  *
  * - **Comments come from the issue document.** They sync and carry a real author.
  * - **Events come from the durable oplog.** Real actors, real timestamps, no
- *   synthetic `synced` marker (that belongs to the workspace Activity feed).
+ *   synthetic `synced` marker (that belongs to the space Activity feed).
  *
  * `commented` events are dropped: a comment is already rendered from the document,
  * so keeping its event too would double-print it.
@@ -663,7 +663,7 @@ function Timeline({
         {/* Said once, quietly. This feed is durable and attributed now — worth
             saying, because it wasn't before. */}
         <span
-          title="This issue's full history, read from its change log on disk — it survives restarts and shows who made each change. (The workspace-wide Activity view is a lighter, per-session feed.)"
+          title="This issue's full history, read from its change log on disk — it survives restarts and shows who made each change. (The space-wide Activity view is a lighter, per-session feed.)"
           className="cursor-help"
         >
           <Info className="size-3" />

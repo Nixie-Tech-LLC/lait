@@ -6,12 +6,12 @@ types are not themselves the wire specification.
 
 ## 1. Identities and trust anchors
 
-- `WorkspaceId` identifies a space.
+- `SpaceId` identifies a space.
 - `ActorId` identifies a member within that space.
 - `DeviceId` is an ed25519 device key and equals the device's iroh endpoint id.
 - Loro peer ids are internal operation-addressing values and are never user
   identities.
-- Workspace tickets carry the genesis trust anchor and founding actor material.
+- Space tickets carry the genesis trust anchor and founding actor material.
 
 Display names, nicknames, paths, project keys, and peer discovery do not confer
 authority.
@@ -32,7 +32,7 @@ contract permits it; unknown signed action semantics may not.
 
 ## 3. Signed domains
 
-Signatures bind, at minimum, their protocol domain and workspace. Distinct uses
+Signatures bind, at minimum, their protocol domain and space. Distinct uses
 must not share a domain merely because they use the same key type. Current
 domains include actor events, device-binding consent, ACL events, content
 authority, gossip, invites, ceremonies, and space authority.
@@ -42,8 +42,8 @@ must reproduce the same bytes, hashes, ids, parent ordering, and tie-breaks.
 
 ## 4. Discovery and presence
 
-Peers discover each other through iroh gossip on a workspace-derived topic.
-Signed gossip carries announce/presence data including the workspace, sender,
+Peers discover each other through iroh gossip on a space-derived topic.
+Signed gossip carries announce/presence data including the space, sender,
 and presence state. Neighbor events contribute reachability but are not proof of
 membership.
 
@@ -77,7 +77,7 @@ state:
 Catalog heads are discovery hints. The issue document remains authoritative for
 its fields, and the receiver recomputes catalog caches after import.
 
-Malformed, undecryptable, unauthorized, or wrong-workspace frames are rejected.
+Malformed, undecryptable, unauthorized, or wrong-space frames are rejected.
 Failure to hold the active epoch key never authorizes a plaintext fallback.
 
 ## 7. Encryption envelope
@@ -102,7 +102,7 @@ and an actor-log frontier. Replay verifies that the signing device belonged to
 that actor at that frontier.
 
 Actor device consent is separately signed and nonce-bound. Invite authorization
-is workspace-bound, expiring, and optionally single-use. Concurrent single-use
+is space-bound, expiring, and optionally single-use. Concurrent single-use
 redemptions deterministically admit at most one actor for a nonce.
 
 Names never appear in authority decisions. Petnames are local projections.

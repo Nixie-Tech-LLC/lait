@@ -53,7 +53,7 @@ impl GateState {
 /// One ordered gate in the diagnosis.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiagnosisGate {
-    /// Stable machine id: `workspace` | `daemon` | `membership` | `peer` | `synced`.
+    /// Stable machine id: `space` | `daemon` | `membership` | `peer` | `synced`.
     pub id: String,
     /// Human label for the gate (left column).
     pub label: String,
@@ -89,9 +89,9 @@ pub struct DiagnosisView {
 /// need not clone its state just to project it.
 #[derive(Debug, Clone, Copy)]
 pub struct DiagnoseInput<'a> {
-    /// The workspace id this store is bound to, if any (`None` before genesis).
-    pub workspace: Option<&'a str>,
-    /// The workspace's synced display name (may be empty on a pre-sync joiner).
+    /// The space id this store is bound to, if any (`None` before genesis).
+    pub space: Option<&'a str>,
+    /// The space's synced display name (may be empty on a pre-sync joiner).
     pub name: &'a str,
     /// This node's ACL standing: `admin` | `member` | `pending`.
     pub membership: &'a str,
@@ -99,10 +99,10 @@ pub struct DiagnoseInput<'a> {
     pub online_peers: usize,
     pub projects: usize,
     pub issues: usize,
-    /// The workspace the caller *intended* to be in — supplied by the `join` tail
+    /// The space the caller *intended* to be in — supplied by the `join` tail
     /// (from the invite ticket) so a directory/store mismatch is caught. `None`
     /// for a standalone `doctor`, which can't know intent.
-    pub expected_workspace: Option<&'a str>,
+    pub expected_space: Option<&'a str>,
     /// Recovery shares present on this device that cannot be used. Borrowed as a
     /// slice so the struct stays `Copy`.
     pub degraded_recovery: &'a [crate::replica::DegradedRecoveryHolder],
@@ -117,15 +117,15 @@ pub struct DiagnoseInput<'a> {
 
 /// Project daemon state into the ordered gate list (pure — the validation core).
 pub fn diagnose(input: DiagnoseInput<'_>) -> DiagnosisView {
-    let bound = input.workspace.unwrap_or("(none)");
+    let bound = input.space.unwrap_or("(none)");
     let is_member = matches!(input.membership, "admin" | "member");
 
-    // 1. workspace — the directory trap made legible. Only fails when the caller
-    //    told us which workspace it expected (the `join` tail) and we bound a
+    // 1. space — the directory trap made legible. Only fails when the caller
+    //    told us which space it expected (the `join` tail) and we bound a
     //    different one; a standalone doctor has no intent to compare against.
-    let workspace = match input.expected_workspace {
-        Some(exp) if input.workspace != Some(exp) => DiagnosisGate::new(
-            "workspace",
+    let space = match input.expected_space {
+        Some(exp) if input.space != Some(exp) => DiagnosisGate::new(
+            "space",
             "space",
             GateState::Fail,
             format!(
@@ -134,7 +134,7 @@ pub fn diagnose(input: DiagnoseInput<'_>) -> DiagnosisView {
             ),
         ),
         _ => DiagnosisGate::new(
-            "workspace",
+            "space",
             "space",
             GateState::Pass,
             if input.name.is_empty() {
@@ -249,7 +249,7 @@ pub fn diagnose(input: DiagnoseInput<'_>) -> DiagnosisView {
     let mut key_notes: Vec<String> = Vec::new();
     for h in input.degraded_recovery {
         let scope = match h.is_current_authority {
-            Some(true) => "the workspace recovery key",
+            Some(true) => "the space recovery key",
             // Currency could not be established; say so rather than assert it.
             _ => "a recovery key (group unidentified)",
         };
@@ -283,7 +283,7 @@ pub fn diagnose(input: DiagnoseInput<'_>) -> DiagnosisView {
         DiagnosisGate::new("keys", "keys", GateState::Warn, key_notes.join("; "))
     };
 
-    let gates = vec![workspace, daemon, membership, peer, synced, keys];
+    let gates = vec![space, daemon, membership, peer, synced, keys];
     let blocked = gates.iter().find(|g| g.state.is_blocking());
     let blocked_on = blocked.map(|g| g.id.clone());
     let summary = summarize(blocked, input.projects, input.issues);
@@ -310,7 +310,7 @@ fn summarize(blocked: Option<&DiagnosisGate>, projects: usize, issues: usize) ->
         None => {
             format!("you're in — {projects} project(s), {issues} issue(s) synced. get to work.")
         }
-        Some("workspace") => "wrong directory: this store is a different space than the invite. \
+        Some("space") => "wrong directory: this store is a different space than the invite. \
              cd to where you ran `lait join`, or run `lait spaces`."
             .to_string(),
         Some("membership") => {
@@ -330,13 +330,13 @@ mod tests {
 
     fn input() -> DiagnoseInput<'static> {
         DiagnoseInput {
-            workspace: Some("ws_A"),
+            space: Some("ws_A"),
             name: "lait",
             membership: "member",
             online_peers: 1,
             projects: 2,
             issues: 3,
-            expected_workspace: None,
+            expected_space: None,
             degraded_recovery: &[],
             rekey_pending: None,
             local_custody: None,
@@ -359,7 +359,7 @@ mod tests {
             ..input()
         });
         assert_eq!(gate(&v, "keys").state, GateState::Warn);
-        assert!(gate(&v, "keys").detail.contains("workspace recovery key"));
+        assert!(gate(&v, "keys").detail.contains("space recovery key"));
         assert!(gate(&v, "keys").detail.contains("another Windows account"));
         // The whole point: a custody problem is not an onboarding blocker.
         assert_eq!(
@@ -376,9 +376,7 @@ mod tests {
             ..input()
         });
         assert!(gate(&v, "keys").detail.contains("group unidentified"));
-        assert!(!gate(&v, "keys")
-            .detail
-            .contains("the workspace recovery key"));
+        assert!(!gate(&v, "keys").detail.contains("the space recovery key"));
     }
 
     #[test]
@@ -404,13 +402,11 @@ mod tests {
     #[test]
     fn a_pending_rekey_warns_on_the_same_gate() {
         let v = diagnose(DiagnoseInput {
-            rekey_pending: Some("revoked invite: xyz still holds a workspace key"),
+            rekey_pending: Some("revoked invite: xyz still holds a space key"),
             ..input()
         });
         assert_eq!(gate(&v, "keys").state, GateState::Warn);
-        assert!(gate(&v, "keys")
-            .detail
-            .contains("still holds a workspace key"));
+        assert!(gate(&v, "keys").detail.contains("still holds a space key"));
         assert_eq!(v.blocked_on, None);
     }
 
@@ -461,29 +457,29 @@ mod tests {
     }
 
     #[test]
-    fn workspace_mismatch_is_the_first_blocker() {
+    fn space_mismatch_is_the_first_blocker() {
         // The directory trap: bound to ws_A but the invite was for ws_B.
         let v = diagnose(DiagnoseInput {
-            expected_workspace: Some("ws_B"),
+            expected_space: Some("ws_B"),
             ..input()
         });
-        assert_eq!(gate(&v, "workspace").state, GateState::Fail);
+        assert_eq!(gate(&v, "space").state, GateState::Fail);
         assert_eq!(
             v.blocked_on.as_deref(),
-            Some("workspace"),
+            Some("space"),
             "a wrong-store mismatch must win over everything downstream"
         );
-        assert!(gate(&v, "workspace").detail.contains("ws_B"));
+        assert!(gate(&v, "space").detail.contains("ws_B"));
         assert!(v.summary.contains("wrong directory"));
     }
 
     #[test]
-    fn matching_expected_workspace_passes() {
+    fn matching_expected_space_passes() {
         let v = diagnose(DiagnoseInput {
-            expected_workspace: Some("ws_A"),
+            expected_space: Some("ws_A"),
             ..input()
         });
-        assert_eq!(gate(&v, "workspace").state, GateState::Pass);
+        assert_eq!(gate(&v, "space").state, GateState::Pass);
         assert_eq!(v.blocked_on, None);
     }
 
@@ -567,14 +563,7 @@ mod tests {
         // joiner walks, and custody health is orthogonal to it.
         assert_eq!(
             ids,
-            [
-                "workspace",
-                "daemon",
-                "membership",
-                "peer",
-                "synced",
-                "keys"
-            ]
+            ["space", "daemon", "membership", "peer", "synced", "keys"]
         );
     }
 }

@@ -1,14 +1,14 @@
-//! The workspace registry (see `docs/UI.md`, joining).
+//! The space registry (see `docs/UI.md`, joining).
 //!
-//! A small global index, `workspaces.json` under [`crate::config::config_root`],
-//! mapping each **store path** to the workspace it holds. Written at every
-//! chokepoint a workspace becomes bound to a path — `lait init` (founding),
+//! A small global index, `spaces.json` under [`crate::config::config_root`],
+//! mapping each **store path** to the space it holds. Written at every
+//! chokepoint a space becomes bound to a path — `lait init` (founding),
 //! `lait join` (bootstrapping), and every successful daemon open — so founders
-//! and joiners alike are observable via `lait workspaces` and addressable via
+//! and joiners alike are observable via `lait spaces` and addressable via
 //! `-w`. It carries **no secrets and no trust** (the signed ACL still gates
 //! every op); it is pure navigation state: the `name` and `projects` fields are
 //! advisory snapshots refreshed on open, a corrupt/absent file degrades to "no
-//! known workspaces", and nothing here is ever a source of truth.
+//! known spaces", and nothing here is ever a source of truth.
 
 use std::path::{Path, PathBuf};
 
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::config_root;
 
-/// Where a store's workspace came from.
+/// Where a store's space came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Origin {
@@ -37,20 +37,20 @@ impl std::fmt::Display for Origin {
     }
 }
 
-/// Advisory snapshot of one project, for cross-workspace listings. Display
-/// only — the authoritative list is the workspace's own catalog.
+/// Advisory snapshot of one project, for cross-space listings. Display
+/// only — the authoritative list is the space's own catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectBrief {
     pub key: String,
     pub name: String,
 }
 
-/// One registered store: a path on this machine and the workspace it holds.
+/// One registered store: a path on this machine and the space it holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkspaceEntry {
-    /// The workspace id (`ws_…`) bound in this store.
-    pub workspace: String,
-    /// The workspace display name at last open (advisory; may lag a rename).
+pub struct SpaceEntry {
+    /// The space id (`ws_…`) bound in this store.
+    pub space: String,
+    /// The space display name at last open (advisory; may lag a rename).
     #[serde(default)]
     pub name: String,
     /// The absolute store path (the `.lait/` dir, or a `$LAIT_HOME`).
@@ -82,7 +82,7 @@ pub enum StorePresence {
 
 /// Check whether an entry's path still holds an initialized store. Mirrors
 /// `Store::is_initialized` without opening (or creating) anything.
-pub fn presence(entry: &WorkspaceEntry) -> StorePresence {
+pub fn presence(entry: &SpaceEntry) -> StorePresence {
     if crate::store::initialized_at(Path::new(&entry.path)) {
         StorePresence::Present
     } else {
@@ -90,18 +90,18 @@ pub fn presence(entry: &WorkspaceEntry) -> StorePresence {
     }
 }
 
-/// Path to the registry file (`config_root/workspaces.json`).
+/// Path to the registry file (`config_root/spaces.json`).
 pub fn registry_file() -> Result<PathBuf> {
-    Ok(config_root()?.join("workspaces.json"))
+    Ok(config_root()?.join("spaces.json"))
 }
 
 /// Read the registry, newest-first. Best-effort: a missing or corrupt file
 /// yields an empty list rather than an error (navigation state, never a gate).
-pub fn list() -> Vec<WorkspaceEntry> {
+pub fn list() -> Vec<SpaceEntry> {
     let Ok(path) = registry_file() else {
         return Vec::new();
     };
-    let mut entries: Vec<WorkspaceEntry> = std::fs::read_to_string(&path)
+    let mut entries: Vec<SpaceEntry> = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
@@ -109,12 +109,12 @@ pub fn list() -> Vec<WorkspaceEntry> {
     entries
 }
 
-fn save(entries: &[WorkspaceEntry]) -> Result<()> {
+fn save(entries: &[SpaceEntry]) -> Result<()> {
     let path = registry_file()?;
-    let json = serde_json::to_string_pretty(entries).context("encode workspace registry")?;
+    let json = serde_json::to_string_pretty(entries).context("encode space registry")?;
     // Write atomically (temp file + rename) so a concurrent reader never
     // observes a half-written, unparseable file and wrongly concludes "no known
-    // workspaces". `rename` replaces the destination atomically on both unix
+    // spaces". `rename` replaces the destination atomically on both unix
     // and Windows (std uses MOVEFILE_REPLACE_EXISTING).
     let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     std::fs::write(&tmp, json).with_context(|| format!("write {}", tmp.display()))?;
@@ -123,16 +123,16 @@ fn save(entries: &[WorkspaceEntry]) -> Result<()> {
 }
 
 /// Insert or refresh an entry, keyed by **store path** (one store holds exactly
-/// one workspace). A refresh preserves fields the caller didn't recompute: an
+/// one space). A refresh preserves fields the caller didn't recompute: an
 /// empty `name`/`projects`/`host_nick` on the new entry keeps the old value, and
 /// `origin` sticks once founded (a daemon-open upsert must not relabel a founder
 /// as joined). Best-effort persistence; callers treat failure as non-fatal (the
 /// registry is a convenience, not a source of truth).
-pub fn upsert(mut entry: WorkspaceEntry) -> Result<()> {
+pub fn upsert(mut entry: SpaceEntry) -> Result<()> {
     let mut entries = list();
     if let Some(old) = entries.iter().find(|e| e.path == entry.path) {
         // Same store re-registered: merge, don't blank.
-        if old.workspace == entry.workspace {
+        if old.space == entry.space {
             if entry.name.is_empty() {
                 entry.name = old.name.clone();
             }
@@ -146,7 +146,7 @@ pub fn upsert(mut entry: WorkspaceEntry) -> Result<()> {
                 entry.origin = Origin::Founded;
             }
         }
-        // A different workspace at the same path (re-init after rm) replaces
+        // A different space at the same path (re-init after rm) replaces
         // the row wholesale.
     }
     entries.retain(|e| e.path != entry.path);
@@ -154,20 +154,20 @@ pub fn upsert(mut entry: WorkspaceEntry) -> Result<()> {
     save(&entries)
 }
 
-/// Deregister entries matching `sel` (exact path, exact workspace id, or a
-/// **unique** workspace-id prefix — an ambiguous prefix removes nothing, so a
+/// Deregister entries matching `sel` (exact path, exact space id, or a
+/// **unique** space-id prefix — an ambiguous prefix removes nothing, so a
 /// stray `forget ws_` can never wipe the registry). Never touches the store on
 /// disk. Returns the removed entries.
-pub fn forget(sel: &str) -> Result<Vec<WorkspaceEntry>> {
+pub fn forget(sel: &str) -> Result<Vec<SpaceEntry>> {
     let entries = list();
-    let exact = |e: &WorkspaceEntry| e.path == sel || e.workspace == sel;
+    let exact = |e: &SpaceEntry| e.path == sel || e.space == sel;
     let matches_exact = entries.iter().filter(|e| exact(e)).count();
     let prefix_hits = entries
         .iter()
-        .filter(|e| sel.starts_with("ws_") && e.workspace.starts_with(sel))
+        .filter(|e| sel.starts_with("ws_") && e.space.starts_with(sel))
         .count();
     let (removed, kept): (Vec<_>, Vec<_>) = entries.into_iter().partition(|e| {
-        exact(e) || (matches_exact == 0 && prefix_hits == 1 && e.workspace.starts_with(sel))
+        exact(e) || (matches_exact == 0 && prefix_hits == 1 && e.space.starts_with(sel))
     });
     if !removed.is_empty() {
         save(&kept)?;
@@ -177,7 +177,7 @@ pub fn forget(sel: &str) -> Result<Vec<WorkspaceEntry>> {
 
 /// Drop every entry whose path no longer holds an initialized store. Returns
 /// the removed entries.
-pub fn prune() -> Result<Vec<WorkspaceEntry>> {
+pub fn prune() -> Result<Vec<SpaceEntry>> {
     let entries = list();
     let (removed, kept): (Vec<_>, Vec<_>) = entries
         .into_iter()
@@ -222,9 +222,9 @@ mod tests {
         }
     }
 
-    fn entry(workspace: &str, path: &str, last_opened: u64) -> WorkspaceEntry {
-        WorkspaceEntry {
-            workspace: workspace.into(),
+    fn entry(space: &str, path: &str, last_opened: u64) -> SpaceEntry {
+        SpaceEntry {
+            space: space.into(),
             name: "demo".into(),
             path: path.into(),
             origin: Origin::Joined,
@@ -240,18 +240,18 @@ mod tests {
         upsert(entry("ws_A", "/tmp/a", 10)).unwrap();
         let got = list();
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].workspace, "ws_A");
+        assert_eq!(got[0].space, "ws_A");
     }
 
     #[test]
     fn upsert_is_keyed_by_path_not_duplicated() {
         let _root = ScopedRoot::new("dedup");
         upsert(entry("ws_A", "/tmp/a", 10)).unwrap();
-        // Same path, different workspace (re-init after rm) → replace, not duplicate.
+        // Same path, different space (re-init after rm) → replace, not duplicate.
         upsert(entry("ws_B", "/tmp/a", 20)).unwrap();
         let got = list();
         assert_eq!(got.len(), 1, "same path must not create a second row");
-        assert_eq!(got[0].workspace, "ws_B", "re-register replaces the row");
+        assert_eq!(got[0].space, "ws_B", "re-register replaces the row");
     }
 
     #[test]
@@ -266,8 +266,8 @@ mod tests {
         upsert(founded).unwrap();
         // A later daemon-open upsert that didn't recompute name/projects and
         // defaulted origin must keep the founded origin and the old snapshots.
-        upsert(WorkspaceEntry {
-            workspace: "ws_A".into(),
+        upsert(SpaceEntry {
+            space: "ws_A".into(),
             name: String::new(),
             path: "/tmp/a".into(),
             origin: Origin::Joined,
@@ -293,7 +293,7 @@ mod tests {
         upsert(entry("ws_old", "/tmp/old", 5)).unwrap();
         upsert(entry("ws_new", "/tmp/new", 50)).unwrap();
         let got = list();
-        assert_eq!(got[0].workspace, "ws_new", "newest last_opened sorts first");
+        assert_eq!(got[0].space, "ws_new", "newest last_opened sorts first");
     }
 
     #[test]
@@ -335,10 +335,10 @@ mod tests {
         upsert(entry("ws_GONE", "/tmp/definitely-gone-xyz", 20)).unwrap();
         let removed = prune().unwrap();
         assert_eq!(removed.len(), 1);
-        assert_eq!(removed[0].workspace, "ws_GONE");
+        assert_eq!(removed[0].space, "ws_GONE");
         let kept = list();
         assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].workspace, "ws_LIVE");
+        assert_eq!(kept[0].space, "ws_LIVE");
         let _ = std::fs::remove_dir_all(&live);
     }
 }

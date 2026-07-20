@@ -51,9 +51,9 @@ pub enum Special {
     Man,
     Profiles,
     Resume,
-    Workspaces,
-    WorkspacesForget,
-    WorkspacesPrune,
+    Spaces,
+    SpacesForget,
+    SpacesPrune,
     ConfigGet,
     ConfigSet,
     ConfigUnset,
@@ -306,7 +306,7 @@ pub fn build_cli(specs: &[Spec]) -> Command {
                 .help("Select the node's home directory (overrides $LAIT_HOME)."),
         )
         .arg(
-            Arg::new("workspace")
+            Arg::new("space")
                 .short('w')
                 .long("space")
                 .alias("workspace")
@@ -597,12 +597,12 @@ fn project_hint(m: &ArgMatches) -> Option<String> {
 pub fn specs() -> Vec<Spec> {
     use ArgSpec as A;
     let mut v = vec![
-        // ---- workspace founding ----
+        // ---- space founding ----
         Spec::special(
             "init",
             "Found a new space here (mints the genesis; seeds a first project).",
             vec![
-                A::val("name", "Workspace display name (default: this directory's name)."),
+                A::val("name", "Space display name (default: this directory's name)."),
                 A::val("nick", "Display nickname (sugar for `lait config set user.nick`)."),
             ],
             Special::Init,
@@ -1147,14 +1147,15 @@ pub fn specs() -> Vec<Spec> {
             |_| Ok(Request::Recover),
         ),
         Spec::req(
-            "recover-workspace",
-            "Break-glass: re-root the WHOLE workspace to this device using the \
-             offline workspace recovery keys (threshold K-of-N), when the admins \
+            "recover-space",
+            "Break-glass: re-root the WHOLE space to this device using the \
+             offline space recovery keys (threshold K-of-N), when the admins \
              are lost or compromised. Sync from a surviving peer first. Under a \
              group key, repeat on each holder until the threshold co-signs.",
             vec![],
             |_| Ok(Request::SpaceRecover),
-        ),
+        )
+        .alias(&["recover-workspace"]),
         Spec::req(
             "recover-approve",
             "Co-sign a pending break-glass recovery as a holder of the group \
@@ -1163,11 +1164,11 @@ pub fn specs() -> Vec<Spec> {
             vec![
                 A::pos(
                     "session",
-                    "The recovery session id (from the initiator's `recover-workspace`).",
+                    "The recovery session id (from the initiator's `recover-space`).",
                 ),
                 A::multi(
                     "to",
-                    "The actor id you expect the workspace to re-root to (repeatable).",
+                    "The actor id you expect the space to re-root to (repeatable).",
                 )
                 .required(),
             ],
@@ -1243,7 +1244,7 @@ pub fn specs() -> Vec<Spec> {
         ),
         Spec::req(
             "elevate-recovery",
-            "Elevate the workspace recovery authority from your solo bootstrap key \
+            "Elevate the space recovery authority from your solo bootstrap key \
              to a K-of-N group key (dealer-free FROST DKG), sharing the recovery \
              burden with co-founders. Run where space-recovery.key lives; the \
              co-founders must already be admitted members.",
@@ -1267,7 +1268,7 @@ pub fn specs() -> Vec<Spec> {
         ),
         Spec::req(
             "activity",
-            "Workspace-wide recent transitions.",
+            "Space-wide recent transitions.",
             vec![A::val("since", "Only events after this seq.").default("0")],
             |m| {
                 Ok(Request::Activity {
@@ -1294,7 +1295,7 @@ pub fn specs() -> Vec<Spec> {
             vec![],
             |_| {
                 Ok(Request::Diagnose {
-                    expected_workspace: None,
+                    expected_space: None,
                 })
             },
         )
@@ -1305,26 +1306,26 @@ pub fn specs() -> Vec<Spec> {
                     "ls",
                     "List known spaces with status (default).",
                     vec![],
-                    Special::Workspaces,
+                    Special::Spaces,
                 ),
                 Spec::special(
                     "forget",
                     "Deregister a space (registry only — never touches the store on disk).",
                     vec![A::pos("sel", "A store path, ws_ id, or unique id prefix.")],
-                    Special::WorkspacesForget,
+                    Special::SpacesForget,
                 ),
                 Spec::special(
                     "prune",
                     "Drop registry entries whose store no longer exists on disk.",
                     vec![],
-                    Special::WorkspacesPrune,
+                    Special::SpacesPrune,
                 ),
             ],
             ..Spec::special(
                 "spaces",
                 "Every space on this machine: name, id, origin, status, projects, path.",
                 vec![],
-                Special::Workspaces,
+                Special::Spaces,
             )
             .alias(&["workspaces"])
         },

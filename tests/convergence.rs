@@ -27,7 +27,7 @@ use proptest::prelude::*;
 use lait::catalog::CatalogDoc;
 use lait::dto::Priority;
 use lait::fabric::op::OpCtx;
-use lait::ids::{ActorId, DeviceId, DocId, LabelId, ProjectId, SystemUlidSource, WorkspaceId};
+use lait::ids::{ActorId, DeviceId, DocId, LabelId, ProjectId, SpaceId, SystemUlidSource};
 use lait::issue::{IssueDoc, NewIssue};
 
 /// A fixed creation timestamp — never varied, so it can never be the reason two
@@ -130,7 +130,7 @@ fn catalog_replica_from(snap: &[u8]) -> CatalogDoc {
 fn base_issue() -> IssueDoc {
     IssueDoc::create(NewIssue {
         doc_id: DocId::mint(&SystemUlidSource),
-        workspace_id: WorkspaceId::mint(&SystemUlidSource),
+        space_id: SpaceId::mint(&SystemUlidSource),
         project_id: ProjectId::mint(&SystemUlidSource),
         title: "base title".into(),
         priority: Priority::None,
@@ -328,7 +328,7 @@ proptest! {
         ops in prop::collection::vec((0u8..3, board_op_strategy()), 0..40),
     ) {
         // Shared base catalog: one project + K issues already on the board.
-        let ws = WorkspaceId::mint(&SystemUlidSource);
+        let ws = SpaceId::mint(&SystemUlidSource);
         let base = CatalogDoc::create(&ws, "test", None, &tester()).unwrap();
         let project = ProjectId::mint(&SystemUlidSource);
         base.add_project(&project, "Engineering", "ENG", "blue").unwrap();
@@ -337,7 +337,7 @@ proptest! {
         for n in 0..k {
             let issue = IssueDoc::create(NewIssue {
                 doc_id: DocId::mint(&SystemUlidSource),
-                workspace_id: ws.clone(),
+                space_id: ws.clone(),
                 project_id: project.clone(),
                 title: format!("issue {n}"),
                 priority: Priority::None,
@@ -414,7 +414,7 @@ proptest! {
         n_replicas in 2usize..=3,
         registrations in prop::collection::vec(0u8..3, 0..30),
     ) {
-        let ws = WorkspaceId::mint(&SystemUlidSource);
+        let ws = SpaceId::mint(&SystemUlidSource);
         let base = CatalogDoc::create(&ws, "test", None, &tester()).unwrap();
         let project = ProjectId::mint(&SystemUlidSource);
         base.add_project(&project, "Engineering", "ENG", "blue").unwrap();
@@ -431,7 +431,7 @@ proptest! {
             let c = &replicas[(*who as usize) % n_replicas];
             let issue = IssueDoc::create(NewIssue {
                 doc_id: DocId::mint(&SystemUlidSource),
-                workspace_id: ws.clone(),
+                space_id: ws.clone(),
                 project_id: project.clone(),
                 title: "grow".into(),
                 priority: Priority::None,
@@ -480,7 +480,7 @@ proptest! {
         n_replicas in 2usize..=3,
         moves in prop::collection::vec((0u8..3, 0usize..6, prop::option::of(0usize..6)), 0..30),
     ) {
-        let ws = WorkspaceId::mint(&SystemUlidSource);
+        let ws = SpaceId::mint(&SystemUlidSource);
         let base = CatalogDoc::create(&ws, "test", None, &tester()).unwrap();
         let project = ProjectId::mint(&SystemUlidSource);
         base.add_project(&project, "Engineering", "ENG", "blue").unwrap();
@@ -549,7 +549,7 @@ proptest! {
         n_replicas in 2usize..=3,
         ops in prop::collection::vec((0u8..3, 0usize..4, 0usize..4, any::<bool>()), 0..40),
     ) {
-        let ws = WorkspaceId::mint(&SystemUlidSource);
+        let ws = SpaceId::mint(&SystemUlidSource);
         let base = CatalogDoc::create(&ws, "test", None, &tester()).unwrap();
         let doc_ids: Vec<DocId> = (0..4).map(|_| DocId::mint(&SystemUlidSource)).collect();
         base.apply(&ctx());

@@ -11,7 +11,7 @@ use lait::dto::{
     ActivityEvent, BoardColumn, BoardView, IssueView, Priority, ProjectDto, Row, WorkflowState,
     SCHEMA_VERSION,
 };
-use lait::ids::{DocId, ProjectId, SystemUlidSource, WorkspaceId};
+use lait::ids::{DocId, ProjectId, SpaceId, SystemUlidSource};
 use lait::mcp::{MCP_TOOL_NAMES, REQUIRED_TRACKER_COMMANDS};
 
 /// Every replica command an agent must drive has exactly one MCP tool. Adding a
@@ -107,7 +107,7 @@ fn response_dtos_round_trip() {
             schema_version: SCHEMA_VERSION,
             reff: "iss_3f9ab2c".into(),
             doc_id: doc_id.clone(),
-            workspace_id: WorkspaceId::mint(&ulid),
+            space_id: SpaceId::mint(&ulid),
             project_id: project.id.clone(),
             project_key: Some("ENG".into()),
             key_alias: Some("ENG-142".into()),
@@ -165,7 +165,7 @@ fn issue_response_status_field_survives_the_kind_tag() {
         schema_version: SCHEMA_VERSION,
         reff: "iss_x".into(),
         doc_id: DocId::mint(&ulid),
-        workspace_id: WorkspaceId::mint(&ulid),
+        space_id: SpaceId::mint(&ulid),
         project_id: ProjectId::mint(&ulid),
         project_key: None,
         key_alias: None,

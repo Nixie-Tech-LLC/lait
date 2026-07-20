@@ -94,7 +94,7 @@ pub fn write_private(path: &Path, bytes: &[u8], create: Create, wrap: Wrap) -> R
 /// but this Windows identity cannot open them. Collapsing that into "absent"
 /// would report the loss of a holder's share as though no share had ever been
 /// stored — for an N-of-N recovery group, the difference between a degraded
-/// holder and an unrecoverable workspace.
+/// holder and an unrecoverable space.
 #[derive(Debug)]
 pub enum SecretError {
     /// The file exists but could not be read.

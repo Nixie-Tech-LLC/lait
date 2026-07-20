@@ -489,8 +489,8 @@ mod tests {
         let bytes = [42u8; 32];
         assert_eq!(topic_id(Topic(bytes)).as_bytes(), &bytes);
 
-        // A workspace topic derived by proto survives the Topic round-trip.
-        let derived = crate::proto::topic_for_workspace("ws-under-test");
+        // A space topic derived by proto survives the Topic round-trip.
+        let derived = crate::proto::topic_for_space("ws-under-test");
         let roundtrip = topic_id(Topic(*derived.as_bytes()));
         assert_eq!(roundtrip, derived);
 

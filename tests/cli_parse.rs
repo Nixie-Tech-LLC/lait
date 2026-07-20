@@ -157,7 +157,7 @@ fn aliases_resolve_to_the_canonical_command() {
     parses_to(
         &["lait", "verify"],
         Request::Diagnose {
-            expected_workspace: None,
+            expected_space: None,
         },
     );
     parses_to(&["lait", "seed", "ls"], Request::SeedList);

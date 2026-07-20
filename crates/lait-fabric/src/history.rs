@@ -28,6 +28,7 @@ use crate::dto::{self, CommentDto, CorruptRecord, FieldChange, Projected};
 use crate::ids::{ActorId, DeviceId};
 
 use crate::issue::{project_comment, IssueDoc};
+use crate::loro_ext as lx;
 use crate::op::OpMeta;
 
 /// One oplog change of an issue doc, projected for the history feed.
@@ -239,7 +240,7 @@ fn set_changes(adds: &[ActorId], removes: &[ActorId]) -> Vec<FieldChange> {
 
 /// Root-map keys that are identity, not activity — creation constants whose
 /// presence in a diff is noise.
-const IDENTITY_KEYS: [&str; 4] = ["id", "workspaceId", "createdBy", "createdAt"];
+const IDENTITY_KEYS: [&str; 4] = ["id", lx::K_SPACE, "createdBy", "createdAt"];
 
 /// What one `diff(from, to)` batch yielded. A struct rather than a tuple: the
 /// corruption sidecar makes five fields, and positional returns stop being

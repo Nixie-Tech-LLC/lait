@@ -21,7 +21,7 @@
 //! **Why self-declared `asof` is safe here.** At-position authorization alone
 //! would let a removed member sign a *new* tombstone against a pre-removal
 //! frontier. The **E2EE epoch** is the recency fence:
-//! Removal always rotates the workspace key (the app layer's `replica::member_remove`
+//! Removal always rotates the space key (the app layer's `replica::member_remove`
 //! → `rotate_key`); post-rotation a removed member cannot produce a payload any
 //! member will decrypt, so their forged tombstone never enters any member's
 //! catalog. The epoch plane is the recency anchor for the authority plane
@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::acl::{self, SignedOp};
 use crate::genesis::Genesis;
-use crate::ids::{DocId, WorkspaceId};
+use crate::ids::{DocId, SpaceId};
 use crate::sigdag::{self, SignedNode};
 
 /// The signing domain for content-authority ops (see [`crate::sigdag`]).
@@ -92,15 +92,9 @@ pub fn sign_authz(
     seed: &[u8; 32],
     op: &AuthzOp,
     parents: Vec<String>,
-    workspace_id: &WorkspaceId,
+    space_id: &SpaceId,
 ) -> SignedNode {
-    sigdag::sign_node(
-        AUTHZ_DOMAIN,
-        seed,
-        op.encode(),
-        parents,
-        workspace_id.as_str(),
-    )
+    sigdag::sign_node(AUTHZ_DOMAIN, seed, op.encode(), parents, space_id.as_str())
 }
 
 /// The materialized content-authority state after replay.
@@ -135,7 +129,7 @@ pub fn replay(
     membership_ops: &[SignedOp],
     authz_ops: &[SignedNode],
 ) -> AuthzState {
-    let ws = genesis.workspace_id.as_str();
+    let ws = genesis.space_id.as_str();
     // Signature-valid nodes; undecodable ops stay as opaque ancestry (the same
     // forward-compat rule as the membership plane).
     let mut nodes: HashMap<String, &SignedNode> = HashMap::new();
@@ -189,16 +183,14 @@ pub fn replay(
     // identically everywhere for a given `actor_asof`, so replay the actor plane
     // once per distinct frontier rather than once per op (the acl.rs shape).
     let mut actor_cache: HashMap<BTreeSet<String>, crate::actor::ActorPlane> = HashMap::new();
-    let mut speaks_for = |device: &crate::ids::DeviceId,
-                          by: &crate::ids::ActorId,
-                          asof: &[String]|
-     -> bool {
-        let key: BTreeSet<String> = asof.iter().cloned().collect();
-        actor_cache
-            .entry(key)
-            .or_insert_with(|| crate::actor::replay_at(&genesis.workspace_id, actor_events, asof))
-            .is_device_of(by, device)
-    };
+    let mut speaks_for =
+        |device: &crate::ids::DeviceId, by: &crate::ids::ActorId, asof: &[String]| -> bool {
+            let key: BTreeSet<String> = asof.iter().cloned().collect();
+            actor_cache
+                .entry(key)
+                .or_insert_with(|| crate::actor::replay_at(&genesis.space_id, actor_events, asof))
+                .is_device_of(by, device)
+        };
 
     // Authorize + apply in topo order (last-writer per doc), remembering the
     // per-doc authorized ops for the restore-wins override.
@@ -270,7 +262,7 @@ mod tests {
     use super::*;
     use crate::acl::{sign_op, AclAction, AclOp, Grant};
     use crate::actor::{self, SignedEvent};
-    use crate::ids::{ActorId, SystemUlidSource, WorkspaceId};
+    use crate::ids::{ActorId, SpaceId, SystemUlidSource};
     use std::collections::BTreeMap;
 
     fn seed(n: u8) -> [u8; 32] {
@@ -279,7 +271,7 @@ mod tests {
     fn doc() -> DocId {
         DocId::mint(&SystemUlidSource)
     }
-    fn incept(n: u8, w: &WorkspaceId) -> (SignedEvent, ActorId) {
+    fn incept(n: u8, w: &SpaceId) -> (SignedEvent, ActorId) {
         actor::incept_single(&seed(n), w, [n; 16], [n ^ 0x55; 16], None)
     }
 
@@ -292,7 +284,7 @@ mod tests {
         actors: BTreeMap<u8, (ActorId, String)>,
     }
     fn fx(founder: u8, others: &[u8]) -> Fx {
-        let w = WorkspaceId::mint(&SystemUlidSource);
+        let w = SpaceId::mint(&SystemUlidSource);
         let mut events = Vec::new();
         let mut actors = BTreeMap::new();
         for n in std::iter::once(founder).chain(others.iter().copied()) {
@@ -302,7 +294,7 @@ mod tests {
         }
         Fx {
             g: Genesis {
-                workspace_id: w,
+                space_id: w,
                 founding_actors: vec![actors[&founder].0.clone()],
                 salt: [0u8; 16],
                 recovery_root: [0u8; 32],
@@ -312,8 +304,8 @@ mod tests {
         }
     }
     impl Fx {
-        fn ws(&self) -> &WorkspaceId {
-            &self.g.workspace_id
+        fn ws(&self) -> &SpaceId {
+            &self.g.space_id
         }
         fn actor(&self, n: u8) -> ActorId {
             self.actors[&n].0.clone()

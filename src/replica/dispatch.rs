@@ -5,7 +5,7 @@ use super::*;
 impl Replica {
     // ---- dispatch ----
 
-    /// Whether this request mutates workspace **content** (and so needs write
+    /// Whether this request mutates space **content** (and so needs write
     /// standing). Membership, device, and recovery ops are excluded — they carry
     /// their own admin/self gates. Anything unlisted defaults to un-gated here,
     /// so a missed variant fails open to today's behavior, never a false denial.
@@ -45,7 +45,7 @@ impl Replica {
     pub fn handle(&mut self, req: Request) -> (Response, Option<DirtySet>) {
         // View-only enforcement. A member with no Write/Admin grant (a viewer)
         // is sealed the key and reads freely, but holds no content authority, so
-        // it may not mutate workspace content. Non-members and agents are refused
+        // it may not mutate space content. Non-members and agents are refused
         // for the same reason. Device/membership/recovery ops are self- or admin-
         // gated in their own handlers, so they are NOT gated here (a viewer must
         // still manage its own devices and recover). Signed content ops

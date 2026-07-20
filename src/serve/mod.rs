@@ -302,8 +302,8 @@ struct RpcQuery {
 /// 2. **An agent's space is observable, not operable.** Writes are refused with the
 ///    agent's name in the message. Reads through an agent's daemon are exactly the
 ///    observability they were scoped in for; a *write* would be signed by the agent
-///    and land under its name. If you are a member of that workspace, write through
-///    your own space and sign as yourself — see [`spaces::scope`].
+///    and land under its name. If you are a member of that space, write through
+///    your own node and sign as yourself — see [`spaces::scope`].
 /// 3. **Destructive verbs keep the CLI's question.** `confirm_destructive` is a TTY
 ///    affordance: it refuses under `--json` because a pipe cannot be asked. A browser
 ///    can — it has a modal — so rather than bypass the gate or inherit the pipe's
@@ -349,7 +349,7 @@ async fn rpc(
                 err_json(
                     &format!(
                         "{name}'s space is read-only here — a write would be signed as {name}. \
-                         Open the same workspace from your own space to write as yourself."
+                         Open the same space through your own node to write as yourself."
                     ),
                     ErrorKind::Error,
                 ),

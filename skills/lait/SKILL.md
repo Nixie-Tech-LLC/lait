@@ -5,7 +5,7 @@ description: File and drive issues in a local-first, peer-to-peer issue tracker 
 
 # Lait: a peer-to-peer issue tracker
 
-You have a `lait` MCP server. It drives a local node that owns the workspace's
+You have a `lait` MCP server. It drives a local node that owns the space's
 Loro-CRDT issue documents over a git-backed store. Every tool returns the same
 versioned JSON DTO the CLI `--json` emits.
 
@@ -33,16 +33,16 @@ re-issue with a more specific handle.
 - `board {project}` — workflow columns × ordered rows.
 - `issue_view {reff}` — the full issue: body, comments, metadata.
 - `history {reff}` — the issue's derived activity feed.
-- `activity {since}` — workspace-wide recent transitions; pass back `last` to follow.
+- `activity {since}` — space-wide recent transitions; pass back `last` to follow.
 
 ## Multi-node & E2EE (P2P)
 Onboarding across nodes is one step: the host calls `invite_ticket` and shares it;
-the other side calls `connect`. Workspace data is end-to-end encrypted, gated by a
+the other side calls `connect`. Space data is end-to-end encrypted, gated by a
 signed membership graph — a joiner sees only ciphertext until an admin admits it:
-- `member_add {who, admin?}` — seal the workspace key to a member (admin-only).
+- `member_add {who, admin?}` — seal the space key to a member (admin-only).
 - `member_remove {who}` — revoke + rotate the key (lazy revocation; admin-only).
 - `key_rotate` / `members` — rotate the key / list members and roles.
-`who` is a presence snapshot; `status` shows the workspace + issue/project counts.
+`who` is a presence snapshot; `status` shows the space + issue/project counts.
 
 There is no compare-and-swap: an edit always applies and merges (a CRDT). Read the
 current state, act, and let it converge.

@@ -6,9 +6,9 @@ impl Replica {
     // ---- catalog-first peer sync; the network layer calls these ----
     // under the replica lock; all QUIC IO happens outside the lock. ----
 
-    /// The workspace id as a string (sync handshake guard).
-    pub fn workspace_str(&self) -> String {
-        self.workspace_id.to_string()
+    /// The space id as a string (sync handshake guard).
+    pub fn space_str(&self) -> String {
+        self.space_id.to_string()
     }
 
     /// The catalog's oplog version vector, wire-encoded (sync handshake).
@@ -42,7 +42,7 @@ impl Replica {
         self.membership.export_from_bytes(peer_vv)
     }
     /// **Puller side.** Import a membership update (plaintext), then refresh our
-    /// keyring — we may have just been added and can now decrypt the workspace.
+    /// keyring — we may have just been added and can now decrypt the space.
     pub fn import_membership(&mut self, update: &[u8]) -> Result<()> {
         self.membership.import(update)?;
         self.store.save_membership(&self.membership)?;
@@ -68,7 +68,7 @@ impl Replica {
     }
 
     /// **Provider side.** Export the catalog ops a puller at `peer_vv` lacks,
-    /// **encrypted** with the current workspace key in a blind-relay envelope.
+    /// **encrypted** with the current space key in a blind-relay envelope.
     pub fn export_catalog_from(&self, peer_vv: &[u8]) -> Result<Vec<u8>> {
         Ok(self.encrypt_payload(self.catalog.export_from_bytes(peer_vv)?))
     }

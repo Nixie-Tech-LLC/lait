@@ -451,7 +451,7 @@ pub enum DeviceResolution {
 }
 
 /// Minimum hex chars accepted as a key id-prefix (short enough to type, long
-/// enough to rarely collide across a workspace's handful of members).
+/// enough to rarely collide across a space's handful of members).
 const DEVICE_PREFIX_MIN: usize = 4;
 
 /// Resolve a `<who>` against a directory: `@me` or `me`; a full
@@ -530,7 +530,7 @@ pub fn is_hidden_by_default(catalog: &CatalogDoc, row: &RowMeta) -> bool {
 mod tests {
     use super::*;
     use crate::dto::Priority;
-    use crate::ids::{SystemUlidSource, WorkspaceId};
+    use crate::ids::{SpaceId, SystemUlidSource};
     use crate::issue::{IssueDoc, NewIssue};
 
     fn test_device() -> DeviceId {
@@ -540,8 +540,8 @@ mod tests {
         c.apply(&crate::fabric::op::OpCtx::structure("test", &test_device()));
     }
 
-    fn setup() -> (CatalogDoc, ProjectId, WorkspaceId) {
-        let ws = WorkspaceId::mint(&SystemUlidSource);
+    fn setup() -> (CatalogDoc, ProjectId, SpaceId) {
+        let ws = SpaceId::mint(&SystemUlidSource);
         let c = CatalogDoc::create(&ws, "test", None, &test_device()).unwrap();
         let p = ProjectId::mint(&SystemUlidSource);
         c.add_project(&p, "Engineering", "ENG", "blue").unwrap();
@@ -551,14 +551,14 @@ mod tests {
 
     fn add_issue(
         c: &CatalogDoc,
-        ws: &WorkspaceId,
+        ws: &SpaceId,
         p: &ProjectId,
         title: &str,
         seq_via_assign: bool,
     ) -> DocId {
         let issue = IssueDoc::create(NewIssue {
             doc_id: DocId::mint(&SystemUlidSource),
-            workspace_id: ws.clone(),
+            space_id: ws.clone(),
             project_id: p.clone(),
             title: title.into(),
             priority: Priority::Medium,

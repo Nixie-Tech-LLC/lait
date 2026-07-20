@@ -194,7 +194,7 @@ impl Replica {
         };
         // Clone viewer context up front so it doesn't conflict with the issue
         // borrow below.
-        let ws = self.workspace_id.clone();
+        let ws = self.space_id.clone();
         let canonical = self.aliases.canonical_for(&doc_id);
         let row = self.catalog.row(&doc_id);
         let project = row
@@ -217,7 +217,7 @@ impl Replica {
                     schema_version: SCHEMA_VERSION,
                     reff: canonical.clone(),
                     doc_id,
-                    workspace_id: ws.clone(),
+                    space_id: ws.clone(),
                     project_id: row.project_id,
                     project_key: project.map(|p| p.key),
                     key_alias,
@@ -256,7 +256,7 @@ impl Replica {
             schema_version: SCHEMA_VERSION,
             reff: canonical.clone(),
             doc_id: doc_id.clone(),
-            workspace_id: issue.workspace_id().unwrap_or_else(|| ws.clone()),
+            space_id: issue.space_id().unwrap_or_else(|| ws.clone()),
             project_id: issue
                 .project_id()
                 .unwrap_or_else(|| row.as_ref().unwrap().project_id.clone()),
@@ -283,7 +283,7 @@ impl Replica {
     /// The issue's history, derived from the **oplog on disk**:
     /// durable across daemon restarts, field-level, attributed (advisory) for
     /// remote changes, with DAG-derived collision flags. The per-session
-    /// activity ring stays what it is — the workspace feed's batch cursor.
+    /// activity ring stays what it is — the space feed's batch cursor.
     pub(super) fn history(&mut self, reff: String) -> Result<Response> {
         let doc_id = match self.resolve_issue(&reff) {
             Ok(id) => id,

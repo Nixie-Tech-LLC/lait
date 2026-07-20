@@ -364,7 +364,7 @@ fn check_schema_version(found: u32) -> Result<()> {
     let supported = crate::dto::SCHEMA_VERSION;
     if found > supported {
         return Err(anyhow!(
-            "this workspace store was written by a newer lait (schema v{found}); \
+            "this space store was written by a newer lait (schema v{found}); \
              this build supports up to schema v{supported} — upgrade lait to open it"
         ));
     }
@@ -375,7 +375,7 @@ fn check_schema_version(found: u32) -> Result<()> {
 mod tests {
     use super::*;
     use crate::dto::{Priority, SCHEMA_VERSION};
-    use crate::ids::WorkspaceId;
+    use crate::ids::SpaceId;
 
     #[test]
     fn schema_gate_accepts_supported_and_refuses_newer() {
@@ -403,7 +403,7 @@ mod tests {
         let store = Store::open(&home).unwrap();
         assert!(store.genesis().unwrap().is_none());
         let g = Genesis {
-            workspace_id: WorkspaceId::mint(&SystemUlidSource),
+            space_id: SpaceId::mint(&SystemUlidSource),
             founding_actors: vec![crate::ids::ActorId::from_incept_hash(&"a".repeat(64))],
             salt: [0u8; 16],
             recovery_root: [0u8; 32],
@@ -417,14 +417,14 @@ mod tests {
     fn catalog_and_issue_persist_and_reload() {
         let home = tmp_home();
         let store = Store::open(&home).unwrap();
-        let ws = WorkspaceId::mint(&SystemUlidSource);
+        let ws = SpaceId::mint(&SystemUlidSource);
         let me = crate::ids::DeviceId::from_key_string("a".repeat(64));
         let cat = CatalogDoc::create(&ws, "test", None, &me).unwrap();
         let p = ProjectId::mint(&SystemUlidSource);
         cat.add_project(&p, "Eng", "ENG", "blue").unwrap();
         let issue = IssueDoc::create(NewIssue {
             doc_id: DocId::mint(&SystemUlidSource),
-            workspace_id: ws.clone(),
+            space_id: ws.clone(),
             project_id: p.clone(),
             title: "persist me".into(),
             priority: Priority::Low,
@@ -455,7 +455,7 @@ mod tests {
     fn atomic_write_leaves_no_tmp() {
         let home = tmp_home();
         let store = Store::open(&home).unwrap();
-        let ws = WorkspaceId::mint(&SystemUlidSource);
+        let ws = SpaceId::mint(&SystemUlidSource);
         let cat = CatalogDoc::create(
             &ws,
             "test",

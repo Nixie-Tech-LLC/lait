@@ -47,7 +47,7 @@
 //!   contributions it is given; agreeing on the accepted-contributor set under
 //!   partial failure is outside this algebraic prototype.
 //!
-//! This module is not wired into the workspace authority path. It validates that
+//! This module is not wired into the space authority path. It validates that
 //! dealer-free generation yields shares the general-access signer accepts; that
 //! functional result does not establish active-adversary security.
 

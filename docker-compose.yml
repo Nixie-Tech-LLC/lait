@@ -1,13 +1,13 @@
 # An always-on lait seed node: a headless peer that stays reachable to bootstrap
-# and backfill encrypted workspace history for other nodes (A§10). It is NOT a
+# and backfill encrypted space history for other nodes (A§10). It is NOT a
 # trust authority — genesis + the signed ACL still gate every op — so a seed only
-# holds ciphertext until an admin admits it to the workspace.
+# holds ciphertext until an admin admits it to the space.
 #
 # Quick start:
 #   docker compose up -d --build
 #   docker compose exec seed lait id                 # copy the node id
 #   # from an admin node: lait members add <that-id> # let the seed hold history
-#   docker compose exec seed lait seed add <ticket>  # adopt a workspace to serve
+#   docker compose exec seed lait seed add <ticket>  # adopt a space to serve
 #   # then share this seed in your invite tickets so cold clients backfill from it
 #
 # iroh handles NAT traversal via relays, so no inbound port is strictly required.

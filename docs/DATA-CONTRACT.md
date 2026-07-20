@@ -62,7 +62,7 @@ locus, reason, and raw value.
 
 ## 4. Catalog document
 
-The catalog owns workspace display metadata, the grow-only issue registry,
+The catalog owns space display metadata, the grow-only issue registry,
 projects, labels, workflow states, and board ordering. `DocMeta` rows mirror
 selected issue fields for fast lists and discovery.
 
@@ -135,7 +135,7 @@ and sealed envelopes. It is local durability and inspectability, not replication
 
 Local machine state may include device private keys, offline actor recovery
 material, encrypted custody shares, configuration, petnames, inbox state, and a
-workspace registry. These files are outside replicated collaborative truth.
+space registry. These files are outside replicated collaborative truth.
 
 Atomic replacement protects individual durable writes. A Git commit is useful
 history but is not a distributed transaction or authorization boundary.

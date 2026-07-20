@@ -1,18 +1,18 @@
-//! `lait/space/1` — the **self-certifying workspace** and its **root lifecycle**.
+//! `lait/space/1` — the **self-certifying space** and its **root lifecycle**.
 //!
 //! Membership made *identity* self-certifying (`ActorId = H(inception)`); this
-//! does the same for the **workspace** one layer up, and gives its trust root a
+//! does the same for the **space** one layer up, and gives its trust root a
 //! **break-glass recovery** path.
 //!
 //! # Self-certifying id
 //!
 //! ```text
-//! workspace_id = ws_<crockford128( blake3("lait/space/1" ‖ device ‖ salt ‖ recovery_commit) )>
+//! space_id = ws_<crockford128( blake3("lait/space/1" ‖ device ‖ salt ‖ recovery_commit) )>
 //! ```
 //!
 //! The founding device key + a random salt + the recovery commitment are hashed
 //! into the id *before* the founding actor is incepted (an inception is scoped to
-//! a workspace id, so the id cannot depend on it). The signed inception is then
+//! a space id, so the id cannot depend on it). The signed inception is then
 //! the "Found" artifact: `ws_id` commits to the device, the inception commits to
 //! `ws_id`, and `founder_actor = H(inception)`. A joiner given
 //! `{ws_id, salt, recovery_commit, founder_inception}` verifies the chain offline.
@@ -27,7 +27,7 @@
 //! Recovery authority is **one public key** — the same shape whether it is a plain
 //! solo key or a **FROST threshold group key** produced by K-of-N holders (a group
 //! signature verifies as a plain Ed25519 signature, so the plane never sees the
-//! threshold; it lives entirely in the off-plane signing ceremony). The workspace
+//! threshold; it lives entirely in the off-plane signing ceremony). The space
 //! commits to `recovery_commit = blake3(recovery_pubkey)` in its id at birth
 //! (mirroring actor recovery's pre-rotation commitment): a `Recover`/`Rotate` is
 //! authorized when its author hashes to the current commitment.
@@ -43,10 +43,10 @@ use serde::{Deserialize, Serialize};
 use crate::actor::{self, SignedEvent};
 use crate::authority::AuthorityConfigurationId;
 use crate::genesis::Genesis;
-use crate::ids::{ActorId, DeviceId, WorkspaceId};
+use crate::ids::{ActorId, DeviceId, SpaceId};
 use crate::sigdag::{self, SignedNode};
 
-/// Domain separator for the workspace-id derivation.
+/// Domain separator for the space-id derivation.
 const SPACE_DOMAIN: &[u8] = b"lait/space/1";
 /// Signing domain for the space-event plane (recovery).
 pub const SPACE_EVENT_DOMAIN: &[u8] = b"lait/space/1/event";
@@ -57,7 +57,7 @@ pub const SPACE_EVENT_DOMAIN: &[u8] = b"lait/space/1/event";
 pub type SignedSpaceEvent = SignedNode;
 
 /// The commitment to a recovery public key: `blake3(pubkey bytes)`. This is what
-/// the workspace id binds at birth and what a `Rotate` installs for the next key.
+/// the space id binds at birth and what a `Rotate` installs for the next key.
 pub fn recovery_commit(recovery_pub: &DeviceId) -> Option<[u8; 32]> {
     let raw = hex32(recovery_pub.as_str())?;
     Some(*blake3::hash(&raw).as_bytes())
@@ -88,7 +88,7 @@ fn hex32(s: &str) -> Option<[u8; 32]> {
     v.as_slice().try_into().ok()
 }
 
-/// A workspace-plane op. All are signed by the **current recovery key** (a solo
+/// A space-plane op. All are signed by the **current recovery key** (a solo
 /// key or a FROST group key); planned admin governance rides the ACL.
 ///
 /// # Standing-authority commitment
@@ -129,7 +129,7 @@ pub enum SpaceOp {
         /// not default, it fails to decode. There is no wire migration from the
         /// earlier two-field `Rotate` — and none is needed, because no `Rotate`
         /// event is deployed. The only producer of a `Rotate` is the FROST
-        /// elevation install path (unreleased ceremony/2); solo workspaces carry
+        /// elevation install path (unreleased ceremony/2); solo spaces carry
         /// no space events beyond genesis, and genesis is `Single` by
         /// construction. An old two-field `Rotate`, were one to exist, would fail
         /// to decode and be skipped in replay — never silently mis-read as a
@@ -172,14 +172,14 @@ pub fn sign_op(
     recovery_seed: &[u8; 32],
     op: &SpaceOp,
     parents: Vec<String>,
-    workspace_id: &WorkspaceId,
+    space_id: &SpaceId,
 ) -> SignedSpaceEvent {
     sigdag::sign_node(
         SPACE_EVENT_DOMAIN,
         recovery_seed,
         op.encode(),
         parents,
-        workspace_id.as_str(),
+        space_id.as_str(),
     )
 }
 
@@ -201,13 +201,13 @@ pub struct RootState {
     pub recovered: bool,
 }
 
-/// Derive the self-certifying workspace id from the founding device, salt, and
+/// Derive the self-certifying space id from the founding device, salt, and
 /// recovery commitment. Pure and deterministic.
-pub fn derive_workspace_id(
+pub fn derive_space_id(
     founding_device: &DeviceId,
     salt: &[u8; 16],
     recovery_commit: &[u8; 32],
-) -> WorkspaceId {
+) -> SpaceId {
     let mut h = blake3::Hasher::new();
     h.update(SPACE_DOMAIN);
     h.update(founding_device.as_str().as_bytes());
@@ -216,26 +216,26 @@ pub fn derive_workspace_id(
     let digest = h.finalize();
     let mut d16 = [0u8; 16];
     d16.copy_from_slice(&digest.as_bytes()[..16]);
-    WorkspaceId::from_digest(d16)
+    SpaceId::from_digest(d16)
 }
 
-/// Verify a workspace's founding commitment and return the **verified** founding
+/// Verify a space's founding commitment and return the **verified** founding
 /// actor to root genesis on. Checks, all offline:
 /// 1. `ws_id` commits to the inception's signing device + `salt` + `recovery_commit`;
 /// 2. the inception is a valid, `ws_id`-scoped founding key-event.
 pub fn verify_founding(
-    ws_id: &WorkspaceId,
+    ws_id: &SpaceId,
     salt: &[u8; 16],
     recovery_commit: &[u8; 32],
     founder_inception: &SignedEvent,
 ) -> Result<ActorId> {
-    if derive_workspace_id(&founder_inception.author, salt, recovery_commit) != *ws_id {
-        bail!("workspace id does not commit to this founder — ticket is forged or corrupt");
+    if derive_space_id(&founder_inception.author, salt, recovery_commit) != *ws_id {
+        bail!("space id does not commit to this founder — ticket is forged or corrupt");
     }
     let founder_actor = ActorId::from_incept_hash(&founder_inception.hash());
     let plane = actor::replay(ws_id, std::slice::from_ref(founder_inception));
     if !plane.exists(&founder_actor) {
-        bail!("founding inception is not valid for this workspace");
+        bail!("founding inception is not valid for this space");
     }
     Ok(founder_actor)
 }
@@ -244,11 +244,11 @@ pub fn verify_founding(
 /// `genesis.founding_actors` / `genesis.recovery_root`, then applies each op —
 /// authored by the current recovery key — in generation order. Deterministic and
 /// convergent: same events → same `RootState` on every replica, order-independent.
-pub fn replay(genesis: &Genesis, ws_id: &WorkspaceId, events: &[SignedSpaceEvent]) -> RootState {
+pub fn replay(genesis: &Genesis, ws_id: &SpaceId, events: &[SignedSpaceEvent]) -> RootState {
     let mut state = RootState {
         root: genesis.founding_actors.clone(),
         recovery_commit: genesis.recovery_root,
-        // Every workspace is born a solo authority; a `Rotate`/`Reshare` moves it.
+        // Every space is born a solo authority; a `Rotate`/`Reshare` moves it.
         configuration: AuthorityConfigurationId::single(),
         gen: 0,
         recovered: false,
@@ -328,22 +328,22 @@ mod tests {
         seed: [u8; 32],
         salt: [u8; 16],
         recovery_commit: [u8; 32],
-    ) -> (WorkspaceId, SignedEvent, ActorId) {
-        let ws = derive_workspace_id(&device_of(&seed), &salt, &recovery_commit);
+    ) -> (SpaceId, SignedEvent, ActorId) {
+        let ws = derive_space_id(&device_of(&seed), &salt, &recovery_commit);
         let (incept, actor) = incept_single(&seed, &ws, [1u8; 16], [2u8; 16], None);
         (ws, incept, actor)
     }
 
-    fn genesis_with(ws: &WorkspaceId, founder: &ActorId, salt: [u8; 16], rc: [u8; 32]) -> Genesis {
+    fn genesis_with(ws: &SpaceId, founder: &ActorId, salt: [u8; 16], rc: [u8; 32]) -> Genesis {
         Genesis {
-            workspace_id: ws.clone(),
+            space_id: ws.clone(),
             founding_actors: vec![founder.clone()],
             salt,
             recovery_root: rc,
         }
     }
 
-    fn a_new_actor(seed: [u8; 32], ws: &WorkspaceId) -> ActorId {
+    fn a_new_actor(seed: [u8; 32], ws: &SpaceId) -> ActorId {
         incept_single(&seed, ws, [7u8; 16], [8u8; 16], None).1
     }
 
@@ -355,7 +355,7 @@ mod tests {
             verify_founding(&ws, &[9u8; 16], &rc, &incept).unwrap(),
             actor
         );
-        assert!(WorkspaceId::parse(ws.as_str()).is_some());
+        assert!(SpaceId::parse(ws.as_str()).is_some());
     }
 
     #[test]

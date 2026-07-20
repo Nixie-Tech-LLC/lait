@@ -205,7 +205,7 @@ pub enum Request {
     /// Work-state verbs: each is one commit and one activity row,
     /// bundling the fields a single human intent moves. Targets are picked by
     /// workflow *category* (first Active / Done / Backlog state), so they track
-    /// whatever the workspace's column set is. They return `Response::Issue`
+    /// whatever the space's column set is. They return `Response::Issue`
     /// (a fresh snapshot) — the one deviation from writes-echo-Ref, because the
     /// CLI needs the title to derive the git branch name.
     IssueStart {
@@ -272,7 +272,7 @@ pub enum Request {
         who: String,
     },
     /// Sponsor an agent keypair. Any human member may sponsor;
-    /// the agent is sealed the workspace key but holds no membership or content
+    /// the agent is sealed the space key but holds no membership or content
     /// authority, and its standing dies with the sponsor.
     AgentAdd {
         /// The agent's ed25519 public key (64-hex).
@@ -289,7 +289,7 @@ pub enum Request {
     /// actor (lait/actor/1). The new machine consumes it with `device accept`.
     DeviceInvite,
     /// Add a device to our actor from its consent blob (produced by
-    /// `device accept`), sealing it the workspace key.
+    /// `device accept`), sealing it the space key.
     DeviceAdd {
         /// Hex-encoded consent binding from the joining device.
         consent: String,
@@ -300,12 +300,12 @@ pub enum Request {
     },
     /// List the device keys currently bound to our actor.
     DeviceList,
-    /// Break-glass **workspace** recovery (lait/space/1 W5): re-root the workspace
-    /// to this device using the offline workspace recovery keys, as threshold
+    /// Break-glass **space** recovery (lait/space/1 W5): re-root the space
+    /// to this device using the offline space recovery keys, as threshold
     /// `Recover` events. Distinct from [`Recover`](Self::Recover), which resets a
     /// single actor's devices.
     SpaceRecover,
-    /// Elevate the workspace recovery authority from a solo bootstrap key to a
+    /// Elevate the space recovery authority from a solo bootstrap key to a
     /// `k`-of-N FROST group key over `cofounders` (device keys) + this device,
     /// via a dealer-free DKG that rides the synced ceremony bulletin board.
     SpaceElevate {
@@ -380,12 +380,12 @@ pub enum Request {
     Status,
     /// Guided-join verifier (`docs/UI.md`, joining): project live
     /// node state into an ordered list of onboarding gates so a stalled joiner
-    /// gets one legible blocker instead of a blank board. `expected_workspace`
+    /// gets one legible blocker instead of a blank board. `expected_space`
     /// (supplied by the `join` tail from the invite ticket) lets it catch a
     /// directory/store mismatch; `None` for a standalone `doctor`.
     Diagnose {
         #[serde(default)]
-        expected_workspace: Option<String>,
+        expected_space: Option<String>,
     },
     Id,
     /// Mint an invite ticket. By default it carries a signed, single-use
@@ -410,7 +410,7 @@ pub enum Request {
         ticket: String,
     },
     /// Pin an always-on seed peer. `arg` is a room ticket (adopt the
-    /// workspace + backfill) or a bare endpoint id (pin only). Sticky across
+    /// space + backfill) or a bare endpoint id (pin only). Sticky across
     /// restarts; grants no trust.
     SeedAdd {
         arg: String,
@@ -654,14 +654,14 @@ pub struct PresenceEntry {
 pub struct StatusInfo {
     pub id: String,
     pub nick: String,
-    /// The workspace display name (synced catalog value; empty on a joiner
+    /// The space display name (synced catalog value; empty on a joiner
     /// whose catalog hasn't arrived yet).
     pub name: String,
     pub online_peers: usize,
-    pub workspace: Option<String>,
+    pub space: Option<String>,
     pub issues: usize,
     pub projects: usize,
-    /// This node's standing in the workspace ACL: `admin` | `member` | `pending`.
+    /// This node's standing in the space ACL: `admin` | `member` | `pending`.
     /// `pending` means we joined from an invite but an admin hasn't approved us
     /// yet, so we cannot decrypt the board. Lets `status` tell a joiner
     /// the truth instead of implying the join already succeeded.

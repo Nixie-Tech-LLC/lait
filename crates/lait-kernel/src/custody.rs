@@ -19,9 +19,9 @@
 //! that DEK a different way, so adding an unlock path never re-encrypts the
 //! secret and never requires having all paths present at once.
 //!
-//! The package binds itself to its context — workspace, authority, ceremony,
+//! The package binds itself to its context — space, authority, ceremony,
 //! principal and leaf — so a restored share cannot be silently reopened against
-//! the wrong workspace or mistaken for a different holder's. [`SharePayload`] is
+//! the wrong space or mistaken for a different holder's. [`SharePayload`] is
 //! an enum rather than raw bytes so the same envelope can carry a general-access
 //! share without a format change.
 
@@ -29,8 +29,8 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::authority::{AuthorityId, AuthorityScheme, LeafId, PrincipalId};
-use crate::crypto::{self, WorkspaceKey};
-use crate::ids::{DeviceId, WorkspaceId};
+use crate::crypto::{self, SpaceKey};
+use crate::ids::{DeviceId, SpaceId};
 
 /// Current package format version.
 pub const PACKAGE_VERSION: u16 = 1;
@@ -123,7 +123,7 @@ pub struct FrostSharePayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthoritySharePackage {
     pub version: u16,
-    pub workspace: WorkspaceId,
+    pub space: SpaceId,
     pub authority: AuthorityId,
     pub ceremony: String,
     pub scheme: AuthorityScheme,
@@ -137,12 +137,12 @@ pub struct AuthoritySharePackage {
 /// What a package must match to be accepted after a restore.
 ///
 /// Verification is a *comparison against expectations*, never a report of what
-/// the package says about itself: a package that names its own workspace proves
+/// the package says about itself: a package that names its own space proves
 /// nothing, and accepting one because its fields are internally consistent is
-/// how a share for the wrong workspace, or another holder's share, gets adopted.
+/// how a share for the wrong space, or another holder's share, gets adopted.
 #[derive(Debug, Clone)]
 pub struct PackageExpectation<'a> {
-    pub workspace: &'a WorkspaceId,
+    pub space: &'a SpaceId,
     pub authority: &'a AuthorityId,
     pub ceremony: &'a str,
     pub leaf: &'a LeafId,
@@ -156,7 +156,7 @@ impl AuthoritySharePackage {
     /// Build a package, encrypting `payload` under a fresh DEK wrapped by every
     /// slot in `slot_specs`.
     pub fn seal(
-        workspace: &WorkspaceId,
+        space: &SpaceId,
         authority: &AuthorityId,
         ceremony: &str,
         principal: &PrincipalId,
@@ -176,7 +176,7 @@ impl AuthoritySharePackage {
             .collect::<Result<Vec<_>>>()?;
         Ok(AuthoritySharePackage {
             version: PACKAGE_VERSION,
-            workspace: workspace.clone(),
+            space: space.clone(),
             authority: authority.clone(),
             ceremony: ceremony.to_string(),
             scheme: authority_scheme_of(payload),
@@ -222,8 +222,8 @@ impl AuthoritySharePackage {
         key: &UnlockKey,
         expect: &PackageExpectation<'_>,
     ) -> Result<SharePayload> {
-        if &self.workspace != expect.workspace {
-            return Err(anyhow!("this package belongs to a different workspace"));
+        if &self.space != expect.space {
+            return Err(anyhow!("this package belongs to a different space"));
         }
         if &self.authority != expect.authority {
             return Err(anyhow!("this package belongs to a different authority"));
@@ -292,7 +292,7 @@ pub enum SlotSpec {
 }
 
 impl SlotSpec {
-    fn wrap(&self, dek: &WorkspaceKey) -> Result<KeySlot> {
+    fn wrap(&self, dek: &SpaceKey) -> Result<KeySlot> {
         match self {
             SlotSpec::WindowsDpapi { wrapped_dek } => Ok(KeySlot::WindowsDpapi {
                 wrapped_dek: wrapped_dek.clone(),
@@ -336,10 +336,10 @@ pub enum UnlockKey {
 }
 
 impl UnlockKey {
-    fn unwrap(&self, slot: &KeySlot) -> Option<WorkspaceKey> {
+    fn unwrap(&self, slot: &KeySlot) -> Option<SpaceKey> {
         match (self, slot) {
             (UnlockKey::Dpapi { dek }, KeySlot::WindowsDpapi { .. }) => {
-                WorkspaceKey::try_from(dek.as_slice()).ok()
+                SpaceKey::try_from(dek.as_slice()).ok()
             }
             (
                 UnlockKey::RecoveryKey { seed, me },
@@ -349,7 +349,7 @@ impl UnlockKey {
                 },
             ) if recipient == me => {
                 let raw = crypto::open_sealed(seed, me, wrapped_dek)?;
-                WorkspaceKey::try_from(raw.as_slice()).ok()
+                SpaceKey::try_from(raw.as_slice()).ok()
             }
             (
                 UnlockKey::Passphrase(p),
@@ -361,7 +361,7 @@ impl UnlockKey {
             ) => {
                 let kek = derive_passphrase_key(p, salt, params).ok()?;
                 let raw = crypto::aead_decrypt(&kek, wrapped_dek)?;
-                WorkspaceKey::try_from(raw.as_slice()).ok()
+                SpaceKey::try_from(raw.as_slice()).ok()
             }
             _ => None,
         }
@@ -375,7 +375,7 @@ fn derive_passphrase_key(
     passphrase: &str,
     salt: &[u8; 16],
     params: &Argon2Params,
-) -> Result<WorkspaceKey> {
+) -> Result<SpaceKey> {
     let params = argon2::Params::new(params.m_cost_kib, params.t_cost, params.p_cost, Some(32))
         .map_err(|e| anyhow!("argon2 parameters rejected: {e}"))?;
     let a2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
@@ -402,14 +402,14 @@ mod tests {
     }
 
     fn fixture() -> (
-        WorkspaceId,
+        SpaceId,
         AuthorityId,
         PrincipalId,
         LeafId,
         SharePayload,
         DeviceId,
     ) {
-        let ws = WorkspaceId::mint(&SystemUlidSource);
+        let ws = SpaceId::mint(&SystemUlidSource);
         let (holders, group_key) = crate::dkg::tests_support::run_dkg(3, 2);
         let (share, pkp) = holders[&1].clone();
         let device = crypto::device_from_seed(&[1u8; 32]);
@@ -561,7 +561,7 @@ mod tests {
         .unwrap();
         let key = UnlockKey::Passphrase("pass".into());
         let good = PackageExpectation {
-            workspace: &ws,
+            space: &ws,
             authority: &authority,
             ceremony: "ceremony-1",
             leaf: &leaf,
@@ -570,12 +570,12 @@ mod tests {
         };
         assert!(pkg.verify_and_open(&key, &good).is_ok());
 
-        let other_ws = WorkspaceId::mint(&SystemUlidSource);
+        let other_ws = SpaceId::mint(&SystemUlidSource);
         assert!(pkg
             .verify_and_open(
                 &key,
                 &PackageExpectation {
-                    workspace: &other_ws,
+                    space: &other_ws,
                     ..good.clone()
                 }
             )
@@ -623,7 +623,7 @@ mod tests {
     /// authority on it.
     #[test]
     fn a_package_with_unusable_private_material_is_refused() {
-        let ws = WorkspaceId::mint(&SystemUlidSource);
+        let ws = SpaceId::mint(&SystemUlidSource);
         let (forged, pkp, group_key) = crate::dkg::tests_support::share_with_foreign_secret();
         let device = crypto::device_from_seed(&[1u8; 32]);
         let principal = PrincipalId::of_device(&device);
@@ -661,7 +661,7 @@ mod tests {
             .verify_and_open(
                 &key,
                 &PackageExpectation {
-                    workspace: &ws,
+                    space: &ws,
                     authority: &authority,
                     ceremony: "ceremony-1",
                     leaf: &leaf,

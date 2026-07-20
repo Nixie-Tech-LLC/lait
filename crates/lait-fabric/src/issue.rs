@@ -21,7 +21,7 @@ use anyhow::{anyhow, Result};
 use loro::{ExportMode, Frontiers, LoroDoc};
 
 use crate::dto::{CommentDto, CorruptRecord, Priority, Projected, DEFAULT_STATUS};
-use crate::ids::{ActorId, DeviceId, DocId, LabelId, ProjectId, WorkspaceId};
+use crate::ids::{ActorId, DeviceId, DocId, LabelId, ProjectId, SpaceId};
 
 use crate::loro_ext as lx;
 use crate::op::{self, OpCtx};
@@ -64,7 +64,6 @@ pub(crate) fn project_comment(m: &loro::LoroMap, locus: String) -> Projected<Com
 
 const ROOT: &str = "issue";
 const K_ID: &str = "id";
-const K_WORKSPACE: &str = "workspaceId";
 const K_PROJECT: &str = "projectId";
 const K_TITLE: &str = "title";
 const K_STATUS: &str = "status";
@@ -79,7 +78,7 @@ const C_COMMENTS: &str = "comments";
 /// Parameters for creating a fresh issue.
 pub struct NewIssue {
     pub doc_id: DocId,
-    pub workspace_id: WorkspaceId,
+    pub space_id: SpaceId,
     pub project_id: ProjectId,
     pub title: String,
     pub priority: Priority,
@@ -108,7 +107,7 @@ impl IssueDoc {
         op::configure(&doc, spec.peer);
         let root = doc.get_map(ROOT);
         root.insert(K_ID, spec.doc_id.as_str())?;
-        root.insert(K_WORKSPACE, spec.workspace_id.as_str())?;
+        root.insert(lx::K_SPACE, spec.space_id.as_str())?;
         root.insert(K_PROJECT, spec.project_id.as_str())?;
         root.insert(K_TITLE, spec.title.as_str())?;
         root.insert(K_STATUS, DEFAULT_STATUS)?;
@@ -217,8 +216,8 @@ impl IssueDoc {
     pub fn doc_id(&self) -> Option<DocId> {
         lx::get_str(&self.root(), K_ID).and_then(|s| DocId::parse(&s))
     }
-    pub fn workspace_id(&self) -> Option<WorkspaceId> {
-        lx::get_str(&self.root(), K_WORKSPACE).and_then(|s| WorkspaceId::parse(&s))
+    pub fn space_id(&self) -> Option<SpaceId> {
+        lx::get_str(&self.root(), lx::K_SPACE).and_then(|s| SpaceId::parse(&s))
     }
     pub fn project_id(&self) -> Option<ProjectId> {
         lx::get_str(&self.root(), K_PROJECT).and_then(|s| ProjectId::parse(&s))
@@ -392,8 +391,8 @@ mod tests {
     use super::*;
     use crate::ids::SystemUlidSource;
 
-    fn ws() -> WorkspaceId {
-        WorkspaceId::mint(&SystemUlidSource)
+    fn ws() -> SpaceId {
+        SpaceId::mint(&SystemUlidSource)
     }
     fn prj() -> ProjectId {
         ProjectId::mint(&SystemUlidSource)
@@ -414,7 +413,7 @@ mod tests {
     fn sample() -> IssueDoc {
         IssueDoc::create(NewIssue {
             doc_id: doc(),
-            workspace_id: ws(),
+            space_id: ws(),
             project_id: prj(),
             title: "fix login".into(),
             priority: Priority::High,

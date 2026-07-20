@@ -6,7 +6,7 @@ owns or merges Loro documents independently.
 
 ## 1. Product model
 
-A space is a local replica of a shared workspace. Run `lait init` to found one
+A space is a local replica of a shared issue tracker. Run `lait init` to found one
 or `lait join` to create a replica from an invite. Other commands require an
 existing space and never create one as a side effect.
 
@@ -54,7 +54,7 @@ than relying on a prompt.
 
 `lait serve` starts a loopback-only web application that can list locally known
 spaces and attach to their daemons. It is a local client and supervisor, not an
-iroh peer and not a workspace member.
+iroh peer and not a space member.
 
 The server uses a per-run bearer capability and origin/rebinding checks. A
 browser may list navigation metadata without waking every daemon. Attaching to a
@@ -112,12 +112,12 @@ current actor:
   recovery key.
 
 Space recovery and custody are separate from actor device recovery. Their
-commands operate on the workspace recovery authority and require explicit
+commands operate on the space recovery authority and require explicit
 expected targets before a device contributes sensitive material.
 
 ## 7. Joining
 
-An invite carries the workspace trust anchor, founding actor information, a peer
+An invite carries the space trust anchor, founding actor information, a peer
 address, and optionally an admin-signed admission grant. Joining creates a new
 local store before the daemon starts.
 
@@ -126,7 +126,7 @@ automatically. Otherwise the join remains pending until an admin approves it.
 Pending nodes may discover peers and exchange membership state but cannot read
 encrypted collaborative content.
 
-`lait doctor` reports onboarding gates in order: workspace, daemon, membership,
+`lait doctor` reports onboarding gates in order: space, daemon, membership,
 peer reachability, sync, and key/custody health where applicable. It distinguishes
 waiting from failure instead of presenting an empty board as success.
 

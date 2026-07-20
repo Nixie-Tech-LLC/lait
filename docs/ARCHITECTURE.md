@@ -76,7 +76,7 @@ Lait has three distinct signed planes:
    unsigned CRDT values.
 
 Each plane is a grow-only set of signed, content-addressed events. Replicas
-converge by deterministic replay from the workspace genesis, rejecting invalid
+converge by deterministic replay from the space genesis, rejecting invalid
 signatures, invalid ancestry, unresolved actor claims, and unauthorized actions.
 Loro transports the event sets but does not adjudicate them.
 
@@ -95,7 +95,7 @@ sites listed in the roadmap.
 
 ## Encryption and key epochs
 
-Collaborative payloads are encrypted with a workspace content key. Key epochs
+Collaborative payloads are encrypted with a space content key. Key epochs
 are signed, content-addressed records; concurrent rotations coexist and the
 active tip is selected deterministically. Ciphertext identifies its epoch so
 older held keys remain usable.
@@ -114,8 +114,8 @@ until it can encrypt under the active epoch.
 
 ## Networking
 
-Each device's iroh endpoint key is its `DeviceId`. Workspace identity comes
-from a `WorkspaceId` and genesis, not a display name. Tickets carry the workspace
+Each device's iroh endpoint key is its `DeviceId`. Space identity comes
+from a `SpaceId` and genesis, not a display name. Tickets carry the space
 anchor, founder actor information, and optional invite authorization.
 
 Signed gossip announces presence and changed heads. Direct QUIC protocols probe
@@ -129,7 +129,7 @@ The exact compatibility contract is in [`PROTOCOL.md`](./PROTOCOL.md).
 
 Each space has a store containing genesis, Loro snapshots, signed authority
 events, and sealed envelopes. Device secrets, actor recovery material, custody
-shares, petnames, configuration, the inbox, and workspace navigation are local
+shares, petnames, configuration, the inbox, and space navigation are local
 machine state and are not synchronized as collaborative data.
 
 Secrets do touch local disk. The security boundary is that plaintext secrets are

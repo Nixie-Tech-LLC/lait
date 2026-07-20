@@ -8,7 +8,7 @@ not an audit report. Novel protocol code remains unaudited.
 - collaborative issue content and history;
 - membership and grant integrity;
 - actor continuity across device changes;
-- workspace and actor recovery authority;
+- space and actor recovery authority;
 - device private keys, recovery keys, and custody shares;
 - attribution of signed authority actions;
 - availability of enough replicas and recovery holders.
@@ -19,10 +19,10 @@ The local process, operating-system account, and readable local secret files are
 inside the device trust boundary. Iroh peers, gossip participants, replicated
 bytes, relays, display names, clocks, and network paths are untrusted.
 
-Genesis is the workspace trust anchor. Signed event validity is established by
-domain-separated signatures, workspace binding, ancestry, deterministic replay,
+Genesis is the space trust anchor. Signed event validity is established by
+domain-separated signatures, space binding, ancestry, deterministic replay,
 actor-at-position resolution, and standing. Network identity alone does not
-grant workspace authority.
+grant space authority.
 
 ## Adversaries considered
 
@@ -60,10 +60,10 @@ grant workspace authority.
   device already copied.
 - **Endpoint compromise.** Malware running as the user can read local plaintext
   and usable keys and can act with the device's current authority.
-- **Recovery-root compromise.** Possession of an actor or workspace recovery
+- **Recovery-root compromise.** Possession of an actor or space recovery
   root may permit takeover within the authority that root controls.
 - **Traffic analysis.** Encryption does not hide peer addresses, timing, sizes,
-  workspace participation, or all membership metadata.
+  space participation, or all membership metadata.
 - **Availability.** Peers can withhold data, disappear, or refuse ceremony
   participation. Cryptography does not guarantee a quorum will be online.
 - **Unsigned content attribution.** An actor id stored in ordinary CRDT content
@@ -79,7 +79,7 @@ grant workspace authority.
 ### Device key
 
 A compromised current device can sign as itself and exercise the grants of any
-actor it validly represents. Revoke the device and rotate the workspace content
+actor it validly represents. Revoke the device and rotate the space content
 key. Previously received content remains exposed.
 
 ### Actor recovery key
@@ -88,9 +88,9 @@ The recovery key can reset the actor's device set. Keep it offline. Loss may mak
 actor recovery impossible; compromise may allow actor takeover. Co-signed actor
 recovery is not part of actor protocol v1.
 
-### Workspace recovery authority
+### Space recovery authority
 
-Workspace recovery can re-root broader space authority. Threshold and
+Space recovery can re-root broader space authority. Threshold and
 general-access arrangements reduce dependence on one device but add novel DKG,
 resharing, custody, and transition code. Operators must not treat these paths as
 independently audited.
@@ -100,13 +100,13 @@ independently audited.
 `lait serve` binds only to loopback and uses a per-run bearer token. Listing
 spaces must not start every daemon, and attaching to a space must preserve the
 selected local identity. Browser-origin and rebinding defenses protect the local
-control capability; the browser is not a peer or workspace member.
+control capability; the browser is not a peer or space member.
 
 ## Security maintenance
 
 Security claims must have tests at the boundary that enforces them. Protocol
 changes require adversarial cases for malformed encodings, signature replay,
-wrong-workspace substitution, concurrency, recovery precedence, and key absence.
+wrong-space substitution, concurrency, recovery precedence, and key absence.
 
 Independent review should cover the actor protocol, ACL replay, epoch healing,
 content authority, FROST integration, general-access signing, DKG, resharing,

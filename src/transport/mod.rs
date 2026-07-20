@@ -34,7 +34,7 @@ pub type PeerId = DeviceId;
 /// A protocol selector for a direct connection (lait's ALPNs: sync, presence).
 pub type Alpn = &'static [u8];
 
-/// A gossip room id — a pure function of the workspace id ([`crate::proto`]).
+/// A gossip room id — a pure function of the space id ([`crate::proto`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Topic(pub [u8; 32]);
 

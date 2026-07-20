@@ -81,14 +81,14 @@ cargo build --release   # → target/release/lait
 ## Docker — always-on seed node
 
 A seed is a headless peer that stays reachable to bootstrap and backfill
-encrypted workspace history for other nodes. It holds only ciphertext until an
+encrypted space history for other nodes. It holds only ciphertext until an
 admin admits it.
 
 ```sh
 docker compose up -d --build          # from the repo root
 docker compose exec seed lait id      # copy the node id
 # from an admin node:  lait members add <that-id>
-docker compose exec seed lait join <invite-ticket>     # bootstrap the workspace to serve
+docker compose exec seed lait join <invite-ticket>     # bootstrap the space to serve
 ```
 
 See [`docker-compose.yml`](../docker-compose.yml) for details. iroh handles NAT

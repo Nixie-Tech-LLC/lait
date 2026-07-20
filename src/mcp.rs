@@ -302,13 +302,13 @@ pub struct MemberAliasArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct JoinArgs {
-    /// A base32 workspace ticket from `invite_ticket`.
+    /// A base32 space ticket from `invite_ticket`.
     pub ticket: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ConnectArgs {
-    /// A base32 workspace ticket from a coworker's `invite_ticket`.
+    /// A base32 space ticket from a coworker's `invite_ticket`.
     pub ticket: String,
 }
 
@@ -641,7 +641,7 @@ impl LaitMcp {
         self.run(Request::LabelList).await
     }
 
-    #[tool(description = "Workspace-wide recent transitions (the pulled activity feed).")]
+    #[tool(description = "Space-wide recent transitions (the pulled activity feed).")]
     async fn activity(
         &self,
         Parameters(a): Parameters<ActivityArgs>,
@@ -651,7 +651,7 @@ impl LaitMcp {
 
     // ---- membership and authorization ----
 
-    #[tool(description = "Add a workspace member (admin-only); seals them the workspace key.")]
+    #[tool(description = "Add a space member (admin-only); seals them the space key.")]
     async fn member_add(
         &self,
         Parameters(a): Parameters<MemberAddArgs>,
@@ -665,7 +665,7 @@ impl LaitMcp {
     }
 
     #[tool(
-        description = "Remove a workspace member (admin-only) and rotate the key (lazy revocation)."
+        description = "Remove a space member (admin-only) and rotate the key (lazy revocation)."
     )]
     async fn member_remove(
         &self,
@@ -686,12 +686,12 @@ impl LaitMcp {
         self.run(Request::AgentAdd { key: a.key }).await
     }
 
-    #[tool(description = "Rotate the workspace key (admin-only).")]
+    #[tool(description = "Rotate the space key (admin-only).")]
     async fn key_rotate(&self) -> Result<CallToolResult, McpError> {
         self.run(Request::KeyRotate).await
     }
 
-    #[tool(description = "List workspace members and their roles (from the signed ACL).")]
+    #[tool(description = "List space members and their roles (from the signed ACL).")]
     async fn members(&self) -> Result<CallToolResult, McpError> {
         self.run(Request::Members).await
     }
@@ -710,7 +710,7 @@ impl LaitMcp {
     }
 
     #[tool(
-        description = "Approve a pending join request by id-prefix / key (admin-only); seals them the workspace key. The joiner's nick is not a valid ref (unauthenticated) — pass `alias` to name them locally."
+        description = "Approve a pending join request by id-prefix / key (admin-only); seals them the space key. The joiner's nick is not a valid ref (unauthenticated) — pass `alias` to name them locally."
     )]
     async fn member_approve(
         &self,
@@ -739,22 +739,20 @@ impl LaitMcp {
 
     // ---- transport / presence ----
 
-    #[tool(
-        description = "Show node + workspace status: id, nick, workspace, issue/project counts."
-    )]
+    #[tool(description = "Show node + space status: id, nick, space, issue/project counts.")]
     async fn status(&self) -> Result<CallToolResult, McpError> {
         self.run(Request::Status).await
     }
 
     #[tool(
         description = "Guided-join verifier: an ordered readout of the onboarding gates \
-                       (workspace, daemon, membership, peer, sync) with the one blocker \
+                       (space, daemon, membership, peer, sync) with the one blocker \
                        named in `blocked_on`. Use it to explain why the board is empty or \
                        a join hasn't completed."
     )]
     async fn doctor(&self) -> Result<CallToolResult, McpError> {
         self.run(Request::Diagnose {
-            expected_workspace: None,
+            expected_space: None,
         })
         .await
     }
@@ -765,7 +763,7 @@ impl LaitMcp {
     }
 
     #[tool(
-        description = "Produce a base32 workspace ticket to share so a coworker can join. The ticket carries a signed, single-use pass so they are auto-admitted on join (no separate approve step)."
+        description = "Produce a base32 space ticket to share so a coworker can join. The ticket carries a signed, single-use pass so they are auto-admitted on join (no separate approve step)."
     )]
     async fn invite_ticket(&self) -> Result<CallToolResult, McpError> {
         self.run(Request::Invite {
@@ -777,9 +775,9 @@ impl LaitMcp {
     }
 
     #[tool(
-        description = "Connect to the bound workspace via a ticket for it and broadcast a request \
+        description = "Connect to the bound space via a ticket for it and broadcast a request \
                        to be added. MCP runs against an already-bound store: a ticket for a \
-                       different workspace errors (join it with the CLI first)."
+                       different space errors (join it with the CLI first)."
     )]
     async fn join_room(
         &self,
@@ -788,9 +786,7 @@ impl LaitMcp {
         self.run(Request::Join { ticket: a.ticket }).await
     }
 
-    #[tool(
-        description = "One-step onboarding: connect to a workspace from a ticket (joins + live)."
-    )]
+    #[tool(description = "One-step onboarding: connect to a space from a ticket (joins + live).")]
     async fn connect(
         &self,
         Parameters(a): Parameters<ConnectArgs>,

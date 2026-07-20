@@ -1,13 +1,13 @@
 //! On-disk state: identity, store discovery, and layered local settings.
 //!
 //! Two locations (DUR-5): a **global identity** (the `secret.key`, under the
-//! platform config dir) and a **per-repo workspace store** (the `.lait/`
+//! platform config dir) and a **per-repo space store** (the `.lait/`
 //! dir discovered git-style by walking up from the cwd). One identity spans every
 //! repo-bound store, like a single `git` `user.email` across many repos.
 //! `$LAIT_HOME` collapses both into one self-contained dir (tests, `--home`,
 //! advanced setups).
 //!
-//! Discovery **never creates a store**: workspaces come into being only through
+//! Discovery **never creates a store**: spaces come into being only through
 //! the two explicit verbs (`lait init` founds, `lait join` bootstraps from a
 //! ticket) via [`store_dir_for_init`]. Every other command resolves an existing
 //! store or fails with [`NoStoreHere`] — the silent decoy-store auto-create (and
@@ -16,7 +16,7 @@
 //! Settings are git-style layered key/value maps ([`Settings`]): a global
 //! `config.json` under the config root and a per-store `config.json` inside
 //! `.lait/`, nearest (store) wins. Keys are validated against the static
-//! [`KEYS`] table; the `workspace.*` namespace is reserved for future settings
+//! [`KEYS`] table; the `space.*` namespace is reserved for future settings
 //! synced through the Catalog.
 
 use std::{
@@ -51,10 +51,10 @@ pub fn registry() -> Result<(Registry, PathBuf)> {
     Ok((Registry::new(base), root.join("sessions.json")))
 }
 
-/// The per-repo workspace store directory name, discovered git-style.
+/// The per-repo space store directory name, discovered git-style.
 const STORE_DIR: &str = ".lait";
 
-/// Walk up from `start` for an existing `.lait/` workspace store, so a
+/// Walk up from `start` for an existing `.lait/` space store, so a
 /// command run anywhere inside a repo binds that repo's store (like `git`
 /// finding `.git`). Returns the store dir, or `None` if none exists above `start`.
 fn find_store_dir(start: &Path) -> Option<PathBuf> {
@@ -99,7 +99,7 @@ fn strip_extended_prefix(p: PathBuf) -> PathBuf {
 }
 
 /// Drop a `.gitignore` into a fresh store so the parent repo never accidentally
-/// commits this node's local workspace replica + daemon state — it syncs over
+/// commits this node's local space replica + daemon state — it syncs over
 /// P2P, and (like `.git/`) is per-node, not source. No-op if one already exists.
 fn ensure_store_gitignore(store: &Path) {
     let p = store.join(".gitignore");
@@ -111,7 +111,7 @@ fn ensure_store_gitignore(store: &Path) {
     }
 }
 
-/// Typed "no workspace store here" error, so callers (the app dispatcher) can
+/// Typed "no space store here" error, so callers (the app dispatcher) can
 /// tell "nothing to bind" apart from real I/O failures and print the guided
 /// error (`lait init` / `lait join` / `-w`) instead of a bare failure.
 #[derive(Debug)]
@@ -123,18 +123,18 @@ impl std::fmt::Display for NoStoreHere {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "no lait workspace found here (searched up from {})",
+            "no lait space found here (searched up from {})",
             self.cwd.display()
         )
     }
 }
 impl std::error::Error for NoStoreHere {}
 
-/// Resolve the **existing** workspace store for this invocation — never
+/// Resolve the **existing** space store for this invocation — never
 /// creating one. Precedence:
 ///   1. an explicit named identity (`resume`/`--as`) — a self-contained home
 ///      under the identity registry (created on demand: it is an identity
-///      container, not a workspace).
+///      container, not a space).
 ///   2. `$LAIT_HOME` — explicit, self-contained override (identity + store
 ///      in one dir): `--home`, tests, advanced setups.
 ///   3. `$LAIT_STORE` — pin set by the CLI for the daemon it spawns (and by
@@ -416,12 +416,12 @@ mod tests {
     }
 
     #[test]
-    fn key_table_rejects_unknown_and_reserves_workspace_namespace() {
+    fn key_table_rejects_unknown_and_reserves_space_namespace() {
         assert!(key_spec("user.nick").is_ok());
         assert!(key_spec("project.default").is_ok());
         let unknown = key_spec("user.nickk").unwrap_err().to_string();
         assert!(unknown.contains("known keys"), "{unknown}");
-        let reserved = key_spec("workspace.name").unwrap_err().to_string();
+        let reserved = key_spec("space.name").unwrap_err().to_string();
         assert!(reserved.contains("reserved"), "{reserved}");
     }
 
@@ -587,8 +587,8 @@ pub const KEYS: &[KeySpec] = &[
     },
 ];
 
-/// Look up a key in the table. `workspace.*` names get the reserved-namespace
-/// error (future synced workspace settings); anything else unknown lists the
+/// Look up a key in the table. `space.*` names get the reserved-namespace
+/// error (future synced space settings); anything else unknown lists the
 /// valid keys.
 ///
 /// The `tui.*` namespace (theme, saved tabs, and the open `tui.key.<action-id>`
@@ -597,8 +597,8 @@ pub const KEYS: &[KeySpec] = &[
 /// live client-side for now; see `docs/UI.md`. If they ever want a home on disk,
 /// this table is where a `web.key.*` prefix would go.
 pub fn key_spec(name: &str) -> Result<&'static KeySpec> {
-    if name.starts_with("workspace.") {
-        anyhow::bail!("'{name}' is reserved for synced workspace settings (not available yet)");
+    if name.starts_with("space.") {
+        anyhow::bail!("'{name}' is reserved for synced space settings (not available yet)");
     }
     KEYS.iter().find(|k| k.name == name).ok_or_else(|| {
         let known: Vec<&str> = KEYS.iter().map(|k| k.name).collect();
@@ -666,7 +666,7 @@ pub struct Settings {
 
 impl Settings {
     /// Load both layers for a store. `home = None` loads only the global layer
-    /// (e.g. `lait config --global` outside any workspace).
+    /// (e.g. `lait config --global` outside any space).
     pub fn load(home: Option<&Path>) -> Self {
         let global = global_config_path()
             .map(|p| ConfigMap::load(&p))

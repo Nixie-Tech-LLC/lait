@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ActorId, DeviceId, DocId, LabelId, ProjectId, WorkspaceId};
+use crate::ids::{ActorId, DeviceId, DocId, LabelId, ProjectId, SpaceId};
 
 /// Schema version gate. Every top-level DTO carries it so a reader
 /// can detect drift; bump on any additive change.
@@ -337,7 +337,7 @@ pub struct IssueView {
     pub schema_version: u32,
     pub reff: String,
     pub doc_id: DocId,
-    pub workspace_id: WorkspaceId,
+    pub space_id: SpaceId,
     pub project_id: ProjectId,
     pub project_key: Option<String>,
     pub key_alias: Option<String>,
@@ -453,7 +453,7 @@ pub struct InboxEntry {
     pub actor_nick: Option<String>,
 }
 
-/// A workspace member projection. Roles come from the
+/// A space member projection. Roles come from the
 /// signed ACL graph — the only cryptographically-verified identity in the system.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberDto {
@@ -518,8 +518,8 @@ pub struct SeedDto {
     pub id: String,
     /// Advisory nick (empty when pinned by bare id).
     pub nick: String,
-    /// The workspace id the seed serves.
-    pub workspace: String,
+    /// The space id the seed serves.
+    pub space: String,
     /// "online" | "away" | "offline" from the live presence map.
     pub state: String,
     /// Whether the seed is currently reachable.

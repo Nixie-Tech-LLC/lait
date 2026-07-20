@@ -84,8 +84,8 @@ fn spawn_daemon(home: &Path) -> Daemon {
     let mut child = Command::new(bin())
         .arg("daemon")
         .env("LAIT_HOME", home)
-        // Isolate the workspace registry per node: the daemon-boot upsert must land
-        // in a scratch config root, never the developer's real workspaces.json.
+        // Isolate the space registry per node: the daemon-boot upsert must land
+        // in a scratch config root, never the developer's real spaces.json.
         .env("LAIT_CONFIG_ROOT", home.join("cfgroot"))
         .env("LAIT_IDLE_SECS", "0")
         // Run the protocol on a fast heartbeat so catch-up/absence windows are
@@ -118,27 +118,27 @@ fn req(home: &Path, r: Request) -> Response {
         .unwrap_or_else(|e| Response::err(format!("{e:#}")))
 }
 
-/// Found a workspace in `home` in-process, using the SAME identity the daemon
+/// Found a space in `home` in-process, using the SAME identity the daemon
 /// will load (`<home>/secret.key`, since the daemon runs with `LAIT_HOME=home`).
-/// Workspaces are never minted lazily anymore — a daemon errors on an
+/// Spaces are never minted lazily anymore — a daemon errors on an
 /// uninitialized store — so every founder home goes through this first.
 fn found_home(home: &Path) {
     let key = lait::config::load_or_create_identity(home).expect("identity");
     let me = lait::crypto::device_from_seed(&key);
     let store = lait::store::Store::open(home).expect("store");
-    lait::replica::found_workspace(&store, &me, &key, "test", &lait::ids::SystemUlidSource)
-        .expect("found workspace");
+    lait::replica::found_space(&store, &me, &key, "test", &lait::ids::SystemUlidSource)
+        .expect("found space");
 }
 
 /// Bootstrap a joiner store from a ticket (the client half of `lait join`), so
-/// its daemon boots already bound to the host's workspace — the daemon-side
-/// Connect/Join no longer adopts a foreign workspace.
+/// its daemon boots already bound to the host's space — the daemon-side
+/// Connect/Join no longer adopts a foreign space.
 fn join_home(home: &Path, ticket: &str) {
-    let t: lait::proto::WorkspaceTicket = ticket.parse().expect("parse ticket");
+    let t: lait::proto::SpaceTicket = ticket.parse().expect("parse ticket");
     let store = lait::store::Store::open(home).expect("store");
-    lait::replica::join_workspace_store(
+    lait::replica::join_space_store(
         &store,
-        &t.workspace,
+        &t.space,
         &t.salt,
         &t.recovery_root,
         t.founder_inception
@@ -244,9 +244,9 @@ fn two_nodes_converge_over_iroh() {
         "A: new"
     );
 
-    // A mints a ticket (carrying its workspace id); B bootstraps its store from
+    // A mints a ticket (carrying its space id); B bootstraps its store from
     // it BEFORE its daemon first starts (the daemon-side Connect no longer
-    // adopts a foreign workspace), then connects.
+    // adopts a foreign space), then connects.
     let ticket = match req(
         &a.home,
         Request::Invite {
@@ -269,8 +269,8 @@ fn two_nodes_converge_over_iroh() {
         "B: connect"
     );
 
-    // Workspace data is end-to-end encrypted: B cannot read until A authorizes it and
-    // seals it the workspace key. Rather than blind-sleep, wait until B has
+    // Space data is end-to-end encrypted: B cannot read until A authorizes it and
+    // seals it the space key. Rather than blind-sleep, wait until B has
     // actually connected to A (a real sync opportunity) — a positive proxy that's
     // both faster and more rigorous than a fixed pause — plus a small settling
     // margin for the pull to complete, then confirm B still sees only ciphertext.

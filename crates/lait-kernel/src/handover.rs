@@ -29,7 +29,7 @@
 //! or transition readiness — candidate-evidence and custody-readiness checks must pass
 //! before an installation is signed, and they live above this module. The
 //! partition-tolerant agreement and liveness layer is not implemented. This
-//! functional prototype is not wired into the workspace authority path.
+//! functional prototype is not wired into the space authority path.
 
 use std::collections::{BTreeMap, BTreeSet};
 

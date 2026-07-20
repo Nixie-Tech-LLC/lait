@@ -3,7 +3,7 @@
 use super::*;
 
 /// Persist the recovery secret beside the store. This is a root credential (the
-/// pre-rotation escrow — losing it forfeits recovery, never workspace access),
+/// pre-rotation escrow — losing it forfeits recovery, never space access),
 /// so it is created **owner-only from the start** (never world-readable, even
 /// for an instant) and any permission error is propagated, never swallowed.
 /// The state of a device-local ceremony artifact.
@@ -123,7 +123,7 @@ pub(super) fn persist_recovery_key(store: &Store, seed: &[u8; 32]) -> Result<()>
     .context("write recovery.key")
 }
 
-/// Persist the workspace **break-glass recovery** secret beside the store as
+/// Persist the space **break-glass recovery** secret beside the store as
 /// `space-recovery.key` (owner-only, move it offline). A root credential, so it is
 /// created owner-only from the start and errors propagate. Elevating to a K-of-N
 /// group key later replaces this with per-holder DKG shares.
@@ -133,7 +133,7 @@ pub(super) fn persist_space_recovery(store: &Store, secret: &[u8; 32]) -> Result
         .context("restrict store home permissions for space-recovery.key")?;
     // PORTABLE, deliberately. The operator is told to move this offline, so a
     // device-bound wrap would make the copy in the safe unopenable — losing the
-    // workspace's last resort to protect it from a threat the file ACL already
+    // space's last resort to protect it from a threat the file ACL already
     // covers.
     crate::secretfs::write_private(
         &home.join("space-recovery.key"),
@@ -145,7 +145,7 @@ pub(super) fn persist_space_recovery(store: &Store, secret: &[u8; 32]) -> Result
 }
 
 impl Replica {
-    /// Load the workspace break-glass recovery seed held beside the store (the
+    /// Load the space break-glass recovery seed held beside the store (the
     /// solo bootstrap key). `None` once elevated to a group key held as DKG shares.
     pub(super) fn read_space_recovery_key(&self) -> Option<[u8; 32]> {
         let path = self.store.home_path().join("space-recovery.key");
@@ -157,8 +157,8 @@ impl Replica {
         raw.as_slice().try_into().ok()
     }
 
-    /// Break-glass **workspace recovery** (lait/space/1 W5). Authors a signed
-    /// `Recover` with the workspace recovery key, re-rooting the space to THIS
+    /// Break-glass **space recovery** (lait/space/1 W5). Authors a signed
+    /// `Recover` with the space recovery key, re-rooting the space to THIS
     /// device and re-keying to fence the old root. For a solo bootstrap key the
     /// held secret signs directly; a K-of-N group key instead produces the group
     /// signature via a FROST ceremony and assembles the same event (the plane
@@ -168,7 +168,7 @@ impl Replica {
     pub fn space_recover_cmd(&mut self) -> (Response, Option<DirtySet>) {
         let cur = crate::space::replay(
             &self.genesis,
-            &self.workspace_id,
+            &self.space_id,
             &self.membership.space_events(),
         );
         // Solo path: a held recovery key that IS the current authority signs the
@@ -228,7 +228,7 @@ impl Replica {
         }
         (
             Response::err(
-                "no way to recover from this device — need either the workspace's current space-recovery.key beside the store, or a threshold share of the current group recovery key",
+                "no way to recover from this device — need either the space's current space-recovery.key beside the store, or a threshold share of the current group recovery key",
             ),
             None,
         )
@@ -248,7 +248,7 @@ impl Replica {
             new_root: vec![me_actor.clone()],
             gen: cur.gen + 1,
         };
-        let ev = crate::space::sign_op(secret, &op, vec![], &self.workspace_id);
+        let ev = crate::space::sign_op(secret, &op, vec![], &self.space_id);
         let res = (|| -> Result<()> {
             self.membership.add_space_event(&ev)?;
             self.persist_membership("space_recover")
@@ -263,7 +263,7 @@ impl Replica {
         (
             Response::Ok {
                 message: Some(format!(
-                    "recovered the workspace — root reset to {} and re-keyed",
+                    "recovered the space — root reset to {} and re-keyed",
                     me_actor.short()
                 )),
             },
@@ -379,7 +379,7 @@ impl Replica {
                     coordinator: self.me.clone(),
                     op: op_bytes.clone(),
                 };
-                let ev = crate::dkg::sign_ceremony(&self.seed, &req, &self.workspace_id);
+                let ev = crate::dkg::sign_ceremony(&self.seed, &req, &self.space_id);
                 let Some(id) = crate::dkg::TranscriptId::of(&ev) else {
                     return (Response::err("could not derive the request id"), None);
                 };
@@ -403,13 +403,13 @@ impl Replica {
         }
         let after = crate::space::replay(
             &self.genesis,
-            &self.workspace_id,
+            &self.space_id,
             &self.membership.space_events(),
         );
         let installed = after.gen > cur.gen && after.root == vec![me_actor.clone()];
         let message = if installed {
             format!(
-                "recovered the workspace — root reset to {} and re-keyed",
+                "recovered the space — root reset to {} and re-keyed",
                 me_actor.short()
             )
         } else {
@@ -429,7 +429,7 @@ impl Replica {
 
     /// Co-sign a pending break-glass recovery request as a holder of the current
     /// group key. This is the explicit consent that `sign_advance_session` demands:
-    /// the holder has verified out-of-band that `session` re-roots the workspace to
+    /// the holder has verified out-of-band that `session` re-roots the space to
     /// the agreed party, and records local intent so their share is contributed to
     /// exactly that op (and no other request on the board).
     pub fn space_recover_approve_cmd(
@@ -498,9 +498,7 @@ impl Replica {
         // a different decision and must not ride this command.
         if req_target != crate::dkg::SignTarget::SpaceOp {
             return (
-                Response::err(
-                    "that request is not a workspace-recovery request — refusing to co-sign",
-                ),
+                Response::err("that request is not a space-recovery request — refusing to co-sign"),
                 None,
             );
         }
@@ -508,7 +506,7 @@ impl Replica {
         // actor set the holder named — refuse to co-sign anything else.
         let cur = crate::space::replay(
             &self.genesis,
-            &self.workspace_id,
+            &self.space_id,
             &self.membership.space_events(),
         );
         let target = match postcard::from_bytes::<crate::space::SpaceOp>(&op_bytes) {
@@ -556,7 +554,7 @@ impl Replica {
         (
             Response::Ok {
                 message: Some(format!(
-                    "co-signed the recovery re-rooting the workspace to {roots} — it installs once the threshold has co-signed"
+                    "co-signed the recovery re-rooting the space to {roots} — it installs once the threshold has co-signed"
                 )),
             },
             Some(DirtySet::catalog(CatalogScope::Acl)),
@@ -597,7 +595,7 @@ impl Replica {
     /// `Unreadable` must never be flattened into `Missing`. A share protected
     /// under a different Windows account or machine is *present* — the holder
     /// exists but cannot act — and for an N-of-N group that is the difference
-    /// between a degraded holder and an unrecoverable workspace. Operators need
+    /// between a degraded holder and an unrecoverable space. Operators need
     /// to see which one they have.
     pub(super) fn dkg_artifact(&self, t: &crate::dkg::TranscriptId, label: &str) -> ArtifactRead {
         match crate::secretfs::read_private(&self.dkg_path(t, label)) {
@@ -624,12 +622,12 @@ impl Replica {
     }
 
     /// Holders on this device whose share exists but cannot be used, restricted
-    /// to transcripts that are — or might be — the workspace's **current**
+    /// to transcripts that are — or might be — the space's **current**
     /// recovery authority.
     ///
     /// The currency check matters: an unreadable share from a superseded group
     /// is not a recovery problem, so announcing "this device has a share for the
-    /// workspace recovery key" on its account would be false. Candidates are
+    /// space recovery key" on its account would be false. Candidates are
     /// filtered through: public-key package, derived group key, recovery commit,
     /// standing RootState.
     ///
@@ -640,7 +638,7 @@ impl Replica {
     pub fn degraded_recovery_holders(&self) -> Vec<DegradedRecoveryHolder> {
         let cur = crate::space::replay(
             &self.genesis,
-            &self.workspace_id,
+            &self.space_id,
             &self.membership.space_events(),
         );
         let events = self.membership.ceremony_events();
@@ -670,7 +668,7 @@ impl Replica {
                     _ => None,
                 };
                 // A share we can PROVE belongs to a superseded group is not a
-                // recovery problem: it could not recover this workspace even if
+                // recovery problem: it could not recover this space even if
                 // it were readable, so reporting it would be false.
                 if is_current_authority == Some(false) {
                     return None;
@@ -749,7 +747,7 @@ impl Replica {
         // Must hold the current recovery key to install the resulting Rotate.
         let cur = crate::space::replay(
             &self.genesis,
-            &self.workspace_id,
+            &self.space_id,
             &self.membership.space_events(),
         );
         let holds_solo = self
@@ -826,7 +824,7 @@ impl Replica {
             current,
         ));
         let _ = n;
-        let ev = crate::dkg::sign_ceremony(&self.seed, &propose, &self.workspace_id);
+        let ev = crate::dkg::sign_ceremony(&self.seed, &propose, &self.space_id);
         let Some(transcript) = crate::dkg::TranscriptId::of(&ev) else {
             return (Response::err("could not derive the proposal id"), None);
         };
@@ -856,11 +854,11 @@ impl Replica {
                     None,
                 );
             };
-            let grant = crate::dkg::sign_authority_grant(&secret, &self.workspace_id, &transcript);
+            let grant = crate::dkg::sign_authority_grant(&secret, &self.space_id, &transcript);
             let auth_ev = crate::dkg::sign_ceremony(
                 &self.seed,
                 &crate::dkg::CeremonyOp::DkgAuthorize(grant),
-                &self.workspace_id,
+                &self.space_id,
             );
             if let Err(e) = self
                 .membership
@@ -912,7 +910,7 @@ impl Replica {
             .group_key_of_transcript(&authority)
             .ok_or_else(|| anyhow!("cannot derive the current group key"))?;
         let (op_bytes, _payload) =
-            crate::dkg::authority_grant_payload(&self.workspace_id, &group_key, proposal);
+            crate::dkg::authority_grant_payload(&self.space_id, &group_key, proposal);
         let events = self.membership.ceremony_events();
         let board = self.ceremony_board(&events);
         let threshold = board
@@ -938,7 +936,7 @@ impl Replica {
                     coordinator: self.me.clone(),
                     op: op_bytes.clone(),
                 };
-                let ev = crate::dkg::sign_ceremony(&self.seed, &req, &self.workspace_id);
+                let ev = crate::dkg::sign_ceremony(&self.seed, &req, &self.space_id);
                 let id = crate::dkg::TranscriptId::of(&ev)
                     .ok_or_else(|| anyhow!("could not derive the request id"))?;
                 self.membership.add_ceremony_event(&ev)?;
@@ -1192,7 +1190,7 @@ impl Replica {
     fn claims_the_standing_authority(&self, claimed: &crate::authority::AuthorityId) -> bool {
         let cur = crate::space::replay(
             &self.genesis,
-            &self.workspace_id,
+            &self.space_id,
             &self.membership.space_events(),
         );
         crate::space::recovery_commit(&claimed.public_key) == Some(cur.recovery_commit)
@@ -1337,7 +1335,7 @@ impl Replica {
         let mut salt = [0u8; 16];
         salt.copy_from_slice(&rand16());
         let package = match crate::custody::AuthoritySharePackage::seal(
-            &self.workspace_id,
+            &self.space_id,
             &authority,
             &dkg.to_hex(),
             &principal,
@@ -1396,7 +1394,7 @@ impl Replica {
             }
         };
         let expect = crate::custody::PackageExpectation {
-            workspace: &self.workspace_id,
+            space: &self.space_id,
             authority: &authority,
             ceremony: &dkg.to_hex(),
             leaf: &leaf,
@@ -1474,9 +1472,9 @@ impl Replica {
                 )
             }
         };
-        if package.workspace != self.workspace_id {
+        if package.space != self.space_id {
             return (
-                Response::err("that package belongs to a different workspace"),
+                Response::err("that package belongs to a different space"),
                 None,
             );
         }
@@ -1489,9 +1487,7 @@ impl Replica {
         let board = self.ceremony_board(&events);
         let Some(t) = board.dkg.get(&dkg) else {
             return (
-                Response::err(
-                    "that ceremony is not on this device's board — sync the workspace first",
-                ),
+                Response::err("that ceremony is not on this device's board — sync the space first"),
                 None,
             );
         };
@@ -1527,7 +1523,7 @@ impl Replica {
         // so a package cannot introduce a group this device never accepted. When
         // the local public package is gone (the very case this command exists
         // for), fall back to the package's own — still bound by the authority
-        // and workspace checks, and validated against the private half below.
+        // and space checks, and validated against the private half below.
         let expected_group = match self.dkg_artifact(&dkg, "pkp") {
             ArtifactRead::Present(pkp) => match crate::dkg::group_key_of_package(&pkp) {
                 Ok(k) => k,
@@ -1545,7 +1541,7 @@ impl Replica {
         let principal = crate::authority::PrincipalId::of_device(&self.me);
         let leaf = crate::authority::LeafId::of_principal(&principal);
         let expect = crate::custody::PackageExpectation {
-            workspace: &self.workspace_id,
+            space: &self.space_id,
             authority: &authority,
             ceremony: &package.ceremony,
             leaf: &leaf,
@@ -1730,7 +1726,7 @@ impl Replica {
     pub(super) fn current_authority(&self) -> Option<crate::authority::AuthorityId> {
         let cur = crate::space::replay(
             &self.genesis,
-            &self.workspace_id,
+            &self.space_id,
             &self.membership.space_events(),
         );
         if let Some(secret) = self.read_space_recovery_key() {
@@ -1791,7 +1787,7 @@ impl Replica {
         &self,
         events: &[crate::space::SignedSpaceEvent],
     ) -> crate::dkg::CeremonyBoard {
-        let mut board = crate::dkg::parse_board(events, &self.workspace_id);
+        let mut board = crate::dkg::parse_board(events, &self.space_id);
         board.restrict_signing_rounds(|authority| {
             self.dkg_manifest(authority).and_then(|m| {
                 m.configuration
@@ -1809,7 +1805,7 @@ impl Replica {
     ///
     /// The device signature on a proposal proves control of a device and nothing
     /// more. Acceptance requires an authorization signed by the key that is the
-    /// workspace's recovery authority — without this, any device could post a
+    /// space's recovery authority — without this, any device could post a
     /// proposal for a transcript and supply its `(n, k, participants)`, which on
     /// the node that initiated an elevation and holds the recovery key would be
     /// installed as the new recovery authority.
@@ -1843,7 +1839,7 @@ impl Replica {
 
         let cur = crate::space::replay(
             &self.genesis,
-            &self.workspace_id,
+            &self.space_id,
             &self.membership.space_events(),
         );
         // `parse_board` already checked every detached signature; what it cannot
@@ -1883,7 +1879,7 @@ impl Replica {
         postcard::from_bytes(&self.dkg_read(dkg, "manifest")?).ok()
     }
 
-    /// The DKG transcript whose group key is the workspace's **standing**
+    /// The DKG transcript whose group key is the space's **standing**
     /// recovery authority, whether or not this device can use its share.
     ///
     /// Separate from [`Self::active_dkg_session`] because conflating them makes
@@ -1900,7 +1896,7 @@ impl Replica {
     pub(super) fn standing_dkg_session(&self) -> Option<crate::dkg::TranscriptId> {
         let cur = crate::space::replay(
             &self.genesis,
-            &self.workspace_id,
+            &self.space_id,
             &self.membership.space_events(),
         );
         self.dkg_manifests().into_iter().find_map(|(id, _)| {
@@ -1991,7 +1987,7 @@ impl Replica {
         };
         // Consent gate: we contribute only to a request we ourselves authorized,
         // byte-for-byte. Without it, posting a Recover-to-me request would let
-        // honest holders' shares hand the workspace over.
+        // honest holders' shares hand the space over.
         if self.dkg_read(signing, "intent").as_deref() != Some(op_bytes.as_slice()) {
             return Ok(false);
         }
@@ -2011,7 +2007,7 @@ impl Replica {
             op_bytes,
             &group_key,
             &[],
-            self.workspace_id.as_str(),
+            self.space_id.as_str(),
         );
 
         // Every commitment posted so far, keyed by index, taken from the authors
@@ -2190,10 +2186,7 @@ impl Replica {
                         .iter()
                         .any(|e| e.hash() == node.hash());
                     if fresh
-                        && node.verify_sig(
-                            crate::space::SPACE_EVENT_DOMAIN,
-                            self.workspace_id.as_str(),
-                        )
+                        && node.verify_sig(crate::space::SPACE_EVENT_DOMAIN, self.space_id.as_str())
                     {
                         self.membership.add_space_event(&node)?;
                         self.persist_membership("group_recover")?;
@@ -2202,7 +2195,7 @@ impl Replica {
                     }
                 }
                 crate::dkg::SignTarget::AuthorityGrant => {
-                    if crate::dkg::authority_grant_of(&node, &self.workspace_id).is_some() {
+                    if crate::dkg::authority_grant_of(&node, &self.space_id).is_some() {
                         let already = self.membership.ceremony_events().iter().any(|e| {
                             matches!(
                                 postcard::from_bytes::<crate::dkg::CeremonyOp>(&e.op),
@@ -2238,7 +2231,7 @@ impl Replica {
         if self.dkg_manifest(dkg).is_none() {
             let cur = crate::space::replay(
                 &self.genesis,
-                &self.workspace_id,
+                &self.space_id,
                 &self.membership.space_events(),
             );
             // Pin WHICH authorization we accepted, not merely that one existed.
@@ -2389,7 +2382,7 @@ impl Replica {
         };
         let cur = crate::space::replay(
             &self.genesis,
-            &self.workspace_id,
+            &self.space_id,
             &self.membership.space_events(),
         );
         let already = crate::space::recovery_commit(&group_key) == Some(cur.recovery_commit);
@@ -2407,7 +2400,7 @@ impl Replica {
         // An INDISPENSABLE arrangement must not install until every custodian
         // has verified a portable backup. Otherwise an N-of-N authority can be
         // created in a state where one holder's share exists only behind a
-        // Windows profile, and the workspace learns that on the day it needs to
+        // Windows profile, and the space learns that on the day it needs to
         // recover — the day it is too late to fix.
         //
         // The gate reads signed attestations from the board rather than local
@@ -2433,7 +2426,7 @@ impl Replica {
                     next_configuration,
                     gen: cur.gen + 1,
                 };
-                let ev = crate::space::sign_op(&secret, &op, vec![], &self.workspace_id);
+                let ev = crate::space::sign_op(&secret, &op, vec![], &self.space_id);
                 self.membership.add_space_event(&ev)?;
                 self.persist_membership("dkg_install")?;
                 return Ok(true);
@@ -2511,7 +2504,7 @@ impl Replica {
                     coordinator: self.me.clone(),
                     op: op_bytes.clone(),
                 };
-                let ev = crate::dkg::sign_ceremony(&self.seed, &req, &self.workspace_id);
+                let ev = crate::dkg::sign_ceremony(&self.seed, &req, &self.space_id);
                 let id = crate::dkg::TranscriptId::of(&ev)
                     .ok_or_else(|| anyhow!("could not derive the request id"))?;
                 self.membership.add_ceremony_event(&ev)?;
@@ -2528,7 +2521,7 @@ impl Replica {
     }
 
     fn post_ceremony(&mut self, op: crate::dkg::CeremonyOp) -> Result<()> {
-        let ev = crate::dkg::sign_ceremony(&self.seed, &op, &self.workspace_id);
+        let ev = crate::dkg::sign_ceremony(&self.seed, &op, &self.space_id);
         self.membership.add_ceremony_event(&ev)?;
         self.persist_membership("dkg_round")
     }

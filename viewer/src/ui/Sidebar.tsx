@@ -88,7 +88,7 @@ function SpaceList({
               ) : (
                 <Folder className="text-mute size-3.5 shrink-0" />
               )}
-              <span className="min-w-0 flex-1 truncate">{s.name || s.workspace}</span>
+              <span className="min-w-0 flex-1 truncate">{s.name || s.space}</span>
               <StatusDot status={s.status} />
             </button>
           </li>

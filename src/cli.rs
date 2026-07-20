@@ -19,8 +19,8 @@ use crate::{
     control::{self, request, ErrorKind, Event, EventKind, Request, Response},
     diagnose::{DiagnosisView, GateState},
     dto::{BoardView, IssueView, Priority, Row},
-    proto::WorkspaceTicket,
-    workspaces::{self, StorePresence, WorkspaceEntry},
+    proto::SpaceTicket,
+    spaces::{self, SpaceEntry, StorePresence},
 };
 
 /// Output mode threaded from the global `--json` / `--no-color` / `--yes` flags.
@@ -382,9 +382,9 @@ pub async fn ensure_daemon(home: &Path) -> Result<()> {
 /// `$LAIT_HOME` and nothing else — never `$LAIT_STORE` — so pointing a spawn at a
 /// self-contained home's store while `LAIT_HOME` is unset opens that store under
 /// the *global* key, silently ignoring the `secret.key` sitting inside it. For a
-/// named agent's home that is not a subtle mismatch: the workspace key is sealed
+/// named agent's home that is not a subtle mismatch: the space key is sealed
 /// to the agent's X25519 key, so the daemon cannot unwrap it, and it would
-/// announce the wrong identity as a peer in the agent's workspace.
+/// announce the wrong identity as a peer in the agent's space.
 ///
 /// One process resolving one store never notices, because its own env already
 /// says which identity it is. `lait serve` holds N homes across *two* identity
@@ -728,20 +728,20 @@ fn print_diagnosis(v: &DiagnosisView, out: Out) {
 }
 
 /// `join` display: send the join, echo the daemon's ack, then run the guided-join
-/// verifier as a tail — passing the ticket's workspace as `expected_workspace`, so
+/// verifier as a tail — passing the ticket's space as `expected_space`, so
 /// a directory/store mismatch (the joiner ran `join` in the wrong folder) is caught
 /// and named immediately instead of surfacing later as a blank board. Under
 /// `--json` we emit only the join DTO (no verifier chrome), mirroring `run_invite`.
 pub async fn run_join(home: &Path, ticket: String, out: Out) -> Result<()> {
-    // Parse client-side to recover the intended workspace before the ticket is
+    // Parse client-side to recover the intended space before the ticket is
     // moved into the request. A malformed ticket simply yields no expectation; the
     // daemon returns the real parse error.
-    let parsed = ticket.parse::<WorkspaceTicket>().ok();
+    let parsed = ticket.parse::<SpaceTicket>().ok();
     // A pass-carrying ticket (Pattern A) admits automatically within seconds, so
     // a pending membership is worth polling out; a pass-less ticket waits on a
     // human admin and would only stall the readout.
     let has_pass = parsed.as_ref().is_some_and(|t| t.invite.is_some());
-    let expected = parsed.map(|t| t.workspace);
+    let expected = parsed.map(|t| t.space);
     let resp = client(home, Request::Join { ticket }).await?;
     match &resp {
         Response::Ok { message } => {
@@ -775,7 +775,7 @@ pub async fn run_join(home: &Path, ticket: String, out: Out) -> Result<()> {
         match client(
             home,
             Request::Diagnose {
-                expected_workspace: expected.clone(),
+                expected_space: expected.clone(),
             },
         )
         .await
@@ -784,9 +784,9 @@ pub async fn run_join(home: &Path, ticket: String, out: Out) -> Result<()> {
                 let settled = match &diag {
                     Response::Diagnosis(v) => match v.blocked_on.as_deref() {
                         None => true,
-                        // `workspace` is the one Fail-state blocker (wrong
+                        // `space` is the one Fail-state blocker (wrong
                         // directory/store) — waiting can't clear it.
-                        Some("workspace") => true,
+                        Some("space") => true,
                         // Pending membership clears itself only under a pass
                         // (Pattern A auto-seal); pass-less waits on a human.
                         Some("membership") => !has_pass,
@@ -1052,8 +1052,8 @@ fn print_diagnosis_or(resp: &Response, out: Out) {
 /// Live status of one registry entry: `missing` (store gone from disk), `up`
 /// (a daemon answers on its control channel), or `idle` (store present, no
 /// daemon). The probe is a short-deadline `Status` round-trip — never a spawn.
-async fn workspace_status(e: &WorkspaceEntry) -> &'static str {
-    if workspaces::presence(e) == StorePresence::Missing {
+async fn space_status(e: &SpaceEntry) -> &'static str {
+    if spaces::presence(e) == StorePresence::Missing {
         return "missing";
     }
     let up = tokio::time::timeout(
@@ -1070,13 +1070,13 @@ async fn workspace_status(e: &WorkspaceEntry) -> &'static str {
     }
 }
 
-/// `lait workspaces`: every workspace on this machine (founded and joined),
+/// `lait spaces`: every space on this machine (founded and joined),
 /// with live status. Honours `--json`.
-pub async fn print_workspaces(out: Out) {
-    let entries = workspaces::list();
+pub async fn print_spaces(out: Out) {
+    let entries = spaces::list();
     let mut statuses = Vec::with_capacity(entries.len());
     for e in &entries {
-        statuses.push(workspace_status(e).await);
+        statuses.push(space_status(e).await);
     }
     if out.json {
         let rows: Vec<serde_json::Value> = entries
@@ -1102,7 +1102,7 @@ pub async fn print_workspaces(out: Out) {
         return;
     }
     for (e, status) in entries.iter().zip(&statuses) {
-        let short: String = e.workspace.chars().take(12).collect();
+        let short: String = e.space.chars().take(12).collect();
         let code = match *status {
             "up" => ansi::GREEN,
             "idle" => ansi::DIM,
@@ -1133,12 +1133,12 @@ pub async fn print_workspaces(out: Out) {
     }
 }
 
-/// The universal "no workspace here" error: any store-needing command run in a
+/// The universal "no space here" error: any store-needing command run in a
 /// directory with no discoverable `.lait/` gets this instead of a silently
-/// minted decoy store. Points at the creation verbs and every known workspace.
+/// minted decoy store. Points at the creation verbs and every known space.
 pub fn err_no_store_here(out: Out) {
     eprintln!("no lait space in this directory (nothing is created implicitly).");
-    let known = workspaces::list();
+    let known = spaces::list();
     if !known.is_empty() {
         eprintln!();
         eprintln!("spaces on this machine:");
@@ -1424,7 +1424,7 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
         Response::Status(s) => {
             println!("id:        {}", s.id);
             println!("nick:      {}", s.nick);
-            let ws_line = match (s.name.is_empty(), s.workspace.as_deref()) {
+            let ws_line = match (s.name.is_empty(), s.space.as_deref()) {
                 (false, Some(ws)) => format!("{} ({ws})", s.name),
                 (true, Some(ws)) => ws.to_string(),
                 (false, None) => s.name.clone(),
@@ -1482,7 +1482,7 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
                     }
                 };
                 let scope = match h.is_current_authority {
-                    Some(true) => "the workspace recovery key",
+                    Some(true) => "the space recovery key",
                     _ => "a recovery key (group unidentified)",
                 };
                 println!();
@@ -1699,7 +1699,7 @@ pub async fn run_invite(
         return Ok(());
     }
     let link = token
-        .parse::<WorkspaceTicket>()
+        .parse::<SpaceTicket>()
         .map(|t| t.link())
         .unwrap_or_else(|_| format!("lait://join/{token}"));
     println!("{token}");

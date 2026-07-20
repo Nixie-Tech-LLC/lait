@@ -9,7 +9,7 @@
 //! 1. **Every advertised shell works** — each `Shell` value produces non-empty,
 //!    well-formed output and exits `0`; an unknown shell fails cleanly (`!= 0`).
 //! 2. **The man page renders** — valid roff naming lait(1).
-//! 3. **They are truly stateless** — dispatched *before* home/identity/workspace
+//! 3. **They are truly stateless** — dispatched *before* home/identity/space
 //!    resolution (`app.rs::run`), so they never spawn a daemon, mint a key, or
 //!    create a store. A packager running them in a clean sandbox must not leave a
 //!    `$LAIT_HOME` behind. This is the regression guard for that early dispatch.
@@ -100,7 +100,7 @@ fn man_page_renders_valid_roff() {
     );
 }
 
-/// The invariant that makes these safe for packagers: they resolve no workspace.
+/// The invariant that makes these safe for packagers: they resolve no space.
 /// Point `$LAIT_HOME` at a fresh empty dir, generate completions + the man page,
 /// and assert the dir is *still* empty — no `secret.key`, `profile.json`, or
 /// `repo/` was created, and no daemon was spawned.

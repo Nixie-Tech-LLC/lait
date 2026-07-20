@@ -288,14 +288,14 @@ Registries + node:
 | `projects [add KEY [NAME] \| ls]` | Manage the project registry (name defaults to the key) |
 | `labels [new <name> --color C \| ls]` | Manage the label registry |
 | `members [add \| remove \| requests \| approve \| name \| rotate-key \| ls]` | Manage E2EE membership (signed ACL); `add` seals the key, `remove` rotates it, `approve` admits a pending joiner, `name` sets a local label for a key |
-| `activity [--since N]` | Workspace-wide recent transitions |
+| `activity [--since N]` | Space-wide recent transitions |
 | `serve [--port N] [--open]` | Open your spaces in a browser (loopback-only) |
 | `status` · `id` · `shutdown` | Node/space status · endpoint id · stop the daemon |
 | `invite [--require-approval] [--reusable] [--ttl-hours N]` · `join <link> [--dir D]` | Invite a teammate; `join` creates the joiner's store (cwd or `--dir`) and the default pass admits them automatically (add `--require-approval` for the gated `members requests`/`members approve` flow) |
 | `who` · `watch` | Peers online · follow the event stream |
 | `profiles` / `resume <name>` | List profiles / switch to a named profile (each a separate identity + store) |
 
-Global flags: `--home DIR`, `-w SEL` (target a workspace by name/id/path from any
+Global flags: `--home DIR`, `-w SEL` (target a space by name/id/path from any
 directory), `--json`, `--no-color`. Exit codes: `0` ok · `1` usage/error · `2` ref
 not found / ambiguous · `3` daemon unreachable.
 
@@ -342,7 +342,7 @@ The default invite carries a **signed, single-use pass**, so a teammate is on th
 board after a single `join` — no separate approval round-trip:
 
 ```bash
-# host — mint an invite link (carries the workspace, genesis, and a single-use pass)
+# host — mint an invite link (carries the space, genesis, and a single-use pass)
 lait invite                        # → a link (+ a scannable QR); send it over
 
 # teammate — join from the link (creates the store in the cwd, or pass --dir);
@@ -372,9 +372,9 @@ lait members requests                   # bob  (claims "bob")   <key-prefix>
 lait members approve <key-prefix> --as bob
 ```
 
-Workspace data is E2EE: issues sync as ciphertext, and a node that isn't in the
+Space data is E2EE: issues sync as ciphertext, and a node that isn't in the
 signed ACL (or has been removed) sees only ciphertext. Auto-approval never weakens
-this — the seal still happens key-side on an admin node holding the workspace key;
+this — the seal still happens key-side on an admin node holding the space key;
 the pass only removes the manual keystroke. Changes propagate live P2P over iroh
 with no central server; any always-on node advertised in a ticket acts as a
 portable seed that backfills cold clients.
@@ -382,7 +382,7 @@ portable seed that backfills cold clients.
 ## Running several nodes on one machine
 
 Set a distinct `LAIT_HOME` per node — one founds, the other joins from the invite
-(there is no shared "room name": the gossip topic derives from the workspace id
+(there is no shared "room name": the gossip topic derives from the space id
 carried in the ticket):
 
 ```bash

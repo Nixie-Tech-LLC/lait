@@ -130,12 +130,12 @@ macro_rules! prefixed_id {
 }
 
 prefixed_id!(
-    /// Workspace id — minted at `workspace init` and committed by genesis.
-    WorkspaceId, "ws_"
+    /// Space id — minted at `space init` and committed by genesis.
+    SpaceId, "ws_"
 );
 
-impl WorkspaceId {
-    /// Derive a **self-certifying** workspace id from a 16-byte digest that
+impl SpaceId {
+    /// Derive a **self-certifying** space id from a 16-byte digest that
     /// commits to the founding device + salt (`lait/space/1`): `ws_<crockford128>`.
     /// The id is bound to its trust root rather than random, so a joiner can
     /// verify a ticket's founder anchor against the id (see [`crate::space`]).
@@ -229,7 +229,7 @@ impl fmt::Display for DeviceId {
 /// self-managed key-event log*; a `DeviceId` (device key) signs, an `ActorId`
 /// *is someone*. Not an ed25519 key — it never verifies a signature — and
 /// content-independent of any device key, so devices rotate under a stable
-/// identity. Minted per-workspace (the `Incept` payload binds the workspace id
+/// identity. Minted per-space (the `Incept` payload binds the space id
 /// + a nonce), so the same human is unlinkable across spaces by default.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ActorId(String);

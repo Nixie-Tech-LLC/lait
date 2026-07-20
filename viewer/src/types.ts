@@ -102,7 +102,7 @@ export interface IssueView {
   schema_version: number;
   reff: string;
   doc_id: string;
-  workspace_id: string;
+  space_id: string;
   project_id: string;
   project_key: string | null;
   key_alias: string | null;
@@ -232,7 +232,7 @@ export interface JoinRequestDto {
 export interface SeedDto {
   id: string;
   nick: string;
-  workspace: string;
+  space: string;
   state: string;
   online: boolean;
 }
@@ -256,17 +256,17 @@ export interface Event {
  * `control.rs` `StatusInfo`.
  *
  * The shape the old viewer got wrong: there is no `room` (it is `name`),
- * `workspace` is nullable, and `membership`/`pending_requests` are new — the
+ * `space` is nullable, and `membership`/`pending_requests` are new — the
  * latter two being how a *pending* joiner learns they are pending rather than
  * staring at an empty board.
  */
 export interface StatusInfo {
   id: string;
   nick: string;
-  /** Workspace display name. (Was `room` in the pre-v0.4.2 shape.) */
+  /** Space display name. (Was `room` in the pre-v0.4.2 shape.) */
   name: string;
   online_peers: number;
-  workspace: string | null;
+  space: string | null;
   issues: number;
   projects: number;
   /** `admin` | `member` | `pending`. */
@@ -286,7 +286,7 @@ export interface ProjectBrief {
 
 export interface SpaceRow {
   id: string;
-  workspace: string;
+  space: string;
   name: string;
   path: string;
   origin: string;
@@ -393,7 +393,7 @@ export type Request =
   | { cmd: "member_approve"; who: string; as_name?: string | null }
   | { cmd: "member_alias"; who: string; name: string }
   | { cmd: "status" }
-  | { cmd: "diagnose"; expected_workspace?: string | null }
+  | { cmd: "diagnose"; expected_space?: string | null }
   | { cmd: "id" }
   | { cmd: "invite"; require_approval?: boolean; reusable?: boolean; ttl_hours?: number | null }
   | { cmd: "join"; ticket: string }
