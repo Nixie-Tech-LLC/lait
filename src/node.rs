@@ -237,12 +237,45 @@ fn seeds_path(home: &Path) -> PathBuf {
     home.join("seeds.json")
 }
 
-/// Load the pinned seed registry (best-effort; empty when absent or corrupt).
+/// Load the pinned seed registry, entry at a time. A pin is deliberately-placed
+/// infrastructure — the anchor a cold client converges through — so one
+/// unreadable record must not unpin the rest, and a dropped pin must never be
+/// silent: every reject is named at warn and the survivors are kept.
+///
+/// An id that is not a device key is rejected rather than pinned: it would be
+/// carried as far as the dial and fail there, with nothing pointing back at the
+/// registry entry that caused it.
 fn load_seeds(home: &Path) -> Vec<SeedRecord> {
     let Ok(data) = std::fs::read_to_string(seeds_path(home)) else {
         return Vec::new();
     };
-    serde_json::from_str(&data).unwrap_or_default()
+    let rows: Vec<serde_json::Value> = match serde_json::from_str(&data) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("seeds.json is not a list of pinned seeds ({e}); pinning none");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let rec: SeedRecord = match serde_json::from_value(row.clone()) {
+            Ok(rec) => rec,
+            Err(e) => {
+                tracing::warn!("skipping an unreadable pinned seed ({e}): {row}");
+                continue;
+            }
+        };
+        match DeviceId::parse(rec.id.as_str()) {
+            // Normalize on the way in so the pin compares equal to the same key
+            // seen over the wire.
+            Some(id) => out.push(SeedRecord { id, ..rec }),
+            None => tracing::warn!(
+                "skipping a pinned seed whose id is not a device key: {:?}",
+                rec.id.as_str()
+            ),
+        }
+    }
+    out
 }
 
 /// Persist the pinned seed registry (best-effort).
@@ -2589,6 +2622,82 @@ mod tests {
         // the real peer, so a restart bootstraps from the peer.
         save_known_peers(&dir, &[me.clone(), peer.clone()]);
         assert_eq!(load_bootstrap_peers(&dir, &me), vec![peer]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The on-disk peer cache is written by one daemon and read by the next,
+    /// possibly across an upgrade, so its encoding is a compatibility surface.
+    /// This fixture is a literal `peers.json` written by a pre-cutover build; it
+    /// must still load, and must still resolve to the same key the identity seed
+    /// derives.
+    #[test]
+    fn a_legacy_peers_file_still_bootstraps() {
+        let dir = std::env::temp_dir().join(format!("gc-legacy-peers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            peers_path(&dir),
+            r#"["8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394"]"#,
+        )
+        .unwrap();
+
+        let me = crate::crypto::device_from_seed(&[9u8; 32]);
+        assert_eq!(
+            load_bootstrap_peers(&dir, &me),
+            vec![crate::crypto::device_from_seed(&[2u8; 32])],
+            "a legacy peers.json must still name the same peer"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same obligation for `seeds.json`, plus the one that matters more:
+    /// a seed is pinned infrastructure, so a file with one bad record keeps
+    /// every good one instead of silently unpinning the lot.
+    #[test]
+    fn a_legacy_seeds_file_keeps_its_pins_and_rejects_only_the_bad_rows() {
+        let dir = std::env::temp_dir().join(format!("gc-legacy-seeds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            seeds_path(&dir),
+            r#"[
+  {
+    "id": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+    "nick": "nas",
+    "space": "ws_x"
+  }
+]"#,
+        )
+        .unwrap();
+
+        let seeds = load_seeds(&dir);
+        assert_eq!(seeds.len(), 1, "a legacy seeds.json must still load");
+        assert_eq!(seeds[0].id, crate::crypto::device_from_seed(&[2u8; 32]));
+        assert_eq!(seeds[0].nick, "nas");
+        assert_eq!(seeds[0].space, "ws_x");
+
+        // One good pin, one row missing its id, one row whose id is not a key.
+        std::fs::write(
+            seeds_path(&dir),
+            r#"[
+  {"id": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394", "nick": "nas", "space": "ws_x"},
+  {"nick": "no-id", "space": "ws_x"},
+  {"id": "not-a-key", "nick": "junk", "space": "ws_x"}
+]"#,
+        )
+        .unwrap();
+        let seeds = load_seeds(&dir);
+        assert_eq!(
+            seeds.len(),
+            1,
+            "a bad row must cost its own pin and no others"
+        );
+        assert_eq!(seeds[0].nick, "nas");
+
+        // A file that is not a list at all pins nothing rather than panicking.
+        std::fs::write(seeds_path(&dir), "not json at all").unwrap();
+        assert!(load_seeds(&dir).is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
