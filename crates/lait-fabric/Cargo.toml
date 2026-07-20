@@ -1,16 +1,17 @@
 [package]
-name = "lait-engine"
+name = "lait-fabric"
 version = "0.5.2"
 edition = "2021"
 rust-version = "1.91"
-description = "The lait engine: the convergence scaffold (Loro) sealed behind typed wrappers. The ONLY crate that names loro."
+description = "The lait fabric: the shared world — documents, persistence, history, convergence, and projection, with the Loro scaffold sealed behind typed wrappers. The ONLY crate that names loro."
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-# lait's roots — the engine wraps the scaffold in lait's own types.
+# lait's roots — the fabric wraps the scaffold in lait's own types.
 lait-kernel = { path = "../lait-kernel" }
-# The convergence scaffold. This is the only crate in the workspace that lists
-# it, so `loro::*` is nameable here and nowhere else — the seal is the manifest.
+# The convergence scaffold. This is the only crate in this Cargo workspace that
+# lists it, so `loro::*` is nameable here and nowhere else — the seal is the
+# manifest.
 loro = "=1.13.6"
 # durable persistence + signed-op encoding
 serde = { version = "1", features = ["derive"] }

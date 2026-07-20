@@ -10,7 +10,7 @@
 //!   * `board_movable_list_converges` — board ordering (movable list)
 //!   * `catalog_docs_grow_set_converges` — the `docs` grow-only key set
 //!
-//! Post-contract note: these tests exercise the sealed engine surface only
+//! Post-contract note: these tests exercise the sealed fabric surface only
 //! (`docs/DATA-CONTRACT.md`) — replicas fork via `from_snapshot`, mutate through
 //! the typed writers, land ops with `apply(OpCtx)`, and exchange bytes through
 //! `oplog_vv_bytes`/`export_from_bytes`/`import`. No raw kernel handle exists
@@ -26,7 +26,7 @@ use proptest::prelude::*;
 
 use lait::catalog::CatalogDoc;
 use lait::dto::Priority;
-use lait::engine::op::OpCtx;
+use lait::fabric::op::OpCtx;
 use lait::ids::{ActorId, DocId, LabelId, ProjectId, SystemUlidSource, UserId, WorkspaceId};
 use lait::issue::{IssueDoc, NewIssue};
 
@@ -41,7 +41,7 @@ fn ctx() -> OpCtx {
     OpCtx::content("test", &tester())
 }
 
-/// The engine surface a convergence test needs from any replicated doc.
+/// The fabric surface a convergence test needs from any replicated doc.
 trait Replica {
     fn vv(&self) -> Vec<u8>;
     fn export_missing(&self, peer_vv: &[u8]) -> Vec<u8>;

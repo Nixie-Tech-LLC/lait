@@ -58,7 +58,7 @@ impl MembershipDoc {
         Ok(Self { doc })
     }
 
-    /// Load stored snapshot bytes with the engine's required Loro configuration.
+    /// Load stored snapshot bytes with the fabric's required Loro configuration.
     pub fn from_snapshot(bytes: &[u8], peer: Option<u64>) -> Result<Self> {
         let doc = LoroDoc::new();
         op::configure(&doc, peer);

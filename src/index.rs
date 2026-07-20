@@ -537,7 +537,7 @@ mod tests {
         UserId::from_key_string("a".repeat(64))
     }
     fn commit(c: &CatalogDoc) {
-        c.apply(&crate::engine::op::OpCtx::structure("test", &test_user()));
+        c.apply(&crate::fabric::op::OpCtx::structure("test", &test_user()));
     }
 
     fn setup() -> (CatalogDoc, ProjectId, WorkspaceId) {

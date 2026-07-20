@@ -12,7 +12,7 @@
 //! `npm run build` (which writes straight here) and guarded by CI diffing a
 //! rebuild. See `docs/UI.md`, web surface.
 //!
-//! Serving it from the engine — rather than from a dev server or a CDN — is also
+//! Serving it from the daemon — rather than from a dev server or a CDN — is also
 //! what makes the client **same-origin**, which is the precondition for the
 //! `Origin` allowlist in [`super::auth`] meaning anything at all.
 

@@ -1110,7 +1110,7 @@ impl Replica {
     /// The ceremony board is grow-only and re-scanned each import; completed and
     /// abandoned sessions are never pruned, so a member could pad it to inflate
     /// per-import work (bounded per call by the `guard` below). Session GC/expiry
-    /// is future work — see the `C_CEREMONY` container in `engine::membership`.
+    /// is future work — see the `C_CEREMONY` container in `fabric::membership`.
     pub fn dkg_advance(&mut self) -> Result<bool> {
         let mut any = false;
         // A ceremony has a bounded number of steps; the guard is a backstop

@@ -1,5 +1,5 @@
 //! Every commit carries a request kind, an advisory committing-device claim,
-//! and a trust tier. The engine is configured so those commits survive as distinct, timestamped,
+//! and a trust tier. Loro is configured so those commits survive as distinct, timestamped,
 //! self-labelled changes in the oplog instead of fusing into one anonymous blob.
 //!
 //! The crate pins Loro 1.13.6, whose configuration makes these details
@@ -115,7 +115,7 @@ impl OpMeta {
     }
 }
 
-/// Engine configuration applied by every wrapper constructor
+/// Loro configuration applied by every wrapper constructor
 /// before any op is written or imported.
 pub(super) fn configure(doc: &LoroDoc, peer: Option<u64>) {
     doc.set_record_timestamp(true);
@@ -159,7 +159,7 @@ mod tests {
     fn commits_stay_distinct_and_survive_reload() {
         // The load-bearing fact: N applies = N changes in the oplog, with real
         // timestamps and messages, after an export/import round trip. Under
-        // engine defaults this collapses to ONE anonymous change.
+        // Loro's defaults this collapses to ONE anonymous change.
         let doc = LoroDoc::new();
         configure(&doc, Some(7));
         for i in 0..5 {

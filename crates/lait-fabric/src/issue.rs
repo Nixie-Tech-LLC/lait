@@ -91,7 +91,7 @@ pub struct NewIssue {
     pub body: Option<String>,
     /// The store's stable peer id: one version-vector entry per
     /// store lifetime instead of one per session. `None` (tests, replicas)
-    /// keeps the engine's fresh random peer.
+    /// keeps Loro's fresh random peer.
     pub peer: Option<u64>,
 }
 
@@ -131,7 +131,7 @@ impl IssueDoc {
     }
 
     /// Load from stored/synced snapshot bytes (the only public constructor from
-    /// bytes; it applies the engine's required Loro configuration before any write
+    /// bytes; it applies the fabric's required Loro configuration before any write
     /// can happen on the loaded doc).
     pub fn from_snapshot(bytes: &[u8], peer: Option<u64>) -> Result<Self> {
         let doc = LoroDoc::new();
@@ -141,7 +141,7 @@ impl IssueDoc {
         Ok(Self { doc })
     }
 
-    /// The raw engine handle, restricted to engine internals.
+    /// The raw Loro handle, restricted to fabric internals.
     pub(crate) fn raw(&self) -> &LoroDoc {
         &self.doc
     }
@@ -163,7 +163,7 @@ impl IssueDoc {
     }
 
     /// The issue document's oplog frontiers: the causal head used as the sync
-    /// digest. Engine-internal; external callers use [`Self::head_hash`].
+    /// digest. Fabric-internal; external callers use [`Self::head_hash`].
     pub(crate) fn head(&self) -> Frontiers {
         self.doc.oplog_frontiers()
     }
@@ -321,7 +321,7 @@ impl IssueDoc {
         Ok(())
     }
 
-    /// Set the description as a **splice**: the engine computes the minimal
+    /// Set the description as a **splice**: Loro computes the minimal
     /// edit, so a concurrent edit by another peer RGA-merges cleanly instead of
     /// concatenating both full bodies, and the oplog records the actual edit instead of
     /// a delete-all/insert-all pair per save.

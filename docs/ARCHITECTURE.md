@@ -30,15 +30,20 @@ dirty notifications, not state; clients re-read the affected projection.
   actor identity, membership, content authority, policy compilation, recovery,
   custody, and cryptographic protocol logic. It does not own Loro documents or
   network connections.
-- `lait-engine` owns Loro containers, storage, history projection, and the
+- `lait-fabric` owns Loro containers, storage, history projection, and the
   plaintext membership document that transports signed kernel events and sealed
   key material.
 - the application crate owns commands, the daemon, iroh transport, sync,
   configuration, local secrets, projections, and product surfaces.
 
-This boundary is intentional. Authority is a pure function of signed inputs;
-replication and persistence move those inputs but do not decide whether they are
-trusted.
+This boundary is intentional. The kernel determines **legitimacy** — identity,
+authority, custody, recovery, and which transitions are valid given signed
+history. The fabric maintains the **shared world** — documents, persistence,
+history, convergence, projection. They are separate crates because the
+dependency edge is a correctness boundary: convergence cannot confer legitimacy.
+Authority is a pure function of signed inputs; replication and persistence move
+those inputs but do not decide whether they are trusted. The two ship, test, and
+version together as lait's substrate.
 
 ## Identity
 

@@ -2864,7 +2864,7 @@ dependencies = [
  "iroh-base",
  "iroh-gossip",
  "iroh-relay",
- "lait-engine",
+ "lait-fabric",
  "lait-kernel",
  "libc",
  "n0-future",
@@ -2890,7 +2890,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lait-engine"
+name = "lait-fabric"
 version = "0.5.2"
 dependencies = [
  "anyhow",

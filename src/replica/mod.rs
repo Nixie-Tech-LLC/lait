@@ -18,8 +18,8 @@ use crate::dto::{
     ActivityEvent, BoardColumn, BoardView, FieldChange, GraphView, IssueView, LabelDto, LinkDto,
     Priority, ProjectDto, Row, StatusCategory, SCHEMA_VERSION,
 };
-use crate::engine::history;
-use crate::engine::op::OpCtx;
+use crate::fabric::history;
+use crate::fabric::op::OpCtx;
 use crate::genesis::Genesis;
 use crate::ids::{ActorId, DocId, LabelId, ProjectId, UlidSource, UserId, WorkspaceId};
 use crate::index::{self, AliasTable, RefResolution};

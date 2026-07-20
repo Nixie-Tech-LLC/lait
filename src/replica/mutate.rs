@@ -792,7 +792,7 @@ impl Replica {
             return Ok((Response::err("an issue cannot be its own parent"), None));
         }
         // validate-then-commit: reject a locally visible cycle before staging
-        // any op (the engine's CyclicMoveError is the backstop; concurrent
+        // any op (Loro's CyclicMoveError is the backstop; concurrent
         // cross-peer cycles are resolved by the merge itself).
         let mut cur = parent_id.clone();
         while let Some(p) = cur {

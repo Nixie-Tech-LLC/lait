@@ -83,7 +83,7 @@ pub struct ImportDelta {
     pub kinds: Vec<String>,
 }
 
-/// Opaque pre-import capture (the engine's `loro::*` types never leave the module).
+/// Opaque pre-import capture (Loro's `loro::*` types never leave the module).
 pub struct ImportMark {
     frontiers: Frontiers,
     vv: loro::VersionVector,

@@ -1,6 +1,6 @@
 //! `lait serve` — the local HTTP surface, and the browser's Layer-B client.
 //!
-//! The engine's contract has always been [`crate::control`]: a versioned,
+//! The daemon's contract has always been [`crate::control`]: a versioned,
 //! hand-maintained imperative façade over the CRDT, spoken over a Unix socket or
 //! a named pipe. Native clients are local processes, so that
 //! transport cost them nothing. A browser cannot speak a named pipe. This module

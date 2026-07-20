@@ -1015,7 +1015,7 @@ fn injected_epoch_without_an_authorized_mint_is_never_adopted() {
     evil.add_op(&forged_mint).unwrap();
     let sealed = crate::crypto::seal_to(&victim_dev, &attacker_key).unwrap();
     evil.put_sealed(&poison_id, &victim_dev, &sealed).unwrap();
-    evil.apply(&crate::engine::op::OpCtx::authority("poison", &atk_dev));
+    evil.apply(&crate::fabric::op::OpCtx::authority("poison", &atk_dev));
     let diff = evil.export_from_bytes(&a_vv).unwrap();
 
     // Victim imports it over sync (import_membership is ungated by design).
@@ -4065,10 +4065,10 @@ fn project_key_charset_is_validated() {
     }
 }
 
-/// The read contract the **web viewer** depends on, pinned so an engine change
+/// The read contract the **web viewer** depends on, pinned so a fabric change
 /// can't silently rot it.
 ///
-/// This exists because it already happened once. The engine moved per-issue
+/// This exists because it already happened once. The fabric moved per-issue
 /// history from a session ring onto the durable oplog, which changed how an
 /// `ActivityEvent` attributes: `actor` became the real per-op key and
 /// `actor_nick` went empty. The viewer read `actor_nick` for the display name,

@@ -4,9 +4,16 @@
 //!
 //! This crate lists **no scaffold** in its manifest — not Loro, not iroh — so a
 //! scaffold reference here does not compile. That absence *is* the boundary:
-//! "where lait starts and ends" is the dependency edge, enforced by rustc. What
-//! lives here is pure over identity + signed
-//! bytes:
+//! "where lait starts and ends" is the dependency edge, enforced by rustc.
+//!
+//! The kernel determines **legitimacy** — identity, authority, custody,
+//! recovery, and which transitions are valid given signed history. `lait-fabric`
+//! maintains the **shared world** — documents, persistence, history,
+//! convergence, projection. They are separate crates because that dependency
+//! edge is a correctness boundary: convergence cannot confer legitimacy. They
+//! ship, test, and version together as lait's substrate.
+//!
+//! What lives here is pure over identity + signed bytes:
 //!
 //! - [`ids`] — self-certifying identity types (a `UserId` *is* an ed25519 key).
 //! - [`crypto`] — sealing/identity primitives (pure RustCrypto/dalek).
