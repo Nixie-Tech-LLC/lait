@@ -19,6 +19,7 @@
 //! the same bytes iroh calls an `EndpointId` (the T0 identity agreement). The
 //! iroh impl converts at its own edge; nothing above this seam names an iroh id.
 
+pub mod iroh;
 pub mod mem;
 
 use anyhow::Result;
@@ -37,13 +38,23 @@ pub type Alpn = &'static [u8];
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Topic(pub [u8; 32]);
 
+/// Max framed message size (64 MiB) — a guard against a malformed length.
+/// Framing policy belongs to the transport (the seam that owns the wire), so the
+/// constant lives here; `sync.rs` holds a private duplicate until PR-2 re-points
+/// it. Enforced read-side by every implementation; send-side only the
+/// `u32::try_from` overflow guard applies.
+pub const MAX_FRAME: u32 = 64 * 1024 * 1024;
+
 /// What a gossip subscription yields. The daemon's `recv_loop` is written against
 /// exactly this — decode/verify a `Received`, `touch` on `NeighborUp`, mark
 /// offline on `NeighborDown`.
 #[derive(Debug, Clone)]
 pub enum GossipEvent {
-    /// A signed application frame from `from` (the daemon verifies it — the
-    /// transport does not authenticate payloads).
+    /// A signed application frame. `from` is the **delivering neighbor** — the
+    /// last hop in the gossip overlay, a routing hint, never an authenticated
+    /// author (iroh-gossip relays frames peer-to-peer, so the deliverer is
+    /// usually not the signer). The daemon derives authorship from the signed
+    /// payload; the transport does not authenticate payloads.
     Received { from: PeerId, bytes: Vec<u8> },
     /// A peer joined our view of the room.
     NeighborUp(PeerId),
@@ -54,14 +65,42 @@ pub enum GossipEvent {
 /// A bidirectional, **framed** byte stream — one lait protocol message per frame.
 /// Length framing is the transport's job, so `sync.rs` sends/receives whole
 /// `Msg`s instead of hand-rolling length prefixes over a raw QUIC stream.
+///
+/// **Close semantics (dialer side):** dropping a dialer's `Box<dyn Stream>`
+/// closes the underlying connection — that IS the dialer's "done" signal (the
+/// iroh impl's stream owns the dial-side connection; today's `conn.close(0, …)`
+/// reason strings were diagnostics only). Dialers never call
+/// [`wait_closed`](Stream::wait_closed).
+///
+/// **Readiness (accept side):** an accepted stream may not exist on the wire
+/// until the dialer opens it and writes — accepters must not assume anything
+/// before their first `recv`/`send` (lait's protocols all have the dialer speak
+/// first; a presence probe never opens a stream at all).
 #[async_trait]
 pub trait Stream: Send {
-    /// Send one frame.
+    /// Send one frame. May park indefinitely under the peer's flow control
+    /// (real transports have backpressure; the in-memory one buffers
+    /// unboundedly) — callers own their timeouts.
     async fn send(&mut self, frame: &[u8]) -> Result<()>;
-    /// Receive the next frame, or `None` at clean end-of-stream.
+    /// Receive the next frame. `Ok(None)` at **clean** end-of-stream (the peer
+    /// finished at a frame boundary); an end mid-frame or a lost connection is
+    /// an `Err` — truncation is loud, never a quiet end.
     async fn recv(&mut self) -> Result<Option<Vec<u8>>>;
-    /// Signal we are done sending (the peer sees end-of-stream).
+    /// Signal we are done sending (the peer sees end-of-stream after draining).
+    /// This only **queues** the end marker — it does NOT confirm delivery;
+    /// accepters must follow with [`wait_closed`](Stream::wait_closed) before
+    /// dropping the stream.
     async fn finish(&mut self) -> Result<()>;
+    /// Park until the peer has closed the connection under this stream (or it
+    /// is lost). **Accept-side contract:** after the accepter has sent its last
+    /// frame and called [`finish`](Stream::finish), it MUST await this before
+    /// dropping the stream — `finish` only queues end-of-stream, and dropping
+    /// the stream tears the connection down (CONNECTION_CLOSE), truncating any
+    /// frames the dialer has not yet drained (the silent-partial-sync bug
+    /// guarded at the daemon's sync accepter). Resolves once the dialer has
+    /// closed/dropped its side, which it does only after draining. Dialers
+    /// never need this — a dialer signals "done" by dropping its stream.
+    async fn wait_closed(&mut self);
 }
 
 /// An accepted inbound connection: who dialed, on which protocol, and the stream.
@@ -71,13 +110,31 @@ pub struct Incoming {
     pub stream: Box<dyn Stream>,
 }
 
-/// A joined gossip room: broadcast to it, and pull the next event.
+/// The send half of a joined gossip room. Split from the receive half so the
+/// daemon can share the sender across its heartbeat/announce tasks (behind an
+/// `Arc`/`Mutex`) *while* `recv_loop` owns the receiver — one combined object
+/// can't serve both at once. `&self` + `Send + Sync` makes sharing natural.
 #[async_trait]
-pub trait GossipRoom: Send {
-    /// Broadcast an (already-signed) frame to the room.
+pub trait GossipSender: Send + Sync {
+    /// Broadcast an (already-signed) frame to the room. Gossip is **lossy** —
+    /// delivery is best-effort and unordered; the protocol tolerates misses
+    /// (announces piggyback on the heartbeat).
     async fn broadcast(&self, bytes: Vec<u8>) -> Result<()>;
-    /// The next event, or `None` when the room is gone.
+}
+
+/// The receive half of a joined gossip room.
+#[async_trait]
+pub trait GossipReceiver: Send {
+    /// The next event, or `None` when the room is gone. A lossy transport may
+    /// silently skip missed messages (there is no Lagged event — gossip is
+    /// lossy by contract and the daemon already tolerates loss).
     async fn next(&mut self) -> Option<GossipEvent>;
+    /// Resolve once the room is usable — connected to at least one peer (the
+    /// ticket-join "connected to the host or fail loudly" path). May consume
+    /// the initial `NeighborUp` from the event stream. The in-memory transport
+    /// is always joined and resolves immediately. Callers own the timeout, as
+    /// the daemon's `join_topic` does today.
+    async fn joined(&mut self) -> Result<()>;
 }
 
 /// lait's network mechanism. The daemon depends on this, not on iroh types.
@@ -104,9 +161,23 @@ pub trait Transport: Send + Sync {
     /// loops this and dispatches by `alpn` — its `Router` replacement.
     async fn accept(&self) -> Option<Incoming>;
 
-    /// Join a gossip room, bootstrapping from `bootstrap` peers.
-    async fn subscribe(&self, topic: Topic, bootstrap: &[PeerId]) -> Result<Box<dyn GossipRoom>>;
+    /// The direct addresses a minted ticket must carry so a peer can reach us
+    /// **when the policy has no relay/discovery** (Isolated). Empty under
+    /// Public/Local — those tickets stay address-free (the policy resolves bare
+    /// ids), so the policy test lives here, not in the daemon.
+    fn advertised_addrs(&self) -> Vec<std::net::SocketAddr>;
 
-    /// Best-effort teardown.
+    /// Join a gossip room, bootstrapping from `bootstrap` peers (which the
+    /// transport also [`learn`](Transport::learn)s, so bare-id dials to them
+    /// resolve). Non-waiting — a solo founder must not block; callers wanting a
+    /// join-wait use [`GossipReceiver::joined`] under their own timeout.
+    async fn subscribe(
+        &self,
+        topic: Topic,
+        bootstrap: &[PeerId],
+    ) -> Result<(Box<dyn GossipSender>, Box<dyn GossipReceiver>)>;
+
+    /// Best-effort teardown: unblocks a parked [`accept`](Transport::accept)
+    /// (which returns `None` from then on) and closes the network.
     async fn shutdown(&self);
 }
