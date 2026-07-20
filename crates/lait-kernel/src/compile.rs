@@ -288,6 +288,38 @@ impl StructurallyValidatedCompiledPolicy {
         })
     }
 
+    /// Coefficients `μ` expressing the `lost` leaf's row as a combination of the
+    /// `helpers`' rows: `Σ_j μ_j · A_{helper_j} = A_lost`, or `None` if the lost
+    /// row is not in the helpers' span.
+    ///
+    /// D5 repair uses this: since `s_lost = ⟨A_lost, ρ⟩ = Σ_j μ_j ⟨A_{helper_j},
+    /// ρ⟩ = Σ_j μ_j s_{helper_j}`, a helper set whose rows span the lost row can
+    /// recompute its share as a linear combination of theirs. Note this is
+    /// *strictly stronger* than the helpers merely being qualified: qualification
+    /// spans only `e₀` (the secret), whereas repair needs the lost leaf's whole
+    /// row. The result pairs each contributing helper with its coefficient, in
+    /// row order, dropping zero coefficients.
+    pub fn repair_coefficients(
+        &self,
+        helpers: &[LeafId],
+        lost: &LeafId,
+    ) -> Option<Vec<(LeafId, Scalar)>> {
+        let mut idxs: Vec<usize> = helpers.iter().filter_map(|l| self.index_of(l)).collect();
+        idxs.sort_unstable();
+        idxs.dedup();
+        let rows = self.scalar_rows(&idxs);
+        let lost_idx = self.index_of(lost)?;
+        let target = self.scalar_rows(&[lost_idx]).into_iter().next()?;
+        let mu = solve_row_combination(&rows, &target)?;
+        Some(
+            idxs.iter()
+                .enumerate()
+                .filter(|&(pos, _)| mu[pos] != Scalar::ZERO)
+                .map(|(pos, &i)| (self.0.leaves[i].clone(), mu[pos]))
+                .collect(),
+        )
+    }
+
     /// Verify a witness against this structure. Requires, beyond the linear
     /// equation, a single canonical interpretation (§19 finding 5): the witness
     /// binds this exact commitment, its leaves are ours, strictly ordered by row

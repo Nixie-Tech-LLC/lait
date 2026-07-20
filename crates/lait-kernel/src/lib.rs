@@ -34,6 +34,7 @@ pub mod genesis;
 pub mod handover;
 pub mod ids;
 pub mod policy;
+pub mod refresh;
 pub mod reshare;
 pub mod sigdag;
 pub mod space;
