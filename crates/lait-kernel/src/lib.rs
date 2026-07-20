@@ -38,4 +38,5 @@ pub mod refresh;
 pub mod reshare;
 pub mod sigdag;
 pub mod space;
+pub mod status;
 pub mod transition;
