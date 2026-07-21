@@ -35,6 +35,9 @@ pub mod list_picker;
 pub mod mcp;
 pub mod members_ui;
 pub mod node;
+/// The product's adoption of the orbital lifecycle (hosts a World, drives
+/// Sessions through the public `runtime` API).
+pub mod orbital;
 pub mod presence;
 pub mod proto;
 pub mod registry;

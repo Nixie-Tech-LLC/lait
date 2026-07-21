@@ -230,15 +230,18 @@ impl Session {
         let world = &self.world;
         let principal = &self.principal;
         let label = intent.schema.as_str().to_string();
-        // Run the World callback, containing a panic as a typed error.
-        let effect: WorldEffect = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let mut ctx = WorldContext::new(principal);
-            world.submit(&mut ctx, intent)
-        }))
-        .unwrap_or(Err(WorldError::WorldImplementationFailed))?;
-
-        // Durably commit the staged operations through the exclusive writer.
+        // Hold the exclusive writer across the whole transaction: the World reads
+        // the stable committed snapshot, stages operations against it, and the
+        // commit lands atomically — a read-modify-write with no interleaving.
         let mut replica = self.core.replica.lock().unwrap_or_else(|p| p.into_inner());
+        let effect: WorldEffect = {
+            let reader = ReplicaReader(&*replica);
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let mut ctx = WorldContext::with_reads(principal, &reader);
+                world.submit(&mut ctx, intent)
+            }))
+            .unwrap_or(Err(WorldError::WorldImplementationFailed))?
+        };
         let frontier = replica
             .commit(&label, &effect.operations)
             .map_err(|_| WorldError::Persistence)?;
