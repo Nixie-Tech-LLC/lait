@@ -18,6 +18,8 @@ use crate::wire::length_framed;
 
 /// The Beacon signing domain.
 pub const BEACON_DOMAIN: &[u8] = b"lait/beacon/1";
+/// The only Beacon protocol version this build speaks (never negotiated).
+pub const BEACON_PROTOCOL: u16 = 1;
 /// Ed25519 algorithm tag.
 pub const SIG_ALG_ED25519: u8 = 1;
 /// Maximum encoded Beacon size.
@@ -65,6 +67,8 @@ pub struct SignedBeaconV1 {
 /// Why a Beacon failed validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BeaconError {
+    /// The signed protocol field names a version this build does not speak.
+    UnsupportedProtocol(u16),
     UnsupportedVersion(u8),
     UnsupportedSignatureAlgorithm(u8),
     NonCanonical,
@@ -151,6 +155,9 @@ impl SignedBeaconV1 {
             return Err(BeaconError::UnsupportedSignatureAlgorithm(
                 self.signature_algorithm,
             ));
+        }
+        if self.body.protocol != BEACON_PROTOCOL {
+            return Err(BeaconError::UnsupportedProtocol(self.body.protocol));
         }
         let space = std::str::from_utf8(&self.body.space)
             .ok()

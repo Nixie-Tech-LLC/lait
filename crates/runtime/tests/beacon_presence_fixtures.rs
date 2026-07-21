@@ -19,7 +19,7 @@ fn space_bytes() -> [u8; 29] {
 
 fn beacon(epoch: u64, sequence: u64, routes: Vec<RouteHint>) -> SignedBeaconV1 {
     SignedBeaconV1::emit(
-        7,
+        runtime::beacon::BEACON_PROTOCOL,
         &space(),
         StationEpoch::from_u64(epoch),
         sequence,
@@ -174,7 +174,39 @@ fn station_of(seed: &[u8; 32]) -> StationId {
 
 fn probe(nonce: [u8; 32]) -> ProbeV1 {
     let responder = station_of(&RESPONDER_SEED).key_bytes();
-    ProbeV1::sign(7, space_bytes(), responder, nonce, &INITIATOR_SEED).unwrap()
+    ProbeV1::sign(
+        runtime::neighbor_presence::PRESENCE_PROTOCOL,
+        space_bytes(),
+        responder,
+        nonce,
+        &INITIATOR_SEED,
+    )
+    .unwrap()
+}
+
+#[test]
+fn an_unsupported_protocol_version_is_refused_not_negotiated() {
+    // Beacon: a signed frame naming a future protocol is rejected by name.
+    let b = SignedBeaconV1::emit(
+        99,
+        &space(),
+        StationEpoch::from_u64(1),
+        0,
+        [1u8; 32],
+        0,
+        vec![],
+        &STATION_SEED,
+    )
+    .unwrap();
+    assert_eq!(b.verify(), Err(BeaconError::UnsupportedProtocol(99)));
+
+    // Presence probe: same rule.
+    let responder = station_of(&RESPONDER_SEED).key_bytes();
+    let p = ProbeV1::sign(99, space_bytes(), responder, [1u8; 32], &INITIATOR_SEED).unwrap();
+    assert_eq!(
+        p.verify(&space_bytes(), &station_of(&INITIATOR_SEED)),
+        Err(PresenceError::UnsupportedProtocol(99))
+    );
 }
 
 #[test]

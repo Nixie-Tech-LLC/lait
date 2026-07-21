@@ -68,6 +68,16 @@ pub struct PrincipalResolution {
 /// authorization, and the commit-side authority-frontier compare-and-swap).
 /// Supplied by the deployment composition root (which owns the replayed signed
 /// history); Sessions and Worlds can neither replace nor bypass it.
+///
+/// **Atomicity contract.** Runtime performs authorization, the frontier
+/// compare-and-swap, and the durable commit inside one Station-writer critical
+/// section. Authority mutations that themselves serialize through the same
+/// Station writer (as orbital authority mutations do — membership changes are
+/// Replica commits) therefore cannot interleave between the comparison and the
+/// commit. An implementation whose state mutates *outside* that writer must
+/// provide linearizable reads and accept that its mutations are ordered
+/// against commits by the frontier CAS: a commit never proceeds against a
+/// frontier the view no longer reports.
 pub trait AuthorityView: Send + Sync {
     /// Resolve a local device's principal, or `None` when the device has no
     /// standing in the Space.

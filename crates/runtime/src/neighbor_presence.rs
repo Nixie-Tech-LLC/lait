@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::wire::length_framed;
 
+/// The only presence protocol version this build speaks (never negotiated).
+pub const PRESENCE_PROTOCOL: u16 = 1;
 /// Probe signing domain.
 pub const PROBE_DOMAIN: &[u8] = b"lait/neighbor-presence/1/probe";
 /// Ack signing domain.
@@ -52,6 +54,8 @@ pub struct AckV1 {
 /// Why a presence message failed validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PresenceError {
+    /// The signed protocol field names a version this build does not speak.
+    UnsupportedProtocol(u16),
     UnsupportedSignatureAlgorithm(u8),
     NonCanonical,
     /// A signer/StationId/transport identity did not agree.
@@ -166,6 +170,9 @@ impl ProbeV1 {
         expected_space: &[u8; 29],
         transport_peer: &StationId,
     ) -> Result<(), PresenceError> {
+        if self.protocol != PRESENCE_PROTOCOL {
+            return Err(PresenceError::UnsupportedProtocol(self.protocol));
+        }
         if self.signature_algorithm != SIG_ALG_ED25519 {
             return Err(PresenceError::UnsupportedSignatureAlgorithm(
                 self.signature_algorithm,

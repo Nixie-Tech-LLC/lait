@@ -60,6 +60,23 @@ fn a_valid_hello_exchange_completes() {
 }
 
 #[test]
+fn an_unsupported_contact_protocol_is_refused() {
+    let h = ContactHelloV1::sign(
+        99,
+        space_bytes(),
+        station_of(&RESPONDER_SEED).key_bytes(),
+        [3u8; 32],
+        contact(),
+        &INITIATOR_SEED,
+    )
+    .unwrap();
+    assert_eq!(
+        h.verify(&space_bytes(), &station_of(&INITIATOR_SEED)),
+        Err(ContactWireError::UnsupportedProtocol(99))
+    );
+}
+
+#[test]
 fn hello_substitution_and_replay_are_rejected() {
     let h = hello();
     // Cross-Space replay.

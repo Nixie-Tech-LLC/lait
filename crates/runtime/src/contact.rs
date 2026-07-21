@@ -33,6 +33,10 @@ use crate::wire::length_framed;
 
 /// The Contact ALPN.
 pub const CONTACT_ALPN: &[u8] = b"lait/contact/1";
+/// The only Contact protocol version this build speaks. There is no
+/// mixed-version window: an unknown version is refused by name, never
+/// negotiated (clean-break formats).
+pub const CONTACT_PROTOCOL: u16 = 1;
 /// Hello signing domain.
 pub const HELLO_DOMAIN: &[u8] = b"lait/contact/1/hello";
 /// HelloAck signing domain.
@@ -167,6 +171,8 @@ pub struct ContactHelloAckV1 {
 /// Why a Contact hello/frame failed validation before the state machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContactWireError {
+    /// The signed protocol field names a version this build does not speak.
+    UnsupportedProtocol(u16),
     UnsupportedSignatureAlgorithm(u8),
     NonCanonical,
     IdentityMismatch,
@@ -284,6 +290,9 @@ impl ContactHelloV1 {
         expected_space: &[u8; 29],
         transport_peer: &StationId,
     ) -> Result<(), ContactWireError> {
+        if self.protocol != CONTACT_PROTOCOL {
+            return Err(ContactWireError::UnsupportedProtocol(self.protocol));
+        }
         if self.signature_algorithm != SIG_ALG_ED25519 {
             return Err(ContactWireError::UnsupportedSignatureAlgorithm(
                 self.signature_algorithm,

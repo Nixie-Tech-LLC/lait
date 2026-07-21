@@ -203,30 +203,37 @@ impl Session {
         })
     }
 
-    /// Contain a World's staged effect inside its own namespace and registered
-    /// mutation models. A buggy or hostile World must not be able to write
-    /// another World's Bodies or exceed the transaction bound.
-    fn contain_effect(&self, effect: &WorldEffect) -> Result<(), WorldError> {
+    /// Contain a World's staged effect inside its own namespace and the
+    /// mutation model of **the intent's schema** — not merely "any model the
+    /// World registered". A World with both atomic and collaborative schemas
+    /// therefore cannot smuggle the other model's operations through an intent:
+    /// an atomic-schema intent may stage only atomic replacement (plus
+    /// create/tombstone), a collaborative-schema intent only the collaborative
+    /// algebra (plus create/tombstone).
+    fn contain_effect(
+        &self,
+        effect: &WorldEffect,
+        intent_schema: &SchemaId,
+    ) -> Result<(), WorldError> {
         if effect.operations.len() > replica::algebra::MAX_OPS_PER_TRANSACTION {
             return Err(WorldError::ContractViolation);
         }
-        let allows_atomic = self
+        let schema = self
             .schemas
             .iter()
-            .any(|s| matches!(s.mutation, MutationModel::Atomic));
-        let allows_collab = self
-            .schemas
-            .iter()
-            .any(|s| matches!(s.mutation, MutationModel::Collaborative(_)));
+            .find(|s| &s.id == intent_schema)
+            // ensure_writable_schema ran before the World; absence is a bug.
+            .ok_or(WorldError::ContractViolation)?;
+        let collaborative = matches!(schema.mutation, MutationModel::Collaborative(_));
         for (key, op) in &effect.operations {
             if key.world != self.world_id {
                 return Err(WorldError::ContractViolation);
             }
             let permitted = match op {
-                BodyOp::ReplaceAtomic { .. } => allows_atomic,
-                // Create/tombstone are legal under either registered model.
-                BodyOp::Create | BodyOp::Tombstone => allows_atomic || allows_collab,
-                _ => allows_collab,
+                BodyOp::ReplaceAtomic { .. } => !collaborative,
+                // Create/tombstone are legal under either model.
+                BodyOp::Create | BodyOp::Tombstone => true,
+                _ => collaborative,
             };
             if !permitted {
                 return Err(WorldError::ContractViolation);
@@ -308,20 +315,24 @@ impl Session {
         self.ensure_live()?;
         self.ensure_within_limit(intent.payload.len())?;
         self.ensure_writable_schema(&intent.schema, intent.schema_version)?;
-        // Per-request authorization: derive fresh facts from the mechanics view.
-        let principal = self.fresh_principal()?;
         let world = &self.world;
         let label = intent.schema.as_str().to_string();
-        // Hold the exclusive writer across the whole transaction: the World reads
-        // the stable committed snapshot, stages operations against it, and the
-        // commit lands atomically — a read-modify-write with no interleaving.
-        // The closed flag is checked INSIDE this critical section, so commit
-        // admission and Station shutdown are one serialized transition: no
-        // commit can land after the dormancy checkpoint.
+        let intent_schema = intent.schema.clone();
+        // Hold the exclusive writer across the WHOLE transaction — including
+        // both authority resolutions. Authorization, the World callback, the
+        // frontier compare-and-swap, and the durable commit all run inside one
+        // critical section, so any authority mutation that itself serializes
+        // through this Station's writer (as orbital authority mutations do —
+        // membership changes are Replica commits) cannot interleave between
+        // the comparison and the commit. External `AuthorityView`
+        // implementations owe the linearizable-read contract documented on
+        // the trait.
         let mut inner = self.core.lock();
         if inner.closed {
             return Err(WorldError::StationDormant);
         }
+        // Per-request authorization, resolved under the writer lock.
+        let principal = self.fresh_principal()?;
         let effect: WorldEffect = {
             let reader = ReplicaReader(&inner.replica);
             let principal = &principal;
@@ -331,11 +342,13 @@ impl Session {
             }))
             .unwrap_or(Err(WorldError::WorldImplementationFailed))?
         };
-        // Contain the staged effect inside this World's namespace and models.
-        self.contain_effect(&effect)?;
-        // Authority-frontier compare-and-swap: the frontier the request was
-        // authorized at must still be current at commit. A change refuses the
-        // commit with AuthorityChanged and commits nothing.
+        // Contain the staged effect inside this World's namespace and the
+        // intent schema's mutation model.
+        self.contain_effect(&effect, &intent_schema)?;
+        // Authority-frontier compare-and-swap, still under the writer lock:
+        // the frontier the request was authorized at must still be current at
+        // commit. A change refuses the commit with AuthorityChanged and
+        // commits nothing.
         let current = self
             .authority
             .resolve(&principal.device)

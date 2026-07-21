@@ -836,6 +836,98 @@ fn a_collaborative_world_commits_and_reads_through_the_session() {
     assert_eq!(proj.bytes, b"2:first comment,second comment");
 }
 
+/// A World registering BOTH mutation models but staging collaborative ops from
+/// its ATOMIC schema's intent — the schema-containment violation of finding #8.
+struct MixedWorld {
+    id: WorldId,
+    schemas: Vec<BodySchema>,
+}
+impl World for MixedWorld {
+    fn id(&self) -> WorldId {
+        self.id.clone()
+    }
+    fn schemas(&self) -> &[BodySchema] {
+        &self.schemas
+    }
+    fn submit(
+        &self,
+        _ctx: &mut WorldContext<'_>,
+        _intent: WorldIntent,
+    ) -> Result<WorldEffect, WorldError> {
+        // Regardless of which schema the intent named, stage a collaborative op.
+        let key = BodyKey::new(self.id.clone(), BodyId::from_bytes([5u8; 16]));
+        Ok(WorldEffect {
+            operations: vec![(
+                key.clone(),
+                BodyOp::CounterAdd {
+                    path: "sneak".into(),
+                    delta: 1,
+                },
+            )],
+            scopes: vec![key],
+            effect: vec![],
+        })
+    }
+    fn query(
+        &self,
+        _ctx: &WorldContext<'_>,
+        _query: WorldQuery,
+    ) -> Result<WorldProjection, WorldError> {
+        Err(WorldError::InvalidRequest)
+    }
+}
+
+#[test]
+fn containment_is_bound_to_the_intent_schema_not_the_world() {
+    let id = WorldId::parse("com.example.mixed").unwrap();
+    let schemas = vec![
+        BodySchema {
+            id: SchemaId::parse("atomicdoc").unwrap(),
+            version: 1,
+            encoding: EncodingId::parse("bytes").unwrap(),
+            mutation: MutationModel::Atomic,
+            readable_predecessors: vec![],
+        },
+        BodySchema {
+            id: SchemaId::parse("collabdoc").unwrap(),
+            version: 1,
+            encoding: EncodingId::parse("collab").unwrap(),
+            mutation: MutationModel::Collaborative(replica::body::CollaborativeSchema::default()),
+            readable_predecessors: vec![],
+        },
+    ];
+    let reg = WorldRegistration {
+        id: id.clone(),
+        implementation_version: WorldVersion(1),
+        schemas: schemas.clone(),
+        limits: WorldLimits::default(),
+    };
+    let world: Arc<dyn World> = Arc::new(MixedWorld {
+        id: id.clone(),
+        schemas,
+    });
+    let station = station_with(reg, world);
+    let session = station.dock(&id, &writer()).unwrap();
+    let before = station.frontier();
+    // An ATOMIC-schema intent staging a collaborative op is refused even though
+    // the World also registers a collaborative schema.
+    let r = session.submit(WorldIntent {
+        schema: SchemaId::parse("atomicdoc").unwrap(),
+        schema_version: 1,
+        payload: vec![],
+    });
+    assert_eq!(r, Err(WorldError::ContractViolation));
+    assert_eq!(station.frontier(), before, "nothing committed");
+    // The SAME staged ops under the collaborative schema are legal.
+    session
+        .submit(WorldIntent {
+            schema: SchemaId::parse("collabdoc").unwrap(),
+            schema_version: 1,
+            payload: vec![],
+        })
+        .unwrap();
+}
+
 #[test]
 fn observation_cursor_starts_at_a_reset_boundary() {
     let station = station();
