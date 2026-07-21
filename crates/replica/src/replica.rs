@@ -660,6 +660,28 @@ impl Replica {
         if effect.len() > crate::receipt::MAX_EFFECT_BYTES {
             return Err(ReplicaCommitError::EffectTooLarge);
         }
+        // An idempotent no-op: no operations, nothing applied, the frontier
+        // does not advance — but the receipt is still recorded durably so an
+        // identical retry replays instead of re-running the World.
+        if ops.is_empty() {
+            let receipt = RequestReceiptV1 {
+                version: 1,
+                space: ctx.space.clone(),
+                world: world.clone(),
+                device: device.clone(),
+                request: *request,
+                payload_hash: *payload_hash,
+                effect,
+                scopes,
+                frontier: self.frontier,
+            };
+            if self.durable.is_some() {
+                self.persist_receipt_only(&receipt)?;
+            }
+            self.receipts
+                .insert(receipt.scope_key(), (receipt.clone(), None));
+            return Ok(ActionOutcome::Committed(receipt));
+        }
         // Space pinning: one store, one Space.
         match &self.space {
             None => self.space = Some(ctx.space.clone()),
@@ -1537,6 +1559,78 @@ impl Replica {
         let receipt = receipt.expect("local commits carry a receipt");
         self.persist_graph(ctx, tx, &sealed, new_records, Some(&receipt), next_frontier)?;
         Ok(receipt)
+    }
+
+    /// Persist ONLY a new idempotency receipt: the body index, manifest, and
+    /// frontier are unchanged; every existing object is carried forward.
+    fn persist_receipt_only(
+        &mut self,
+        receipt: &RequestReceiptV1,
+    ) -> Result<(), ReplicaCommitError> {
+        let store = self.durable.as_ref().expect("durable path");
+        let prior: Option<StoreMetaV1> = store
+            .manifest()
+            .map(|m| postcard::from_bytes(&m.meta))
+            .transpose()
+            .map_err(|e| ReplicaCommitError::Integrity(format!("store meta: {e}")))?;
+        let receipt_bytes = receipt.encode();
+        let receipt_ref = object_ref(&receipt_bytes);
+        let mut keep: Vec<ObjectRef> = Vec::new();
+        let mut receipt_meta: Vec<(Vec<u8>, ObjectRef)> = Vec::new();
+        for (scope, (_, existing_ref)) in &self.receipts {
+            if let Some(r) = existing_ref {
+                receipt_meta.push((scope.clone(), *r));
+                keep.push(*r);
+            }
+        }
+        receipt_meta.push((receipt.scope_key(), receipt_ref));
+        let (bodies, manifest_root, manifest_pages) = match prior {
+            Some(meta) => (meta.bodies, meta.manifest_root, meta.manifest_pages),
+            None => (self.bodies.clone().into_iter().collect(), None, Vec::new()),
+        };
+        for (_, record) in &bodies {
+            if let Some(r) = record.protected {
+                keep.push(r);
+            }
+            if let Some(r) = record.transaction {
+                keep.push(r);
+            }
+        }
+        if let Some(r) = manifest_root {
+            keep.push(r);
+        }
+        keep.extend(manifest_pages.iter().copied());
+        keep.sort_by_key(|r| r.hash);
+        keep.dedup_by_key(|r| r.hash);
+        let meta = StoreMetaV1 {
+            version: 1,
+            space: self.space.clone(),
+            frontier: self.frontier,
+            quota: self.quota,
+            bodies,
+            receipts: receipt_meta,
+            manifest_root,
+            manifest_pages,
+        };
+        let meta_bytes =
+            postcard::to_stdvec(&meta).map_err(|e| ReplicaCommitError::Fabric(e.to_string()))?;
+        let store = self.durable.as_mut().expect("durable path");
+        match store.commit(std::slice::from_ref(&receipt_bytes), &keep, meta_bytes) {
+            Ok(_) => {}
+            Err(FabricError::OutcomeUnknown) => {
+                self.poisoned = true;
+                return Err(ReplicaCommitError::OutcomeUnknown);
+            }
+            Err(e) => {
+                self.poisoned = true;
+                return Err(ReplicaCommitError::Durability(e.to_string()));
+            }
+        }
+        self.receipts.insert(
+            receipt.scope_key(),
+            (receipt.clone(), Some(object_ref(&receipt_bytes))),
+        );
+        Ok(())
     }
 
     fn persist_incorporation(

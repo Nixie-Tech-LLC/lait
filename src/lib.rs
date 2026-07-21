@@ -46,6 +46,8 @@ pub mod secretfs;
 pub mod serve;
 pub mod spaces;
 pub mod sync;
+/// The product's orbital World adapter (the C4 contract packet + IssuesWorld).
+pub mod world;
 
 // The **kernel** (`mechanics`) holds lait's roots — identity, the trust
 // planes, derivation rules — in a crate that lists no scaffold, so a `loro::`

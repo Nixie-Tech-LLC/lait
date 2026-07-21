@@ -70,7 +70,7 @@ pub use session::{
     Session, DEFAULT_OBSERVATION_CAPACITY, MAX_OBSERVATION_CAPACITY,
 };
 pub use world::{
-    AuthorityView, BodyReader, LocalIdentity, PrincipalFacts, PrincipalResolution, Standing, World,
-    WorldContext, WorldEffect, WorldIntent, WorldLimits, WorldProjection, WorldQuery,
-    WorldRegistration, WorldVersion,
+    AuthorityView, BodyDeclaration, BodyReader, LocalIdentity, PrincipalFacts, PrincipalResolution,
+    Standing, World, WorldContext, WorldEffect, WorldIntent, WorldLimits, WorldProjection,
+    WorldQuery, WorldRegistration, WorldVersion,
 };
