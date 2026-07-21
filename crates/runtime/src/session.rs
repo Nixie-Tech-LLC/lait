@@ -510,6 +510,8 @@ impl Session {
                 replica::ReplicaCommitError::TypeConflict => WorldError::Conflict,
                 replica::ReplicaCommitError::SchemaMismatch => WorldError::ContractViolation,
                 replica::ReplicaCommitError::RequestIdConflict => WorldError::RequestIdConflict,
+                replica::ReplicaCommitError::QuotaExceeded
+                | replica::ReplicaCommitError::OpaqueQuotaExceeded => WorldError::LimitExceeded,
                 // Illegitimate is an incorporation-path error; a local commit
                 // never produces it, but the match stays exhaustive.
                 replica::ReplicaCommitError::Illegitimate(_)

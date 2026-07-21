@@ -109,11 +109,14 @@ pub trait AuthorityIncorporator {
 /// graph. [`crate::Replica::incorporate_bundle`] accepts only this.
 pub struct ValidatedContactBundle {
     pub(crate) authority_receipt: AuthorityReceipt,
-    pub(crate) units: Vec<(
-        crate::transaction::BodyTransactionV1,
-        Vec<(crate::ids::BodyKey, Vec<u8>)>,
-    )>,
+    pub(crate) units: BundleUnits,
 }
+
+/// The bundle's validated transactions with their per-Body payloads.
+pub(crate) type BundleUnits = Vec<(
+    crate::transaction::BodyTransactionV1,
+    Vec<(crate::ids::BodyKey, Vec<u8>)>,
+)>;
 
 impl ValidatedContactBundle {
     /// The durable authority receipt this bundle's Body phase rests on.

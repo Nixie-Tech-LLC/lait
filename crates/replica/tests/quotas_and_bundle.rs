@@ -268,7 +268,7 @@ fn adversarial_stagings_are_rejected_whole() {
     let mut a = keyed_replica();
     commit_note(&mut a, [2u8; 16], &body(2), "target").unwrap();
     let staged = stage(&a);
-    let mut b = keyed_replica();
+    let b = keyed_replica();
     let mut incorporator = RecordingIncorporator::default();
 
     // A stray payload naming a Body outside the verified graph.

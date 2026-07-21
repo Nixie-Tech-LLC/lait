@@ -1307,8 +1307,8 @@ impl Replica {
             }
         }
         // 6. Every received Body payload resolves through the verified graph.
-        let mut units: BTreeMap<[u8; 16], (BodyTransactionV1, Vec<(BodyKey, Vec<u8>)>)> =
-            BTreeMap::new();
+        type Units = BTreeMap<[u8; 16], (BodyTransactionV1, Vec<(BodyKey, Vec<u8>)>)>;
+        let mut units: Units = BTreeMap::new();
         for (tx_id, key, envelope) in &staged.bodies {
             if envelope.len() > MAX_BODY_BYTES {
                 return Err(illegit("payload exceeds the Body maximum".into()));
