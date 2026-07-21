@@ -61,16 +61,17 @@ fn discover_space(home: &Path) -> Result<SpaceId> {
     found.ok_or_else(|| anyhow!("no Space under {} — run `lait init`", root.display()))
 }
 
-/// The orbital daemon: the composed stack plus the docked routing Session.
+/// The orbital daemon: the composed stack plus a lazily-docked routing Session.
 pub struct OrbitalDaemon {
     mechanics: OrbitalMechanics,
     station: Station,
-    session: Session,
+    /// The routing Session. `None` until this device holds standing — an
+    /// un-admitted joiner serves control (Status/Connect/Members) and drives
+    /// Contact before it can dock, then docks lazily once admission lands.
+    session: Mutex<Option<Session>>,
     identity: LocalIdentity,
     device_seed: [u8; 32],
     home: PathBuf,
-    /// The Observation broadcaster epoch, for Subscribe reset framing.
-    doorbell_epoch: u64,
     /// Signalled by a `Stop` request so `serve` returns (the injectable
     /// contract: return, don't `exit`).
     shutdown: Arc<tokio::sync::Notify>,
@@ -119,30 +120,54 @@ impl OrbitalDaemon {
             })
             .map_err(|e| anyhow!("activate: {e:?}"))?;
         let identity = Runtime::identity_from_seed(&device_seed);
+        // Dock now if we already hold standing (founder / re-opened member);
+        // otherwise defer until admission lands (an un-admitted joiner cannot
+        // dock, but must still serve control to drive its own Contact).
         let session = station
             .dock(&crate::world::contract::world_id(), &identity)
-            .map_err(|e| anyhow!("dock: {e:?}"))?;
-        let doorbell_epoch = session.epoch().as_u64();
+            .ok();
 
         Ok(Self {
             mechanics,
             station,
-            session,
+            session: Mutex::new(session),
             identity,
             device_seed,
             home: home.to_path_buf(),
-            doorbell_epoch,
             shutdown: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
-    fn router(&self) -> IssueRouter<'_> {
-        // The clock is a fresh ULID source each call (stateless).
-        IssueRouter::new(
-            &self.session,
+    /// Ensure a routing Session exists, docking lazily once standing is held.
+    /// Returns whether a Session is available after the attempt.
+    fn ensure_session(&self) -> bool {
+        let mut guard = self.session.lock().expect("session lock");
+        if guard.is_none() && self.mechanics.am_i_member() {
+            *guard = self
+                .station
+                .dock(&crate::world::contract::world_id(), &self.identity)
+                .ok();
+        }
+        guard.is_some()
+    }
+
+    /// Route an issue-family request through the docked Session, or refuse with a
+    /// typed "not admitted yet" when this device holds no standing.
+    fn route_issue(&self, req: Request) -> Response {
+        if !self.ensure_session() {
+            return Response::err(
+                "not admitted to this space yet — run `lait connect` to reach an \
+                 admin and complete admission before filing issues",
+            );
+        }
+        let guard = self.session.lock().expect("session lock");
+        let session = guard.as_ref().expect("session present after ensure");
+        let router = IssueRouter::new(
+            session,
             &self.identity,
             CLOCK.get_or_init(|| SystemUlidSource),
-        )
+        );
+        router.route(req, &self.facts()).0
     }
 
     fn facts(&self) -> RouterFacts {
@@ -165,7 +190,7 @@ impl OrbitalDaemon {
     /// Route one control request to its plane.
     fn dispatch(&self, req: Request) -> Response {
         if IssueRouter::handles(&req) {
-            return self.router().route(req, &self.facts()).0;
+            return self.route_issue(req);
         }
         match req {
             // ---- transport / status ----
@@ -345,9 +370,23 @@ impl OrbitalDaemon {
 
     async fn stream_subscribe(&self, mut write_half: tokio::io::WriteHalf<LocalStream>) {
         // A fresh stream from the current cursor: first frame is always a reset.
-        let mut stream = self.session.observe(None);
+        // Without standing there is no Session to observe yet — emit the reset
+        // and return; the client re-subscribes after admission.
+        let (mut stream, epoch) = {
+            if !self.ensure_session() {
+                let reset = Doorbell {
+                    reset: true,
+                    ..Default::default()
+                };
+                let _ = write_line_half(&mut write_half, &reset).await;
+                return;
+            }
+            let guard = self.session.lock().expect("session lock");
+            let session = guard.as_ref().expect("session present after ensure");
+            (session.observe(None), session.epoch().as_u64())
+        };
         let reset = Doorbell {
-            epoch: self.doorbell_epoch,
+            epoch,
             seq: 0,
             reset: true,
             ..Default::default()
@@ -446,10 +485,22 @@ fn request_name(req: &Request) -> String {
 }
 
 /// Run the orbital daemon on `home` with the default transport, holding the
-/// daemon lock for its lifetime.
+/// daemon lock for its lifetime. Identity is the process-global one.
 pub async fn run_orbital_daemon(home: PathBuf, factory: &dyn TransportFactory) -> Result<()> {
-    let _lock = acquire_daemon_lock(&home)?;
     let device_seed = load_or_create_identity(&crate::config::identity_dir()?)?;
+    run_orbital_daemon_with(home, device_seed, factory).await
+}
+
+/// The injectable orbital daemon: everything [`run_orbital_daemon`] does, but it
+/// takes an explicit device seed rather than reading the process-global identity
+/// — so several orbital daemons can run in one process, each its own device,
+/// sharing nothing but the runtime (the multi-node test contract).
+pub async fn run_orbital_daemon_with(
+    home: PathBuf,
+    device_seed: [u8; 32],
+    factory: &dyn TransportFactory,
+) -> Result<()> {
+    let _lock = acquire_daemon_lock(&home)?;
     let daemon = Arc::new(OrbitalDaemon::open(&home, device_seed, factory).await?);
     daemon.serve().await?;
     #[cfg(unix)]

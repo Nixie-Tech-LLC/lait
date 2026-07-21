@@ -88,7 +88,7 @@ pub fn open_orbital_runtime(
 pub mod daemon;
 pub mod mechanics;
 
-pub use daemon::{run_orbital_daemon, OrbitalDaemon};
+pub use daemon::{run_orbital_daemon, run_orbital_daemon_with, OrbitalDaemon};
 pub use mechanics::{AuthorityRecord, OrbitalMechanics};
 
 use crate::world::IssuesWorld;
@@ -162,6 +162,38 @@ pub fn form_space(
         .map_err(|e| anyhow::anyhow!("space-init: {e:?}"))?;
     let _ = station.go_dormant();
     let _ = SpaceFormationOptions::default(); // keep the type referenced
+    Ok((mechanics, coords))
+}
+
+/// Bootstrap a joiner's full orbital footprint under `home` from an invite
+/// link — the `lait join` store heir. Parses the founder-signed Coordinates,
+/// mints the joiner's mechanics store ([`OrbitalMechanics::enter`]: genesis
+/// adoption, self-inception held pending, admission stashed), then materializes
+/// the Runtime Orbit store at the SAME Space by entering those Coordinates.
+/// Returns the mechanics handle and the entered Space id. Admission itself is
+/// redeemed later, over Contact, once the daemon is serving.
+pub fn enter_space(
+    home: &Path,
+    device_seed: &[u8; 32],
+    invite_link: &str,
+) -> Result<(OrbitalMechanics, runtime::SignedCoordinatesV1)> {
+    if let Some(err) = detect_legacy_home(home) {
+        return Err(anyhow::anyhow!("{err}"));
+    }
+    let coords = runtime::SignedCoordinatesV1::parse_link(invite_link.trim())
+        .map_err(|e| anyhow::anyhow!("invalid invite link: {e}"))?;
+    let root = orbital_store_root(home);
+    let mechanics = OrbitalMechanics::enter(&root, device_seed, &coords)?;
+    // Materialize the Runtime Orbit store at the entered Space so the daemon can
+    // acquire the Orbit and drive Contact/admission.
+    let rt = Runtime::open(
+        root,
+        issues_registry()?,
+        Arc::new(mechanics.clone()),
+        Arc::new(mechanics.clone()),
+    );
+    rt.enter_orbit(&coords, EnterOptions)
+        .map_err(|e| anyhow::anyhow!("materialize orbit: {e:?}"))?;
     Ok((mechanics, coords))
 }
 
