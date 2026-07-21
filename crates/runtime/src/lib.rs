@@ -35,6 +35,7 @@ pub mod lifecycle;
 pub mod neighbor_presence;
 pub mod registry;
 pub mod session;
+pub mod store;
 pub(crate) mod wire;
 pub mod world;
 
@@ -45,7 +46,10 @@ pub use coordinates::{
     CoordinatesPayloadV1, SignedCoordinatesV1, VerifiedCoordinates,
 };
 pub use error::{ContactError, DormancyError, LifecycleError, StationExit, WorldError};
-pub use lifecycle::{ContactOutcome, Neighbor, Orbit, OrbitObservation, Runtime, Station};
+pub use lifecycle::{
+    ActivationOptions, CancelToken, ContactOutcome, DeorbitConfirmation, EnterOptions, Neighbor,
+    Orbit, OrbitObservation, Reachability, Runtime, SpaceFormationOptions, Station,
+};
 pub use neighbor_presence::{AckV1, PresenceError, ProbeV1};
 pub use registry::{RuntimeBuilder, WorldRegistry};
 pub use session::{Observation, ObservationCursor, Session};

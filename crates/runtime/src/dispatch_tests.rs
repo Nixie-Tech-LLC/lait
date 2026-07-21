@@ -2,13 +2,15 @@
 //! Session dispatch — no product types anywhere. This exercises the
 //! envelope → dock → World → Effect/Projection seam the product adopts in S5.
 
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use lait_kernel::acl::Grant;
-use lait_kernel::ids::{ActorId, DeviceId, SpaceId, StationEpoch, StationId};
+use lait_kernel::ids::{ActorId, DeviceId, StationId};
 
 use crate::error::WorldError;
-use crate::lifecycle::{ActivationOptions, Orbit};
+use crate::lifecycle::{ActivationOptions, Runtime, SpaceFormationOptions};
 use crate::registry::RuntimeBuilder;
 use crate::session::ObservationCursor;
 use crate::world::{
@@ -114,16 +116,24 @@ fn note_registration() -> (WorldRegistration, Arc<dyn World>) {
     (reg, Arc::new(world))
 }
 
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn temp_root() -> PathBuf {
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("lait-dispatch-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 fn station() -> crate::lifecycle::Station {
     let (reg, world) = note_registration();
     let registry = RuntimeBuilder::new().register(reg, world).build().unwrap();
-    Orbit::new(
-        SpaceId::from_digest([9u8; 16]),
-        registry,
-        StationEpoch::ZERO,
-    )
-    .activate(ActivationOptions)
-    .unwrap()
+    let rt = Runtime::open(temp_root(), registry);
+    rt.form_space(SpaceFormationOptions::default())
+        .unwrap()
+        .activate(ActivationOptions::default())
+        .unwrap()
 }
 
 #[test]
@@ -197,6 +207,54 @@ fn many_sessions_dock_independently_without_owning_the_station() {
         .is_ok());
     // The Station survives its Sessions and can still go dormant.
     assert!(station.go_dormant().is_ok());
+}
+
+#[test]
+fn dormancy_terminates_sessions() {
+    let station = station();
+    let world_id = WorldId::parse("com.example.notes").unwrap();
+    let session = station
+        .dock(&world_id, principal(vec![Grant::Write]))
+        .unwrap();
+    // Going dormant terminates the Session: further requests fail closed.
+    let _orbit = station.go_dormant().unwrap();
+    assert_eq!(
+        session.query(WorldQuery {
+            schema: SchemaId::parse("note").unwrap(),
+            schema_version: 1,
+            payload: b"x".to_vec(),
+        }),
+        Err(WorldError::StationDormant)
+    );
+}
+
+#[test]
+fn a_session_cannot_stop_the_station() {
+    let station = station();
+    let world_id = WorldId::parse("com.example.notes").unwrap();
+    // Dock a Session and drop it (undock) — the Station is unaffected and can
+    // still serve new Sessions.
+    let s = station
+        .dock(&world_id, principal(vec![Grant::Write]))
+        .unwrap();
+    s.undock();
+    let s2 = station
+        .dock(&world_id, principal(vec![Grant::Write]))
+        .unwrap();
+    assert!(s2
+        .query(WorldQuery {
+            schema: SchemaId::parse("note").unwrap(),
+            schema_version: 1,
+            payload: b"ok".to_vec(),
+        })
+        .is_ok());
+    // A tracked task panicking does not stop the Station's ability to go dormant.
+    station.spawn_tracked(|_c| panic!("boom")).unwrap();
+    let exit = station.wait();
+    assert!(matches!(
+        exit.reason,
+        Some(crate::error::StationExitReason::TaskFailed(_))
+    ));
 }
 
 #[test]

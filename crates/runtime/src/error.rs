@@ -32,8 +32,20 @@ pub enum LifecycleError {
     UnsupportedCoordinatesVersion,
     /// The store failed integrity or protocol-version validation on acquisition.
     IntegrityFailure(String),
+    /// This Runtime has no configured store root, so it cannot form or acquire a
+    /// durable Orbit (use [`Runtime::open`](crate::lifecycle::Runtime::open)).
+    NoStoreRoot,
+    /// A store already exists for this Space under the Runtime root.
+    AlreadyExists(SpaceId),
+    /// The durable activation-epoch counter would overflow; activation fails
+    /// closed rather than reuse a committed epoch.
+    EpochOverflow,
+    /// An underlying store I/O operation failed.
+    StoreIo(String),
+    /// The Station is going dormant (or has exited); new docks/tasks are refused.
+    StationDormant,
     /// The operation is not yet wired at this stage of the carve. Present only so
-    /// S0's sealed lifecycle surface compiles; production never routes through
+    /// the sealed lifecycle surface compiles; production never routes through
     /// these paths until the owning stage lands.
     NotYetWired(&'static str),
 }

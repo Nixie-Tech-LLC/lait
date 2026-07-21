@@ -28,6 +28,11 @@ blake3 = "1"
 # NFC validation of the human-facing display-name/nick hints in Coordinates v1
 # (the canonical form rejects non-NFC UTF-8).
 unicode-normalization = "0.1"
+# Cross-platform advisory file lock: the Orbit's exclusive store lock (the typed
+# double-lock). Same lock the product's single-instance daemon guard uses.
+fs2 = "0.4"
+# Minting a fresh SpaceId digest at formation.
+getrandom = "0.3"
 anyhow = "1"
 
 [dev-dependencies]

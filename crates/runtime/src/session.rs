@@ -58,6 +58,9 @@ pub struct Session {
     world: Arc<dyn World>,
     principal: PrincipalFacts,
     epoch: StationEpoch,
+    /// A shared flag: `false` once the Station is going dormant or has exited.
+    /// A Session only *reads* it — it can never stop the Station.
+    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Session {
@@ -66,12 +69,22 @@ impl Session {
         world: Arc<dyn World>,
         principal: PrincipalFacts,
         epoch: StationEpoch,
+        alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             world_id,
             world,
             principal,
             epoch,
+            alive,
+        }
+    }
+
+    fn ensure_live(&self) -> Result<(), WorldError> {
+        if self.alive.load(std::sync::atomic::Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(WorldError::StationDormant)
         }
     }
 
@@ -89,12 +102,14 @@ impl Session {
     /// caller cannot assert them. The World stages Body operations; durable
     /// commit and Observation publication land in S5.
     pub fn submit(&self, intent: WorldIntent) -> Result<WorldEffect, WorldError> {
+        self.ensure_live()?;
         let mut ctx = WorldContext::new(&self.principal);
         self.world.submit(&mut ctx, intent)
     }
 
     /// Query the World over the stable committed snapshot.
     pub fn query(&self, query: WorldQuery) -> Result<WorldProjection, WorldError> {
+        self.ensure_live()?;
         let ctx = WorldContext::new(&self.principal);
         self.world.query(&ctx, query)
     }
