@@ -173,14 +173,37 @@ impl OrbitalDaemon {
             Request::Id => Response::Ok {
                 message: Some(crate::crypto::device_from_seed(&self.device_seed).to_string()),
             },
-            Request::Who => Response::Members { members: vec![] },
-            Request::Invite { .. } => self.invite(),
+            Request::Who => Response::Who { peers: vec![] },
+            Request::Invite {
+                require_approval, ..
+            } => self.invite(require_approval),
             Request::Connect { ticket } | Request::Join { ticket } => self.connect(&ticket),
             Request::ConfigReload => Response::Ok { message: None },
             Request::Stop => Response::Ok {
                 message: Some("stopping".into()),
             },
+
+            // ---- membership plane (over the signed ACL DAG) ----
             Request::Members => self.members(),
+            Request::MemberAdd { who, admin, .. } => match self.mechanics.member_add(&who, admin) {
+                Ok(()) => Response::Ok {
+                    message: Some(format!("added {who}")),
+                },
+                Err(e) => Response::err(format!("{e}")),
+            },
+            Request::MemberRemove { who } => match self.mechanics.member_remove(&who) {
+                Ok(()) => Response::Ok {
+                    message: Some(format!("removed {who}")),
+                },
+                Err(e) => Response::err(format!("{e}")),
+            },
+            Request::MemberLog => Response::MemberLog {
+                entries: self.mechanics.member_log(),
+            },
+            // No pending-join announcements are tracked on the orbital plane yet:
+            // admission is redeemed inline during Contact incorporation, so the
+            // truthful answer is an empty pending set (not a mis-served refusal).
+            Request::MemberRequests => Response::JoinRequests { requests: vec![] },
 
             // ---- not yet on the orbital plane (honest boundary) ----
             other => Response::err(format!(
@@ -213,19 +236,24 @@ impl OrbitalDaemon {
     }
 
     fn members(&self) -> Response {
-        Response::Members { members: vec![] }
+        Response::Members {
+            members: self.mechanics.members(),
+        }
     }
 
-    fn invite(&self) -> Response {
-        // Mint a single-use admission-bearing Coordinates link.
-        let admission =
-            match self
-                .mechanics
-                .mint_admission(&self.device_seed, 24 * 3600, true, now_secs())
-            {
-                Ok(a) => a,
-                Err(e) => return Response::err(format!("mint admission: {e}")),
-            };
+    fn invite(&self, require_approval: bool) -> Response {
+        // Mint a single-use admission-bearing Coordinates link. `require_approval`
+        // inverts the capability's auto-admit bit: an approval-gated invite carries
+        // the joiner's material but does not self-admit on redemption.
+        let admission = match self.mechanics.mint_admission(
+            &self.device_seed,
+            24 * 3600,
+            !require_approval,
+            now_secs(),
+        ) {
+            Ok(a) => a,
+            Err(e) => return Response::err(format!("mint admission: {e}")),
+        };
         match self
             .mechanics
             .mint_coordinates(&self.device_seed, "", vec![], Some(admission))

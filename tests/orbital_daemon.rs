@@ -204,6 +204,58 @@ fn the_orbital_daemon_serves_the_issue_surface_over_the_control_socket() {
     );
     assert!(matches!(resp, Response::Board(_)), "{resp:?}");
 
+    // Members reports the founder as an admin over the signed ACL roster.
+    let resp = req(&client_rt, &home, Request::Members);
+    let Response::Members { members } = resp else {
+        panic!("expected Members, got {resp:?}");
+    };
+    assert_eq!(members.len(), 1, "just the founder");
+    assert_eq!(members[0].role, "admin");
+    assert!(members[0].me, "the founder is this device's actor");
+
+    // The membership audit log replays the signed ACL DAG. A freshly formed
+    // Space founds membership by Genesis and mints epoch-0, so the log carries
+    // the founder-authored mint (not an AddMember), and every op is recognized.
+    let resp = req(&client_rt, &home, Request::MemberLog);
+    let Response::MemberLog { entries } = resp else {
+        panic!("expected MemberLog, got {resp:?}");
+    };
+    assert!(!entries.is_empty(), "the audit log is non-empty");
+    assert!(
+        entries.iter().all(|e| e.authorized),
+        "every founding op is authorized: {entries:?}"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.kind == "mint_epoch" && !e.actor.is_empty()),
+        "the founder-authored epoch-0 mint is present: {entries:?}"
+    );
+
+    // Adding a well-formed but unknown actor is refused (its inception is not
+    // known locally — no Contact has imported it).
+    let unknown = format!("act_{}", "ab".repeat(32));
+    let resp = req(
+        &client_rt,
+        &home,
+        Request::MemberAdd {
+            who: unknown,
+            admin: false,
+            as_name: None,
+        },
+    );
+    assert!(
+        matches!(resp, Response::Error { .. }),
+        "adding an unknown actor is refused, got {resp:?}"
+    );
+
+    // No pending join announcements are tracked on the orbital plane yet.
+    let resp = req(&client_rt, &home, Request::MemberRequests);
+    assert!(
+        matches!(resp, Response::JoinRequests { ref requests } if requests.is_empty()),
+        "{resp:?}"
+    );
+
     // Invite mints a Coordinates link (not a SpaceTicket).
     let resp = req(
         &client_rt,

@@ -530,6 +530,139 @@ impl OrbitalMechanics {
         inner.my_actor().is_some_and(|a| inner.acl().is_member(&a))
     }
 
+    /// Whether this device's actor is an admin.
+    pub fn am_i_admin(&self) -> bool {
+        let inner = self.lock();
+        inner.my_actor().is_some_and(|a| inner.acl().is_admin(&a))
+    }
+
+    /// This device's actor id, if established.
+    pub fn my_actor(&self) -> Option<ActorId> {
+        self.lock().my_actor()
+    }
+
+    /// The membership roster as `control::MemberDto` rows.
+    pub fn members(&self) -> Vec<crate::dto::MemberDto> {
+        let inner = self.lock();
+        let acl = inner.acl();
+        let me = inner.my_actor();
+        let mut out: Vec<crate::dto::MemberDto> = acl
+            .members()
+            .into_iter()
+            .map(|(actor, grants)| crate::dto::MemberDto {
+                key: actor.as_str().to_string(),
+                role: role_of(&grants),
+                me: me.as_ref() == Some(&actor),
+                sponsor: None,
+                alias: String::new(),
+            })
+            .collect();
+        for (agent, sponsor) in acl.agents() {
+            out.push(crate::dto::MemberDto {
+                key: agent.as_str().to_string(),
+                role: "agent".into(),
+                me: me.as_ref() == Some(&agent),
+                sponsor: Some(sponsor.as_str().to_string()),
+                alias: String::new(),
+            });
+        }
+        out
+    }
+
+    /// The signed ACL DAG replayed as an audit log.
+    pub fn member_log(&self) -> Vec<crate::dto::MemberLogEntry> {
+        let inner = self.lock();
+        inner
+            .membership
+            .ops()
+            .into_iter()
+            .map(|signed| {
+                let decoded: Option<AclOp> = postcard::from_bytes(&signed.op).ok();
+                let actor = decoded
+                    .as_ref()
+                    .map(|o| o.by.as_str().to_string())
+                    .unwrap_or_default();
+                let (kind, subject, role) = match decoded.as_ref().map(|o| &o.action) {
+                    Some(AclAction::AddMember { actor, grants }) => (
+                        "add_member",
+                        Some(actor.as_str().to_string()),
+                        Some(role_of(grants)),
+                    ),
+                    Some(AclAction::RemoveMember { actor }) => {
+                        ("remove_member", Some(actor.as_str().to_string()), None)
+                    }
+                    Some(AclAction::SetGrants { actor, grants }) => (
+                        "set_grants",
+                        Some(actor.as_str().to_string()),
+                        Some(role_of(grants)),
+                    ),
+                    Some(AclAction::AddAgent { actor }) => {
+                        ("add_agent", Some(actor.as_str().to_string()), None)
+                    }
+                    Some(AclAction::MintEpoch { .. }) => ("mint_epoch", None, None),
+                    Some(AclAction::RevokeInvite { .. }) => ("revoke_invite", None, None),
+                    None => ("unknown", None, None),
+                };
+                crate::dto::MemberLogEntry {
+                    op: signed.hash(),
+                    actor,
+                    kind: kind.into(),
+                    subject,
+                    role,
+                    authorized: decoded.is_some(),
+                }
+            })
+            .collect()
+    }
+
+    /// Add (or re-grant) a member by actor id — admin-only. The target actor's
+    /// inception must already be known (imported via a prior Contact/admission).
+    pub fn member_add(&self, actor_str: &str, admin: bool) -> Result<()> {
+        let mut inner = self.lock();
+        let actor = ActorId::parse(actor_str).ok_or_else(|| anyhow!("invalid actor id"))?;
+        match inner.my_actor() {
+            Some(me) if inner.acl().is_admin(&me) => {}
+            _ => return Err(anyhow!("only an admin may add members")),
+        }
+        if !inner.actor_plane().exists(&actor) {
+            return Err(anyhow!("that actor's identity is not known locally yet"));
+        }
+        if inner.acl().is_member(&actor) {
+            return Ok(());
+        }
+        let grants = if admin {
+            vec![Grant::Admin, Grant::Write]
+        } else {
+            vec![Grant::Write]
+        };
+        inner.author(
+            AclAction::AddMember {
+                actor: actor.clone(),
+                grants,
+            },
+            None,
+            "member_add",
+        )?;
+        inner.seal_epochs_to_actor(&actor)?;
+        inner.persist()?;
+        Ok(())
+    }
+
+    /// Remove a member by actor id — admin-only.
+    pub fn member_remove(&self, actor_str: &str) -> Result<()> {
+        let mut inner = self.lock();
+        let actor = ActorId::parse(actor_str).ok_or_else(|| anyhow!("invalid actor id"))?;
+        match inner.my_actor() {
+            Some(me) if inner.acl().is_admin(&me) => {}
+            _ => return Err(anyhow!("only an admin may remove members")),
+        }
+        if !inner.acl().is_member(&actor) {
+            return Ok(());
+        }
+        inner.author(AclAction::RemoveMember { actor }, None, "member_remove")?;
+        Ok(())
+    }
+
     /// The authority records this Station serves in a Contact (the export
     /// seam): its membership material, plus — while unadmitted — its
     /// admission redemption request.
@@ -662,5 +795,16 @@ impl replica::AuthorityIncorporator for OrbitalMechanics {
         Ok(replica::AuthorityReceipt {
             frontier: inner.frontier(),
         })
+    }
+}
+
+/// Render an ACL grant set as the product's coarse role label.
+fn role_of(grants: &[Grant]) -> String {
+    if grants.contains(&Grant::Admin) {
+        "admin".into()
+    } else if grants.contains(&Grant::Write) {
+        "member".into()
+    } else {
+        "viewer".into()
     }
 }
