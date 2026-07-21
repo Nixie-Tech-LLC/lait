@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use lait_kernel::ids::{SpaceId, StationEpoch, StationId};
+use mechanics::ids::{SpaceId, StationEpoch, StationId};
 
 use crate::error::{ContactError, DormancyError, LifecycleError, StationExit, StationExitReason};
 use crate::registry::{RuntimeBuilder, WorldRegistry};
@@ -38,7 +38,7 @@ struct DenyAllAuthority;
 impl AuthorityView for DenyAllAuthority {
     fn resolve(
         &self,
-        _device: &lait_kernel::ids::DeviceId,
+        _device: &mechanics::ids::DeviceId,
     ) -> Option<crate::world::PrincipalResolution> {
         None
     }

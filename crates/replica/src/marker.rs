@@ -12,7 +12,7 @@
 //! `NotAReplicaStore`, a wrong version is `UnsupportedStoreVersion`, and a body
 //! that will not decode or fails its checksum is `CorruptStoreMarker`.
 
-use lait_kernel::ids::SpaceId;
+use mechanics::ids::SpaceId;
 use serde::{Deserialize, Serialize};
 
 /// The store magic (fixed-length, matched byte-for-byte before anything else).

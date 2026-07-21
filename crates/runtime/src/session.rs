@@ -25,7 +25,7 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
-use lait_kernel::ids::StationEpoch;
+use mechanics::ids::StationEpoch;
 use replica::body::{BodyOp, BodySchema, MutationModel};
 use replica::frontier::ReplicaFrontier;
 use replica::ids::{BodyKey, SchemaId, WorldId};

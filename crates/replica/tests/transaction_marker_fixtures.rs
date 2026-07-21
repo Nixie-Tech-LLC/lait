@@ -1,7 +1,7 @@
 //! S5b fixtures: BodyTransactionV1 protection-boundary matrix and store-marker
 //! classification.
 
-use lait_kernel::ids::SpaceId;
+use mechanics::ids::SpaceId;
 use replica::body::ContentCommitment;
 use replica::frontier::AuthorityFrontier as AF;
 use replica::frontier::{AuthorityFrontier, ReplicaFrontier, TransactionId};
@@ -20,7 +20,7 @@ fn space_bytes() -> [u8; 29] {
     <[u8; 29]>::try_from(space().as_str().as_bytes()).unwrap()
 }
 fn signer_key() -> [u8; 32] {
-    lait_kernel::crypto::device_from_seed(&SIGNER_SEED)
+    mechanics::crypto::device_from_seed(&SIGNER_SEED)
         .key_bytes()
         .unwrap()
 }

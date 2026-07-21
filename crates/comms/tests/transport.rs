@@ -1,4 +1,4 @@
-//! Transport-level tests for the shipped transport ([`lait_net::DefaultTransport`]) — no
+//! Transport-level tests for the shipped transport ([`comms::DefaultTransport`]) — no
 //! daemon. Two real iroh endpoints over loopback under `Network::Isolated`
 //! (no relay, no discovery: each `learn`s the other's `advertised_addrs`,
 //! exactly the ticket path), plus one Local-policy test on an in-process relay
@@ -10,19 +10,19 @@
 
 use std::time::Duration;
 
+use comms::policy::Network;
+use comms::{Alpn, DefaultTransport, GossipEvent, Topic, Transport};
 use iroh::{endpoint::presets, Endpoint, RelayMap, RelayMode, RelayUrl, SecretKey};
 use iroh_relay::tls::CaRootsConfig;
-use lait_net::policy::Network;
-use lait_net::{Alpn, DefaultTransport, GossipEvent, Topic, Transport};
 
 // Protocol selectors belong to the application; any two distinct ALPNs exercise
 // dispatch identically, so the seam's tests name their own rather than pinning
 // the daemon's spelling of them.
-const SYNC_ALPN: Alpn = b"lait-net/test-sync/1";
-const PRESENCE_ALPN: Alpn = b"lait-net/test-presence/1";
+const SYNC_ALPN: Alpn = b"comms/test-sync/1";
+const PRESENCE_ALPN: Alpn = b"comms/test-presence/1";
 
-fn device(seed: u8) -> lait_kernel::ids::DeviceId {
-    lait_kernel::crypto::device_from_seed(&[seed; 32])
+fn device(seed: u8) -> mechanics::ids::DeviceId {
+    mechanics::crypto::device_from_seed(&[seed; 32])
 }
 
 /// Two Isolated transports that can reach each other: build both, then cross-
@@ -146,14 +146,14 @@ async fn framing_interops_with_legacy_read_msg_bytes() {
         .await
         .expect("build dialer");
     dialer.learn(
-        lait_kernel::ids::DeviceId::from_key_string(raw_id.to_string()),
+        mechanics::ids::DeviceId::from_key_string(raw_id.to_string()),
         &raw_addrs,
     );
 
     tokio::time::timeout(Duration::from_secs(20), async {
         let mut s = dialer
             .connect(
-                lait_kernel::ids::DeviceId::from_key_string(raw_id.to_string()),
+                mechanics::ids::DeviceId::from_key_string(raw_id.to_string()),
                 ALPN,
             )
             .await
@@ -409,7 +409,7 @@ async fn local_policy_relay_resolution() {
     });
 
     // Register {server_id, relay} exactly as PeerBook::learn does under Local.
-    c_lookup.add_endpoint_info(lait_net::policy::relay_addr(&relay_url, server_id));
+    c_lookup.add_endpoint_info(comms::policy::relay_addr(&relay_url, server_id));
     let result = tokio::time::timeout(Duration::from_secs(20), async move {
         let conn = client.connect(server_id, ALPN).await.expect("connect");
         let (mut send, mut recv) = conn.open_bi().await.unwrap();

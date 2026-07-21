@@ -18,8 +18,8 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
-use lait_kernel::actor::SignedEvent;
-use lait_kernel::ids::{ActorId, DeviceId, SpaceId};
+use mechanics::actor::SignedEvent;
+use mechanics::ids::{ActorId, DeviceId, SpaceId};
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
@@ -227,7 +227,7 @@ impl AdmissionCapabilityV1 {
         single_use: bool,
         issuer_seed: &[u8; 32],
     ) -> Option<Self> {
-        let issuer = lait_kernel::crypto::device_from_seed(issuer_seed).key_bytes()?;
+        let issuer = mechanics::crypto::device_from_seed(issuer_seed).key_bytes()?;
         let mut cap = Self {
             version: 1,
             space: space_id_bytes(space)?,
@@ -239,7 +239,7 @@ impl AdmissionCapabilityV1 {
             signature_algorithm: SIG_ALG_ED25519,
             signature: [0u8; 64],
         };
-        cap.signature = lait_kernel::crypto::sign_detached(issuer_seed, &cap.preimage());
+        cap.signature = mechanics::crypto::sign_detached(issuer_seed, &cap.preimage());
         Some(cap)
     }
 
@@ -257,7 +257,7 @@ impl AdmissionCapabilityV1 {
         if space_id_bytes(space).as_ref() != Some(&self.space) {
             return Err(CoordinatesError::BadAdmission);
         }
-        if !lait_kernel::crypto::verify_detached(&self.issuer, &self.preimage(), &self.signature) {
+        if !mechanics::crypto::verify_detached(&self.issuer, &self.preimage(), &self.signature) {
             return Err(CoordinatesError::BadSignature);
         }
         Ok(())
@@ -278,7 +278,7 @@ impl SignedCoordinatesV1 {
     /// Mint and sign Coordinates from the approach Station's device seed. The
     /// seed's public key must equal `payload.approach_station`.
     pub fn sign(payload: CoordinatesPayloadV1, station_seed: &[u8; 32]) -> Self {
-        let issuer = lait_kernel::crypto::device_from_seed(station_seed)
+        let issuer = mechanics::crypto::device_from_seed(station_seed)
             .key_bytes()
             .expect("device key bytes");
         let mut coords = Self {
@@ -288,7 +288,7 @@ impl SignedCoordinatesV1 {
             signature_algorithm: SIG_ALG_ED25519,
             signature: [0u8; 64],
         };
-        coords.signature = lait_kernel::crypto::sign_detached(station_seed, &coords.preimage());
+        coords.signature = mechanics::crypto::sign_detached(station_seed, &coords.preimage());
         coords
     }
 
@@ -358,7 +358,7 @@ impl SignedCoordinatesV1 {
         let inception: SignedEvent = postcard::from_bytes(&p.founder_inception)
             .map_err(|_| CoordinatesError::FoundingInvalid)?;
         let founder_actor =
-            lait_kernel::space::verify_founding(&space, &p.salt, &p.recovery_root, &inception)
+            mechanics::space::verify_founding(&space, &p.salt, &p.recovery_root, &inception)
                 .map_err(|_| CoordinatesError::FoundingInvalid)?;
 
         // issuer == approach_station.
@@ -377,7 +377,7 @@ impl SignedCoordinatesV1 {
         }
 
         // Outer signature by the approach Station.
-        if !lait_kernel::crypto::verify_detached(&self.issuer, &self.preimage(), &self.signature) {
+        if !mechanics::crypto::verify_detached(&self.issuer, &self.preimage(), &self.signature) {
             return Err(CoordinatesError::BadSignature);
         }
 

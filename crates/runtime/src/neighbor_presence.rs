@@ -9,7 +9,7 @@
 //! identity (in LAIT a peer *is* its device key). Nonces come from the OS
 //! CSPRNG; challenges are single-use for one exchange.
 
-use lait_kernel::ids::StationId;
+use mechanics::ids::StationId;
 use serde::{Deserialize, Serialize};
 
 use crate::wire::length_framed;
@@ -119,7 +119,7 @@ impl ProbeV1 {
         nonce: [u8; 32],
         initiator_seed: &[u8; 32],
     ) -> Option<Self> {
-        let station = lait_kernel::crypto::device_from_seed(initiator_seed).key_bytes()?;
+        let station = mechanics::crypto::device_from_seed(initiator_seed).key_bytes()?;
         let preimage = Self::preimage(
             protocol,
             &space,
@@ -128,7 +128,7 @@ impl ProbeV1 {
             &station,
             &nonce,
         );
-        let signature = lait_kernel::crypto::sign_detached(initiator_seed, &preimage);
+        let signature = mechanics::crypto::sign_detached(initiator_seed, &preimage);
         Some(Self {
             protocol,
             space,
@@ -194,11 +194,8 @@ impl ProbeV1 {
             &self.initiator_transport,
             &self.nonce,
         );
-        if !lait_kernel::crypto::verify_detached(
-            &self.initiator_station,
-            &preimage,
-            &self.signature,
-        ) {
+        if !mechanics::crypto::verify_detached(&self.initiator_station, &preimage, &self.signature)
+        {
             return Err(PresenceError::BadSignature);
         }
         Ok(())
@@ -218,10 +215,10 @@ impl AckV1 {
 
     /// Sign an ack answering `probe` from the responder's device seed.
     pub fn sign(probe: &ProbeV1, nonce: [u8; 32], responder_seed: &[u8; 32]) -> Option<Self> {
-        let responder = lait_kernel::crypto::device_from_seed(responder_seed).key_bytes()?;
+        let responder = mechanics::crypto::device_from_seed(responder_seed).key_bytes()?;
         let probe_hash = probe.hash();
         let preimage = Self::preimage(&probe_hash, &responder, &nonce);
-        let signature = lait_kernel::crypto::sign_detached(responder_seed, &preimage);
+        let signature = mechanics::crypto::sign_detached(responder_seed, &preimage);
         Some(Self {
             probe_hash,
             responder_transport: responder,
@@ -265,11 +262,8 @@ impl AckV1 {
             return Err(PresenceError::IdentityMismatch);
         }
         let preimage = Self::preimage(&self.probe_hash, &self.responder_transport, &self.nonce);
-        if !lait_kernel::crypto::verify_detached(
-            &probe.responder_station,
-            &preimage,
-            &self.signature,
-        ) {
+        if !mechanics::crypto::verify_detached(&probe.responder_station, &preimage, &self.signature)
+        {
             return Err(PresenceError::BadSignature);
         }
         Ok(())

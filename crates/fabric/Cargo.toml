@@ -1,5 +1,5 @@
 [package]
-name = "lait-fabric"
+name = "fabric"
 version = "0.6.0"
 edition = "2021"
 rust-version = "1.91"
@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 # lait's roots — the fabric wraps the scaffold in lait's own types.
-lait-kernel = { path = "../lait-kernel" }
+mechanics = { path = "../mechanics" }
 # The convergence scaffold. This is the only crate in this Cargo workspace that
 # lists it, so `loro::*` is nameable here and nowhere else — the seal is the
 # manifest.

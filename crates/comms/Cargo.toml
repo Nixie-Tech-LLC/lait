@@ -1,5 +1,5 @@
 [package]
-name = "lait-net"
+name = "comms"
 version = "0.6.0"
 edition = "2021"
 rust-version = "1.91"
@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 # lait's roots. The seam speaks `DeviceId` and nothing else of lait's: a peer is
 # its ed25519 key, so identity crosses this boundary already self-certifying.
-lait-kernel = { path = "../lait-kernel" }
+mechanics = { path = "../mechanics" }
 
 # The connectivity scaffold. This is the only crate in the workspace that lists
 # it, so `iroh::*` is nameable here and nowhere else — the seal is the manifest.

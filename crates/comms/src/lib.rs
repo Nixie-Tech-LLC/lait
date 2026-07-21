@@ -33,7 +33,7 @@ pub mod policy;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use lait_kernel::ids::DeviceId;
+use mechanics::ids::DeviceId;
 
 /// The transport lait ships with: QUIC over the relay mesh its [`policy`]
 /// selects, and the factory that builds it. Exported under their role rather

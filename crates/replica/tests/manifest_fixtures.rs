@@ -3,7 +3,7 @@
 //! valid concurrent roots coexisting, replay dedup, and same-coordinate
 //! equivocation.
 
-use lait_kernel::ids::SpaceId;
+use mechanics::ids::SpaceId;
 use replica::frontier::AuthorityFrontier as AF;
 use replica::frontier::{AuthorityFrontier, ReplicaFrontier};
 use replica::ids::{BodyId, BodyKey, WorldId};
@@ -18,10 +18,10 @@ const SIGNER_KEY_SEED: [u8; 32] = SIGNER_SEED;
 struct BothSigners;
 impl AuthoritySource for BothSigners {
     fn signer_authorized(&self, signer: &[u8; 32], _f: &AF) -> bool {
-        let s1 = lait_kernel::crypto::device_from_seed(&SIGNER_KEY_SEED)
+        let s1 = mechanics::crypto::device_from_seed(&SIGNER_KEY_SEED)
             .key_bytes()
             .unwrap();
-        let s2 = lait_kernel::crypto::device_from_seed(&OTHER_SEED)
+        let s2 = mechanics::crypto::device_from_seed(&OTHER_SEED)
             .key_bytes()
             .unwrap();
         *signer == s1 || *signer == s2

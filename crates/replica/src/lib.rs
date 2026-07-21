@@ -4,8 +4,8 @@
 //! material, World Bodies, semantic frontiers, locally held keys, and enough
 //! metadata to distinguish unknown, partial, and corrupt material. Replica is a
 //! LAIT semantic type — **not Loro**, and it never exposes Loro. It applies
-//! transaction, incorporation, and Convergence policy using [`lait_kernel`]
-//! (mechanics) for legitimacy and [`lait_fabric`] (Fabric) for canonical
+//! transaction, incorporation, and Convergence policy using [`mechanics`]
+//! (mechanics) for legitimacy and [`fabric`] (Fabric) for canonical
 //! collaborative representation and durability.
 //!
 //! This crate is prefix-free from birth (the S8 renames do not touch it). It
@@ -32,9 +32,9 @@ pub use body::{
     BodyDescriptor, BodyOp, BodySchema, CollaborativeSchema, ContentCommitment, MutationModel,
 };
 pub use convergence::{ConvergenceOutcome, IncorporationClass};
+pub use fabric::{CollaborativeView, ListElement};
 pub use frontier::{AuthorityFrontier, ReplicaFrontier, TransactionId};
 pub use ids::{BodyId, BodyKey, EncodingId, SchemaId, WorldId};
-pub use lait_fabric::{CollaborativeView, ListElement};
 pub use manifest::{
     AuthorizedRoot, ManifestBook, ManifestEntryV1, ManifestError, ManifestPageV1, ManifestRootV1,
     RootObservation,

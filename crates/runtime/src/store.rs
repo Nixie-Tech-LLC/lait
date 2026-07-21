@@ -16,7 +16,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
-use lait_kernel::ids::SpaceId;
+use mechanics::ids::SpaceId;
 use replica::marker::{MarkerError, StoreMarkerV1};
 
 use crate::error::LifecycleError;

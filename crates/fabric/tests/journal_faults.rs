@@ -4,8 +4,8 @@
 //! mixture. Plus integrity classification, orphan GC, counter monotonicity,
 //! and carried-object semantics.
 
-use lait_fabric::journal::{JournaledStore, ObjectRef, FAULT_POINTS};
-use lait_fabric::FabricError;
+use fabric::journal::{JournaledStore, ObjectRef, FAULT_POINTS};
+use fabric::FabricError;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 

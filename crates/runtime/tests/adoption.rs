@@ -11,8 +11,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use lait_kernel::acl::Grant;
-use lait_kernel::ids::{ActorId, DeviceId};
+use mechanics::acl::Grant;
+use mechanics::ids::{ActorId, DeviceId};
 use replica::body::{BodyOp, BodySchema, MutationModel};
 use replica::frontier::{AuthorityFrontier, ReplicaFrontier};
 use replica::ids::{BodyId, BodyKey, EncodingId, SchemaId, WorldId};
@@ -32,7 +32,7 @@ struct ConsumerAuthority;
 
 impl AuthorityView for ConsumerAuthority {
     fn resolve(&self, device: &DeviceId) -> Option<PrincipalResolution> {
-        let writer = lait_kernel::crypto::device_from_seed(&WRITER_SEED);
+        let writer = mechanics::crypto::device_from_seed(&WRITER_SEED);
         let grants = if device == &writer {
             vec![Grant::Write]
         } else {

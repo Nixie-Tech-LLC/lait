@@ -1,7 +1,7 @@
 //! S4 canonical fixtures: Beacon v1 identity/freshness/route matrix and the
 //! Neighbor presence v1 challenge transcript matrix.
 
-use lait_kernel::ids::{SpaceId, StationEpoch, StationId};
+use mechanics::ids::{SpaceId, StationEpoch, StationId};
 use runtime::beacon::{
     BeaconAcceptance, BeaconError, BeaconHighWater, RouteHint, SignedBeaconV1, MAX_ROUTE_HINTS,
 };
@@ -44,7 +44,7 @@ fn valid_beacon_verifies() {
     assert_eq!(v.space(), &space());
     assert_eq!(
         v.station(),
-        &StationId::from_device(&lait_kernel::crypto::device_from_seed(&STATION_SEED)).unwrap()
+        &StationId::from_device(&mechanics::crypto::device_from_seed(&STATION_SEED)).unwrap()
     );
     assert_eq!(v.coordinate(), (2, 5));
 }
@@ -169,7 +169,7 @@ const INITIATOR_SEED: [u8; 32] = [21u8; 32];
 const RESPONDER_SEED: [u8; 32] = [22u8; 32];
 
 fn station_of(seed: &[u8; 32]) -> StationId {
-    StationId::from_device(&lait_kernel::crypto::device_from_seed(seed)).unwrap()
+    StationId::from_device(&mechanics::crypto::device_from_seed(seed)).unwrap()
 }
 
 fn probe(nonce: [u8; 32]) -> ProbeV1 {

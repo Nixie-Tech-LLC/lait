@@ -47,28 +47,28 @@ pub mod serve;
 pub mod spaces;
 pub mod sync;
 
-// The **kernel** (`lait-kernel`) holds lait's roots — identity, the trust
+// The **kernel** (`mechanics`) holds lait's roots — identity, the trust
 // planes, derivation rules — in a crate that lists no scaffold, so a `loro::`
 // or `iroh::` reference there cannot compile. Re-exported here so the app layer
 // keeps reaching them by their historical crate-root paths (`crate::acl`,
 // `lait::ids`, …); the boundary is enforced by the kernel crate's manifest, not
 // by these aliases.
-pub use lait_kernel::{
+pub use mechanics::{
     acl, actor, authority, authz, compile, crypto, custody, dkg, dto, expand, genesis, ids, policy,
     sigdag, space, transition,
 };
 
-// The **fabric** (`lait-fabric`) maintains the shared world — documents,
+// The **fabric** (`fabric`) maintains the shared world — documents,
 // persistence, history, convergence, projection — and is the only crate that
 // names Loro. Re-exported here as the `fabric` module and its wrappers, while
 // the app crate's manifest lists no `loro`, so `loro::*` is unnameable outside
 // the fabric.
-pub use lait_fabric::{self as fabric, catalog, issue, membership, store};
+pub use fabric::{self as fabric, catalog, issue, membership, store};
 
-// The **net adapter** (`lait-net`) is how independently held replicas exchange
+// The **net adapter** (`comms`) is how independently held replicas exchange
 // their material: lait's own `Transport` seam plus the network policy behind it,
 // in a crate that alone lists iroh. `iroh` is absent from THIS manifest, so no
 // `iroh::` reference compiles in the app layer. Re-exported so the daemon keeps
 // reaching the seam by its historical paths (`crate::transport`, `crate::net`).
-pub use lait_net as transport;
-pub use lait_net::policy as net;
+pub use comms as transport;
+pub use comms::policy as net;

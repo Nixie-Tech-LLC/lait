@@ -15,7 +15,7 @@
 //! and mechanics validates the signer's standing before any byte reaches the
 //! engine. It is never reachable from a World or an ordinary Session.
 
-use lait_fabric::{
+use fabric::{
     CollaborativeView, Fabric, FabricError, FabricKey, FabricOp, FabricTransactionRequest,
     JournaledStore, LoroFabric, MemFabric,
 };
@@ -273,7 +273,7 @@ impl Replica {
     /// representation cutover.)
     pub fn export_signed(
         &self,
-        space: &lait_kernel::ids::SpaceId,
+        space: &mechanics::ids::SpaceId,
         authority_frontier: crate::frontier::AuthorityFrontier,
         signer_seed: &[u8; 32],
     ) -> Result<(crate::transaction::BodyTransactionV1, Vec<u8>), ReplicaCommitError> {
@@ -284,7 +284,7 @@ impl Replica {
         body_raw.copy_from_slice(&digest.as_bytes()[..16]);
         let mut tx_raw = [0u8; 16];
         tx_raw.copy_from_slice(&digest.as_bytes()[16..32]);
-        let signer = lait_kernel::crypto::device_from_seed(signer_seed)
+        let signer = mechanics::crypto::device_from_seed(signer_seed)
             .key_bytes()
             .ok_or_else(|| ReplicaCommitError::Fabric("signer key".into()))?;
         let space_bytes = <[u8; 29]>::try_from(space.as_str().as_bytes())
@@ -930,13 +930,13 @@ mod tests {
 
     const EXPORT_SEED: [u8; 32] = [91u8; 32];
 
-    fn export_space() -> lait_kernel::ids::SpaceId {
-        lait_kernel::ids::SpaceId::from_digest([14u8; 16])
+    fn export_space() -> mechanics::ids::SpaceId {
+        mechanics::ids::SpaceId::from_digest([14u8; 16])
     }
 
     fn export_authority() -> OnlySigner {
         OnlySigner(
-            lait_kernel::crypto::device_from_seed(&EXPORT_SEED)
+            mechanics::crypto::device_from_seed(&EXPORT_SEED)
                 .key_bytes()
                 .unwrap(),
         )

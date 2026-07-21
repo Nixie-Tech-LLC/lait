@@ -1,11 +1,11 @@
-//! Tests for the network-policy seam (`lait_net::policy`), driven through lait's REAL
+//! Tests for the network-policy seam (`comms::policy`), driven through lait's REAL
 //! reachability path.
 //!
 //! Under `Local`, lait dials peers by **bare `EndpointId`** (its address-free
 //! design) and resolves them through a `MemoryLookup` it populates with
 //! `{id, relay}` — the address lait already knows because it configured the
 //! relay. No discovery service, plaintext or otherwise, exists to fake. These
-//! tests use exactly that construction (`lait_net::policy::relay_addr` + a
+//! tests use exactly that construction (`comms::policy::relay_addr` + a
 //! `MemoryLookup`, then `connect(bare_id)`), so a green result reflects the
 //! daemon's actual mechanism, not an iroh feature.
 //!
@@ -16,12 +16,12 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use comms::policy::{build_endpoint, relay_addr, LocalNet, Network};
 use iroh::{
     address_lookup::MemoryLookup, endpoint::presets, Endpoint, RelayMap, RelayMode, RelayUrl,
     SecretKey,
 };
 use iroh_relay::tls::CaRootsConfig;
-use lait_net::policy::{build_endpoint, relay_addr, LocalNet, Network};
 
 const TEST_ALPN: &[u8] = b"lait/hermetic-test/1";
 

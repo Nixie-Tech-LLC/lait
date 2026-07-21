@@ -42,7 +42,7 @@ pub const MIN_SUPPORTED_SCHEMA: u32 = 3;
 /// string leaf and projected here.
 ///
 /// ```
-/// use lait_kernel::dto::Priority;
+/// use mechanics::dto::Priority;
 /// assert_eq!(Priority::parse("urgent"), Some(Priority::Urgent));
 /// assert_eq!(Priority::parse("h"), Some(Priority::High)); // one-letter alias
 /// assert!(Priority::Urgent > Priority::Low);              // orders low→high

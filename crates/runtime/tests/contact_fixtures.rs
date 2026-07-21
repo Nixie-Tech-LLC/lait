@@ -3,7 +3,7 @@
 //! substitution, wrong-state, duplicate/conflicting/overlapping chunks, gaps,
 //! commitment and transcript mismatches, and limit overflows.
 
-use lait_kernel::ids::{SpaceId, StationId};
+use mechanics::ids::{SpaceId, StationId};
 use replica::body::ContentCommitment;
 use replica::ids::{BodyId, BodyKey, WorldId};
 use runtime::contact::{
@@ -16,7 +16,7 @@ const INITIATOR_SEED: [u8; 32] = [71u8; 32];
 const RESPONDER_SEED: [u8; 32] = [72u8; 32];
 
 fn station_of(seed: &[u8; 32]) -> StationId {
-    StationId::from_device(&lait_kernel::crypto::device_from_seed(seed)).unwrap()
+    StationId::from_device(&mechanics::crypto::device_from_seed(seed)).unwrap()
 }
 
 fn space_bytes() -> [u8; 29] {

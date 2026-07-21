@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use lait::orbital::{open_orbital_runtime, orbital_store_root};
-use lait_kernel::acl::Grant;
-use lait_kernel::ids::{ActorId, DeviceId};
+use mechanics::acl::Grant;
+use mechanics::ids::{ActorId, DeviceId};
 use runtime::{
     ActivationOptions, AuthorityView, PrincipalResolution, Runtime, RuntimeBuilder,
     SpaceFormationOptions, Standing, World, WorldContext, WorldEffect, WorldError, WorldIntent,
@@ -40,7 +40,7 @@ struct ExampleAuthority;
 
 impl AuthorityView for ExampleAuthority {
     fn resolve(&self, device: &DeviceId) -> Option<PrincipalResolution> {
-        let writer = lait_kernel::crypto::device_from_seed(&WRITER_SEED);
+        let writer = mechanics::crypto::device_from_seed(&WRITER_SEED);
         (device == &writer).then(|| PrincipalResolution {
             actor: ActorId::from_incept_hash(&"c".repeat(64)),
             standing: Standing::new(vec![Grant::Write]),

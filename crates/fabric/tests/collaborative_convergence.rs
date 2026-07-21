@@ -4,7 +4,7 @@
 //! sets, summed counters, no lost list inserts, preserved concurrent text, and
 //! an agreed LWW register winner.
 
-use lait_fabric::{Fabric, FabricKey, FabricOp, FabricTransactionRequest, LoroFabric};
+use fabric::{Fabric, FabricKey, FabricOp, FabricTransactionRequest, LoroFabric};
 
 fn key() -> FabricKey {
     FabricKey::from_bytes(b"body/collab".to_vec())
@@ -69,7 +69,7 @@ fn forked_pair() -> (LoroFabric, LoroFabric) {
 }
 
 /// Cross-merge both engines and assert their views are identical.
-fn converge(a: &mut LoroFabric, b: &mut LoroFabric) -> lait_fabric::CollaborativeView {
+fn converge(a: &mut LoroFabric, b: &mut LoroFabric) -> fabric::CollaborativeView {
     let sa = Fabric::snapshot(a).unwrap();
     let sb = Fabric::snapshot(b).unwrap();
     a.merge(&sb).unwrap();

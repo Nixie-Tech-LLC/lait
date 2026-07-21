@@ -23,7 +23,7 @@
 //! area. Exact duplicate chunks are idempotent. `TransferAck` acknowledges
 //! framing/receipt only, never durable Convergence.
 
-use lait_kernel::ids::StationId;
+use mechanics::ids::StationId;
 use replica::body::ContentCommitment;
 use replica::ids::BodyKey;
 use serde::{Deserialize, Serialize};
@@ -236,7 +236,7 @@ impl ContactHelloV1 {
         contact: ContactId,
         initiator_seed: &[u8; 32],
     ) -> Option<Self> {
-        let station = lait_kernel::crypto::device_from_seed(initiator_seed).key_bytes()?;
+        let station = mechanics::crypto::device_from_seed(initiator_seed).key_bytes()?;
         let preimage = Self::preimage(
             protocol,
             &space,
@@ -246,7 +246,7 @@ impl ContactHelloV1 {
             &nonce,
             &contact,
         );
-        let signature = lait_kernel::crypto::sign_detached(initiator_seed, &preimage);
+        let signature = mechanics::crypto::sign_detached(initiator_seed, &preimage);
         Some(Self {
             protocol,
             space,
@@ -315,11 +315,8 @@ impl ContactHelloV1 {
             &self.nonce,
             &self.contact,
         );
-        if !lait_kernel::crypto::verify_detached(
-            &self.initiator_station,
-            &preimage,
-            &self.signature,
-        ) {
+        if !mechanics::crypto::verify_detached(&self.initiator_station, &preimage, &self.signature)
+        {
             return Err(ContactWireError::BadSignature);
         }
         Ok(())
@@ -343,10 +340,10 @@ impl ContactHelloAckV1 {
         nonce: [u8; 32],
         responder_seed: &[u8; 32],
     ) -> Option<Self> {
-        let responder = lait_kernel::crypto::device_from_seed(responder_seed).key_bytes()?;
+        let responder = mechanics::crypto::device_from_seed(responder_seed).key_bytes()?;
         let hello_hash = hello.hash();
         let preimage = Self::preimage(&hello_hash, &responder, &nonce);
-        let signature = lait_kernel::crypto::sign_detached(responder_seed, &preimage);
+        let signature = mechanics::crypto::sign_detached(responder_seed, &preimage);
         Some(Self {
             hello_hash,
             responder_transport: responder,
@@ -387,11 +384,8 @@ impl ContactHelloAckV1 {
             return Err(ContactWireError::IdentityMismatch);
         }
         let preimage = Self::preimage(&self.hello_hash, &self.responder_transport, &self.nonce);
-        if !lait_kernel::crypto::verify_detached(
-            &hello.responder_station,
-            &preimage,
-            &self.signature,
-        ) {
+        if !mechanics::crypto::verify_detached(&hello.responder_station, &preimage, &self.signature)
+        {
             return Err(ContactWireError::BadSignature);
         }
         Ok(())

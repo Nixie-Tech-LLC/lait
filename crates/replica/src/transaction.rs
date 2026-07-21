@@ -22,7 +22,7 @@
 //! consults a mechanics-provided [`AuthoritySource`]. Retention/Convergence must
 //! use `verify_authorized`, never `verify` alone.
 
-use lait_kernel::ids::SpaceId;
+use mechanics::ids::SpaceId;
 use serde::{Deserialize, Serialize};
 
 use crate::body::ContentCommitment;
@@ -110,7 +110,7 @@ pub enum TransactionError {
 /// A mechanics-provided view of Space authority, consulted before a Body
 /// transaction is retained or incorporated. Replica owns no authority state; it
 /// asks this seam whether a signer was admitted with standing at a given
-/// authority frontier. Mechanics (`lait-kernel`) implements it over replayed
+/// authority frontier. Mechanics (`mechanics`) implements it over replayed
 /// signed history.
 pub trait AuthoritySource {
     /// Whether the device key `signer` was an admitted member with authoring
@@ -166,7 +166,7 @@ impl BodyTransactionV1 {
         descriptors: Vec<BodyDescriptorV1>,
         signer_seed: &[u8; 32],
     ) -> Option<Self> {
-        let signer = lait_kernel::crypto::device_from_seed(signer_seed).key_bytes()?;
+        let signer = mechanics::crypto::device_from_seed(signer_seed).key_bytes()?;
         let mut tx = Self {
             version: 1,
             space: space_bytes(space)?,
@@ -178,7 +178,7 @@ impl BodyTransactionV1 {
             signature_algorithm: SIG_ALG_ED25519,
             signature: [0u8; 64],
         };
-        tx.signature = lait_kernel::crypto::sign_detached(signer_seed, &tx.preimage());
+        tx.signature = mechanics::crypto::sign_detached(signer_seed, &tx.preimage());
         Some(tx)
     }
 
@@ -238,7 +238,7 @@ impl BodyTransactionV1 {
             }
         }
 
-        if !lait_kernel::crypto::verify_detached(&self.signer, &self.preimage(), &self.signature) {
+        if !mechanics::crypto::verify_detached(&self.signer, &self.preimage(), &self.signature) {
             return Err(TransactionError::BadSignature);
         }
         Ok(())

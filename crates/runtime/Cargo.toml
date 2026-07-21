@@ -8,12 +8,12 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 # mechanics — Space/Actor/Device/Station identity and authority facts.
-lait-kernel = { path = "../lait-kernel" }
+mechanics = { path = "../mechanics" }
 # replica — Body semantics, schemas, descriptors, frontiers, Convergence.
 replica = { path = "../replica" }
 # comms — gossip, presence dial, framed streams, ALPN adapters. Runtime drives
 # the transport seam; `iroh` is absent from this manifest by construction.
-lait-net = { path = "../lait-net" }
+comms = { path = "../comms" }
 
 serde = { version = "1", features = ["derive"] }
 # `[u8; 64]` signature fields: serde only derives arrays up to length 32.

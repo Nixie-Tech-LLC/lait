@@ -17,7 +17,7 @@
 //! self-signature, canonical form, payload binding, and version rejection are
 //! real.
 
-use lait_kernel::ids::{ActorId, DeviceId, SpaceId};
+use mechanics::ids::{ActorId, DeviceId, SpaceId};
 use replica::frontier::AuthorityFrontier;
 use replica::ids::{SchemaId, WorldId};
 use serde::{Deserialize, Serialize};
@@ -140,9 +140,9 @@ impl SignedWorldActionV1 {
     /// Construct and sign a World action from the acting device's identity seed.
     /// The seed's public key must equal `header.device`.
     pub fn sign(header: WorldActionHeader, payload: Vec<u8>, device_seed: &[u8; 32]) -> Self {
-        let signer = lait_kernel::crypto::device_from_seed(device_seed);
+        let signer = mechanics::crypto::device_from_seed(device_seed);
         let preimage = action_preimage(1, &header, &payload, &signer);
-        let signature = lait_kernel::crypto::sign_detached(device_seed, &preimage);
+        let signature = mechanics::crypto::sign_detached(device_seed, &preimage);
         Self {
             version: 1,
             header,
@@ -195,7 +195,7 @@ impl SignedWorldActionV1 {
         }
         let key = self.signer.key_bytes().ok_or(ActionError::SignerMismatch)?;
         let preimage = action_preimage(self.version, &self.header, &self.payload, &self.signer);
-        if !lait_kernel::crypto::verify_detached(&key, &preimage, &self.signature) {
+        if !mechanics::crypto::verify_detached(&key, &preimage, &self.signature) {
             return Err(ActionError::BadSignature);
         }
         Ok(IdempotencyKey {
@@ -226,7 +226,7 @@ mod tests {
     }
 
     fn signed(seed: &[u8; 32]) -> SignedWorldActionV1 {
-        let device = lait_kernel::crypto::device_from_seed(seed);
+        let device = mechanics::crypto::device_from_seed(seed);
         let payload = b"an application intent".to_vec();
         SignedWorldActionV1::sign(header(&payload, &device), payload, seed)
     }
@@ -259,7 +259,7 @@ mod tests {
     fn wrong_signer_is_rejected() {
         // Re-sign the preimage with a different seed but claim the original device.
         let mut action = signed(&[7u8; 32]);
-        action.signer = lait_kernel::crypto::device_from_seed(&[9u8; 32]);
+        action.signer = mechanics::crypto::device_from_seed(&[9u8; 32]);
         // signer no longer matches header.device
         assert_eq!(action.verify_self(), Err(ActionError::SignerMismatch));
     }
@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn oversized_payload_is_rejected() {
         let seed = [3u8; 32];
-        let device = lait_kernel::crypto::device_from_seed(&seed);
+        let device = mechanics::crypto::device_from_seed(&seed);
         let payload = vec![0u8; MAX_PAYLOAD + 1];
         let action = SignedWorldActionV1::sign(header(&payload, &device), payload, &seed);
         assert_eq!(action.verify_self(), Err(ActionError::PayloadTooLarge));

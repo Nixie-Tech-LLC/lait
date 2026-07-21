@@ -4,7 +4,7 @@
 //! `serde` + `anyhow`. `Display` renders the `Debug` form — the categories carry
 //! no remote prose; human-facing callers map the variant to their own text.
 
-use lait_kernel::ids::SpaceId;
+use mechanics::ids::SpaceId;
 
 /// Implement `Display` (via `Debug`) and `std::error::Error` for a plain enum.
 macro_rules! debug_error {

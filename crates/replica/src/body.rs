@@ -7,7 +7,7 @@
 //! fixture and implemented through Fabric in S5. This module defines the sealed
 //! contract shapes; S0 introduces no production routing.
 
-use lait_kernel::ids::{SpaceId, StationId};
+use mechanics::ids::{SpaceId, StationId};
 use serde::{Deserialize, Serialize};
 
 use crate::frontier::{AuthorityFrontier, ReplicaFrontier, TransactionId};

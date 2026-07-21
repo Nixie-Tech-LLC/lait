@@ -1,7 +1,7 @@
 //! S2 Coordinates v1 packet: golden positive verification plus the exhaustive
 //! malformed/substitution rejection matrix required before any routing change.
 
-use lait_kernel::ids::SpaceId;
+use mechanics::ids::SpaceId;
 use runtime::coordinates::{
     AdmissionCapabilityV1, ApproachAddr, CoordinatesAdmission, CoordinatesError,
     CoordinatesPayloadV1, SignedCoordinatesV1, MAX_INCEPTION, MAX_NAME,
@@ -14,18 +14,17 @@ const SALT: [u8; 16] = [9u8; 16];
 
 /// A valid founding: (space, recovery_root, canonical inception bytes).
 fn founding(founder_seed: [u8; 32], salt: [u8; 16]) -> (SpaceId, [u8; 32], Vec<u8>) {
-    let rc =
-        lait_kernel::space::recovery_commit(&lait_kernel::space::recovery_pub_of(&RECOVERY_SEED))
-            .unwrap();
-    let device = lait_kernel::space::recovery_pub_of(&founder_seed);
-    let ws = lait_kernel::space::derive_space_id(&device, &salt, &rc);
+    let rc = mechanics::space::recovery_commit(&mechanics::space::recovery_pub_of(&RECOVERY_SEED))
+        .unwrap();
+    let device = mechanics::space::recovery_pub_of(&founder_seed);
+    let ws = mechanics::space::derive_space_id(&device, &salt, &rc);
     let (incept, _actor) =
-        lait_kernel::actor::incept_single(&founder_seed, &ws, [1u8; 16], [2u8; 16], None);
+        mechanics::actor::incept_single(&founder_seed, &ws, [1u8; 16], [2u8; 16], None);
     (ws, rc, postcard::to_stdvec(&incept).unwrap())
 }
 
 fn station_pubkey() -> [u8; 32] {
-    lait_kernel::crypto::device_from_seed(&STATION_SEED)
+    mechanics::crypto::device_from_seed(&STATION_SEED)
         .key_bytes()
         .unwrap()
 }

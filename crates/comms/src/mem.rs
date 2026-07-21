@@ -259,10 +259,10 @@ mod tests {
 
     /// Any ALPN routes the same way here; the daemon's real protocol selectors
     /// are the application's to name, not the transport's.
-    const TEST_ALPN: Alpn = b"lait-net/test/1";
+    const TEST_ALPN: Alpn = b"comms/test/1";
 
     fn id(seed: u8) -> PeerId {
-        lait_kernel::crypto::device_from_seed(&[seed; 32])
+        mechanics::crypto::device_from_seed(&[seed; 32])
     }
 
     #[tokio::test]

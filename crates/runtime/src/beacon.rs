@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use lait_kernel::ids::{SpaceId, StationEpoch, StationId};
+use mechanics::ids::{SpaceId, StationEpoch, StationId};
 use serde::{Deserialize, Serialize};
 
 use crate::wire::length_framed;
@@ -108,7 +108,7 @@ impl SignedBeaconV1 {
         routes: Vec<RouteHint>,
         station_seed: &[u8; 32],
     ) -> Option<Self> {
-        let station = lait_kernel::crypto::device_from_seed(station_seed).key_bytes()?;
+        let station = mechanics::crypto::device_from_seed(station_seed).key_bytes()?;
         let body = BeaconBodyV1 {
             protocol,
             space: space_bytes(space)?,
@@ -119,7 +119,7 @@ impl SignedBeaconV1 {
             frontier_count,
             routes,
         };
-        let signature = lait_kernel::crypto::sign_detached(station_seed, &Self::preimage(&body));
+        let signature = mechanics::crypto::sign_detached(station_seed, &Self::preimage(&body));
         Some(Self {
             version: 1,
             body,
@@ -175,7 +175,7 @@ impl SignedBeaconV1 {
                 return Err(BeaconError::UnsortedOrDuplicateRoutes);
             }
         }
-        if !lait_kernel::crypto::verify_detached(
+        if !mechanics::crypto::verify_detached(
             &self.body.station,
             &Self::preimage(&self.body),
             &self.signature,

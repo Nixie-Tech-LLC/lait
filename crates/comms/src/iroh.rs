@@ -39,7 +39,7 @@ use super::{
     Alpn, GossipEvent, GossipReceiver, GossipSender, Incoming, PeerId, Stream, Topic, Transport,
     MAX_FRAME,
 };
-use lait_kernel::ids::DeviceId;
+use mechanics::ids::DeviceId;
 
 /// Inbound connections buffered between the Router's handlers and a slow
 /// [`Transport::accept`] loop before handlers start parking in their forward.
@@ -493,7 +493,7 @@ mod tests {
     /// conversions at this edge are exact inverses.
     #[test]
     fn id_topic_conversions() {
-        let device = lait_kernel::crypto::device_from_seed(&[7u8; 32]);
+        let device = mechanics::crypto::device_from_seed(&[7u8; 32]);
         let ep = endpoint_id(&device).expect("a lait device id is a valid endpoint id");
         assert_eq!(peer_id(ep), device, "peer_id ∘ endpoint_id = identity");
 

@@ -24,7 +24,7 @@
 //! integration adds; until then the book safely treats unordered roots as
 //! concurrent (union) and dedupes exact replays.
 
-use lait_kernel::ids::SpaceId;
+use mechanics::ids::SpaceId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -215,7 +215,7 @@ impl ManifestRootV1 {
         authority_frontier: AuthorityFrontier,
         signer_seed: &[u8; 32],
     ) -> Option<Self> {
-        let signer = lait_kernel::crypto::device_from_seed(signer_seed).key_bytes()?;
+        let signer = mechanics::crypto::device_from_seed(signer_seed).key_bytes()?;
         let hashes: Vec<[u8; 32]> = pages.iter().map(|p| p.hash()).collect();
         let mut root = Self {
             version: 1,
@@ -229,7 +229,7 @@ impl ManifestRootV1 {
             signature_algorithm: SIG_ALG_ED25519,
             signature: [0u8; 64],
         };
-        root.signature = lait_kernel::crypto::sign_detached(signer_seed, &root.preimage());
+        root.signature = mechanics::crypto::sign_detached(signer_seed, &root.preimage());
         Some(root)
     }
 
@@ -269,7 +269,7 @@ impl ManifestRootV1 {
         {
             return Err(ManifestError::PagesRootMismatch);
         }
-        if !lait_kernel::crypto::verify_detached(&self.signer, &self.preimage(), &self.signature) {
+        if !mechanics::crypto::verify_detached(&self.signer, &self.preimage(), &self.signature) {
             return Err(ManifestError::BadSignature);
         }
         Ok(())

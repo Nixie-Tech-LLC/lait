@@ -13,8 +13,8 @@
 //! work. Runtime contains an unwind-safe panic as `WorldImplementationFailed`
 //! without ending the Station.
 
-use lait_kernel::acl::Grant;
-use lait_kernel::ids::{ActorId, DeviceId, StationId};
+use mechanics::acl::Grant;
+use mechanics::ids::{ActorId, DeviceId, StationId};
 use replica::body::BodyOp;
 use replica::frontier::AuthorityFrontier;
 use replica::ids::{BodyKey, WorldId};
@@ -96,7 +96,7 @@ pub struct LocalIdentity {
 impl LocalIdentity {
     pub(crate) fn from_seed(seed: &[u8; 32]) -> Self {
         Self {
-            device: lait_kernel::crypto::device_from_seed(seed),
+            device: mechanics::crypto::device_from_seed(seed),
         }
     }
 

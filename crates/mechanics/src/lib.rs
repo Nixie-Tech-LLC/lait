@@ -7,7 +7,7 @@
 //! "where lait starts and ends" is the dependency edge, enforced by rustc.
 //!
 //! The kernel determines **legitimacy** — identity, authority, custody,
-//! recovery, and which transitions are valid given signed history. `lait-fabric`
+//! recovery, and which transitions are valid given signed history. `fabric`
 //! maintains the **shared world** — documents, persistence, history,
 //! convergence, projection. They are separate crates because that dependency
 //! edge is a correctness boundary: convergence cannot confer legitimacy. They

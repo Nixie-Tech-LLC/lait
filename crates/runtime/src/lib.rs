@@ -13,7 +13,7 @@
 //! Orbits, activating them into Stations, hosting Worlds, docking Sessions,
 //! Contact policy, and Observation publication. It exposes **no** Loro, iroh,
 //! stream, file, key, ciphertext, mutex, or product request types — those live
-//! below the boundary in [`lait_fabric`], [`lait_net`], and [`lait_kernel`].
+//! below the boundary in [`fabric`], [`comms`], and [`mechanics`].
 //!
 //! Orbit and Station are the same durable relationship in mutually exclusive
 //! states: [`Orbit::activate`] consumes the Orbit and returns a [`Station`];

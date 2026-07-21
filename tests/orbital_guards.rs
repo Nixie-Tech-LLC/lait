@@ -68,10 +68,10 @@ fn rust_sources(crate_dir: &str) -> Vec<PathBuf> {
 fn only_fabric_names_loro_in_its_manifest() {
     // Passing control: fabric lists loro; the concept crates do not.
     assert!(
-        manifest_lists_dep("lait-fabric", "loro"),
+        manifest_lists_dep("fabric", "loro"),
         "fabric must list loro — it is the sealed Loro boundary"
     );
-    for crate_dir in ["lait-kernel", "lait-net", "replica", "runtime"] {
+    for crate_dir in ["mechanics", "comms", "replica", "runtime"] {
         assert!(
             !manifest_lists_dep(crate_dir, "loro"),
             "{crate_dir} must NOT name loro — the dependency edge is the seal"
@@ -79,7 +79,7 @@ fn only_fabric_names_loro_in_its_manifest() {
     }
     // Injected failing case: the predicate genuinely rejects a non-listed dep.
     assert!(
-        !manifest_lists_dep("lait-fabric", "definitely-not-a-dependency"),
+        !manifest_lists_dep("fabric", "definitely-not-a-dependency"),
         "guard has teeth: a dep that is not listed is not reported as listed"
     );
 }
@@ -87,10 +87,10 @@ fn only_fabric_names_loro_in_its_manifest() {
 #[test]
 fn only_comms_names_iroh_in_its_manifest() {
     assert!(
-        manifest_lists_dep("lait-net", "iroh"),
-        "comms (lait-net) must list iroh — it is the sole network contractor"
+        manifest_lists_dep("comms", "iroh"),
+        "comms must list iroh — it is the sole network contractor"
     );
-    for crate_dir in ["lait-kernel", "lait-fabric", "replica", "runtime"] {
+    for crate_dir in ["mechanics", "fabric", "replica", "runtime"] {
         assert!(
             !manifest_lists_dep(crate_dir, "iroh"),
             "{crate_dir} must NOT name iroh"
@@ -139,12 +139,13 @@ fn concept_crates_are_free_of_product_vocabulary() {
 }
 
 // ---------------------------------------------------------------------------
-// G2 — the new concept crates are prefix-free.
+// G2 / S8 — every concept crate is prefix-free; no legacy crate name remains.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn new_concept_crates_are_prefix_free() {
-    for (crate_dir, expected_name) in [("replica", "replica"), ("runtime", "runtime")] {
+fn every_concept_crate_is_prefix_free() {
+    // After S8 all five concept crates carry their prefix-free canonical names.
+    for crate_dir in ["mechanics", "fabric", "comms", "replica", "runtime"] {
         let manifest = read(
             &workspace_root()
                 .join("crates")
@@ -156,12 +157,36 @@ fn new_concept_crates_are_prefix_free() {
             .find(|l| l.trim_start().starts_with("name ="))
             .expect("a name line");
         assert!(
-            name_line.contains(&format!("\"{expected_name}\"")),
-            "{crate_dir} package name must be the prefix-free `{expected_name}`"
+            name_line.contains(&format!("\"{crate_dir}\"")),
+            "{crate_dir} package name must equal its prefix-free directory name"
         );
         assert!(
             !name_line.contains("lait-") && !name_line.contains("lait_"),
-            "{crate_dir} is prefix-free from birth (no lait- prefix)"
+            "{crate_dir} is prefix-free — no legacy lait- crate name remains"
         );
+    }
+}
+
+#[test]
+fn no_legacy_crate_name_or_directory_remains() {
+    let crates = workspace_root().join("crates");
+    for legacy in ["lait-kernel", "lait-fabric", "lait-net"] {
+        assert!(
+            !crates.join(legacy).exists(),
+            "legacy crate directory {legacy} must not exist after S8"
+        );
+    }
+    // No source or manifest may still name a legacy crate path.
+    for crate_dir in ["mechanics", "fabric", "comms", "replica", "runtime"] {
+        for src in rust_sources(crate_dir) {
+            let text = read(&src);
+            for legacy in ["lait_kernel", "lait_fabric", "lait_net"] {
+                assert!(
+                    !text.contains(legacy),
+                    "legacy crate path `{legacy}` remains in {}",
+                    src.display()
+                );
+            }
+        }
     }
 }

@@ -17,7 +17,7 @@
 //! and commit metadata inside the fabric boundary.
 
 // Kernel re-exports give fabric modules one internal namespace for shared types.
-pub(crate) use lait_kernel::{acl, actor, dto, genesis, ids, sigdag, space};
+pub(crate) use mechanics::{acl, actor, dto, genesis, ids, sigdag, space};
 
 pub mod catalog;
 pub mod fabric;

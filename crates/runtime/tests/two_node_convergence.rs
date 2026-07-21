@@ -9,7 +9,7 @@
 //! carrying these exact frames over a comms `Stream`; the framing, validation,
 //! and incorporation proven here are transport-independent.)
 
-use lait_kernel::ids::SpaceId;
+use mechanics::ids::SpaceId;
 use replica::frontier::AuthorityFrontier;
 use replica::transaction::{AuthoritySource, BodyTransactionV1};
 use replica::{BodyId, BodyKey, BodyOp, Replica, WorldId};
@@ -34,7 +34,7 @@ struct ExporterAuthorized;
 impl AuthoritySource for ExporterAuthorized {
     fn signer_authorized(&self, signer: &[u8; 32], _f: &AuthorityFrontier) -> bool {
         *signer
-            == lait_kernel::crypto::device_from_seed(&EXPORT_SEED)
+            == mechanics::crypto::device_from_seed(&EXPORT_SEED)
                 .key_bytes()
                 .unwrap()
     }
