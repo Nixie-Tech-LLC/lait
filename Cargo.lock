@@ -4659,6 +4659,7 @@ dependencies = [
  "mechanics",
  "postcard",
  "replica",
+ "schemars",
  "serde",
  "serde-byte-array",
  "serde_json",
