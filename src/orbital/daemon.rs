@@ -255,15 +255,59 @@ impl OrbitalDaemon {
         }
     }
 
+    /// Best-effort (issues, projects) counts from the docked Session's catalog
+    /// snapshot. `(0, 0)` when undocked (un-admitted) or the query is unavailable.
+    fn counts(&self) -> (usize, usize) {
+        use crate::world::contract::{self, IssueQuery};
+        if !self.ensure_session() {
+            return (0, 0);
+        }
+        let guard = self.session.lock().expect("session lock");
+        let Some(session) = guard.as_ref() else {
+            return (0, 0);
+        };
+        let query = |q: IssueQuery| -> Option<serde_json::Value> {
+            let bytes = session
+                .query(runtime::WorldQuery {
+                    schema: contract::issue_schema(),
+                    schema_version: contract::ISSUE_SCHEMA_VERSION,
+                    payload: q.to_json(),
+                })
+                .ok()?
+                .bytes;
+            serde_json::from_slice(&bytes).ok()
+        };
+        let projects = query(IssueQuery::Snapshot)
+            .and_then(|v| {
+                v.get("catalog")?
+                    .get("projects")?
+                    .as_object()
+                    .map(|m| m.len())
+            })
+            .unwrap_or(0);
+        let issues = query(IssueQuery::List {
+            project: None,
+            label: None,
+            status: None,
+            mine: None,
+            all: true,
+            me: None,
+        })
+        .and_then(|v| v.as_array().map(|a| a.len()))
+        .unwrap_or(0);
+        (issues, projects)
+    }
+
     fn status(&self) -> Response {
+        let (issues, projects) = self.counts();
         Response::Status(Box::new(StatusInfo {
             id: crate::crypto::device_from_seed(&self.device_seed).to_string(),
             nick: String::new(),
             name: String::new(),
             online_peers: self.station.neighbors().len(),
             space: Some(self.station.space_id().as_str().to_string()),
-            issues: 0,
-            projects: 0,
+            issues,
+            projects,
             membership: if self.mechanics.am_i_member() {
                 "member".into()
             } else {
