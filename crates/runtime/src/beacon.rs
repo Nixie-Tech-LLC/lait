@@ -140,9 +140,10 @@ impl SignedBeaconV1 {
         Ok(beacon)
     }
 
-    /// Verify structure + emitting-Station signature. Returns the verified
-    /// `(SpaceId, StationId, epoch, sequence)` freshness coordinate.
-    pub fn verify(&self) -> Result<(SpaceId, StationId, u64, u64), BeaconError> {
+    /// Verify structure + emitting-Station signature, yielding a
+    /// [`VerifiedBeacon`]. This is the **only** way to obtain one, so freshness
+    /// state can only ever be advanced by a beacon whose signature was checked.
+    pub fn verify(&self) -> Result<VerifiedBeacon, BeaconError> {
         if self.version != 1 {
             return Err(BeaconError::UnsupportedVersion(self.version));
         }
@@ -174,12 +175,40 @@ impl SignedBeaconV1 {
         ) {
             return Err(BeaconError::BadSignature);
         }
-        Ok((
+        Ok(VerifiedBeacon {
             space,
-            StationId::from_key_bytes(self.body.station),
-            self.body.epoch,
-            self.body.sequence,
-        ))
+            station: StationId::from_key_bytes(self.body.station),
+            space_bytes: self.body.space,
+            station_bytes: self.body.station,
+            epoch: self.body.epoch,
+            sequence: self.body.sequence,
+        })
+    }
+}
+
+/// A beacon whose signature and structure have been verified. It cannot be
+/// constructed except by [`SignedBeaconV1::verify`], so a forged signed
+/// structure can never reach [`BeaconHighWater::offer`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedBeacon {
+    space: SpaceId,
+    station: StationId,
+    space_bytes: [u8; 29],
+    station_bytes: [u8; 32],
+    epoch: u64,
+    sequence: u64,
+}
+
+impl VerifiedBeacon {
+    pub fn space(&self) -> &SpaceId {
+        &self.space
+    }
+    pub fn station(&self) -> &StationId {
+        &self.station
+    }
+    /// The freshness coordinate `(epoch, sequence)`.
+    pub fn coordinate(&self) -> (u64, u64) {
+        (self.epoch, self.sequence)
     }
 }
 
@@ -207,11 +236,13 @@ impl BeaconHighWater {
         Self::default()
     }
 
-    /// Offer a *verified* Beacon. Advances and accepts only if strictly ahead of
-    /// the recorded `(epoch, sequence)`; fails closed at the `u64` ceiling.
-    pub fn offer(&mut self, beacon: &SignedBeaconV1) -> BeaconAcceptance {
-        let key = (beacon.body.space, beacon.body.station);
-        let incoming = (beacon.body.epoch, beacon.body.sequence);
+    /// Offer a [`VerifiedBeacon`]. The type makes verification non-optional: a
+    /// caller cannot advance freshness state with a beacon whose signature was
+    /// not checked. Advances and accepts only if strictly ahead of the recorded
+    /// `(epoch, sequence)`; fails closed at the `u64` ceiling.
+    pub fn offer(&mut self, beacon: &VerifiedBeacon) -> BeaconAcceptance {
+        let key = (beacon.space_bytes, beacon.station_bytes);
+        let incoming = beacon.coordinate();
         if incoming.0 == u64::MAX && incoming.1 == u64::MAX {
             return BeaconAcceptance::Overflow;
         }

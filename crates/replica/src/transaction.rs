@@ -10,6 +10,17 @@
 //!
 //! There is no plaintext hash anywhere: the commitment is ciphertext-only
 //! ([`crate::body::ContentCommitment`]), which avoids an equality oracle.
+//!
+//! **Two levels of verification, deliberately separate.**
+//! [`BodyTransactionV1::verify`] is the *opaque structural* check any Station can
+//! run without membership state: canonical shape, descriptor binding, ordering,
+//! and the committing signature. It is **not** an authority check — a
+//! structurally-valid transaction may still be signed by a device with no
+//! standing. Before a transaction is retained or incorporated, mechanics must
+//! also prove the signer had authority at the referenced frontier;
+//! [`BodyTransactionV1::verify_authorized`] runs the structural check and then
+//! consults a mechanics-provided [`AuthoritySource`]. Retention/Convergence must
+//! use `verify_authorized`, never `verify` alone.
 
 use lait_kernel::ids::SpaceId;
 use serde::{Deserialize, Serialize};
@@ -90,6 +101,21 @@ pub enum TransactionError {
     /// enclosing transaction's (a transplanted descriptor).
     Transplanted,
     BadSignature,
+    /// The transaction is structurally valid and correctly signed, but the
+    /// signer had no authority (membership/standing) at the referenced authority
+    /// frontier. Produced only by [`BodyTransactionV1::verify_authorized`].
+    AuthorityUnverified,
+}
+
+/// A mechanics-provided view of Space authority, consulted before a Body
+/// transaction is retained or incorporated. Replica owns no authority state; it
+/// asks this seam whether a signer was admitted with standing at a given
+/// authority frontier. Mechanics (`lait-kernel`) implements it over replayed
+/// signed history.
+pub trait AuthoritySource {
+    /// Whether the device key `signer` was an admitted member with authoring
+    /// standing at `authority_frontier`.
+    fn signer_authorized(&self, signer: &[u8; 32], authority_frontier: &AuthorityFrontier) -> bool;
 }
 
 impl std::fmt::Display for TransactionError {
@@ -172,9 +198,10 @@ impl BodyTransactionV1 {
         Ok(tx)
     }
 
-    /// Verify structure, descriptor binding, ordering, and the committing
-    /// signature. Mechanics separately proves the signer's authority at
-    /// `authority_frontier`; that check is not part of this opaque validation.
+    /// **Structural** verification only: canonical shape, descriptor binding,
+    /// ordering, and the committing signature. This does **not** prove authority
+    /// — a valid device key with no standing produces a transaction that passes
+    /// here. Use [`Self::verify_authorized`] before retaining or incorporating.
     pub fn verify(&self) -> Result<(), TransactionError> {
         if self.version != 1 {
             return Err(TransactionError::UnsupportedVersion(self.version));
@@ -213,6 +240,22 @@ impl BodyTransactionV1 {
 
         if !lait_kernel::crypto::verify_detached(&self.signer, &self.preimage(), &self.signature) {
             return Err(TransactionError::BadSignature);
+        }
+        Ok(())
+    }
+
+    /// Full verification for retention/incorporation: the structural
+    /// [`Self::verify`] **and** the mechanics authority check — the signer must
+    /// have been an admitted member with standing at `authority_frontier`. Any
+    /// valid device key that lacks that standing fails with
+    /// [`TransactionError::AuthorityUnverified`].
+    pub fn verify_authorized(
+        &self,
+        authority: &dyn AuthoritySource,
+    ) -> Result<(), TransactionError> {
+        self.verify()?;
+        if !authority.signer_authorized(&self.signer, &self.authority_frontier) {
+            return Err(TransactionError::AuthorityUnverified);
         }
         Ok(())
     }

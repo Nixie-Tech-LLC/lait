@@ -3,10 +3,13 @@
 
 use lait_kernel::ids::SpaceId;
 use replica::body::ContentCommitment;
+use replica::frontier::AuthorityFrontier as AF;
 use replica::frontier::{AuthorityFrontier, ReplicaFrontier, TransactionId};
 use replica::ids::{BodyId, EncodingId, SchemaId, WorldId};
 use replica::marker::{MarkerError, StoreMarkerV1, STORE_MAGIC};
-use replica::transaction::{BodyDescriptorV1, BodyTransactionV1, TransactionError};
+use replica::transaction::{
+    AuthoritySource, BodyDescriptorV1, BodyTransactionV1, TransactionError,
+};
 
 const SIGNER_SEED: [u8; 32] = [12u8; 32];
 
@@ -151,6 +154,38 @@ fn a_transplanted_descriptor_is_rejected() {
     assert_eq!(tx.verify(), Err(TransactionError::Transplanted));
 }
 
+/// A stub mechanics authority view: authorizes only a named signer key.
+struct OnlyAuthorizes([u8; 32]);
+impl AuthoritySource for OnlyAuthorizes {
+    fn signer_authorized(&self, signer: &[u8; 32], _frontier: &AF) -> bool {
+        *signer == self.0
+    }
+}
+
+#[test]
+fn structural_verify_is_not_an_authority_check() {
+    // A structurally valid, correctly-signed transaction passes verify() even
+    // when its signer has no standing — this is why retention must use
+    // verify_authorized.
+    let tx = valid_tx();
+    tx.verify().unwrap();
+
+    // Mechanics view that authorizes nobody: the transaction is refused.
+    struct Nobody;
+    impl AuthoritySource for Nobody {
+        fn signer_authorized(&self, _s: &[u8; 32], _f: &AF) -> bool {
+            false
+        }
+    }
+    assert_eq!(
+        tx.verify_authorized(&Nobody),
+        Err(TransactionError::AuthorityUnverified)
+    );
+
+    // A view that authorizes the actual signer: accepted.
+    assert!(tx.verify_authorized(&OnlyAuthorizes(signer_key())).is_ok());
+}
+
 #[test]
 fn tampered_signature_is_rejected() {
     let mut tx = valid_tx();
@@ -203,6 +238,19 @@ fn a_corrupt_marker_is_detected() {
     let mut marker = StoreMarkerV1::new(&space()).unwrap();
     marker.checksum[0] ^= 0xff;
     let bytes = marker.encode();
+    assert_eq!(
+        StoreMarkerV1::classify(&bytes),
+        Err(MarkerError::CorruptStoreMarker)
+    );
+}
+
+#[test]
+fn a_corrupt_lait_marker_is_distinct_from_a_foreign_directory() {
+    // Magic + version present, but the postcard body is truncated: this is our
+    // marker gone bad, not someone else's file.
+    let mut bytes = STORE_MAGIC.to_vec();
+    bytes.push(1); // version
+    bytes.extend_from_slice(&[0x00, 0x01]); // a stub, not a full body
     assert_eq!(
         StoreMarkerV1::classify(&bytes),
         Err(MarkerError::CorruptStoreMarker)

@@ -31,33 +31,49 @@ fn beacon(epoch: u64, sequence: u64, routes: Vec<RouteHint>) -> SignedBeaconV1 {
     .unwrap()
 }
 
+/// A verified beacon — the only thing `BeaconHighWater::offer` accepts.
+fn verified(epoch: u64, sequence: u64) -> runtime::beacon::VerifiedBeacon {
+    beacon(epoch, sequence, vec![]).verify().unwrap()
+}
+
 // ---- Beacon v1 ----
 
 #[test]
 fn valid_beacon_verifies() {
-    let b = beacon(2, 5, vec![]);
-    let (sp, station, epoch, seq) = b.verify().unwrap();
-    assert_eq!(sp, space());
+    let v = beacon(2, 5, vec![]).verify().unwrap();
+    assert_eq!(v.space(), &space());
     assert_eq!(
-        station,
-        StationId::from_device(&lait_kernel::crypto::device_from_seed(&STATION_SEED)).unwrap()
+        v.station(),
+        &StationId::from_device(&lait_kernel::crypto::device_from_seed(&STATION_SEED)).unwrap()
     );
-    assert_eq!((epoch, seq), (2, 5));
+    assert_eq!(v.coordinate(), (2, 5));
+}
+
+#[test]
+fn high_water_only_accepts_verified_beacons() {
+    // The type system enforces it: `offer` takes a VerifiedBeacon, which can
+    // only come from `verify()`. A forged signed structure cannot be verified,
+    // so it can never reach the high-water state.
+    let mut forged = beacon(9, 9, vec![]);
+    forged.signature[0] ^= 0xff;
+    assert!(matches!(forged.verify(), Err(BeaconError::BadSignature)));
+    let mut hw = BeaconHighWater::new();
+    assert_eq!(hw.offer(&verified(1, 0)), BeaconAcceptance::Accepted);
 }
 
 #[test]
 fn high_water_accepts_forward_and_rejects_stale() {
     let mut hw = BeaconHighWater::new();
-    assert_eq!(hw.offer(&beacon(1, 0, vec![])), BeaconAcceptance::Accepted);
-    assert_eq!(hw.offer(&beacon(1, 1, vec![])), BeaconAcceptance::Accepted);
+    assert_eq!(hw.offer(&verified(1, 0)), BeaconAcceptance::Accepted);
+    assert_eq!(hw.offer(&verified(1, 1)), BeaconAcceptance::Accepted);
     // Same coordinate is a duplicate.
-    assert_eq!(hw.offer(&beacon(1, 1, vec![])), BeaconAcceptance::Stale);
+    assert_eq!(hw.offer(&verified(1, 1)), BeaconAcceptance::Stale);
     // A lower sequence is stale.
-    assert_eq!(hw.offer(&beacon(1, 0, vec![])), BeaconAcceptance::Stale);
+    assert_eq!(hw.offer(&verified(1, 0)), BeaconAcceptance::Stale);
     // A new epoch always advances.
-    assert_eq!(hw.offer(&beacon(2, 0, vec![])), BeaconAcceptance::Accepted);
+    assert_eq!(hw.offer(&verified(2, 0)), BeaconAcceptance::Accepted);
     // An old epoch, even with a high sequence, is stale.
-    assert_eq!(hw.offer(&beacon(1, 9999, vec![])), BeaconAcceptance::Stale);
+    assert_eq!(hw.offer(&verified(1, 9999)), BeaconAcceptance::Stale);
 }
 
 #[test]
@@ -65,16 +81,16 @@ fn high_water_survives_restart_as_persisted_state() {
     // The high-water map IS the persisted state; a fresh receiver that reloads
     // it rejects a replay of an already-seen coordinate.
     let mut hw = BeaconHighWater::new();
-    assert_eq!(hw.offer(&beacon(5, 5, vec![])), BeaconAcceptance::Accepted);
+    assert_eq!(hw.offer(&verified(5, 5)), BeaconAcceptance::Accepted);
     // "Restart": the same recorded state rejects a lower/equal coordinate.
-    assert_eq!(hw.offer(&beacon(5, 5, vec![])), BeaconAcceptance::Stale);
-    assert_eq!(hw.offer(&beacon(4, 100, vec![])), BeaconAcceptance::Stale);
+    assert_eq!(hw.offer(&verified(5, 5)), BeaconAcceptance::Stale);
+    assert_eq!(hw.offer(&verified(4, 100)), BeaconAcceptance::Stale);
 }
 
 #[test]
 fn counter_overflow_fails_closed() {
     assert_eq!(
-        BeaconHighWater::new().offer(&beacon(u64::MAX, u64::MAX, vec![])),
+        BeaconHighWater::new().offer(&verified(u64::MAX, u64::MAX)),
         BeaconAcceptance::Overflow
     );
 }

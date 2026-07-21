@@ -40,7 +40,9 @@ pub(crate) mod wire;
 pub mod world;
 
 pub use action::{ActionError, IdempotencyKey, RequestId, SignedWorldActionV1, WorldActionHeader};
-pub use beacon::{BeaconAcceptance, BeaconError, BeaconHighWater, RouteHint, SignedBeaconV1};
+pub use beacon::{
+    BeaconAcceptance, BeaconError, BeaconHighWater, RouteHint, SignedBeaconV1, VerifiedBeacon,
+};
 pub use coordinates::{
     AdmissionCapabilityV1, ApproachAddr, CoordinatesAdmission, CoordinatesError,
     CoordinatesPayloadV1, SignedCoordinatesV1, VerifiedCoordinates,

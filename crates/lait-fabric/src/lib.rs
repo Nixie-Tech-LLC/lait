@@ -28,4 +28,7 @@ pub mod membership;
 pub mod op;
 pub mod store;
 
-pub use fabric::{CausalToken, FabricCommitReceipt, FabricKey, FabricOp, FabricTransactionRequest};
+pub use fabric::{
+    CausalToken, Fabric, FabricCommitReceipt, FabricError, FabricKey, FabricOp,
+    FabricTransactionRequest, MemFabric,
+};

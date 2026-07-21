@@ -384,11 +384,17 @@ impl Station {
             .registry
             .world(world_id)
             .ok_or(LifecycleError::NotYetWired("unknown world at dock"))?;
+        let registration = self
+            .registry
+            .registration(world_id)
+            .ok_or(LifecycleError::NotYetWired("unknown world at dock"))?;
         Ok(Session::new(
             world_id.clone(),
             world,
             principal,
             self.epoch,
+            registration.limits,
+            registration.schemas.clone(),
             self.alive.clone(),
         ))
     }
@@ -647,6 +653,25 @@ mod tests {
             rt.orbit(&space),
             Err(LifecycleError::OrbitNotFound(_))
         ));
+    }
+
+    #[test]
+    fn deorbit_confirmation_must_name_the_same_space() {
+        let root = temp_root();
+        let rt = runtime(&root);
+        let orbit = rt.form_space(SpaceFormationOptions::default()).unwrap();
+        let space = orbit.space_id().clone();
+        // A confirmation for a *different* Space is refused, and the store is
+        // left intact (the confirmation binds removal to an exact Space).
+        let wrong = DeorbitConfirmation::for_space(SpaceId::from_digest([0xEE; 16]));
+        assert!(matches!(
+            orbit.deorbit(wrong),
+            Err(LifecycleError::IntegrityFailure(_))
+        ));
+        assert!(
+            rt.orbit(&space).is_ok(),
+            "store survived the refused deorbit"
+        );
     }
 
     #[test]

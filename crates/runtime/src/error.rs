@@ -122,6 +122,9 @@ pub enum WorldError {
     Persistence,
     /// Continuity was lost; the caller must reset/re-query.
     ResetRequired,
+    /// The World callback panicked. Runtime contains the unwind as this typed
+    /// error without ending the Station or discarding the Replica.
+    WorldImplementationFailed,
 }
 
 debug_error!(

@@ -126,14 +126,18 @@ fn temp_root() -> PathBuf {
     dir
 }
 
-fn station() -> crate::lifecycle::Station {
-    let (reg, world) = note_registration();
+fn station_with(reg: WorldRegistration, world: Arc<dyn World>) -> crate::lifecycle::Station {
     let registry = RuntimeBuilder::new().register(reg, world).build().unwrap();
     let rt = Runtime::open(temp_root(), registry);
     rt.form_space(SpaceFormationOptions::default())
         .unwrap()
         .activate(ActivationOptions::default())
         .unwrap()
+}
+
+fn station() -> crate::lifecycle::Station {
+    let (reg, world) = note_registration();
+    station_with(reg, world)
 }
 
 #[test]
@@ -255,6 +259,112 @@ fn a_session_cannot_stop_the_station() {
         exit.reason,
         Some(crate::error::StationExitReason::TaskFailed(_))
     ));
+}
+
+/// A World whose `submit` panics — to prove Runtime contains it.
+struct PanicWorld {
+    id: WorldId,
+    schemas: Vec<BodySchema>,
+}
+impl World for PanicWorld {
+    fn id(&self) -> WorldId {
+        self.id.clone()
+    }
+    fn schemas(&self) -> &[BodySchema] {
+        &self.schemas
+    }
+    fn submit(
+        &self,
+        _ctx: &mut WorldContext<'_>,
+        _intent: WorldIntent,
+    ) -> Result<WorldEffect, WorldError> {
+        panic!("world callback panics")
+    }
+    fn query(
+        &self,
+        _ctx: &WorldContext<'_>,
+        _query: WorldQuery,
+    ) -> Result<WorldProjection, WorldError> {
+        Err(WorldError::InvalidRequest)
+    }
+}
+
+#[test]
+fn a_world_panic_is_contained_and_does_not_end_the_station() {
+    let id = WorldId::parse("com.example.panic").unwrap();
+    let schemas = vec![BodySchema {
+        id: SchemaId::parse("note").unwrap(),
+        version: 1,
+        encoding: EncodingId::parse("text.utf8").unwrap(),
+        mutation: MutationModel::Atomic,
+        readable_predecessors: vec![],
+    }];
+    let reg = WorldRegistration {
+        id: id.clone(),
+        implementation_version: WorldVersion(1),
+        schemas: schemas.clone(),
+        limits: WorldLimits::default(),
+    };
+    let world: Arc<dyn World> = Arc::new(PanicWorld {
+        id: id.clone(),
+        schemas,
+    });
+    let station = station_with(reg, world);
+    let session = station.dock(&id, principal(vec![Grant::Write])).unwrap();
+    let r = session.submit(WorldIntent {
+        schema: SchemaId::parse("note").unwrap(),
+        schema_version: 1,
+        payload: b"x".to_vec(),
+    });
+    assert_eq!(r, Err(WorldError::WorldImplementationFailed));
+    // The Station survives the panic and can still go dormant cleanly.
+    assert!(station.go_dormant().is_ok());
+}
+
+#[test]
+fn payload_over_the_declared_limit_is_rejected_before_the_callback() {
+    let (mut reg, world) = note_registration();
+    reg.limits = WorldLimits {
+        max_payload_bytes: 4,
+    };
+    let station = station_with(reg, world);
+    let world_id = WorldId::parse("com.example.notes").unwrap();
+    let session = station
+        .dock(&world_id, principal(vec![Grant::Write]))
+        .unwrap();
+    let r = session.submit(WorldIntent {
+        schema: SchemaId::parse("note").unwrap(),
+        schema_version: 1,
+        payload: b"toolong".to_vec(),
+    });
+    assert_eq!(r, Err(WorldError::LimitExceeded));
+}
+
+#[test]
+fn unregistered_schema_and_version_are_rejected() {
+    let station = station();
+    let world_id = WorldId::parse("com.example.notes").unwrap();
+    let session = station
+        .dock(&world_id, principal(vec![Grant::Write]))
+        .unwrap();
+    // Unknown schema.
+    assert_eq!(
+        session.submit(WorldIntent {
+            schema: SchemaId::parse("other").unwrap(),
+            schema_version: 1,
+            payload: b"x".to_vec(),
+        }),
+        Err(WorldError::UnsupportedSchema)
+    );
+    // Known schema, unknown version.
+    assert_eq!(
+        session.submit(WorldIntent {
+            schema: SchemaId::parse("note").unwrap(),
+            schema_version: 9,
+            payload: b"x".to_vec(),
+        }),
+        Err(WorldError::UnsupportedSchemaVersion)
+    );
 }
 
 #[test]
