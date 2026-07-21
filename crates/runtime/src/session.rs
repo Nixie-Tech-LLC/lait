@@ -85,9 +85,9 @@ pub(crate) struct StationCore {
 }
 
 impl StationCore {
-    pub(crate) fn new(epoch: StationEpoch) -> Self {
+    pub(crate) fn new(epoch: StationEpoch, replica: replica::Replica) -> Self {
         Self {
-            replica: std::sync::Mutex::new(replica::Replica::in_memory()),
+            replica: std::sync::Mutex::new(replica),
             obs_seq: std::sync::atomic::AtomicU64::new(0),
             epoch,
         }
@@ -98,6 +98,14 @@ impl StationCore {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .frontier()
+    }
+
+    /// Serialize the Replica's durable state for a dormancy checkpoint.
+    pub(crate) fn checkpoint(&self) -> Result<Vec<u8>, replica::ReplicaCommitError> {
+        self.replica
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .checkpoint()
     }
 }
 

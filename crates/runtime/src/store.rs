@@ -24,6 +24,10 @@ use crate::error::LifecycleError;
 const MARKER_FILE: &str = "marker";
 const EPOCH_FILE: &str = "epoch";
 const LOCK_FILE: &str = "lock";
+/// The Replica content checkpoint (engine snapshot + frontier). The full S5
+/// store adds `current-manifest`, `transactions/`, and `journal/`; this single
+/// atomically-replaced file is the S5a durable-content seam.
+const CONTENT_FILE: &str = "replica-content";
 
 fn io_err(e: std::io::Error) -> LifecycleError {
     LifecycleError::StoreIo(e.to_string())
@@ -149,6 +153,23 @@ impl OrbitStore {
             // If we cannot even open the lock file, treat as not lockable-by-us.
             Err(_) => true,
         }
+    }
+
+    /// The Replica content checkpoint bytes, if a checkpoint has been written.
+    pub fn read_content(&self) -> Result<Option<Vec<u8>>, LifecycleError> {
+        match std::fs::read(self.dir.join(CONTENT_FILE)) {
+            Ok(b) => Ok(Some(b)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io_err(e)),
+        }
+    }
+
+    /// Atomically write the Replica content checkpoint (temp + rename + fsync),
+    /// so a crash mid-write never corrupts the prior checkpoint.
+    pub fn write_content(&self, bytes: &[u8]) -> Result<(), LifecycleError> {
+        let tmp = self.dir.join(format!("{CONTENT_FILE}.tmp"));
+        write_sync(&tmp, bytes)?;
+        std::fs::rename(&tmp, self.dir.join(CONTENT_FILE)).map_err(io_err)
     }
 
     /// Destroy the store directory. The caller must hold the lock (i.e. be the

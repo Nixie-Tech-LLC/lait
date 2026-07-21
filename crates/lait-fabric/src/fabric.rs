@@ -138,6 +138,12 @@ pub trait Fabric {
 
     /// Read the committed canonical bytes at a key, if present.
     fn read(&self, key: &FabricKey) -> Option<Vec<u8>>;
+
+    /// Export the full durable representation as bytes. The engine's own
+    /// constructor restores it (`LoroFabric::from_snapshot` / `MemFabric::
+    /// from_snapshot`), so the caller persists the bytes and reopens with the
+    /// matching engine.
+    fn snapshot(&self) -> Result<Vec<u8>, FabricError>;
 }
 
 /// A minimal in-memory reference engine. It is a real engine — it applies
@@ -154,6 +160,13 @@ pub struct MemFabric {
 impl MemFabric {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Restore an in-memory engine from a [`Fabric::snapshot`].
+    pub fn from_snapshot(bytes: &[u8]) -> Result<Self, FabricError> {
+        let state: BTreeMap<FabricKey, Vec<u8>> =
+            postcard::from_bytes(bytes).map_err(|e| FabricError::Durability(e.to_string()))?;
+        Ok(Self { state, counter: 0 })
     }
 }
 
@@ -185,6 +198,97 @@ impl Fabric for MemFabric {
     fn read(&self, key: &FabricKey) -> Option<Vec<u8>> {
         self.state.get(key).cloned()
     }
+
+    fn snapshot(&self) -> Result<Vec<u8>, FabricError> {
+        postcard::to_stdvec(&self.state).map_err(|e| FabricError::Durability(e.to_string()))
+    }
+}
+
+/// The Loro-backed Fabric engine — Fabric's real implementation, and the reason
+/// this crate is the only one that names Loro. Bodies are stored as canonical
+/// binary values in a single Loro map keyed by the hex of their [`FabricKey`];
+/// each commit lands as a Loro change and the receipt carries the Loro oplog
+/// frontier as its opaque causal token. [`LoroFabric::snapshot`] /
+/// [`LoroFabric::from_snapshot`] give the durable-representation round-trip the
+/// store cutover persists. The collaborative operation set (register/map/list/
+/// text/set/counter over Loro containers) extends [`FabricOp`] here in S5.
+pub struct LoroFabric {
+    doc: loro::LoroDoc,
+}
+
+const BODIES_MAP: &str = "bodies";
+
+impl LoroFabric {
+    /// A fresh, empty Loro-backed engine with the crate's canonical Loro config.
+    pub fn new() -> Self {
+        let doc = loro::LoroDoc::new();
+        crate::op::configure(&doc, None);
+        Self { doc }
+    }
+
+    /// Restore an engine from a durable snapshot ([`LoroFabric::snapshot`]).
+    pub fn from_snapshot(bytes: &[u8]) -> Result<Self, FabricError> {
+        let doc = loro::LoroDoc::new();
+        crate::op::configure(&doc, None);
+        doc.import(bytes)
+            .map_err(|e| FabricError::Durability(format!("import snapshot: {e}")))?;
+        Ok(Self { doc })
+    }
+
+    /// Export the full durable representation as a Loro snapshot.
+    pub fn snapshot(&self) -> Result<Vec<u8>, FabricError> {
+        self.doc
+            .export(loro::ExportMode::Snapshot)
+            .map_err(|e| FabricError::Durability(format!("export snapshot: {e}")))
+    }
+
+    fn key_str(key: &FabricKey) -> String {
+        data_encoding::HEXLOWER.encode(key.as_bytes())
+    }
+}
+
+impl Default for LoroFabric {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Fabric for LoroFabric {
+    fn commit(
+        &mut self,
+        request: FabricTransactionRequest,
+    ) -> Result<FabricCommitReceipt, FabricError> {
+        let bodies = self.doc.get_map(BODIES_MAP);
+        for op in &request.ops {
+            match op {
+                FabricOp::PutCanonical { key, value } => bodies
+                    .insert(&Self::key_str(key), value.as_slice())
+                    .map_err(|e| FabricError::Durability(format!("put: {e}")))?,
+                FabricOp::Remove { key } => bodies
+                    .delete(&Self::key_str(key))
+                    .map_err(|e| FabricError::Durability(format!("remove: {e}")))?,
+            }
+        }
+        // Label the change and land it as one Loro commit.
+        self.doc.set_next_commit_message(&request.request);
+        self.doc.commit();
+        // The Loro oplog frontier is the opaque causal token.
+        let causal = CausalToken::from_bytes(self.doc.oplog_frontiers().encode());
+        Ok(FabricCommitReceipt::new(causal, request.ops.len() as u32))
+    }
+
+    fn read(&self, key: &FabricKey) -> Option<Vec<u8>> {
+        let bodies = self.doc.get_map(BODIES_MAP);
+        bodies
+            .get(&Self::key_str(key))
+            .and_then(|v| v.into_value().ok())
+            .and_then(|v| v.into_binary().ok())
+            .map(|b| b.to_vec())
+    }
+
+    fn snapshot(&self) -> Result<Vec<u8>, FabricError> {
+        LoroFabric::snapshot(self)
+    }
 }
 
 #[cfg(test)]
@@ -208,6 +312,41 @@ mod tests {
         let bytes = postcard::to_stdvec(&req).unwrap();
         let back: FabricTransactionRequest = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(req, back);
+    }
+
+    #[test]
+    fn loro_engine_persists_reads_and_survives_a_snapshot_roundtrip() {
+        let mut fabric = LoroFabric::new();
+        let key = FabricKey::from_bytes(b"body/0".to_vec());
+        fabric
+            .commit(FabricTransactionRequest::new(
+                "created",
+                vec![FabricOp::PutCanonical {
+                    key: key.clone(),
+                    value: b"durable".to_vec(),
+                }],
+            ))
+            .unwrap();
+        assert_eq!(fabric.read(&key).as_deref(), Some(&b"durable"[..]));
+
+        // Durable round-trip: a restored engine reads back the same state.
+        let snap = fabric.snapshot().unwrap();
+        let restored = LoroFabric::from_snapshot(&snap).unwrap();
+        assert_eq!(restored.read(&key).as_deref(), Some(&b"durable"[..]));
+
+        // Remove is durable too, and the causal token advances.
+        let mut fabric = restored;
+        let before = fabric
+            .commit(FabricTransactionRequest::new("noop", vec![]))
+            .unwrap();
+        let after = fabric
+            .commit(FabricTransactionRequest::new(
+                "removed",
+                vec![FabricOp::Remove { key: key.clone() }],
+            ))
+            .unwrap();
+        assert_ne!(before.causal(), after.causal());
+        assert_eq!(fabric.read(&key), None);
     }
 
     #[test]

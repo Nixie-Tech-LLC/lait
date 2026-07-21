@@ -379,6 +379,51 @@ fn unregistered_schema_and_version_are_rejected() {
 }
 
 #[test]
+fn committed_bodies_survive_dormancy_and_reactivation() {
+    // The full durable loop: form → activate → submit → go_dormant (checkpoint)
+    // → re-acquire → activate → the committed Body is read back.
+    let (reg, world) = note_registration();
+    let registry = RuntimeBuilder::new().register(reg, world).build().unwrap();
+    let rt = Runtime::open(temp_root(), registry);
+    let world_id = WorldId::parse("com.example.notes").unwrap();
+
+    let orbit = rt.form_space(SpaceFormationOptions::default()).unwrap();
+    let space = orbit.space_id().clone();
+    let station = orbit.activate(ActivationOptions::default()).unwrap();
+    let session = station
+        .dock(&world_id, principal(vec![Grant::Write]))
+        .unwrap();
+    session
+        .submit(WorldIntent {
+            schema: SchemaId::parse("note").unwrap(),
+            schema_version: 1,
+            payload: b"durable".to_vec(),
+        })
+        .unwrap();
+    // Go dormant: this checkpoints the Replica to the store.
+    let orbit = station.go_dormant().unwrap();
+    drop(orbit);
+
+    // Re-acquire and reactivate: the committed Body is restored.
+    let station = rt
+        .orbit(&space)
+        .unwrap()
+        .activate(ActivationOptions::default())
+        .unwrap();
+    let session = station
+        .dock(&world_id, principal(vec![Grant::Write]))
+        .unwrap();
+    let proj = session
+        .query(WorldQuery {
+            schema: SchemaId::parse("note").unwrap(),
+            schema_version: 1,
+            payload: vec![],
+        })
+        .unwrap();
+    assert_eq!(proj.bytes, b"DURABLE");
+}
+
+#[test]
 fn observation_cursor_starts_at_a_reset_boundary() {
     let station = station();
     let world_id = WorldId::parse("com.example.notes").unwrap();

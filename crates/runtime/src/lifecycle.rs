@@ -272,6 +272,13 @@ impl Orbit {
     /// offline; grants no new Space authority.
     pub fn activate(self, options: ActivationOptions) -> Result<Station, LifecycleError> {
         let epoch = StationEpoch::from_u64(self.store.bump_epoch()?);
+        // Restore the durable Replica from the store's content checkpoint, or
+        // start fresh over the Loro-backed engine.
+        let replica = match self.store.read_content()? {
+            Some(bytes) => replica::Replica::restore_loro(&bytes)
+                .map_err(|e| LifecycleError::IntegrityFailure(e.to_string()))?,
+            None => replica::Replica::loro(),
+        };
         Ok(Station {
             store: self.store,
             registry: self.registry,
@@ -281,7 +288,7 @@ impl Orbit {
             cancel: CancelToken::new(),
             handles: Mutex::new(Vec::new()),
             drain_deadline: options.drain_deadline,
-            core: Arc::new(crate::session::StationCore::new(epoch)),
+            core: Arc::new(crate::session::StationCore::new(epoch, replica)),
         })
     }
 
@@ -463,7 +470,15 @@ impl Station {
         // 3) cancel and drain tracked tasks within the deadline.
         let deadline = Instant::now() + self.drain_deadline;
         let (timed_out, _panicked) = self.drain_tasks(deadline);
-        // 4) checkpoint (Replica checkpoint is a no-op until S5 content lands).
+        // 4) checkpoint the Replica durably to the store (engine snapshot +
+        //    frontier), so a later activation restores committed Bodies.
+        let checkpoint = self
+            .core
+            .checkpoint()
+            .map_err(|e| DormancyError::Checkpoint(e.to_string()))?;
+        self.store
+            .write_content(&checkpoint)
+            .map_err(|e| DormancyError::Checkpoint(format!("{e}")))?;
         // 5) build the recovered Orbit and release the lock last.
         let lock = self.lock.take().expect("station holds its lock");
         if timed_out {

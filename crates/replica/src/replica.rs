@@ -11,7 +11,8 @@
 //! ([`Replica::in_memory`]); the Loro-backed engine and the collaborative
 //! operation set land in the S5 store cutover, behind this same API.
 
-use lait_fabric::{Fabric, FabricKey, FabricOp, FabricTransactionRequest, MemFabric};
+use lait_fabric::{Fabric, FabricKey, FabricOp, FabricTransactionRequest, LoroFabric, MemFabric};
+use serde::{Deserialize, Serialize};
 
 use crate::body::BodyOp;
 use crate::frontier::ReplicaFrontier;
@@ -42,6 +43,14 @@ impl std::error::Error for ReplicaCommitError {}
 /// The Orbit's durable local materialization, over a Fabric engine.
 pub struct Replica {
     fabric: Box<dyn Fabric + Send>,
+    frontier: ReplicaFrontier,
+}
+
+/// The serialized durable state of a Replica: the engine snapshot and the
+/// semantic frontier, checkpointed together so a restore is consistent.
+#[derive(Serialize, Deserialize)]
+struct Checkpoint {
+    engine: Vec<u8>,
     frontier: ReplicaFrontier,
 }
 
@@ -79,6 +88,38 @@ impl Replica {
     /// Build a Replica over the in-memory reference engine.
     pub fn in_memory() -> Self {
         Self::new(Box::new(MemFabric::new()))
+    }
+
+    /// Build a durable Replica over the Loro-backed engine.
+    pub fn loro() -> Self {
+        Self::new(Box::new(LoroFabric::new()))
+    }
+
+    /// Serialize the full durable state — the engine snapshot plus the semantic
+    /// frontier — for a checkpoint. [`Replica::restore_loro`] reopens it.
+    pub fn checkpoint(&self) -> Result<Vec<u8>, ReplicaCommitError> {
+        let engine = self
+            .fabric
+            .snapshot()
+            .map_err(|e| ReplicaCommitError::Fabric(e.to_string()))?;
+        postcard::to_stdvec(&Checkpoint {
+            engine,
+            frontier: self.frontier,
+        })
+        .map_err(|e| ReplicaCommitError::Fabric(e.to_string()))
+    }
+
+    /// Reopen a durable Loro-backed Replica from a [`Replica::checkpoint`],
+    /// restoring both the committed Bodies and the semantic frontier.
+    pub fn restore_loro(bytes: &[u8]) -> Result<Self, ReplicaCommitError> {
+        let cp: Checkpoint =
+            postcard::from_bytes(bytes).map_err(|e| ReplicaCommitError::Fabric(e.to_string()))?;
+        let fabric = LoroFabric::from_snapshot(&cp.engine)
+            .map_err(|e| ReplicaCommitError::Fabric(e.to_string()))?;
+        Ok(Self {
+            fabric: Box::new(fabric),
+            frontier: cp.frontier,
+        })
     }
 
     /// The current semantic frontier.
@@ -160,6 +201,28 @@ mod tests {
         assert_eq!(f2.transaction_count, 2);
         assert_ne!(f1, f2);
         assert_eq!(r.read(&key(0)), None);
+    }
+
+    #[test]
+    fn a_loro_replica_checkpoint_restores_bodies_and_frontier() {
+        let mut r = Replica::loro();
+        let f = r
+            .commit(
+                "created",
+                &[(
+                    key(1),
+                    BodyOp::ReplaceAtomic {
+                        value: b"persist-me".to_vec(),
+                    },
+                )],
+            )
+            .unwrap();
+        let bytes = r.checkpoint().unwrap();
+
+        // Reopen from the checkpoint: committed Body and frontier both restored.
+        let restored = Replica::restore_loro(&bytes).unwrap();
+        assert_eq!(restored.frontier(), f);
+        assert_eq!(restored.read(&key(1)).as_deref(), Some(&b"persist-me"[..]));
     }
 
     #[test]
