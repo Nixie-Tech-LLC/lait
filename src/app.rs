@@ -43,9 +43,11 @@ fn resolve_space_selector(sel: &str) -> Result<std::path::PathBuf> {
     // the `.lait` dir itself or its parent.
     if sel.contains('/') || sel.contains('\\') || Path::new(sel).is_dir() {
         let p = Path::new(sel);
-        let store = if crate::store::initialized_at(p) {
+        let has_space =
+            |h: &Path| crate::store::initialized_at(h) || crate::orbital::is_orbital_home(h);
+        let store = if has_space(p) {
             p.to_path_buf()
-        } else if crate::store::initialized_at(&p.join(".lait")) {
+        } else if has_space(&p.join(".lait")) {
             p.join(".lait")
         } else {
             return Err(anyhow!(
@@ -275,7 +277,7 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
             }
             // A fresh identity home holds no space yet — say so instead of
             // spawning a daemon that can only fail to open the store.
-            if !crate::store::initialized_at(&home) {
+            if !crate::store::initialized_at(&home) && !crate::orbital::is_orbital_home(&home) {
                 crate::cli::emit_ok(
                     &format!(
                         "identity '{name}' has no space yet — `lait init` to found one, or `lait join <link>`"
@@ -851,7 +853,8 @@ async fn run_join_cli(m: &ArgMatches, out: Out) -> Result<()> {
 /// `ConfigReload`, else it applies on next start (and says so).
 async fn run_config(dispatch: &Dispatch, m: &ArgMatches, out: Out) -> Result<()> {
     use crate::config::{key_spec, ConfigMap, KeyLayers, Settings, KEYS};
-    let home = config::existing_home().filter(|h| crate::store::initialized_at(h));
+    let home = config::existing_home()
+        .filter(|h| crate::store::initialized_at(h) || crate::orbital::is_orbital_home(h));
     let which = match dispatch {
         Dispatch::Special(s) => *s,
         _ => unreachable!(),

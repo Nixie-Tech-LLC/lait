@@ -534,8 +534,10 @@ async fn serve_contact(
     // Arm a reciprocal dial to the initiator: the responder only SERVES material
     // here, so a pull back is what redeems a joiner's admission and converges us.
     // First-contact gated (see `note_reciprocable`) so converged peers do not
-    // ping-pong.
-    {
+    // ping-pong. Only in the autonomous-convergence (gossip) mode a live daemon
+    // runs — a bare harness driving explicit Contacts stays deterministic, with
+    // no background dials injected behind its assertions.
+    if ctx.options.gossip.is_some() {
         let lease_ms = ctx.options.route_lease.as_millis() as u64;
         let mut registry = ctx.registry.lock().unwrap_or_else(|p| p.into_inner());
         let _ = registry.note_reciprocable(&transport_peer, now_ms(), lease_ms);

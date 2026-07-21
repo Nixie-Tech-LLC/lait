@@ -88,7 +88,8 @@ pub enum StorePresence {
 /// Check whether an entry's path still holds an initialized store. Mirrors
 /// `Store::is_initialized` without opening (or creating) anything.
 pub fn presence(entry: &SpaceEntry) -> StorePresence {
-    if crate::store::initialized_at(Path::new(&entry.path)) {
+    let path = Path::new(&entry.path);
+    if crate::store::initialized_at(path) || crate::orbital::is_orbital_home(path) {
         StorePresence::Present
     } else {
         StorePresence::Missing

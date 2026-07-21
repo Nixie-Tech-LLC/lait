@@ -75,6 +75,11 @@ pub struct OrbitalDaemon {
     /// Signalled by a `Stop` request so `serve` returns (the injectable
     /// contract: return, don't `exit`).
     shutdown: Arc<tokio::sync::Notify>,
+    /// Control connections currently being served (idle-shutdown suppressor).
+    active_conns: std::sync::atomic::AtomicU64,
+    /// When the last control connection was accepted or completed — the idle
+    /// clock's reference point.
+    last_activity: Mutex<std::time::Instant>,
 }
 
 impl OrbitalDaemon {
@@ -135,6 +140,8 @@ impl OrbitalDaemon {
             device_seed,
             home: home.to_path_buf(),
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            active_conns: std::sync::atomic::AtomicU64::new(0),
+            last_activity: Mutex::new(std::time::Instant::now()),
         })
     }
 
@@ -193,6 +200,14 @@ impl OrbitalDaemon {
             return self.route_issue(req);
         }
         match req {
+            // ---- protocol handshake ----
+            // The first frame a client sends: answer with our control-protocol
+            // version so the probe classifies us as a live, compatible daemon
+            // (not a pre-handshake legacy node).
+            Request::Hello { .. } => Response::Hello {
+                protocol_version: crate::control::CONTROL_PROTOCOL_VERSION,
+            },
+
             // ---- transport / status ----
             Request::Status => self.status(),
             Request::Id => Response::Ok {
@@ -320,9 +335,17 @@ impl OrbitalDaemon {
             "orbital daemon online in space {}",
             self.station.space_id().as_str()
         );
+        let idle_window = idle_window_from_env();
+        let mut idle_tick = tokio::time::interval(Duration::from_millis(500));
         loop {
             tokio::select! {
                 _ = self.shutdown.notified() => break,
+                _ = idle_tick.tick() => {
+                    if self.should_idle_shutdown(idle_window) {
+                        tracing::info!("orbital daemon idle-shutdown after {idle_window:?}");
+                        break;
+                    }
+                }
                 accept = listener.accept() => match accept {
                     Ok(stream) => {
                         let me = self.clone();
@@ -340,7 +363,43 @@ impl OrbitalDaemon {
         Ok(())
     }
 
+    /// Whether the idle window has elapsed with nothing to keep us alive: a
+    /// non-zero window, no in-flight connections, no neighbors to converge with,
+    /// and no activity for at least the window. Mirrors the legacy node's rule.
+    fn should_idle_shutdown(&self, window: Duration) -> bool {
+        use std::sync::atomic::Ordering;
+        if window.is_zero() {
+            return false;
+        }
+        if self.active_conns.load(Ordering::SeqCst) != 0 {
+            return false;
+        }
+        if !self.station.neighbors().is_empty() {
+            return false;
+        }
+        let idle_for = self
+            .last_activity
+            .lock()
+            .map(|t| t.elapsed())
+            .unwrap_or_default();
+        idle_for >= window
+    }
+
     async fn handle_conn(self: Arc<Self>, stream: LocalStream) {
+        use std::sync::atomic::Ordering;
+        self.active_conns.fetch_add(1, Ordering::SeqCst);
+        // Decrement + stamp activity on every exit path (guard on drop).
+        struct ConnGuard<'a>(&'a OrbitalDaemon);
+        impl Drop for ConnGuard<'_> {
+            fn drop(&mut self) {
+                self.0.active_conns.fetch_sub(1, Ordering::SeqCst);
+                if let Ok(mut t) = self.0.last_activity.lock() {
+                    *t = std::time::Instant::now();
+                }
+            }
+        }
+        let _guard = ConnGuard(&self);
+
         let (read_half, write_half) = tokio::io::split(stream);
         let mut reader = BufReader::new(read_half);
         let mut line = String::new();
@@ -429,6 +488,20 @@ fn now_secs() -> u64 {
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// The idle-shutdown window, from `LAIT_IDLE_SECS` (0 disables), else 30 min —
+/// the same contract the legacy node honors.
+fn idle_window_from_env() -> Duration {
+    const DEFAULT: Duration = Duration::from_secs(30 * 60);
+    match std::env::var("LAIT_IDLE_SECS") {
+        Ok(s) => s
+            .trim()
+            .parse::<u64>()
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT),
+        Err(_) => DEFAULT,
+    }
 }
 
 fn comms_options(
