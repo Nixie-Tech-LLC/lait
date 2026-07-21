@@ -5,7 +5,9 @@
 
 pub mod contract;
 pub mod issues;
+pub mod router;
 pub mod views;
 
 pub use contract::{IssueEffect, IssueIntent, IssueQuery, PRODUCT_WORLD};
 pub use issues::IssuesWorld;
+pub use router::{IssueRouter, RouterFacts};
