@@ -152,7 +152,7 @@ fn the_product_composes_the_orbital_runtime_for_an_independent_world() {
     let keys = Arc::new(replica::StaticBodyKeys::new(
         mechanics::crypto::AuthorizedBodyKey::for_authorized_epoch([1u8; 16], [2u8; 32]),
     ));
-    let rt = open_orbital_runtime(&home, registry, Arc::new(ExampleAuthority), keys);
+    let rt = open_orbital_runtime(&home, registry, Arc::new(ExampleAuthority), keys).unwrap();
     assert!(orbital_store_root(&home).ends_with("orbital"));
 
     let writer = Runtime::identity_from_seed(&WRITER_SEED);
@@ -207,4 +207,27 @@ fn the_product_composes_the_orbital_runtime_for_an_independent_world() {
     assert_eq!(proj.bytes, b"8");
     // Runtime stamped the real committed frontier onto the projection.
     assert_eq!(proj.frontier, second.frontier);
+}
+
+#[test]
+fn a_legacy_home_is_refused_with_recreation_guidance_and_never_overwritten() {
+    let home = temp_home();
+    // A pre-orbital store signature.
+    std::fs::create_dir_all(home.join("repo")).unwrap();
+    std::fs::write(home.join("repo").join("genesis.json"), b"{}").unwrap();
+    let registry = RuntimeBuilder::new().build().unwrap();
+    let keys = Arc::new(replica::StaticBodyKeys::new(
+        mechanics::crypto::AuthorizedBodyKey::for_authorized_epoch([1u8; 16], [2u8; 32]),
+    ));
+    let err = match open_orbital_runtime(&home, registry, Arc::new(ExampleAuthority), keys) {
+        Err(err) => err,
+        Ok(_) => panic!("a legacy home must be refused"),
+    };
+    assert!(err.guidance.contains("clean break"));
+    assert!(err.to_string().contains("unsupported store version"));
+    // Nothing orbital was created beside the legacy home.
+    assert!(
+        !orbital_store_root(&home).exists(),
+        "no fresh Orbit beside a detected old home"
+    );
 }
