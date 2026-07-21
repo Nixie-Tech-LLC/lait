@@ -7,9 +7,12 @@
 //! receipt — the frontier root is derived from the Fabric-issued causal token,
 //! so the frontier cannot advance without a real commit.
 //!
-//! S5a wires the write path over the in-memory reference engine
-//! ([`Replica::in_memory`]); the Loro-backed engine and the collaborative
-//! operation set land in the S5 store cutover, behind this same API.
+//! [`Replica::loro`] runs the full algebra (atomic + collaborative) over the
+//! Loro-backed engine with per-commit durability; [`Replica::in_memory`] is the
+//! atomic-only reference engine for tests. [`Replica::incorporate_trusted`] is
+//! the engine-convergence step of the Convergence pipeline — its callers must
+//! first establish legitimacy through mechanics; it is never reachable from a
+//! World or an ordinary Session.
 
 use lait_fabric::{
     CollaborativeView, Fabric, FabricError, FabricKey, FabricOp, FabricTransactionRequest,
@@ -19,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::algebra;
 use crate::body::BodyOp;
+use crate::convergence::ConvergenceOutcome;
 use crate::frontier::ReplicaFrontier;
 use crate::ids::BodyKey;
 
@@ -207,10 +211,74 @@ impl Replica {
                 return Err(ReplicaCommitError::Durability(m));
             }
         };
-        let next = advance(self.frontier, receipt.causal().as_bytes());
+        self.persist_and_advance(receipt.causal().as_bytes())
+    }
 
-        // Durability BEFORE acknowledgment: land the post-commit state in the
-        // store, then advance the acknowledged frontier.
+    /// Incorporate **already-validated** remote material by merging another
+    /// replica's exported representation. This is the engine-convergence step of
+    /// the Convergence pipeline — the caller (Contact incorporation, or an
+    /// administrative/test path) must FIRST have established Space legitimacy
+    /// and signer authority through mechanics
+    /// ([`crate::transaction::BodyTransactionV1::verify_authorized`]); this
+    /// method trusts its input and is therefore **never** reachable from a World
+    /// or an ordinary Session. Durability before acknowledgment applies exactly
+    /// as for a local commit; the frontier advances only from the engine's
+    /// merge receipt, and already-known material reports `unchanged`.
+    pub fn incorporate_trusted(
+        &mut self,
+        exported: &[u8],
+    ) -> Result<ConvergenceOutcome, ReplicaCommitError> {
+        if self.poisoned {
+            return Err(ReplicaCommitError::Poisoned);
+        }
+        let previous = self.frontier;
+        let receipt = match self.fabric.merge(exported) {
+            Ok(r) => r,
+            Err(FabricError::Unsupported) => return Err(ReplicaCommitError::UnsupportedOp),
+            Err(FabricError::TypeConflict) => return Err(ReplicaCommitError::TypeConflict),
+            Err(FabricError::InvalidOp(m)) => return Err(ReplicaCommitError::InvalidOp(m)),
+            Err(FabricError::Durability(m)) => {
+                self.poisoned = true;
+                return Err(ReplicaCommitError::Durability(m));
+            }
+        };
+        match receipt {
+            None => {
+                let mut outcome = ConvergenceOutcome::unchanged(previous);
+                outcome.unchanged = 1;
+                Ok(outcome)
+            }
+            Some(receipt) => {
+                let current = self.persist_and_advance(receipt.causal().as_bytes())?;
+                Ok(ConvergenceOutcome {
+                    previous,
+                    current,
+                    accepted: 1,
+                    unchanged: 0,
+                    rejected: 0,
+                    unsupported_retained: 0,
+                    retryable: 0,
+                })
+            }
+        }
+    }
+
+    /// Export the full representation for a peer to incorporate.
+    pub fn export_all(&self) -> Result<Vec<u8>, ReplicaCommitError> {
+        self.fabric
+            .snapshot()
+            .map_err(|e| ReplicaCommitError::Fabric(e.to_string()))
+    }
+
+    /// Durability BEFORE acknowledgment: land the post-change state in the
+    /// store, then advance the acknowledged frontier from the engine receipt's
+    /// causal token. A failed durable write refuses the change and poisons the
+    /// Replica (the in-memory engine has state the store does not).
+    fn persist_and_advance(
+        &mut self,
+        causal: &[u8],
+    ) -> Result<ReplicaFrontier, ReplicaCommitError> {
+        let next = advance(self.frontier, causal);
         if let Some(sink) = &self.sink {
             let engine = self
                 .fabric
@@ -707,6 +775,96 @@ mod tests {
             ReplicaCommitError::InvalidOp(_)
         ));
         assert_eq!(r.frontier(), ReplicaFrontier::EMPTY);
+    }
+
+    #[test]
+    fn two_replicas_converge_through_trusted_incorporation() {
+        let k = key(6);
+        let mut a = Replica::loro();
+        a.commit(
+            "created",
+            &[
+                (k.clone(), BodyOp::Create),
+                (
+                    k.clone(),
+                    BodyOp::CounterAdd {
+                        path: "votes".into(),
+                        delta: 4,
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+
+        // A fresh replica incorporates A's material: accepted, frontier advances.
+        let mut b = Replica::loro();
+        let outcome = b.incorporate_trusted(&a.export_all().unwrap()).unwrap();
+        assert_eq!(outcome.accepted, 1);
+        assert!(outcome.advanced());
+        assert_eq!(b.read_collaborative(&k), a.read_collaborative(&k));
+
+        // B edits concurrently-ish and A incorporates back.
+        b.commit(
+            "edited",
+            &[(
+                k.clone(),
+                BodyOp::CounterAdd {
+                    path: "votes".into(),
+                    delta: 6,
+                },
+            )],
+        )
+        .unwrap();
+        let outcome = a.incorporate_trusted(&b.export_all().unwrap()).unwrap();
+        assert_eq!(outcome.accepted, 1);
+        assert_eq!(a.read_collaborative(&k).unwrap().counters["votes"], 10);
+
+        // Incorporating material A already holds is `unchanged`: no frontier
+        // movement, no acceptance.
+        let before = a.frontier();
+        let outcome = a.incorporate_trusted(&b.export_all().unwrap()).unwrap();
+        assert_eq!(outcome.unchanged, 1);
+        assert_eq!(outcome.accepted, 0);
+        assert!(!outcome.advanced());
+        assert_eq!(a.frontier(), before);
+    }
+
+    #[test]
+    fn incorporation_is_durable_before_acknowledgment() {
+        use std::sync::{Arc, Mutex};
+        let k = key(7);
+        let mut a = Replica::loro();
+        a.commit(
+            "created",
+            &[(
+                k.clone(),
+                BodyOp::RegisterSet {
+                    path: "title".into(),
+                    value: b"remote".to_vec(),
+                },
+            )],
+        )
+        .unwrap();
+
+        // B has a capturing durability sink: the checkpoint written during
+        // incorporation must already contain the incorporated material.
+        let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_captured = captured.clone();
+        let mut b = Replica::loro().with_durability(Box::new(move |bytes| {
+            sink_captured.lock().unwrap().push(bytes.to_vec());
+            Ok(())
+        }));
+        b.incorporate_trusted(&a.export_all().unwrap()).unwrap();
+
+        let writes = captured.lock().unwrap();
+        assert_eq!(writes.len(), 1, "one durable write per incorporation");
+        let restored = Replica::restore_loro(&writes[0]).unwrap();
+        assert_eq!(
+            restored.read_collaborative(&k).unwrap().registers["title"],
+            b"remote".to_vec(),
+            "the durable checkpoint already holds the incorporated material"
+        );
+        assert_eq!(restored.frontier(), b.frontier());
     }
 
     #[test]

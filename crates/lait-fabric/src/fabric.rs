@@ -253,6 +253,13 @@ pub trait Fabric {
     /// (`None` for absent keys and atomic values).
     fn read_collaborative(&self, key: &FabricKey) -> Option<CollaborativeView>;
 
+    /// Merge another replica's exported representation into this one — the
+    /// engine-level convergence primitive. Returns `Some(receipt)` when the
+    /// representation changed (the receipt is engine-constructed, like every
+    /// receipt) and `None` when everything was already known. The reference
+    /// engine does not support merge.
+    fn merge(&mut self, exported: &[u8]) -> Result<Option<FabricCommitReceipt>, FabricError>;
+
     /// Export the full durable representation as bytes. The engine's own
     /// constructor restores it (`LoroFabric::from_snapshot` / `MemFabric::
     /// from_snapshot`), so the caller persists the bytes and reopens with the
@@ -319,6 +326,10 @@ impl Fabric for MemFabric {
     fn read_collaborative(&self, _key: &FabricKey) -> Option<CollaborativeView> {
         // The reference engine holds no collaborative Bodies.
         None
+    }
+
+    fn merge(&mut self, _exported: &[u8]) -> Result<Option<FabricCommitReceipt>, FabricError> {
+        Err(FabricError::Unsupported)
     }
 
     fn snapshot(&self) -> Result<Vec<u8>, FabricError> {
@@ -401,16 +412,6 @@ impl LoroFabric {
         self.doc
             .export(loro::ExportMode::Snapshot)
             .map_err(|e| FabricError::Durability(format!("export snapshot: {e}")))
-    }
-
-    /// Merge another replica's exported representation into this one — the
-    /// Loro-level convergence primitive Contact incorporation will drive.
-    /// Concurrent collaborative edits converge under the declared algebra.
-    pub fn merge(&mut self, exported: &[u8]) -> Result<(), FabricError> {
-        self.doc
-            .import(exported)
-            .map(|_| ())
-            .map_err(|e| FabricError::InvalidOp(format!("merge import: {e}")))
     }
 
     fn key_str(key: &FabricKey) -> String {
@@ -816,6 +817,23 @@ impl Fabric for LoroFabric {
             }
         }
         Some(view)
+    }
+
+    fn merge(&mut self, exported: &[u8]) -> Result<Option<FabricCommitReceipt>, FabricError> {
+        // Concurrent collaborative edits converge under the declared algebra;
+        // the oplog frontier tells whether the merge brought anything new.
+        let before = self.doc.oplog_frontiers().encode();
+        self.doc
+            .import(exported)
+            .map_err(|e| FabricError::InvalidOp(format!("merge import: {e}")))?;
+        let after = self.doc.oplog_frontiers().encode();
+        if after == before {
+            return Ok(None);
+        }
+        Ok(Some(FabricCommitReceipt::new(
+            CausalToken::from_bytes(after),
+            0,
+        )))
     }
 
     fn snapshot(&self) -> Result<Vec<u8>, FabricError> {
