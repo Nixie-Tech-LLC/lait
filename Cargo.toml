@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/lait-kernel", "crates/lait-fabric", "crates/lait-net"]
+members = [
+    "crates/lait-kernel",
+    "crates/lait-fabric",
+    "crates/lait-net",
+    "crates/replica",
+    "crates/runtime",
+]
 # Pin resolver 2 explicitly: the release binary's non-linkage of the dev-only
 # `test-utils` feature (which would flip presets::N0 from prod to staging relays)
 # depends on it, and must not silently regress to v1 if this ever becomes a

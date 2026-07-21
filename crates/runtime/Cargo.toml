@@ -1,0 +1,21 @@
+[package]
+name = "runtime"
+version = "0.6.0"
+edition = "2021"
+rust-version = "1.91"
+description = "LAIT orbital lifecycle: Runtime, Orbit, Station, World hosting, Dock/Session, Contact policy, and Observation publication. Exposes no Loro, iroh, stream, file, key, ciphertext, mutex, or product request types."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# mechanics — Space/Actor/Device/Station identity and authority facts.
+lait-kernel = { path = "../lait-kernel" }
+# replica — Body semantics, schemas, descriptors, frontiers, Convergence.
+replica = { path = "../replica" }
+# comms — gossip, presence dial, framed streams, ALPN adapters. Runtime drives
+# the transport seam; `iroh` is absent from this manifest by construction.
+lait-net = { path = "../lait-net" }
+
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+
+[dev-dependencies]

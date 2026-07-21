@@ -299,6 +299,87 @@ impl fmt::Display for ActorId {
     }
 }
 
+/// A **station** id — the stable device identity of one Orbit, represented as
+/// the same canonical ed25519 public-key bytes as a [`DeviceId`] under a
+/// domain-specific newtype (`lait/station/1`). It is *not* per activation: it is
+/// the durable identity a Station presents as a Neighbor and signs Beacons/
+/// Contact with. Device-key replacement mints a *new* `StationId` and requires
+/// mechanics-authorized device admission/revocation.
+///
+/// Neighbor state is keyed by verified `StationId`; there is no wire-level
+/// `NeighborId`. Comparison is over the canonical 32 key bytes, never a display
+/// string.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct StationId([u8; 32]);
+
+impl StationId {
+    /// The 32 ed25519 public-key bytes this station identity *is*.
+    pub fn from_key_bytes(raw: [u8; 32]) -> Self {
+        Self(raw)
+    }
+
+    /// The device this station speaks as (the same key, viewed as a `DeviceId`).
+    pub fn from_device(device: &DeviceId) -> Option<Self> {
+        device.key_bytes().map(Self)
+    }
+
+    /// The raw 32 public-key bytes — the canonical comparison form.
+    pub fn key_bytes(&self) -> [u8; 32] {
+        self.0
+    }
+
+    /// The device id this station identity corresponds to (64-hex form).
+    pub fn as_device(&self) -> DeviceId {
+        DeviceId::from_key_bytes(&self.0)
+    }
+
+    /// A short, display-friendly prefix (first 8 hex chars of the key).
+    pub fn short(&self) -> String {
+        data_encoding::HEXLOWER.encode(&self.0[..4])
+    }
+}
+
+impl fmt::Display for StationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&data_encoding::HEXLOWER.encode(&self.0))
+    }
+}
+
+/// A **station epoch** — a fresh activation identifier, a `u64` counter durably
+/// incremented before each activation of an Orbit. It is never an authority
+/// identity: it distinguishes one live Station instance from the next, and
+/// Beacon/Observation freshness is ordered by `(epoch, sequence)`. Recovery
+/// never reuses a committed epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct StationEpoch(u64);
+
+impl StationEpoch {
+    /// The zero epoch — the value before any activation has been committed.
+    pub const ZERO: StationEpoch = StationEpoch(0);
+
+    /// Wrap a raw counter value.
+    pub fn from_u64(v: u64) -> Self {
+        Self(v)
+    }
+
+    /// The raw counter value.
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    /// The next epoch, or `None` on counter overflow (activation must then fail
+    /// closed rather than reuse a committed epoch).
+    pub fn next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+}
+
+impl fmt::Display for StationEpoch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,5 +468,26 @@ mod tests {
             "non-hex rejected"
         );
         assert_eq!(DeviceId::parse(&key).unwrap().short().len(), 8);
+    }
+
+    #[test]
+    fn station_id_roundtrips_device_key_bytes() {
+        let raw = [7u8; 32];
+        let station = StationId::from_key_bytes(raw);
+        assert_eq!(station.key_bytes(), raw);
+        // A StationId is the same key bytes as its device, viewed under a domain
+        // newtype: the round-trip through DeviceId is byte-exact.
+        let device = station.as_device();
+        assert_eq!(StationId::from_device(&device), Some(station.clone()));
+        assert_eq!(device.key_bytes(), Some(raw));
+    }
+
+    #[test]
+    fn station_epoch_is_monotone_and_fails_closed_on_overflow() {
+        assert_eq!(StationEpoch::ZERO.as_u64(), 0);
+        assert_eq!(StationEpoch::ZERO.next(), Some(StationEpoch::from_u64(1)));
+        // Overflow must return None so activation fails closed rather than
+        // reusing a committed epoch.
+        assert_eq!(StationEpoch::from_u64(u64::MAX).next(), None);
     }
 }

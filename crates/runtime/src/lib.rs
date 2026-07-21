@@ -1,0 +1,41 @@
+//! **Runtime** — LAIT's orbital lifecycle.
+//!
+//! ```text
+//! Space
+//!   +-- Orbit: one device's durable relationship to the Space
+//!         +-- Replica: durable local materialization
+//!         +-- Station: that Orbit activated for exclusive local operation
+//!               +-- hosted World implementation
+//!                     +-- docked Session
+//! ```
+//!
+//! Runtime owns the domain lifecycle: forming/entering/observing/acquiring
+//! Orbits, activating them into Stations, hosting Worlds, docking Sessions,
+//! Contact policy, and Observation publication. It exposes **no** Loro, iroh,
+//! stream, file, key, ciphertext, mutex, or product request types — those live
+//! below the boundary in [`lait_fabric`], [`lait_net`], and [`lait_kernel`].
+//!
+//! Orbit and Station are the same durable relationship in mutually exclusive
+//! states: [`Orbit::activate`] consumes the Orbit and returns a [`Station`];
+//! [`Station::go_dormant`] consumes the Station and returns the Orbit.
+//!
+//! S0 establishes the sealed lifecycle contract surface and a **real, tested**
+//! immutable World registry (duplicate registration is rejected). The lifecycle
+//! transitions are wired in later stages (Orbit in S2, Station in S3,
+//! World/Session/Contact in S5); their signatures here fix ownership and
+//! consumption semantics.
+
+pub mod error;
+pub mod lifecycle;
+pub mod registry;
+pub mod session;
+pub mod world;
+
+pub use error::{ContactError, DormancyError, LifecycleError, StationExit, WorldError};
+pub use lifecycle::{ContactOutcome, Neighbor, Orbit, OrbitObservation, Runtime, Station};
+pub use registry::{RuntimeBuilder, WorldRegistry};
+pub use session::{Observation, ObservationCursor, Session};
+pub use world::{
+    PrincipalFacts, Standing, World, WorldContext, WorldEffect, WorldIntent, WorldLimits,
+    WorldProjection, WorldQuery, WorldRegistration, WorldVersion,
+};

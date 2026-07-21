@@ -20,9 +20,12 @@
 pub(crate) use lait_kernel::{acl, actor, dto, genesis, ids, sigdag, space};
 
 pub mod catalog;
+pub mod fabric;
 pub mod history;
 pub mod issue;
 mod loro_ext;
 pub mod membership;
 pub mod op;
 pub mod store;
+
+pub use fabric::{CausalToken, FabricCommitReceipt, FabricKey, FabricOp, FabricTransactionRequest};
