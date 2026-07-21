@@ -4661,6 +4661,7 @@ dependencies = [
  "replica",
  "serde",
  "serde-byte-array",
+ "serde_json",
  "unicode-normalization",
 ]
 

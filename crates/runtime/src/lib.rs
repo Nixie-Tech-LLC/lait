@@ -31,6 +31,7 @@ pub mod contact;
 pub mod coordinates;
 #[cfg(test)]
 mod dispatch_tests;
+pub mod dto;
 pub mod error;
 pub mod lifecycle;
 pub mod neighbor_presence;

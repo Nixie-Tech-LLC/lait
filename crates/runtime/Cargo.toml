@@ -25,6 +25,9 @@ postcard = { version = "1", features = ["use-std"] }
 data-encoding = "2.6"
 # Payload commitment in the World-action header.
 blake3 = "1"
+# The external DTO surface (S7): versioned JSON, strict unknown-field
+# rejection.
+serde_json = "1"
 # NFC validation of the human-facing display-name/nick hints in Coordinates v1
 # (the canonical form rejects non-NFC UTF-8).
 unicode-normalization = "0.1"
