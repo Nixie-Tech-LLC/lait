@@ -9,8 +9,6 @@
 //! counter overflow. Route hints never override verified transport/Station
 //! identity; they are advisory and receiver-leased.
 
-use std::collections::HashMap;
-
 use mechanics::ids::{SpaceId, StationEpoch, StationId};
 use serde::{Deserialize, Serialize};
 
@@ -185,8 +183,6 @@ impl SignedBeaconV1 {
         Ok(VerifiedBeacon {
             space,
             station: StationId::from_key_bytes(self.body.station),
-            space_bytes: self.body.space,
-            station_bytes: self.body.station,
             epoch: self.body.epoch,
             sequence: self.body.sequence,
             frontier_root: self.body.frontier_root,
@@ -198,13 +194,12 @@ impl SignedBeaconV1 {
 
 /// A beacon whose signature and structure have been verified. It cannot be
 /// constructed except by [`SignedBeaconV1::verify`], so a forged signed
-/// structure can never reach [`BeaconHighWater::offer`].
+/// structure can never reach freshness state (the Neighbor registry only
+/// advances its high-water from a [`VerifiedBeacon`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedBeacon {
     space: SpaceId,
     station: StationId,
-    space_bytes: [u8; 29],
-    station_bytes: [u8; 32],
     epoch: u64,
     sequence: u64,
     frontier_root: [u8; 32],
@@ -230,49 +225,5 @@ impl VerifiedBeacon {
     /// The verified route hints (advisory).
     pub fn routes(&self) -> &[RouteHint] {
         &self.routes
-    }
-}
-
-/// How a Beacon compared to what a receiver has already seen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BeaconAcceptance {
-    /// New and strictly ahead — accepted; the high-water mark advanced.
-    Accepted,
-    /// At or behind the high-water mark — stale/duplicate, rejected.
-    Stale,
-    /// The counter would overflow — fail closed.
-    Overflow,
-}
-
-/// A per-`(Space, Station)` high-water mark of the highest accepted
-/// `(epoch, sequence)`. Persisted by a receiver so a replayed or reordered
-/// Beacon is rejected. The mark is per Space+Station, never global per device.
-#[derive(Debug, Default)]
-pub struct BeaconHighWater {
-    seen: HashMap<([u8; 29], [u8; 32]), (u64, u64)>,
-}
-
-impl BeaconHighWater {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Offer a [`VerifiedBeacon`]. The type makes verification non-optional: a
-    /// caller cannot advance freshness state with a beacon whose signature was
-    /// not checked. Advances and accepts only if strictly ahead of the recorded
-    /// `(epoch, sequence)`; fails closed at the `u64` ceiling.
-    pub fn offer(&mut self, beacon: &VerifiedBeacon) -> BeaconAcceptance {
-        let key = (beacon.space_bytes, beacon.station_bytes);
-        let incoming = beacon.coordinate();
-        if incoming.0 == u64::MAX && incoming.1 == u64::MAX {
-            return BeaconAcceptance::Overflow;
-        }
-        match self.seen.get(&key) {
-            Some(&hw) if incoming <= hw => BeaconAcceptance::Stale,
-            _ => {
-                self.seen.insert(key, incoming);
-                BeaconAcceptance::Accepted
-            }
-        }
     }
 }

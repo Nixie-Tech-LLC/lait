@@ -15,13 +15,12 @@
 //!   proof of a real Fabric commit — an outside crate cannot forge the token
 //!   Replica advances from.
 //!
-//! [`LoroFabric`] is the canonical engine: atomic Bodies plus the frozen
+//! [`LoroFabric`] is the sole engine: atomic Bodies plus the frozen
 //! collaborative algebra (register/map/list/text/set/counter with stable
 //! element identity) over real Loro containers — one Loro document per Body,
 //! so per-Body export/import carries exactly one Body's causal history — with
-//! batch atomicity and cross-replica merge. [`MemFabric`] remains the
-//! atomic-only reference engine for tests. The durable store is the journaled
-//! protocol in [`crate::journal`].
+//! batch atomicity. The durable store is the journaled protocol in
+//! [`crate::journal`], persisting per-Body protected objects.
 
 use std::collections::BTreeMap;
 
@@ -194,7 +193,8 @@ pub enum FabricError {
     /// A durable write (or a rollback after a failed apply) failed. The engine
     /// state may have diverged from the store — the caller must fail stop.
     Durability(String),
-    /// The engine does not support this operation ([`MemFabric`] is atomic-only).
+    /// The engine does not support this operation. Reserved (the Loro engine
+    /// supports the full algebra); the error surface stays stable.
     Unsupported,
     /// The operation's type disagrees with what its target is already bound to:
     /// a collaborative op on an atomic Body, an atomic put over a collaborative
@@ -244,11 +244,11 @@ impl std::fmt::Display for FabricError {
 }
 impl std::error::Error for FabricError {}
 
-/// The Fabric engine: the durable, canonical collaborative representation Replica
-/// drives. It accepts semantic operations and returns a receipt whose
-/// construction is Fabric-private; it also serves committed reads. The Loro
-/// engine (S5) implements this same trait, so Replica/runtime are unchanged when
-/// it lands.
+/// The Fabric engine: the durable, canonical collaborative representation
+/// Replica drives. It accepts semantic operations and returns a receipt whose
+/// construction is Fabric-private, serves committed reads, and exports/imports
+/// **one Body at a time** — the canonical store persists per-Body protected
+/// objects, never a whole-engine snapshot. [`LoroFabric`] is the only engine.
 pub trait Fabric {
     /// Durably apply a transaction and return a commit receipt. Atomic: either
     /// every op is applied and a receipt returned, or nothing changes.
@@ -263,13 +263,6 @@ pub trait Fabric {
     /// Read the committed collaborative view of a Body, if the key holds one
     /// (`None` for absent keys and atomic values).
     fn read_collaborative(&self, key: &FabricKey) -> Option<CollaborativeView>;
-
-    /// Merge another replica's exported representation into this one — the
-    /// engine-level convergence primitive. Returns `Some(receipt)` when the
-    /// representation changed (the receipt is engine-constructed, like every
-    /// receipt) and `None` when everything was already known. The reference
-    /// engine does not support merge.
-    fn merge(&mut self, exported: &[u8]) -> Result<Option<FabricCommitReceipt>, FabricError>;
 
     /// Export **one Body's** canonical representation, if the Body exists. A
     /// collaborative export preserves causal history and stable element
@@ -288,13 +281,6 @@ pub trait Fabric {
         key: &FabricKey,
         export: &BodyExport,
     ) -> Result<Option<FabricCommitReceipt>, FabricError>;
-
-    /// Export the full durable representation as bytes. The engine's own
-    /// constructor restores it (`LoroFabric::from_snapshot` / `MemFabric::
-    /// from_snapshot`), so the caller persists the bytes and reopens with the
-    /// matching engine. Test/checkpoint convenience — the canonical durable
-    /// store persists per-Body protected objects, not this.
-    fn snapshot(&self) -> Result<Vec<u8>, FabricError>;
 }
 
 /// One Body's canonical exported representation: an atomic Body's canonical
@@ -304,101 +290,6 @@ pub trait Fabric {
 pub enum BodyExport {
     Atomic(Vec<u8>),
     Collaborative(Vec<u8>),
-}
-
-/// A minimal in-memory reference engine. It is a real engine — it applies
-/// operations, serves reads, and mints receipts whose causal token advances with
-/// each commit — standing in for the Loro-backed engine until S5. It owns receipt
-/// construction, so a receipt from here denotes a genuine (in-memory durable)
-/// commit.
-#[derive(Debug, Default)]
-pub struct MemFabric {
-    state: BTreeMap<FabricKey, Vec<u8>>,
-    counter: u64,
-}
-
-impl MemFabric {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Restore an in-memory engine from a [`Fabric::snapshot`].
-    pub fn from_snapshot(bytes: &[u8]) -> Result<Self, FabricError> {
-        let state: BTreeMap<FabricKey, Vec<u8>> =
-            postcard::from_bytes(bytes).map_err(|e| FabricError::Durability(e.to_string()))?;
-        Ok(Self { state, counter: 0 })
-    }
-}
-
-impl Fabric for MemFabric {
-    fn commit(
-        &mut self,
-        request: FabricTransactionRequest,
-    ) -> Result<FabricCommitReceipt, FabricError> {
-        // Apply atomically against a scratch copy, then swap in on success. The
-        // reference engine is atomic-only; collaborative operations require the
-        // Loro engine.
-        let mut next = self.state.clone();
-        for op in &request.ops {
-            match op {
-                FabricOp::PutCanonical { key, value } => {
-                    next.insert(key.clone(), value.clone());
-                }
-                FabricOp::Remove { key } => {
-                    next.remove(key);
-                }
-                _ => return Err(FabricError::Unsupported),
-            }
-        }
-        self.state = next;
-        self.counter += 1;
-        Ok(FabricCommitReceipt::new(
-            CausalToken::from_bytes(self.counter.to_le_bytes().to_vec()),
-            request.ops.len() as u32,
-        ))
-    }
-
-    fn read(&self, key: &FabricKey) -> Option<Vec<u8>> {
-        self.state.get(key).cloned()
-    }
-
-    fn read_collaborative(&self, _key: &FabricKey) -> Option<CollaborativeView> {
-        // The reference engine holds no collaborative Bodies.
-        None
-    }
-
-    fn merge(&mut self, _exported: &[u8]) -> Result<Option<FabricCommitReceipt>, FabricError> {
-        Err(FabricError::Unsupported)
-    }
-
-    fn export_body(&self, key: &FabricKey) -> Option<BodyExport> {
-        self.state.get(key).map(|v| BodyExport::Atomic(v.clone()))
-    }
-
-    fn import_body(
-        &mut self,
-        key: &FabricKey,
-        export: &BodyExport,
-    ) -> Result<Option<FabricCommitReceipt>, FabricError> {
-        match export {
-            BodyExport::Atomic(bytes) => {
-                if self.state.get(key) == Some(bytes) {
-                    return Ok(None);
-                }
-                self.state.insert(key.clone(), bytes.clone());
-                self.counter += 1;
-                Ok(Some(FabricCommitReceipt::new(
-                    CausalToken::from_bytes(self.counter.to_le_bytes().to_vec()),
-                    1,
-                )))
-            }
-            BodyExport::Collaborative(_) => Err(FabricError::Unsupported),
-        }
-    }
-
-    fn snapshot(&self) -> Result<Vec<u8>, FabricError> {
-        postcard::to_stdvec(&self.state).map_err(|e| FabricError::Durability(e.to_string()))
-    }
 }
 
 /// The Loro-backed engine: the canonical collaborative representation, and the
@@ -514,26 +405,6 @@ impl LoroFabric {
         Self {
             bodies: BTreeMap::new(),
         }
-    }
-
-    /// Restore an engine from a durable snapshot ([`LoroFabric::snapshot`]).
-    pub fn from_snapshot(bytes: &[u8]) -> Result<Self, FabricError> {
-        let exports: BTreeMap<FabricKey, BodyExport> =
-            postcard::from_bytes(bytes).map_err(|e| FabricError::Durability(e.to_string()))?;
-        let mut bodies = BTreeMap::new();
-        for (key, export) in &exports {
-            bodies.insert(key.clone(), BodyState::from_export(export)?);
-        }
-        Ok(Self { bodies })
-    }
-
-    /// Export the full durable representation (per-Body exports, keyed).
-    pub fn snapshot(&self) -> Result<Vec<u8>, FabricError> {
-        let mut exports: BTreeMap<&FabricKey, BodyExport> = BTreeMap::new();
-        for (key, state) in &self.bodies {
-            exports.insert(key, state.export()?);
-        }
-        postcard::to_stdvec(&exports).map_err(|e| FabricError::Durability(e.to_string()))
     }
 
     /// The keys of every present Body.
@@ -1008,21 +879,6 @@ impl Fabric for LoroFabric {
         Some(view)
     }
 
-    fn merge(&mut self, exported: &[u8]) -> Result<Option<FabricCommitReceipt>, FabricError> {
-        let exports: BTreeMap<FabricKey, BodyExport> = postcard::from_bytes(exported)
-            .map_err(|e| FabricError::InvalidOp(format!("merge decode: {e}")))?;
-        let mut changed = std::collections::BTreeSet::new();
-        for (key, export) in &exports {
-            if self.import_body(key, export)?.is_some() {
-                changed.insert(key.clone());
-            }
-        }
-        if changed.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(FabricCommitReceipt::new(self.causal_for(&changed), 0)))
-    }
-
     fn export_body(&self, key: &FabricKey) -> Option<BodyExport> {
         self.bodies.get(key).and_then(|s| s.export().ok())
     }
@@ -1073,10 +929,6 @@ impl Fabric for LoroFabric {
         let mut touched = std::collections::BTreeSet::new();
         touched.insert(key.clone());
         Ok(Some(FabricCommitReceipt::new(self.causal_for(&touched), 0)))
-    }
-
-    fn snapshot(&self) -> Result<Vec<u8>, FabricError> {
-        LoroFabric::snapshot(self)
     }
 }
 
@@ -1234,43 +1086,8 @@ mod tests {
     }
 
     #[test]
-    fn loro_engine_persists_reads_and_survives_a_snapshot_roundtrip() {
+    fn atomic_bodies_commit_read_remove_and_advance_the_causal_token() {
         let mut fabric = LoroFabric::new();
-        let key = FabricKey::from_bytes(b"body/0".to_vec());
-        fabric
-            .commit(FabricTransactionRequest::new(
-                "created",
-                vec![FabricOp::PutCanonical {
-                    key: key.clone(),
-                    value: b"durable".to_vec(),
-                }],
-            ))
-            .unwrap();
-        assert_eq!(fabric.read(&key).as_deref(), Some(&b"durable"[..]));
-
-        // Durable round-trip: a restored engine reads back the same state.
-        let snap = fabric.snapshot().unwrap();
-        let restored = LoroFabric::from_snapshot(&snap).unwrap();
-        assert_eq!(restored.read(&key).as_deref(), Some(&b"durable"[..]));
-
-        // Remove is durable too, and the causal token advances.
-        let mut fabric = restored;
-        let before = fabric
-            .commit(FabricTransactionRequest::new("noop", vec![]))
-            .unwrap();
-        let after = fabric
-            .commit(FabricTransactionRequest::new(
-                "removed",
-                vec![FabricOp::Remove { key: key.clone() }],
-            ))
-            .unwrap();
-        assert_ne!(before.causal(), after.causal());
-        assert_eq!(fabric.read(&key), None);
-    }
-
-    #[test]
-    fn engine_applies_atomically_and_issues_advancing_receipts() {
-        let mut fabric = MemFabric::new();
         let key = FabricKey::from_bytes(b"body/0".to_vec());
         let r1 = fabric
             .commit(FabricTransactionRequest::new(

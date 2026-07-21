@@ -31,6 +31,6 @@ pub mod store;
 
 pub use fabric::{
     BodyExport, CausalToken, CollaborativeView, Fabric, FabricCommitReceipt, FabricError,
-    FabricKey, FabricOp, FabricTransactionRequest, ListElement, LoroFabric, MemFabric,
+    FabricKey, FabricOp, FabricTransactionRequest, ListElement, LoroFabric,
 };
 pub use journal::{FaultInjector, JournaledStore, ObjectRef, StoreManifestV1, FAULT_POINTS};

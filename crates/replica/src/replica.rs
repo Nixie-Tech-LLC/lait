@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use fabric::{
     journal::ObjectRef, BodyExport, Fabric, FabricError, FabricKey, FabricOp,
-    FabricTransactionRequest, JournaledStore, LoroFabric, MemFabric,
+    FabricTransactionRequest, JournaledStore, LoroFabric,
 };
 use mechanics::crypto::BODY_EPOCH_ID_LEN;
 use mechanics::ids::SpaceId;
@@ -398,11 +398,6 @@ impl Replica {
             receipts: BTreeMap::new(),
             raw_material: BTreeMap::new(),
         }
-    }
-
-    /// Build a Replica over the in-memory reference engine.
-    pub fn in_memory() -> Self {
-        Self::new(Box::new(MemFabric::new()))
     }
 
     /// Build a Loro-backed Replica with **no** durable store (tests/scratch).

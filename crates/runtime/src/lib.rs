@@ -44,9 +44,7 @@ pub(crate) mod wire;
 pub mod world;
 
 pub use action::{ActionError, IdempotencyKey, RequestId, SignedWorldActionV1, WorldActionHeader};
-pub use beacon::{
-    BeaconAcceptance, BeaconError, BeaconHighWater, RouteHint, SignedBeaconV1, VerifiedBeacon,
-};
+pub use beacon::{BeaconError, RouteHint, SignedBeaconV1, VerifiedBeacon};
 pub use contact::{
     AccepterEvent, AccepterValidator, ContactFrame, ContactHelloAckV1, ContactHelloV1, ContactId,
     ContactWireError, InitiatorReceiver, InitiatorState, Progress, ReceivedMaterial,

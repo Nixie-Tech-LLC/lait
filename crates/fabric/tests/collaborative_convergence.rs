@@ -63,17 +63,19 @@ fn forked_pair() -> (LoroFabric, LoroFabric) {
         },
     ]))
     .unwrap();
-    let snap = Fabric::snapshot(&a).unwrap();
-    let b = LoroFabric::from_snapshot(&snap).unwrap();
+    // Fork by cloning the single Body's canonical per-Body export into b.
+    let export = a.export_body(&key()).unwrap();
+    let mut b = LoroFabric::new();
+    b.import_body(&key(), &export).unwrap();
     (a, b)
 }
 
-/// Cross-merge both engines and assert their views are identical.
+/// Cross-merge both engines (per-Body) and assert their views are identical.
 fn converge(a: &mut LoroFabric, b: &mut LoroFabric) -> fabric::CollaborativeView {
-    let sa = Fabric::snapshot(a).unwrap();
-    let sb = Fabric::snapshot(b).unwrap();
-    a.merge(&sb).unwrap();
-    b.merge(&sa).unwrap();
+    let ea = a.export_body(&key()).unwrap();
+    let eb = b.export_body(&key()).unwrap();
+    a.import_body(&key(), &eb).unwrap();
+    b.import_body(&key(), &ea).unwrap();
     let va = a.read_collaborative(&key()).unwrap();
     let vb = b.read_collaborative(&key()).unwrap();
     assert_eq!(va, vb, "both replicas converge to the same view");
