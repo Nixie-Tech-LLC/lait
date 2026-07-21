@@ -4,11 +4,29 @@
 //! equivocation.
 
 use lait_kernel::ids::SpaceId;
+use replica::frontier::AuthorityFrontier as AF;
 use replica::frontier::{AuthorityFrontier, ReplicaFrontier};
 use replica::ids::{BodyId, BodyKey, WorldId};
 use replica::manifest::{
     ManifestBook, ManifestEntryV1, ManifestError, ManifestPageV1, ManifestRootV1, RootObservation,
 };
+use replica::transaction::AuthoritySource;
+
+const SIGNER_KEY_SEED: [u8; 32] = SIGNER_SEED;
+
+/// A mechanics view that authorizes both test signer seeds.
+struct BothSigners;
+impl AuthoritySource for BothSigners {
+    fn signer_authorized(&self, signer: &[u8; 32], _f: &AF) -> bool {
+        let s1 = lait_kernel::crypto::device_from_seed(&SIGNER_KEY_SEED)
+            .key_bytes()
+            .unwrap();
+        let s2 = lait_kernel::crypto::device_from_seed(&OTHER_SEED)
+            .key_bytes()
+            .unwrap();
+        *signer == s1 || *signer == s2
+    }
+}
 
 const SIGNER_SEED: [u8; 32] = [81u8; 32];
 const OTHER_SEED: [u8; 32] = [82u8; 32];
@@ -149,8 +167,16 @@ fn concurrent_roots_coexist_and_replays_dedupe() {
     let root_b =
         ManifestRootV1::sign(&space(), frontier(2), &pages_b, auth(), &OTHER_SEED).unwrap();
 
-    assert_eq!(book.observe(&root_a).unwrap(), RootObservation::Accepted);
-    assert_eq!(book.observe(&root_b).unwrap(), RootObservation::Accepted);
+    assert_eq!(
+        book.observe(&root_a.clone().verify_authorized(&BothSigners).unwrap())
+            .unwrap(),
+        RootObservation::Accepted
+    );
+    assert_eq!(
+        book.observe(&root_b.verify_authorized(&BothSigners).unwrap())
+            .unwrap(),
+        RootObservation::Accepted
+    );
     assert_eq!(book.len(), 2, "incomparable roots coexist");
 
     // The same signer at a NEW coordinate is a new root, not equivocation.
@@ -161,11 +187,16 @@ fn concurrent_roots_coexist_and_replays_dedupe() {
             pages,
         )
     };
-    assert_eq!(book.observe(&advanced).unwrap(), RootObservation::Accepted);
+    assert_eq!(
+        book.observe(&advanced.verify_authorized(&BothSigners).unwrap())
+            .unwrap(),
+        RootObservation::Accepted
+    );
 
     // An exact replay dedupes.
     assert_eq!(
-        book.observe(&root_a).unwrap(),
+        book.observe(&root_a.verify_authorized(&BothSigners).unwrap())
+            .unwrap(),
         RootObservation::AlreadyKnown
     );
     assert_eq!(book.len(), 3);
@@ -175,7 +206,8 @@ fn concurrent_roots_coexist_and_replays_dedupe() {
 fn same_coordinate_equivocation_is_rejected() {
     let mut book = ManifestBook::new();
     let (root_a, _) = valid_manifest();
-    book.observe(&root_a).unwrap();
+    book.observe(&root_a.verify_authorized(&BothSigners).unwrap())
+        .unwrap();
 
     // The SAME signer signs a DIFFERENT Body set at the SAME frontier
     // coordinate: that is equivocation, rejected and reportable.
@@ -183,11 +215,36 @@ fn same_coordinate_equivocation_is_rejected() {
     let equivocating =
         ManifestRootV1::sign(&space(), frontier(1), &other_pages, auth(), &SIGNER_SEED).unwrap();
     assert_eq!(
-        book.observe(&equivocating),
+        book.observe(&equivocating.verify_authorized(&BothSigners).unwrap()),
         Err(ManifestError::Equivocation)
     );
     // The first-seen root is retained.
     assert_eq!(book.len(), 1);
+}
+
+#[test]
+fn a_root_without_authority_cannot_enter_the_book() {
+    // Structurally valid + correctly signed, but the signer has no standing:
+    // verify_authorized refuses, so the coordinate can never be poisoned.
+    let (root, _) = valid_manifest();
+    root.verify().unwrap();
+    struct Nobody;
+    impl AuthoritySource for Nobody {
+        fn signer_authorized(&self, _s: &[u8; 32], _f: &AF) -> bool {
+            false
+        }
+    }
+    assert_eq!(
+        root.clone().verify_authorized(&Nobody),
+        Err(ManifestError::AuthorityUnverified)
+    );
+    // With authority, it becomes an AuthorizedRoot the book accepts.
+    let authorized = root.verify_authorized(&BothSigners).unwrap();
+    let mut book = ManifestBook::new();
+    assert_eq!(
+        book.observe(&authorized).unwrap(),
+        RootObservation::Accepted
+    );
 }
 
 #[test]

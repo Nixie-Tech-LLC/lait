@@ -9,10 +9,11 @@
 //!
 //! [`Replica::loro`] runs the full algebra (atomic + collaborative) over the
 //! Loro-backed engine with per-commit durability; [`Replica::in_memory`] is the
-//! atomic-only reference engine for tests. [`Replica::incorporate_trusted`] is
-//! the engine-convergence step of the Convergence pipeline — its callers must
-//! first establish legitimacy through mechanics; it is never reachable from a
-//! World or an ordinary Session.
+//! atomic-only reference engine for tests. [`Replica::incorporate`] is the
+//! Convergence step: incoming material must arrive as a signed
+//! [`crate::transaction::BodyTransactionV1`] whose commitment binds the payload,
+//! and mechanics validates the signer's standing before any byte reaches the
+//! engine. It is never reachable from a World or an ordinary Session.
 
 use lait_fabric::{
     CollaborativeView, Fabric, FabricError, FabricKey, FabricOp, FabricTransactionRequest,
@@ -31,6 +32,11 @@ const BODY_KEY_DOMAIN: &[u8] = b"lait/fabric-key/1";
 /// Domain separator for advancing the semantic frontier from a commit receipt.
 const FRONTIER_DOMAIN: &[u8] = b"lait/replica-frontier/1";
 
+/// The reserved World id carried by the interim whole-engine export envelope.
+pub const ENGINE_EXPORT_WORLD: &str = "org.lait.engine";
+/// The reserved schema id of the interim whole-engine export envelope.
+pub const ENGINE_EXPORT_SCHEMA: &str = "engine.export";
+
 /// Why a Replica commit failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplicaCommitError {
@@ -48,6 +54,9 @@ pub enum ReplicaCommitError {
     /// The operation was structurally invalid at apply time (out-of-bounds
     /// index, unknown element id, counter overflow). Nothing was committed.
     InvalidOp(String),
+    /// Incoming material failed legitimacy validation (signature, signer
+    /// authority, or payload binding). Nothing was incorporated.
+    Illegitimate(String),
     /// The durable store failed integrity validation on open — never repaired
     /// heuristically; recreation guidance is the caller's.
     Integrity(String),
@@ -253,25 +262,102 @@ impl Replica {
         self.persist_and_advance(receipt.causal().as_bytes())
     }
 
-    /// Incorporate **already-validated** remote material by merging another
-    /// replica's exported representation. This is the engine-convergence step of
-    /// the Convergence pipeline — the caller (Contact incorporation, or an
-    /// administrative/test path) must FIRST have established Space legitimacy
-    /// and signer authority through mechanics
-    /// ([`crate::transaction::BodyTransactionV1::verify_authorized`]); this
-    /// method trusts its input and is therefore **never** reachable from a World
-    /// or an ordinary Session. Durability before acknowledgment applies exactly
-    /// as for a local commit; the frontier advances only from the engine's
-    /// merge receipt, and already-known material reports `unchanged`.
-    pub fn incorporate_trusted(
+    /// Export this Replica's representation as a **signed, authority-bound
+    /// envelope**: a [`BodyTransactionV1`] whose single descriptor's ciphertext
+    /// commitment covers the exported bytes, signed by the exporting device.
+    /// The incorporating side verifies the transaction (structure, signature,
+    /// **and signer standing at the authority frontier**) and the payload
+    /// binding before any byte reaches the engine — there is no unbound merge
+    /// path. (Interim: the envelope carries the whole engine representation as
+    /// one reserved-World descriptor; the per-Body descriptor split is the
+    /// representation cutover.)
+    pub fn export_signed(
+        &self,
+        space: &lait_kernel::ids::SpaceId,
+        authority_frontier: crate::frontier::AuthorityFrontier,
+        signer_seed: &[u8; 32],
+    ) -> Result<(crate::transaction::BodyTransactionV1, Vec<u8>), ReplicaCommitError> {
+        use crate::body::ContentCommitment;
+        let payload = self.export_all()?;
+        let digest = blake3::hash(&payload);
+        let mut body_raw = [0u8; 16];
+        body_raw.copy_from_slice(&digest.as_bytes()[..16]);
+        let mut tx_raw = [0u8; 16];
+        tx_raw.copy_from_slice(&digest.as_bytes()[16..32]);
+        let signer = lait_kernel::crypto::device_from_seed(signer_seed)
+            .key_bytes()
+            .ok_or_else(|| ReplicaCommitError::Fabric("signer key".into()))?;
+        let space_bytes = <[u8; 29]>::try_from(space.as_str().as_bytes())
+            .map_err(|_| ReplicaCommitError::Fabric("space id shape".into()))?;
+        let descriptor = crate::transaction::BodyDescriptorV1 {
+            space: space_bytes,
+            world: crate::ids::WorldId::parse(ENGINE_EXPORT_WORLD).expect("reserved world id"),
+            body: crate::ids::BodyId::from_bytes(body_raw),
+            schema: crate::ids::SchemaId::parse(ENGINE_EXPORT_SCHEMA).expect("reserved schema"),
+            schema_version: 1,
+            encoding: crate::ids::EncodingId::parse("loro.snapshot").expect("encoding id"),
+            replica_frontier: self.frontier,
+            content_commitment: ContentCommitment::over_protected_payload(&payload).as_bytes(),
+            transaction: tx_raw,
+            signer,
+            authority_frontier: authority_frontier.clone(),
+        };
+        let transaction = crate::transaction::BodyTransactionV1::sign(
+            space,
+            crate::frontier::TransactionId::from_bytes(tx_raw),
+            self.frontier,
+            authority_frontier,
+            vec![descriptor],
+            signer_seed,
+        )
+        .ok_or_else(|| ReplicaCommitError::Fabric("sign export".into()))?;
+        Ok((transaction, payload))
+    }
+
+    /// Incorporate remote material through the Convergence pipeline: the signed
+    /// [`BodyTransactionV1`] is verified — structure, signature, **and signer
+    /// standing at its authority frontier through mechanics** — and its
+    /// descriptor's ciphertext commitment must cover the payload byte-for-byte
+    /// **before** any byte reaches the engine. There is no unvalidated merge
+    /// path, and this method is never reachable from a World or an ordinary
+    /// Session. Illegitimate material is rejected with nothing incorporated.
+    /// Durability before acknowledgment applies exactly as for a local commit;
+    /// the frontier advances only from the engine's merge receipt, and
+    /// already-known material reports `unchanged`.
+    pub fn incorporate(
         &mut self,
-        exported: &[u8],
+        transaction: &crate::transaction::BodyTransactionV1,
+        payload: &[u8],
+        authority: &dyn crate::transaction::AuthoritySource,
     ) -> Result<ConvergenceOutcome, ReplicaCommitError> {
         if self.poisoned {
             return Err(ReplicaCommitError::Poisoned);
         }
+        // Legitimacy first: mechanics-validated signature + authority.
+        transaction
+            .verify_authorized(authority)
+            .map_err(|e| ReplicaCommitError::Illegitimate(e.to_string()))?;
+        // The envelope must be exactly the reserved engine-export descriptor,
+        // and its commitment must bind these bytes.
+        let [descriptor] = transaction.descriptors.as_slice() else {
+            return Err(ReplicaCommitError::Illegitimate(
+                "expected exactly one engine-export descriptor".into(),
+            ));
+        };
+        if descriptor.world.as_str() != ENGINE_EXPORT_WORLD
+            || descriptor.schema.as_str() != ENGINE_EXPORT_SCHEMA
+        {
+            return Err(ReplicaCommitError::Illegitimate(
+                "not an engine-export envelope".into(),
+            ));
+        }
+        if !descriptor.commits_to(payload) {
+            return Err(ReplicaCommitError::Illegitimate(
+                "payload does not match the signed commitment".into(),
+            ));
+        }
         let previous = self.frontier;
-        let receipt = match self.fabric.merge(exported) {
+        let receipt = match self.fabric.merge(payload) {
             Ok(r) => r,
             Err(FabricError::Unsupported) => return Err(ReplicaCommitError::UnsupportedOp),
             Err(FabricError::TypeConflict) => return Err(ReplicaCommitError::TypeConflict),
@@ -830,8 +916,43 @@ mod tests {
         assert_eq!(r.frontier(), ReplicaFrontier::EMPTY);
     }
 
+    /// The test mechanics view: authorizes exactly one signer key.
+    struct OnlySigner([u8; 32]);
+    impl crate::transaction::AuthoritySource for OnlySigner {
+        fn signer_authorized(
+            &self,
+            signer: &[u8; 32],
+            _frontier: &crate::frontier::AuthorityFrontier,
+        ) -> bool {
+            *signer == self.0
+        }
+    }
+
+    const EXPORT_SEED: [u8; 32] = [91u8; 32];
+
+    fn export_space() -> lait_kernel::ids::SpaceId {
+        lait_kernel::ids::SpaceId::from_digest([14u8; 16])
+    }
+
+    fn export_authority() -> OnlySigner {
+        OnlySigner(
+            lait_kernel::crypto::device_from_seed(&EXPORT_SEED)
+                .key_bytes()
+                .unwrap(),
+        )
+    }
+
+    fn signed_export(r: &Replica) -> (crate::transaction::BodyTransactionV1, Vec<u8>) {
+        r.export_signed(
+            &export_space(),
+            crate::frontier::AuthorityFrontier::from_canonical_bytes(vec![1]),
+            &EXPORT_SEED,
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn two_replicas_converge_through_trusted_incorporation() {
+    fn two_replicas_converge_through_signed_incorporation() {
         let k = key(6);
         let mut a = Replica::loro();
         a.commit(
@@ -849,14 +970,16 @@ mod tests {
         )
         .unwrap();
 
-        // A fresh replica incorporates A's material: accepted, frontier advances.
+        // A fresh replica incorporates A's SIGNED material: mechanics validates
+        // the signer, the commitment binds the payload, then it merges.
         let mut b = Replica::loro();
-        let outcome = b.incorporate_trusted(&a.export_all().unwrap()).unwrap();
+        let (tx, payload) = signed_export(&a);
+        let outcome = b.incorporate(&tx, &payload, &export_authority()).unwrap();
         assert_eq!(outcome.accepted, 1);
         assert!(outcome.advanced());
         assert_eq!(b.read_collaborative(&k), a.read_collaborative(&k));
 
-        // B edits concurrently-ish and A incorporates back.
+        // B edits and A incorporates back.
         b.commit(
             "edited",
             &[(
@@ -868,18 +991,69 @@ mod tests {
             )],
         )
         .unwrap();
-        let outcome = a.incorporate_trusted(&b.export_all().unwrap()).unwrap();
+        let (tx, payload) = signed_export(&b);
+        let outcome = a.incorporate(&tx, &payload, &export_authority()).unwrap();
         assert_eq!(outcome.accepted, 1);
         assert_eq!(a.read_collaborative(&k).unwrap().counters["votes"], 10);
 
-        // Incorporating material A already holds is `unchanged`: no frontier
-        // movement, no acceptance.
+        // Re-incorporating known material is `unchanged`.
         let before = a.frontier();
-        let outcome = a.incorporate_trusted(&b.export_all().unwrap()).unwrap();
+        let (tx, payload) = signed_export(&b);
+        let outcome = a.incorporate(&tx, &payload, &export_authority()).unwrap();
         assert_eq!(outcome.unchanged, 1);
         assert_eq!(outcome.accepted, 0);
         assert!(!outcome.advanced());
         assert_eq!(a.frontier(), before);
+    }
+
+    #[test]
+    fn illegitimate_material_is_refused_before_the_engine() {
+        let k = key(9);
+        let mut a = Replica::loro();
+        a.commit(
+            "created",
+            &[(
+                k.clone(),
+                BodyOp::CounterAdd {
+                    path: "votes".into(),
+                    delta: 1,
+                },
+            )],
+        )
+        .unwrap();
+        let (tx, payload) = signed_export(&a);
+
+        let mut b = Replica::loro();
+        struct Nobody;
+        impl crate::transaction::AuthoritySource for Nobody {
+            fn signer_authorized(
+                &self,
+                _s: &[u8; 32],
+                _f: &crate::frontier::AuthorityFrontier,
+            ) -> bool {
+                false
+            }
+        }
+        // An unauthorized signer is refused; nothing incorporated.
+        assert!(matches!(
+            b.incorporate(&tx, &payload, &Nobody),
+            Err(ReplicaCommitError::Illegitimate(_))
+        ));
+        assert_eq!(b.frontier(), ReplicaFrontier::EMPTY);
+
+        // A payload not matching the signed commitment is refused.
+        let mut tampered = payload.clone();
+        tampered.push(0);
+        assert!(matches!(
+            b.incorporate(&tx, &tampered, &export_authority()),
+            Err(ReplicaCommitError::Illegitimate(_))
+        ));
+        assert_eq!(b.frontier(), ReplicaFrontier::EMPTY);
+        assert!(b.read_collaborative(&k).is_none());
+
+        // The legitimate envelope still works.
+        b.incorporate(&tx, &payload, &export_authority()).unwrap();
+        assert_eq!(b.read_collaborative(&k).unwrap().counters["votes"], 1);
     }
 
     fn temp_store(tag: &str) -> std::path::PathBuf {
@@ -911,7 +1085,8 @@ mod tests {
         // incorporated material and the advanced frontier.
         let dir = temp_store("incorporate");
         let mut b = Replica::open_journaled(&dir).unwrap();
-        let outcome = b.incorporate_trusted(&a.export_all().unwrap()).unwrap();
+        let (tx, payload) = signed_export(&a);
+        let outcome = b.incorporate(&tx, &payload, &export_authority()).unwrap();
         assert_eq!(outcome.accepted, 1);
         let frontier = b.frontier();
         drop(b); // crash: no dormancy, no checkpoint call

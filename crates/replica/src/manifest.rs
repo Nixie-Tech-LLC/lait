@@ -103,6 +103,9 @@ pub enum ManifestError {
     BadSignature,
     /// Two different roots by the same signer at the same frontier coordinate.
     Equivocation,
+    /// Structurally valid and correctly signed, but the signer had no standing
+    /// at the root's authority frontier.
+    AuthorityUnverified,
 }
 
 impl std::fmt::Display for ManifestError {
@@ -314,6 +317,36 @@ impl ManifestRootV1 {
         h.update(&self.encode());
         *h.finalize().as_bytes()
     }
+
+    /// Full verification for retention: the structural [`Self::verify`] **and**
+    /// the mechanics authority check — the signer must have had standing at the
+    /// root's authority frontier. This is the **only** way to mint an
+    /// [`AuthorizedRoot`], and [`ManifestBook`] accepts nothing else, so an
+    /// unverified or unauthorized root can never poison a signer's coordinate.
+    pub fn verify_authorized(
+        self,
+        authority: &dyn crate::transaction::AuthoritySource,
+    ) -> Result<AuthorizedRoot, ManifestError> {
+        self.verify()?;
+        if !authority.signer_authorized(&self.signer, &self.authority_frontier) {
+            return Err(ManifestError::AuthorityUnverified);
+        }
+        Ok(AuthorizedRoot { root: self })
+    }
+}
+
+/// A manifest root whose structure, signature, **and signer authority** have
+/// been verified. Constructible only through
+/// [`ManifestRootV1::verify_authorized`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedRoot {
+    root: ManifestRootV1,
+}
+
+impl AuthorizedRoot {
+    pub fn root(&self) -> &ManifestRootV1 {
+        &self.root
+    }
 }
 
 /// How [`ManifestBook::observe`] classified a verified root.
@@ -341,9 +374,11 @@ impl ManifestBook {
         Self::default()
     }
 
-    /// Observe a **verified** root. Equivocation is rejected and reported; the
-    /// caller audits it (the book keeps the first-seen root).
-    pub fn observe(&mut self, root: &ManifestRootV1) -> Result<RootObservation, ManifestError> {
+    /// Observe an authority-verified root — the type makes verification
+    /// non-optional. Equivocation is rejected and reported; the caller audits
+    /// it (the book keeps the first-seen root).
+    pub fn observe(&mut self, root: &AuthorizedRoot) -> Result<RootObservation, ManifestError> {
+        let root = root.root();
         let (signer, frontier) = root.coordinate();
         let coordinate = (signer, frontier.root, frontier.transaction_count);
         let hash = root.root_hash();

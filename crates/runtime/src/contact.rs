@@ -11,7 +11,7 @@
 //! transport-free** state machines that validate a transcript — the initiator's
 //! receiving machine with the full staging/abort matrix, and the accepter's
 //! request validator. Driving these over a real stream (and handing the result
-//! to Convergence via mechanics validation + `Replica::incorporate_trusted`) is
+//! to Convergence via mechanics validation + `Replica::incorporate`) is
 //! the transport integration that follows.
 //!
 //! Framing rules (normative): every frame begins `(tag: u8, contact_id:
@@ -574,7 +574,7 @@ struct BodyStaging {
 }
 
 /// Everything a cleanly completed Contact received. Handing this to
-/// Convergence (mechanics validation, then `Replica::incorporate_trusted`) is
+/// Convergence (mechanics validation, then `Replica::incorporate`) is
 /// the incorporation step — receipt of this material implies **no** legitimacy.
 #[derive(Debug)]
 pub struct ReceivedMaterial {
@@ -940,7 +940,7 @@ impl InitiatorReceiver {
 
     /// Take the received material after a clean transfer (state `AckSent`).
     /// Receipt implies no legitimacy — mechanics validation and
-    /// `Replica::incorporate_trusted` are the Convergence step.
+    /// `Replica::incorporate` are the Convergence step.
     pub fn into_received(mut self) -> Option<ReceivedMaterial> {
         if self.state != InitiatorState::AckSent {
             return None;

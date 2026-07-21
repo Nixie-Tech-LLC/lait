@@ -366,7 +366,10 @@ impl Session {
                 | replica::ReplicaCommitError::InvalidOp(_) => WorldError::InvalidRequest,
                 replica::ReplicaCommitError::OpLimit => WorldError::LimitExceeded,
                 replica::ReplicaCommitError::TypeConflict => WorldError::Conflict,
-                replica::ReplicaCommitError::Fabric(_)
+                // Illegitimate is an incorporation-path error; a local commit
+                // never produces it, but the match stays exhaustive.
+                replica::ReplicaCommitError::Illegitimate(_)
+                | replica::ReplicaCommitError::Fabric(_)
                 | replica::ReplicaCommitError::Integrity(_)
                 | replica::ReplicaCommitError::Durability(_)
                 | replica::ReplicaCommitError::OutcomeUnknown

@@ -36,7 +36,8 @@ pub use frontier::{AuthorityFrontier, ReplicaFrontier, TransactionId};
 pub use ids::{BodyId, BodyKey, EncodingId, SchemaId, WorldId};
 pub use lait_fabric::{CollaborativeView, ListElement};
 pub use manifest::{
-    ManifestBook, ManifestEntryV1, ManifestError, ManifestPageV1, ManifestRootV1, RootObservation,
+    AuthorizedRoot, ManifestBook, ManifestEntryV1, ManifestError, ManifestPageV1, ManifestRootV1,
+    RootObservation,
 };
 pub use marker::{MarkerError, StoreMarkerV1};
 pub use replica::{Replica, ReplicaCommitError};
