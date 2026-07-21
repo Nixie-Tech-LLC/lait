@@ -46,6 +46,37 @@ impl std::fmt::Display for UnsupportedStoreVersion {
 }
 impl std::error::Error for UnsupportedStoreVersion {}
 
+/// Whether `home` holds a formed/entered **orbital** Space store — a `ws_*`
+/// directory under the orbital store root. The product's "is there a space
+/// here?" predicate for the orbital era, alongside the legacy
+/// `store::initialized_at`. Cheap (a single directory scan) and side-effect free.
+pub fn is_orbital_home(home: &Path) -> bool {
+    discover_space_id(home).is_some()
+}
+
+/// The single orbital Space id under `home`, if any. `None` for a non-orbital
+/// home or (defensively) if more than one `ws_*` store is present.
+pub fn discover_space_id(home: &Path) -> Option<crate::ids::SpaceId> {
+    let root = orbital_store_root(home);
+    let mut found = None;
+    for entry in std::fs::read_dir(&root).ok()?.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        if let Some(space) = entry
+            .file_name()
+            .to_str()
+            .filter(|n| n.starts_with("ws_"))
+            .and_then(crate::ids::SpaceId::parse)
+        {
+            if found.replace(space).is_some() {
+                return None;
+            }
+        }
+    }
+    found
+}
+
 /// Detect a pre-orbital (v0.x) space store under `home`. The orbital
 /// composition root must NEVER create a fresh Orbit beside or over one.
 pub fn detect_legacy_home(home: &Path) -> Option<UnsupportedStoreVersion> {
@@ -163,6 +194,82 @@ pub fn form_space(
     let _ = station.go_dormant();
     let _ = SpaceFormationOptions::default(); // keep the type referenced
     Ok((mechanics, coords))
+}
+
+/// The `lait init` heir with first-run UX parity: [`form_space`] plus a seeded
+/// default project (named after the space, key derived) so `lait new` works on
+/// the very next command — the founder never faces an empty, project-less space.
+/// Returns the founded Space id and the default project's brief.
+pub fn found_space_cli(
+    home: &Path,
+    device_seed: &[u8; 32],
+    display_name: &str,
+) -> Result<(crate::ids::SpaceId, crate::spaces::ProjectBrief)> {
+    let (mechanics, _coords) = form_space(home, device_seed, display_name)?;
+    let space = mechanics.space();
+
+    // Re-open the now-materialized Orbit offline and file the default project.
+    let rt = Runtime::open(
+        orbital_store_root(home),
+        issues_registry()?,
+        Arc::new(mechanics.clone()),
+        Arc::new(mechanics.clone()),
+    );
+    let station = rt
+        .orbit(&space)
+        .map_err(|e| anyhow::anyhow!("acquire orbit: {e:?}"))?
+        .activate(runtime::ActivationOptions::offline())
+        .map_err(|e| anyhow::anyhow!("activate: {e:?}"))?;
+    let identity = Runtime::identity_from_seed(device_seed);
+    let session = station
+        .dock(&crate::world::contract::world_id(), &identity)
+        .map_err(|e| anyhow::anyhow!("dock: {e:?}"))?;
+
+    let project_name = if display_name.trim().is_empty() {
+        "Main".to_string()
+    } else {
+        display_name.trim().to_string()
+    };
+    let project_key = crate::replica::derive_project_key(&project_name);
+    let project_id = crate::ids::ProjectId::mint(&crate::ids::SystemUlidSource)
+        .as_str()
+        .to_string();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let action = identity
+        .sign_action(
+            &session,
+            runtime::RequestId::mint(),
+            runtime::WorldIntent {
+                schema: crate::world::contract::issue_schema(),
+                schema_version: crate::world::contract::ISSUE_SCHEMA_VERSION,
+                payload: crate::world::contract::IssueIntent::ProjectNew {
+                    id: project_id,
+                    name: project_name.clone(),
+                    key: project_key.clone(),
+                    device: crate::crypto::device_from_seed(device_seed)
+                        .as_str()
+                        .to_string(),
+                    ts: now,
+                }
+                .to_json(),
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("sign project-new: {e:?}"))?;
+    session
+        .submit(action)
+        .map_err(|e| anyhow::anyhow!("project-new: {e:?}"))?;
+    let _ = station.go_dormant();
+
+    Ok((
+        space,
+        crate::spaces::ProjectBrief {
+            key: project_key,
+            name: project_name,
+        },
+    ))
 }
 
 /// Bootstrap a joiner's full orbital footprint under `home` from an invite

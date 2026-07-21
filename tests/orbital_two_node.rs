@@ -277,3 +277,67 @@ fn two_orbital_daemons_join_admit_and_converge_over_the_socket() {
     let _ = std::fs::remove_dir_all(&founder_home);
     let _ = std::fs::remove_dir_all(&joiner_home);
 }
+
+/// The `lait join` contract: the joiner drives Contact to the inviter's
+/// approach Station and the inviter's driver **reciprocates on its own** to
+/// redeem the admission — no manual admin-side Connect. This is what makes an
+/// auto-approving invite "just work" from the joiner's side alone.
+#[test]
+fn the_inviter_reciprocates_so_a_joiner_side_only_connect_admits() {
+    const F_SEED: [u8; 32] = [211u8; 32];
+    const J_SEED: [u8; 32] = [212u8; 32];
+    let net = MemNet::new();
+
+    let founder_home = temp_home("recip-founder");
+    lait::orbital::found_space_cli(&founder_home, &F_SEED, "Reciprocal Space").unwrap();
+    let founder_handle = spawn_daemon(founder_home.clone(), F_SEED, net.clone());
+
+    let client = tokio::runtime::Runtime::new().unwrap();
+    wait_online(&client, &founder_home);
+
+    let Response::Ref { reff: invite } = req(
+        &client,
+        &founder_home,
+        Request::Invite {
+            require_approval: false,
+            reusable: false,
+            ttl_hours: Some(24),
+        },
+    ) else {
+        panic!("expected an invite link");
+    };
+
+    // Joiner bootstraps from the link and serves.
+    let joiner_home = temp_home("recip-joiner");
+    lait::orbital::enter_space(&joiner_home, &J_SEED, &invite).unwrap();
+    let joiner_handle = spawn_daemon(joiner_home.clone(), J_SEED, net.clone());
+    wait_online(&client, &joiner_home);
+
+    // Only the JOINER drives Connect (to the invite's approach Station). The
+    // founder's driver must reciprocate to redeem the admission.
+    let approach = lait::crypto::device_from_seed(&F_SEED).to_string();
+    let admitted = poll_until(Duration::from_secs(25), || {
+        req(
+            &client,
+            &joiner_home,
+            Request::Connect {
+                ticket: approach.clone(),
+            },
+        );
+        match req(&client, &joiner_home, Request::Status) {
+            Response::Status(info) if info.membership == "member" => Some(()),
+            _ => None,
+        }
+    });
+    assert!(
+        admitted.is_some(),
+        "the inviter never reciprocated — joiner-side-only Connect did not admit"
+    );
+
+    let _ = req(&client, &joiner_home, Request::Stop);
+    let _ = req(&client, &founder_home, Request::Stop);
+    let _ = joiner_handle.join();
+    let _ = founder_handle.join();
+    let _ = std::fs::remove_dir_all(&founder_home);
+    let _ = std::fs::remove_dir_all(&joiner_home);
+}

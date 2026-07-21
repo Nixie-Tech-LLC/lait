@@ -531,6 +531,15 @@ async fn serve_contact(
     if hello.responder_station != ctx.station_key {
         return Err(ContactError::Transfer("hello for another Station".into()));
     }
+    // Arm a reciprocal dial to the initiator: the responder only SERVES material
+    // here, so a pull back is what redeems a joiner's admission and converges us.
+    // First-contact gated (see `note_reciprocable`) so converged peers do not
+    // ping-pong.
+    {
+        let lease_ms = ctx.options.route_lease.as_millis() as u64;
+        let mut registry = ctx.registry.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = registry.note_reciprocable(&transport_peer, now_ms(), lease_ms);
+    }
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|e| ContactError::Transfer(e.to_string()))?;
     let ack = ContactHelloAckV1::sign(&hello, nonce, &ctx.options.station_seed)

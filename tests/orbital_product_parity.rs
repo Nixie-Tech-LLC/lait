@@ -683,8 +683,10 @@ fn two_stations_converge_product_issues_over_the_contact_plane() {
         &mechanics::crypto::device_from_seed(&STATION_B_SEED),
     )
     .unwrap();
-    let outcome = station_a.contact(&b_station_id, ContactOptions).unwrap();
-    assert!(outcome.convergence.accepted >= 1);
+    // Convergence may land on this explicit pull or on the driver's background
+    // reciprocal dial (armed by B's earlier inbound Contact); the view below is
+    // the end-state proof either way.
+    let _outcome = station_a.contact(&b_station_id, ContactOptions).unwrap();
     let view: IssueView = driver_a.query(&IssueQuery::View {
         doc: doc.clone(),
         me: None,

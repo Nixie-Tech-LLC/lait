@@ -203,6 +203,63 @@ impl NeighborRegistry {
         Ok(newsworthy)
     }
 
+    /// Note a Station we just accepted an inbound Contact from, so the scheduler
+    /// dials it **back** to complete the bidirectional exchange (the responder
+    /// side only served material; a reciprocal pull is what redeems a joiner's
+    /// admission and converges the responder). Marks the entry pending with a
+    /// direct, leased route toward the peer — dialing resolves by StationId, so
+    /// the route only needs to be present and unexpired to pass eligibility.
+    /// Never overwrites a fresher Beacon-derived frontier/coordinate.
+    pub fn note_reciprocable(
+        &mut self,
+        station: &StationId,
+        now_ms: u64,
+        route_lease_ms: u64,
+    ) -> Result<(), RegistryError> {
+        // Gate to first-contact: arm a reciprocal dial only for a peer we have
+        // not yet successfully pulled (unknown reachability). Once the reciprocal
+        // exchange succeeds (`record_success` → reachable), later inbound
+        // Contacts do not re-arm — so two Stations do not ping-pong forever after
+        // they have converged. Steady-state reconciliation is the Beacon's job.
+        if let Some(existing) = self.entries.get(station) {
+            if existing.reachability != REACH_UNKNOWN {
+                return Ok(());
+            }
+        }
+        let entry = self
+            .entries
+            .entry(station.clone())
+            .or_insert_with(|| NeighborRecordV1 {
+                station: station.clone(),
+                epoch: 0,
+                sequence: 0,
+                frontier_root: [0u8; 32],
+                frontier_count: 0,
+                routes: Vec::new(),
+                reachability: REACH_UNKNOWN,
+                failures: 0,
+                next_attempt_ms: 0,
+                pending: false,
+            });
+        entry.pending = true;
+        // A direct route toward the inbound peer (scheme 0, no address bytes):
+        // the transport dials by StationId, so this only keeps eligibility open.
+        let expires_at_ms = now_ms.saturating_add(route_lease_ms);
+        let direct = crate::beacon::RouteHint {
+            scheme: 0,
+            bytes: Vec::new(),
+        };
+        if let Some(r) = entry.routes.iter_mut().find(|r| r.hint == direct) {
+            r.expires_at_ms = r.expires_at_ms.max(expires_at_ms);
+        } else {
+            entry.routes.push(StoredRoute {
+                hint: direct,
+                expires_at_ms,
+            });
+        }
+        self.persist()
+    }
+
     /// The Neighbors eligible for a Contact attempt now: pending, past their
     /// backoff, and holding an unexpired route lease (route expiry suppresses
     /// dialing). Fair order: sorted by `next_attempt_ms` then StationId.
