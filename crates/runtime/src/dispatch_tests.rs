@@ -379,6 +379,100 @@ fn unregistered_schema_and_version_are_rejected() {
 }
 
 #[test]
+fn an_acknowledged_commit_survives_a_crash_without_dormancy() {
+    // Finding #1's scenario: submit returns success, then the process dies with
+    // NO go_dormant and NO checkpoint call. Dropping the Station without
+    // dormancy models the kill (the OS releases the lock either way). The
+    // acknowledged commit must still be there on the next activation, because
+    // durability happened AT COMMIT, not at shutdown.
+    let (reg, world) = note_registration();
+    let registry = RuntimeBuilder::new().register(reg, world).build().unwrap();
+    let rt = Runtime::open(temp_root(), registry);
+    let world_id = WorldId::parse("com.example.notes").unwrap();
+
+    let orbit = rt.form_space(SpaceFormationOptions::default()).unwrap();
+    let space = orbit.space_id().clone();
+    let station = orbit.activate(ActivationOptions::default()).unwrap();
+    let session = station
+        .dock(&world_id, principal(vec![Grant::Write]))
+        .unwrap();
+    session
+        .submit(WorldIntent {
+            schema: SchemaId::parse("note").unwrap(),
+            schema_version: 1,
+            payload: b"ack'd then crash".to_vec(),
+        })
+        .unwrap();
+    // Crash: no dormancy, no checkpoint.
+    drop(session);
+    drop(station);
+
+    let station = rt
+        .orbit(&space)
+        .unwrap()
+        .activate(ActivationOptions::default())
+        .unwrap();
+    let session = station
+        .dock(&world_id, principal(vec![Grant::Write]))
+        .unwrap();
+    let proj = session
+        .query(WorldQuery {
+            schema: SchemaId::parse("note").unwrap(),
+            schema_version: 1,
+            payload: vec![],
+        })
+        .unwrap();
+    assert_eq!(proj.bytes, b"ACK'D THEN CRASH");
+}
+
+#[test]
+fn commits_made_during_an_activation_survive_wait_exit() {
+    // Finding #1's second scenario: Station::wait returns without a checkpoint.
+    // Per-commit durability means nothing made during the activation is lost.
+    let (reg, world) = note_registration();
+    let registry = RuntimeBuilder::new().register(reg, world).build().unwrap();
+    let rt = Runtime::open(temp_root(), registry);
+    let world_id = WorldId::parse("com.example.notes").unwrap();
+
+    let station = rt
+        .form_space(SpaceFormationOptions::default())
+        .unwrap()
+        .activate(ActivationOptions::default())
+        .unwrap();
+    let space = station.space_id().clone();
+    let session = station
+        .dock(&world_id, principal(vec![Grant::Write]))
+        .unwrap();
+    session
+        .submit(WorldIntent {
+            schema: SchemaId::parse("note").unwrap(),
+            schema_version: 1,
+            payload: b"survives wait".to_vec(),
+        })
+        .unwrap();
+    // Exit via wait (no dormancy checkpoint path).
+    let exit = station.wait();
+    drop(exit);
+
+    let station = rt
+        .orbit(&space)
+        .unwrap()
+        .activate(ActivationOptions::default())
+        .unwrap();
+    let session = station
+        .dock(&world_id, principal(vec![Grant::Write]))
+        .unwrap();
+    let proj = session
+        .query(WorldQuery {
+            schema: SchemaId::parse("note").unwrap(),
+            schema_version: 1,
+            payload: vec![],
+        })
+        .unwrap();
+    assert_eq!(proj.bytes, b"SURVIVES WAIT");
+}
+
+#[test]
 fn committed_bodies_survive_dormancy_and_reactivation() {
     // The full durable loop: form → activate → submit → go_dormant (checkpoint)
     // → re-acquire → activate → the committed Body is read back.

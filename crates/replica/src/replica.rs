@@ -29,9 +29,21 @@ pub enum ReplicaCommitError {
     /// A staged operation is not yet supported by the current engine (the
     /// collaborative algebra lands with the Loro engine in S5).
     UnsupportedOp,
-    /// The Fabric engine failed to durably apply the transaction.
+    /// The Fabric engine failed to apply the transaction.
     Fabric(String),
+    /// The durable write of the committed state failed. The acknowledged
+    /// frontier did not advance, and the Replica is poisoned (fail-stop) so the
+    /// diverged in-memory representation can never acknowledge further commits.
+    Durability(String),
+    /// A previous durability failure poisoned this Replica; reopen from the
+    /// durable store.
+    Poisoned,
 }
+
+/// Where a Replica durably lands each committed state before acknowledging it.
+/// Supplied by the runtime (which owns the Orbit store); the write must be
+/// atomic-replace + fsync so a crash leaves the previous complete checkpoint.
+pub type DurabilitySink = Box<dyn Fn(&[u8]) -> std::io::Result<()> + Send>;
 
 impl std::fmt::Display for ReplicaCommitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -44,6 +56,12 @@ impl std::error::Error for ReplicaCommitError {}
 pub struct Replica {
     fabric: Box<dyn Fabric + Send>,
     frontier: ReplicaFrontier,
+    /// When set, every commit is durably written here **before** it is
+    /// acknowledged — checkpoint-on-shutdown is not durable commit semantics.
+    sink: Option<DurabilitySink>,
+    /// Set after a durability failure: the in-memory engine has state the store
+    /// does not, so no further commit may be acknowledged.
+    poisoned: bool,
 }
 
 /// The serialized durable state of a Replica: the engine snapshot and the
@@ -82,7 +100,18 @@ impl Replica {
         Self {
             fabric,
             frontier: ReplicaFrontier::EMPTY,
+            sink: None,
+            poisoned: false,
         }
+    }
+
+    /// Attach a durability sink: from now on, every commit is written through it
+    /// **before** the commit is acknowledged, so a crash after acknowledgment
+    /// never loses the commit. Runtime attaches the Orbit store's atomic
+    /// checkpoint write here.
+    pub fn with_durability(mut self, sink: DurabilitySink) -> Self {
+        self.sink = Some(sink);
+        self
     }
 
     /// Build a Replica over the in-memory reference engine.
@@ -119,6 +148,8 @@ impl Replica {
         Ok(Self {
             fabric: Box::new(fabric),
             frontier: cp.frontier,
+            sink: None,
+            poisoned: false,
         })
     }
 
@@ -127,13 +158,21 @@ impl Replica {
         self.frontier
     }
 
-    /// Durably commit a set of staged Body operations, advancing the frontier
-    /// from the Fabric receipt. Atomic: on any error the frontier is unchanged.
+    /// Commit a set of staged Body operations. With a durability sink attached,
+    /// the committed state (engine snapshot + advanced frontier) is durably
+    /// written **before** the commit is acknowledged — success means the commit
+    /// is recoverable, not merely applied in memory. On any error the
+    /// acknowledged frontier is unchanged; a durability failure additionally
+    /// poisons the Replica (fail-stop), because the in-memory engine then holds
+    /// state the store does not.
     pub fn commit(
         &mut self,
         request_label: &str,
         ops: &[(BodyKey, BodyOp)],
     ) -> Result<ReplicaFrontier, ReplicaCommitError> {
+        if self.poisoned {
+            return Err(ReplicaCommitError::Poisoned);
+        }
         let mut fabric_ops = Vec::with_capacity(ops.len());
         for (key, op) in ops {
             let fkey = fabric_key(key);
@@ -155,7 +194,26 @@ impl Replica {
             .fabric
             .commit(FabricTransactionRequest::new(request_label, fabric_ops))
             .map_err(|e| ReplicaCommitError::Fabric(e.to_string()))?;
-        self.frontier = advance(self.frontier, receipt.causal().as_bytes());
+        let next = advance(self.frontier, receipt.causal().as_bytes());
+
+        // Durability BEFORE acknowledgment: land the post-commit state in the
+        // store, then advance the acknowledged frontier.
+        if let Some(sink) = &self.sink {
+            let engine = self
+                .fabric
+                .snapshot()
+                .map_err(|e| ReplicaCommitError::Fabric(e.to_string()))?;
+            let bytes = postcard::to_stdvec(&Checkpoint {
+                engine,
+                frontier: next,
+            })
+            .map_err(|e| ReplicaCommitError::Fabric(e.to_string()))?;
+            if let Err(e) = sink(&bytes) {
+                self.poisoned = true;
+                return Err(ReplicaCommitError::Durability(e.to_string()));
+            }
+        }
+        self.frontier = next;
         Ok(self.frontier)
     }
 

@@ -273,12 +273,21 @@ impl Orbit {
     pub fn activate(self, options: ActivationOptions) -> Result<Station, LifecycleError> {
         let epoch = StationEpoch::from_u64(self.store.bump_epoch()?);
         // Restore the durable Replica from the store's content checkpoint, or
-        // start fresh over the Loro-backed engine.
+        // start fresh over the Loro-backed engine — then attach the store's
+        // atomic checkpoint write as the per-commit durability sink, so every
+        // acknowledged commit is recoverable before `submit` returns. A crash,
+        // kill, or `wait` exit after an acknowledged commit loses nothing.
         let replica = match self.store.read_content()? {
             Some(bytes) => replica::Replica::restore_loro(&bytes)
                 .map_err(|e| LifecycleError::IntegrityFailure(e.to_string()))?,
             None => replica::Replica::loro(),
         };
+        let sink_store = self.store.clone();
+        let replica = replica.with_durability(Box::new(move |bytes| {
+            sink_store
+                .write_content(bytes)
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        }));
         Ok(Station {
             store: self.store,
             registry: self.registry,
@@ -470,11 +479,13 @@ impl Station {
         // 3) cancel and drain tracked tasks within the deadline.
         let deadline = Instant::now() + self.drain_deadline;
         let (timed_out, _panicked) = self.drain_tasks(deadline);
-        // 4) checkpoint the Replica durably to the store (engine snapshot +
-        //    frontier), so a later activation restores committed Bodies.
+        // 4) close the committing core and take the final checkpoint as ONE
+        //    transition under the writer mutex — an in-flight submit either
+        //    committed (durably, via the per-commit sink) before the close or is
+        //    refused; none can land after this checkpoint.
         let checkpoint = self
             .core
-            .checkpoint()
+            .close_and_checkpoint()
             .map_err(|e| DormancyError::Checkpoint(e.to_string()))?;
         self.store
             .write_content(&checkpoint)
@@ -492,6 +503,9 @@ impl Station {
     /// Park until every tracked task exits, consuming the Station and returning a
     /// recoverable [`StationExit`]. A task panic is reported as the exit reason;
     /// the durable Orbit is recovered either way and the lock is released last.
+    /// No commit is lost on this path: every acknowledged commit was already
+    /// durably written by the per-commit sink, and the core is closed (under the
+    /// writer mutex) before the Orbit is returned.
     pub fn wait(mut self) -> StationExit {
         let handles = std::mem::take(&mut *self.handles.lock().expect("task set"));
         let mut reason = None;
@@ -503,6 +517,7 @@ impl Station {
             }
         }
         self.alive.store(false, Ordering::SeqCst);
+        self.core.close();
         let lock = self.lock.take().expect("station holds its lock");
         StationExit {
             orbit: Orbit::new(self.store, self.registry, self.epoch, lock),

@@ -74,12 +74,22 @@ pub struct CommittedEffect {
     pub observation: Observation,
 }
 
-/// The Station's exclusive committing state, shared with its Sessions. It holds
-/// the single Replica writer (so all commits serialize) and the monotonic
-/// Observation sequence. Held behind an `Arc` by the Station and every Session;
-/// a Session can commit through it but never stop the Station.
+/// The single mutex-guarded committing state: the Replica writer plus the
+/// closed flag. `closed` lives **inside** the same mutex as the writer so that
+/// commit admission and Station shutdown are one serialized state transition —
+/// a submit admitted before dormancy either commits before the close (and is
+/// durable + checkpointed) or observes `closed` and is refused. There is no
+/// window where a commit lands after the shutdown checkpoint.
+struct CoreInner {
+    replica: replica::Replica,
+    closed: bool,
+}
+
+/// The Station's exclusive committing state, shared with its Sessions. Held
+/// behind an `Arc` by the Station and every Session; a Session can commit
+/// through it but never stop the Station.
 pub(crate) struct StationCore {
-    replica: std::sync::Mutex<replica::Replica>,
+    inner: std::sync::Mutex<CoreInner>,
     obs_seq: std::sync::atomic::AtomicU64,
     epoch: StationEpoch,
 }
@@ -87,25 +97,36 @@ pub(crate) struct StationCore {
 impl StationCore {
     pub(crate) fn new(epoch: StationEpoch, replica: replica::Replica) -> Self {
         Self {
-            replica: std::sync::Mutex::new(replica),
+            inner: std::sync::Mutex::new(CoreInner {
+                replica,
+                closed: false,
+            }),
             obs_seq: std::sync::atomic::AtomicU64::new(0),
             epoch,
         }
     }
 
-    pub(crate) fn frontier(&self) -> ReplicaFrontier {
-        self.replica
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .frontier()
+    fn lock(&self) -> std::sync::MutexGuard<'_, CoreInner> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Serialize the Replica's durable state for a dormancy checkpoint.
-    pub(crate) fn checkpoint(&self) -> Result<Vec<u8>, replica::ReplicaCommitError> {
-        self.replica
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .checkpoint()
+    pub(crate) fn frontier(&self) -> ReplicaFrontier {
+        self.lock().replica.frontier()
+    }
+
+    /// Close the core to further commits and serialize the Replica's durable
+    /// state, as one transition under the writer mutex. After this returns, no
+    /// admitted submit can commit — the checkpoint is final for this activation.
+    pub(crate) fn close_and_checkpoint(&self) -> Result<Vec<u8>, replica::ReplicaCommitError> {
+        let mut inner = self.lock();
+        inner.closed = true;
+        inner.replica.checkpoint()
+    }
+
+    /// Close the core to further commits without checkpointing (used by `wait`;
+    /// every acknowledged commit is already durable via the per-commit sink).
+    pub(crate) fn close(&self) {
+        self.lock().closed = true;
     }
 }
 
@@ -221,8 +242,8 @@ impl Session {
     /// request, runs the World to stage Body operations, then commits them
     /// through the Station's exclusive Replica writer and publishes an
     /// Observation. The returned [`CommittedEffect`] is proof of durability: it
-    /// exists only after the Replica advanced from a real Fabric receipt. A
-    /// refused request commits nothing.
+    /// exists only after the committed state was durably written (the Replica's
+    /// per-commit durability sink). A refused request commits nothing.
     pub fn submit(&self, intent: WorldIntent) -> Result<CommittedEffect, WorldError> {
         self.ensure_live()?;
         self.ensure_within_limit(intent.payload.len())?;
@@ -233,19 +254,26 @@ impl Session {
         // Hold the exclusive writer across the whole transaction: the World reads
         // the stable committed snapshot, stages operations against it, and the
         // commit lands atomically — a read-modify-write with no interleaving.
-        let mut replica = self.core.replica.lock().unwrap_or_else(|p| p.into_inner());
+        // The closed flag is checked INSIDE this critical section, so commit
+        // admission and Station shutdown are one serialized transition: no
+        // commit can land after the dormancy checkpoint.
+        let mut inner = self.core.lock();
+        if inner.closed {
+            return Err(WorldError::StationDormant);
+        }
         let effect: WorldEffect = {
-            let reader = ReplicaReader(&*replica);
+            let reader = ReplicaReader(&inner.replica);
             std::panic::catch_unwind(AssertUnwindSafe(|| {
                 let mut ctx = WorldContext::with_reads(principal, &reader);
                 world.submit(&mut ctx, intent)
             }))
             .unwrap_or(Err(WorldError::WorldImplementationFailed))?
         };
-        let frontier = replica
+        let frontier = inner
+            .replica
             .commit(&label, &effect.operations)
             .map_err(|_| WorldError::Persistence)?;
-        drop(replica);
+        drop(inner);
 
         // Publish the Observation for the committed change.
         let sequence = self
@@ -277,8 +305,11 @@ impl Session {
         self.ensure_readable_schema(&query.schema, query.schema_version)?;
         let world = &self.world;
         let principal = &self.principal;
-        let replica = self.core.replica.lock().unwrap_or_else(|p| p.into_inner());
-        let reader = ReplicaReader(&replica);
+        let inner = self.core.lock();
+        if inner.closed {
+            return Err(WorldError::StationDormant);
+        }
+        let reader = ReplicaReader(&inner.replica);
         std::panic::catch_unwind(AssertUnwindSafe(|| {
             let ctx = WorldContext::with_reads(principal, &reader);
             world.query(&ctx, query)

@@ -59,6 +59,9 @@ impl OrbitStore {
         ))?;
         write_sync(&dir.join(MARKER_FILE), &marker.encode())?;
         write_sync(&dir.join(EPOCH_FILE), &0u64.to_le_bytes())?;
+        // Make the new directory entries themselves durable.
+        sync_dir(&dir);
+        sync_dir(root);
         Ok(Self {
             dir,
             space: space.clone(),
@@ -93,27 +96,51 @@ impl OrbitStore {
 
     /// The current durable epoch (zero if never activated).
     pub fn read_epoch(&self) -> Result<u64, LifecycleError> {
+        // `create` writes the epoch and every later write is an atomic replace,
+        // so a missing or short epoch file is corruption — never "zero". Reading
+        // it as zero would reuse committed epochs, which activation must never
+        // do; fail closed instead.
         let mut f = match File::open(self.dir.join(EPOCH_FILE)) {
             Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(LifecycleError::IntegrityFailure(
+                    "epoch file missing — the store is corrupt; a committed epoch \
+                     cannot be safely reused"
+                        .into(),
+                ))
+            }
             Err(e) => return Err(io_err(e)),
         };
         let mut buf = [0u8; 8];
-        f.read_exact(&mut buf).map_err(io_err)?;
+        f.read_exact(&mut buf).map_err(|_| {
+            LifecycleError::IntegrityFailure("epoch file truncated — the store is corrupt".into())
+        })?;
         Ok(u64::from_le_bytes(buf))
     }
 
-    /// Atomically increment and fsync the epoch, returning the new value.
-    /// Activation must call this before proceeding; a failure to establish the
-    /// durable increment aborts activation, and a committed epoch is never
-    /// reused.
+    /// Atomically increment the epoch, returning the new value. The new value is
+    /// written to a temp sibling, fsynced, and atomically renamed over the epoch
+    /// file — a crash at any point leaves either the complete old or the
+    /// complete new value, never a partial one. A failure aborts activation, and
+    /// a committed epoch is never reused.
     pub fn bump_epoch(&self) -> Result<u64, LifecycleError> {
         let next = self
             .read_epoch()?
             .checked_add(1)
             .ok_or(LifecycleError::EpochOverflow)?;
-        write_sync(&self.dir.join(EPOCH_FILE), &next.to_le_bytes())?;
+        self.atomic_write(EPOCH_FILE, &next.to_le_bytes())?;
         Ok(next)
+    }
+
+    /// Write a store file durably and atomically: temp sibling → fsync → atomic
+    /// rename over the destination → best-effort directory sync. A crash at any
+    /// point leaves either the complete old or the complete new content.
+    fn atomic_write(&self, name: &str, bytes: &[u8]) -> Result<(), LifecycleError> {
+        let tmp = self.dir.join(format!("{name}.tmp"));
+        write_sync(&tmp, bytes)?;
+        atomic_replace(&tmp, &self.dir.join(name)).map_err(io_err)?;
+        sync_dir(&self.dir);
+        Ok(())
     }
 
     /// Acquire the exclusive store lock (the operational-ownership / double-lock
@@ -164,12 +191,11 @@ impl OrbitStore {
         }
     }
 
-    /// Atomically write the Replica content checkpoint (temp + rename + fsync),
-    /// so a crash mid-write never corrupts the prior checkpoint.
+    /// Durably and atomically replace the Replica content checkpoint. Called on
+    /// **every** commit (the durability sink), so a crash after an acknowledged
+    /// commit never loses it, and repeated replacement is safe.
     pub fn write_content(&self, bytes: &[u8]) -> Result<(), LifecycleError> {
-        let tmp = self.dir.join(format!("{CONTENT_FILE}.tmp"));
-        write_sync(&tmp, bytes)?;
-        std::fs::rename(&tmp, self.dir.join(CONTENT_FILE)).map_err(io_err)
+        self.atomic_write(CONTENT_FILE, bytes)
     }
 
     /// Destroy the store directory. The caller must hold the lock (i.e. be the
@@ -237,6 +263,48 @@ fn write_sync(path: &Path, bytes: &[u8]) -> Result<(), LifecycleError> {
     f.write_all(bytes).map_err(io_err)?;
     f.sync_all().map_err(io_err)?;
     Ok(())
+}
+
+/// Atomically move `tmp` over `dst`, replacing any existing file. `std::fs::
+/// rename` replaces on both platforms lait targets (Windows uses `MoveFileExW`
+/// with `MOVEFILE_REPLACE_EXISTING`), but on Windows a transient sharing
+/// violation (antivirus/indexer holding the destination) can fail a single
+/// attempt — retry briefly before giving up.
+fn atomic_replace(tmp: &Path, dst: &Path) -> std::io::Result<()> {
+    let mut last = None;
+    for attempt in 0..5 {
+        match std::fs::rename(tmp, dst) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = Some(e);
+                if attempt < 4 {
+                    std::thread::sleep(std::time::Duration::from_millis(10 << attempt));
+                }
+            }
+        }
+    }
+    Err(last.expect("at least one attempt"))
+}
+
+/// Best-effort directory durability after a rename/create, so the directory
+/// entry itself survives a crash. On unix this is a real fsync of the directory.
+/// On Windows directories need `FILE_FLAG_BACKUP_SEMANTICS` to open at all and
+/// NTFS journals metadata; the flush is attempted and a failure is tolerated.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) {
+    let _ = File::open(dir).and_then(|d| d.sync_all());
+}
+
+#[cfg(windows)]
+fn sync_dir(dir: &Path) {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let _ = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)
+        .and_then(|d| d.sync_all());
 }
 
 fn marker_err(e: MarkerError) -> LifecycleError {

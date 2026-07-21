@@ -34,5 +34,5 @@ pub use convergence::{ConvergenceOutcome, IncorporationClass};
 pub use frontier::{AuthorityFrontier, ReplicaFrontier, TransactionId};
 pub use ids::{BodyId, BodyKey, EncodingId, SchemaId, WorldId};
 pub use marker::{MarkerError, StoreMarkerV1};
-pub use replica::{Replica, ReplicaCommitError};
+pub use replica::{DurabilitySink, Replica, ReplicaCommitError};
 pub use transaction::{AuthoritySource, BodyDescriptorV1, BodyTransactionV1, TransactionError};
