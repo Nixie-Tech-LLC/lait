@@ -54,6 +54,12 @@ fn reader() -> LocalIdentity {
     Runtime::identity_from_seed(&READER_SEED)
 }
 
+fn test_keys() -> Arc<dyn replica::BodyKeySource> {
+    Arc::new(replica::StaticBodyKeys::new(
+        mechanics::crypto::AuthorizedBodyKey::for_authorized_epoch([1u8; 16], [2u8; 32]),
+    ))
+}
+
 /// Sign and submit an intent through the frozen public action API.
 fn submit_as(
     session: &crate::session::Session,
@@ -116,6 +122,7 @@ impl World for NoteWorld {
             )],
             scopes: vec![key],
             effect: intent.payload,
+            declarations: vec![],
         })
     }
     fn query(
@@ -163,7 +170,7 @@ fn temp_root() -> PathBuf {
 
 fn station_with(reg: WorldRegistration, world: Arc<dyn World>) -> crate::lifecycle::Station {
     let registry = RuntimeBuilder::new().register(reg, world).build().unwrap();
-    let rt = Runtime::open(temp_root(), registry, Arc::new(SeedAuthority));
+    let rt = Runtime::open(temp_root(), registry, Arc::new(SeedAuthority), test_keys());
     rt.form_space(SpaceFormationOptions::default())
         .unwrap()
         .activate(ActivationOptions::default())
@@ -425,7 +432,7 @@ fn an_acknowledged_commit_survives_a_crash_without_dormancy() {
     // durability happened AT COMMIT, not at shutdown.
     let (reg, world) = note_registration();
     let registry = RuntimeBuilder::new().register(reg, world).build().unwrap();
-    let rt = Runtime::open(temp_root(), registry, Arc::new(SeedAuthority));
+    let rt = Runtime::open(temp_root(), registry, Arc::new(SeedAuthority), test_keys());
     let world_id = WorldId::parse("com.example.notes").unwrap();
 
     let orbit = rt.form_space(SpaceFormationOptions::default()).unwrap();
@@ -468,7 +475,7 @@ fn commits_made_during_an_activation_survive_wait_exit() {
     // Per-commit durability means nothing made during the activation is lost.
     let (reg, world) = note_registration();
     let registry = RuntimeBuilder::new().register(reg, world).build().unwrap();
-    let rt = Runtime::open(temp_root(), registry, Arc::new(SeedAuthority));
+    let rt = Runtime::open(temp_root(), registry, Arc::new(SeedAuthority), test_keys());
     let world_id = WorldId::parse("com.example.notes").unwrap();
 
     let station = rt
@@ -514,7 +521,7 @@ fn committed_bodies_survive_dormancy_and_reactivation() {
     // → re-acquire → activate → the committed Body is read back.
     let (reg, world) = note_registration();
     let registry = RuntimeBuilder::new().register(reg, world).build().unwrap();
-    let rt = Runtime::open(temp_root(), registry, Arc::new(SeedAuthority));
+    let rt = Runtime::open(temp_root(), registry, Arc::new(SeedAuthority), test_keys());
     let world_id = WorldId::parse("com.example.notes").unwrap();
 
     let orbit = rt.form_space(SpaceFormationOptions::default()).unwrap();
@@ -583,6 +590,7 @@ impl World for RogueWorld {
             )],
             scopes: vec![foreign],
             effect: vec![],
+            declarations: vec![],
         })
     }
     fn query(
@@ -696,7 +704,7 @@ fn a_changed_authority_frontier_refuses_the_commit() {
         authority: authority.clone(),
     });
     let registry = RuntimeBuilder::new().register(reg, world).build().unwrap();
-    let rt = Runtime::open(temp_root(), registry, authority);
+    let rt = Runtime::open(temp_root(), registry, authority, test_keys());
     let station = rt
         .form_space(SpaceFormationOptions::default())
         .unwrap()
@@ -811,6 +819,7 @@ impl World for BoardWorld {
             ],
             scopes: vec![key],
             effect: vec![],
+            declarations: vec![],
         })
     }
     fn query(
@@ -852,7 +861,7 @@ fn a_collaborative_world_commits_and_reads_through_the_session() {
         .register(reg, Arc::new(world))
         .build()
         .unwrap();
-    let rt = Runtime::open(temp_root(), registry, Arc::new(SeedAuthority));
+    let rt = Runtime::open(temp_root(), registry, Arc::new(SeedAuthority), test_keys());
     let orbit = rt.form_space(SpaceFormationOptions::default()).unwrap();
     let space = orbit.space_id().clone();
     let station = orbit.activate(ActivationOptions::default()).unwrap();
@@ -917,6 +926,7 @@ impl World for MixedWorld {
             )],
             scopes: vec![key],
             effect: vec![],
+            declarations: vec![],
         })
     }
     fn query(

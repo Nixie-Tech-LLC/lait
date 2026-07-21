@@ -188,6 +188,74 @@ fn box_key(shared: &[u8], eph_pub: &[u8], recip_pub: &[u8]) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// The key-epoch id length prefixed to every protected Body envelope.
+pub const BODY_EPOCH_ID_LEN: usize = 16;
+/// The fixed protected-Body envelope overhead:
+/// `epoch_id(16) || nonce(12) || tag(16)` beyond the plaintext length.
+pub const BODY_ENVELOPE_OVERHEAD: usize = BODY_EPOCH_ID_LEN + NONCE_LEN + 16;
+
+/// An **opaque, non-serializable** capability authorizing Body protection under
+/// one approved key epoch: the authorized epoch id plus its current key
+/// material. Mechanics-side policy (the composition root, reading the
+/// authorized epoch set) mints it; Replica selects it under Space policy and
+/// passes it only to Fabric seal/open. Fabric never decides epoch legitimacy —
+/// holding this capability *is* the legitimacy decision, made upstream. The
+/// key material has no accessor, no serialization, and no `Debug` leak.
+#[derive(Clone)]
+pub struct AuthorizedBodyKey {
+    epoch: [u8; BODY_EPOCH_ID_LEN],
+    key: SpaceKey,
+}
+
+impl std::fmt::Debug for AuthorizedBodyKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorizedBodyKey")
+            .field("epoch", &data_encoding::HEXLOWER.encode(&self.epoch))
+            .finish_non_exhaustive()
+    }
+}
+
+impl AuthorizedBodyKey {
+    /// Mint the capability for an **authorized** epoch. The caller owes the
+    /// authorization proof (a valid writer-signed epoch mint replayed from
+    /// signed history); this constructor only packages the decision.
+    pub fn for_authorized_epoch(epoch: [u8; BODY_EPOCH_ID_LEN], key: SpaceKey) -> Self {
+        Self { epoch, key }
+    }
+
+    /// The authorized epoch id this capability speaks for.
+    pub fn epoch_id(&self) -> &[u8; BODY_EPOCH_ID_LEN] {
+        &self.epoch
+    }
+}
+
+/// Seal a Body plaintext under an authorized key epoch. The persisted envelope
+/// is exactly `epoch_id[16] || nonce[12] || ciphertext_and_tag` — the existing
+/// construction; this completion pass introduces no new cryptography.
+pub fn body_seal(key: &AuthorizedBodyKey, plaintext: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(BODY_EPOCH_ID_LEN + NONCE_LEN + plaintext.len() + 16);
+    out.extend_from_slice(&key.epoch);
+    out.extend_from_slice(&aead_encrypt(&key.key, plaintext));
+    out
+}
+
+/// Open a protected Body envelope with the capability for **its** epoch.
+/// `None` when the envelope names a different epoch, the key is wrong, or the
+/// blob is malformed — without the right epoch key you learn nothing.
+pub fn body_open(key: &AuthorizedBodyKey, envelope: &[u8]) -> Option<Vec<u8>> {
+    let (epoch, blob) = envelope.split_at_checked(BODY_EPOCH_ID_LEN)?;
+    if epoch != key.epoch {
+        return None;
+    }
+    aead_decrypt(&key.key, blob)
+}
+
+/// The epoch id a protected Body envelope names (no key required — this is the
+/// lookup tag, deliberately public).
+pub fn body_epoch_id(envelope: &[u8]) -> Option<[u8; BODY_EPOCH_ID_LEN]> {
+    envelope.get(..BODY_EPOCH_ID_LEN)?.try_into().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -106,6 +106,7 @@ impl World for TallyWorld {
             )],
             scopes: vec![key],
             effect: next.to_string().into_bytes(),
+            declarations: vec![],
         })
     }
     fn query(
@@ -148,7 +149,10 @@ fn the_product_composes_the_orbital_runtime_for_an_independent_world() {
         .unwrap();
 
     // The product's composition seam: store-root convention + supplied parts.
-    let rt = open_orbital_runtime(&home, registry, Arc::new(ExampleAuthority));
+    let keys = Arc::new(replica::StaticBodyKeys::new(
+        mechanics::crypto::AuthorizedBodyKey::for_authorized_epoch([1u8; 16], [2u8; 32]),
+    ));
+    let rt = open_orbital_runtime(&home, registry, Arc::new(ExampleAuthority), keys);
     assert!(orbital_store_root(&home).ends_with("orbital"));
 
     let writer = Runtime::identity_from_seed(&WRITER_SEED);

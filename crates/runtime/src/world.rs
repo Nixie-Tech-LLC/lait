@@ -154,6 +154,19 @@ impl LocalIdentity {
     }
 }
 
+/// The docked identity signs the durable Body transactions its Session
+/// commits; the seed never leaves this type.
+impl replica::transaction::TransactionSigner for LocalIdentity {
+    fn signer_key(&self) -> [u8; 32] {
+        self.device
+            .key_bytes()
+            .expect("seed-derived device key is well-formed")
+    }
+    fn sign_preimage(&self, preimage: &[u8]) -> [u8; 64] {
+        mechanics::crypto::sign_detached(&self.seed, preimage)
+    }
+}
+
 /// A World's declared implementation version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct WorldVersion(pub u32);
@@ -192,6 +205,18 @@ pub struct WorldQuery {
     pub payload: Vec<u8>,
 }
 
+/// A runtime-owned create declaration: the immutable schema binding for a Body
+/// this transaction creates. An operation on a new Body with no declaration
+/// defaults to the intent's schema; an operation on an existing Body uses its
+/// recorded binding — a later write can never change a Body's schema
+/// implicitly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BodyDeclaration {
+    pub key: BodyKey,
+    pub schema: replica::ids::SchemaId,
+    pub schema_version: u32,
+}
+
 /// The result a World returns from `submit`: the staged Body operations, the
 /// Observation scopes they touch, and an opaque application effect payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,6 +228,9 @@ pub struct WorldEffect {
     pub scopes: Vec<BodyKey>,
     /// An opaque application-defined effect payload returned to the caller.
     pub effect: Vec<u8>,
+    /// Schema declarations for Bodies this transaction creates (multi-schema
+    /// transactions declare each non-intent-schema Body explicitly).
+    pub declarations: Vec<BodyDeclaration>,
 }
 
 /// A canonical, versioned Projection a World returns from `query`, plus the

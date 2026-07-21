@@ -145,6 +145,8 @@ pub struct Session {
     space: mechanics::ids::SpaceId,
     world_id: WorldId,
     world: Arc<dyn World>,
+    /// The docked identity: signs this Session's durable Body transactions.
+    identity: crate::world::LocalIdentity,
     principal: PrincipalFacts,
     epoch: StationEpoch,
     /// The World's declared limits, enforced before the callback runs.
@@ -167,6 +169,7 @@ impl Session {
         space: mechanics::ids::SpaceId,
         world_id: WorldId,
         world: Arc<dyn World>,
+        identity: crate::world::LocalIdentity,
         principal: PrincipalFacts,
         epoch: StationEpoch,
         limits: WorldLimits,
@@ -179,6 +182,7 @@ impl Session {
             space,
             world_id,
             world,
+            identity,
             principal,
             epoch,
             limits,
@@ -224,40 +228,72 @@ impl Session {
         })
     }
 
-    /// Contain a World's staged effect inside its own namespace and the
-    /// mutation model of **the intent's schema** — not merely "any model the
-    /// World registered". A World with both atomic and collaborative schemas
-    /// therefore cannot smuggle the other model's operations through an intent:
-    /// an atomic-schema intent may stage only atomic replacement (plus
-    /// create/tombstone), a collaborative-schema intent only the collaborative
-    /// algebra (plus create/tombstone).
+    /// Contain a World's staged effect inside its own namespace and each
+    /// staged Body's **exact schema binding** — not merely "any model the
+    /// World registered". Every operation resolves a binding: an existing
+    /// Body's recorded (immutable) binding, an explicit create declaration, or
+    /// — for a new Body with no declaration — the intent's schema. The binding
+    /// must be a registered, writable schema of this World, and the operation
+    /// family must match its mutation model. Returns the per-Body bindings the
+    /// commit is made under.
     fn contain_effect(
         &self,
+        replica: &replica::Replica,
         effect: &WorldEffect,
         intent_schema: &SchemaId,
-    ) -> Result<(), WorldError> {
+    ) -> Result<Vec<(BodyKey, replica::BodyBinding)>, WorldError> {
         if effect.operations.len() > replica::algebra::MAX_OPS_PER_TRANSACTION {
             return Err(WorldError::ContractViolation);
         }
-        let schema = self
-            .schemas
-            .iter()
-            .find(|s| &s.id == intent_schema)
-            // ensure_writable_schema ran before the World; absence is a bug.
-            .ok_or(WorldError::ContractViolation)?;
-        let collaborative = matches!(schema.mutation, MutationModel::Collaborative(_));
+        let mut bindings: Vec<(BodyKey, replica::BodyBinding)> = Vec::new();
         for (key, op) in &effect.operations {
             if key.world != self.world_id {
                 return Err(WorldError::ContractViolation);
             }
+            // Resolve the Body's schema binding.
+            let (schema_id, version) = if let Some(existing) = replica.binding(key) {
+                // Existing Body: its binding is immutable; a declaration that
+                // disagrees is a violation.
+                if let Some(d) = effect.declarations.iter().find(|d| &d.key == key) {
+                    if d.schema != existing.schema || d.schema_version != existing.schema_version {
+                        return Err(WorldError::ContractViolation);
+                    }
+                }
+                (existing.schema.clone(), existing.schema_version)
+            } else if let Some(d) = effect.declarations.iter().find(|d| &d.key == key) {
+                (d.schema.clone(), d.schema_version)
+            } else {
+                (intent_schema.clone(), self.intent_version(intent_schema)?)
+            };
+            let schema = self
+                .schemas
+                .iter()
+                .find(|s| s.id == schema_id && s.version == version)
+                .ok_or(WorldError::ContractViolation)?;
+            let collaborative = matches!(schema.mutation, MutationModel::Collaborative(_));
             let permitted = match op {
                 BodyOp::ReplaceAtomic { .. } => !collaborative,
-                // Create/tombstone are legal under either model.
-                BodyOp::Create | BodyOp::Tombstone => true,
+                BodyOp::Create => collaborative,
+                BodyOp::Tombstone => true,
                 _ => collaborative,
             };
             if !permitted {
                 return Err(WorldError::ContractViolation);
+            }
+            if !bindings.iter().any(|(k, _)| k == key) {
+                bindings.push((
+                    key.clone(),
+                    replica::BodyBinding {
+                        schema: schema.id.clone(),
+                        schema_version: schema.version,
+                        encoding: schema.encoding.clone(),
+                        mutation_model: if collaborative {
+                            replica::MUTATION_COLLABORATIVE
+                        } else {
+                            replica::MUTATION_ATOMIC
+                        },
+                    },
+                ));
             }
         }
         for scope in &effect.scopes {
@@ -265,7 +301,17 @@ impl Session {
                 return Err(WorldError::ContractViolation);
             }
         }
-        Ok(())
+        Ok(bindings)
+    }
+
+    /// The registered version of the intent schema (validated writable before
+    /// the callback ran).
+    fn intent_version(&self, schema: &SchemaId) -> Result<u32, WorldError> {
+        self.schemas
+            .iter()
+            .find(|s| &s.id == schema)
+            .map(|s| s.version)
+            .ok_or(WorldError::ContractViolation)
     }
 
     fn ensure_live(&self) -> Result<(), WorldError> {
@@ -420,9 +466,10 @@ impl Session {
             }))
             .unwrap_or(Err(WorldError::WorldImplementationFailed))?
         };
-        // Contain the staged effect inside this World's namespace and the
-        // intent schema's mutation model.
-        self.contain_effect(&effect, &intent_schema)?;
+        // Contain the staged effect inside this World's namespace and each
+        // Body's exact schema binding, resolving the bindings the commit is
+        // made under.
+        let bindings = self.contain_effect(&inner.replica, &effect, &intent_schema)?;
         // Authority-frontier compare-and-swap, still under the writer lock:
         // the frontier the request was authorized at must still be current at
         // commit. A change refuses the commit with AuthorityChanged and
@@ -434,10 +481,15 @@ impl Session {
         if current.authority_frontier != action.header.authority_frontier {
             return Err(WorldError::AuthorityChanged);
         }
+        let ctx = replica::CommitContext {
+            space: &self.space,
+            signer: &self.identity,
+            authority_frontier: action.header.authority_frontier.clone(),
+        };
         let outcome = inner
             .replica
             .commit_action(
-                &self.space,
+                &ctx,
                 &self.world_id,
                 &principal.device,
                 &request,
@@ -446,6 +498,7 @@ impl Session {
                 effect.scopes,
                 &label,
                 &effect.operations,
+                &bindings,
             )
             .map_err(|e| match e {
                 // A staged op the engine cannot express is a World bug.
@@ -455,12 +508,14 @@ impl Session {
                 replica::ReplicaCommitError::OpLimit => WorldError::LimitExceeded,
                 replica::ReplicaCommitError::EffectTooLarge => WorldError::LimitExceeded,
                 replica::ReplicaCommitError::TypeConflict => WorldError::Conflict,
+                replica::ReplicaCommitError::SchemaMismatch => WorldError::ContractViolation,
                 replica::ReplicaCommitError::RequestIdConflict => WorldError::RequestIdConflict,
                 // Illegitimate is an incorporation-path error; a local commit
                 // never produces it, but the match stays exhaustive.
                 replica::ReplicaCommitError::Illegitimate(_)
                 | replica::ReplicaCommitError::Fabric(_)
                 | replica::ReplicaCommitError::Integrity(_)
+                | replica::ReplicaCommitError::BodyKeyUnavailable
                 | replica::ReplicaCommitError::Durability(_)
                 | replica::ReplicaCommitError::OutcomeUnknown
                 | replica::ReplicaCommitError::Poisoned => WorldError::Persistence,

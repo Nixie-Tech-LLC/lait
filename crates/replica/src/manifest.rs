@@ -215,7 +215,23 @@ impl ManifestRootV1 {
         authority_frontier: AuthorityFrontier,
         signer_seed: &[u8; 32],
     ) -> Option<Self> {
-        let signer = mechanics::crypto::device_from_seed(signer_seed).key_bytes()?;
+        Self::sign_with(
+            space,
+            replica_frontier,
+            pages,
+            authority_frontier,
+            &crate::transaction::SeedSigner(signer_seed),
+        )
+    }
+
+    /// Build and sign a root through an opaque signing capability.
+    pub fn sign_with(
+        space: &SpaceId,
+        replica_frontier: ReplicaFrontier,
+        pages: &[ManifestPageV1],
+        authority_frontier: AuthorityFrontier,
+        signer: &dyn crate::transaction::TransactionSigner,
+    ) -> Option<Self> {
         let hashes: Vec<[u8; 32]> = pages.iter().map(|p| p.hash()).collect();
         let mut root = Self {
             version: 1,
@@ -224,12 +240,12 @@ impl ManifestRootV1 {
             page_count: hashes.len() as u32,
             pages_root: pages_root(&hashes),
             ordered_page_hashes: hashes,
-            signer,
+            signer: signer.signer_key(),
             authority_frontier,
             signature_algorithm: SIG_ALG_ED25519,
             signature: [0u8; 64],
         };
-        root.signature = mechanics::crypto::sign_detached(signer_seed, &root.preimage());
+        root.signature = signer.sign_preimage(&root.preimage());
         Some(root)
     }
 

@@ -130,6 +130,13 @@ fn object_hash(bytes: &[u8]) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// The content address the store gives a byte object — public so a caller can
+/// predict the [`ObjectRef`] of material it hands to [`JournaledStore::commit`]
+/// (e.g. Replica's meta index referencing the objects of the same commit).
+pub fn object_content_hash(bytes: &[u8]) -> [u8; 32] {
+    object_hash(bytes)
+}
+
 fn manifest_hash(bytes: &[u8]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(MANIFEST_DOMAIN);

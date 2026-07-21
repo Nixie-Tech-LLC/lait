@@ -54,6 +54,12 @@ fn reader() -> LocalIdentity {
     Runtime::identity_from_seed(&READER_SEED)
 }
 
+fn test_keys() -> std::sync::Arc<dyn replica::BodyKeySource> {
+    std::sync::Arc::new(replica::StaticBodyKeys::new(
+        mechanics::crypto::AuthorizedBodyKey::for_authorized_epoch([1u8; 16], [2u8; 32]),
+    ))
+}
+
 /// Sign and submit an intent through the frozen public action API.
 fn submit_as(
     session: &runtime::Session,
@@ -130,6 +136,7 @@ impl World for KvWorld {
             )],
             scopes: vec![body],
             effect: value.as_bytes().to_vec(),
+            declarations: vec![],
         })
     }
     fn query(
@@ -160,7 +167,12 @@ fn kv_runtime(root: &std::path::Path) -> Runtime {
         .register(reg, Arc::new(world))
         .build()
         .unwrap();
-    Runtime::open(root.to_path_buf(), registry, Arc::new(ConsumerAuthority))
+    Runtime::open(
+        root.to_path_buf(),
+        registry,
+        Arc::new(ConsumerAuthority),
+        test_keys(),
+    )
 }
 
 fn world_id() -> WorldId {

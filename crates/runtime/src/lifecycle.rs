@@ -30,7 +30,7 @@ use crate::session::Session;
 use crate::store::{OrbitStore, StoreLock};
 use crate::world::{AuthorityView, LocalIdentity, PrincipalFacts};
 use replica::ids::WorldId;
-use replica::ConvergenceOutcome;
+use replica::{BodyKeySource, ConvergenceOutcome};
 
 /// The authority view a Runtime without one falls back to: nobody resolves, so
 /// nothing can dock. Standing exists only when the deployment supplies a real
@@ -42,6 +42,20 @@ impl AuthorityView for DenyAllAuthority {
         &self,
         _device: &mechanics::ids::DeviceId,
     ) -> Option<crate::world::PrincipalResolution> {
+        None
+    }
+}
+
+/// The key source a Runtime without one falls back to: no sealing or opening
+/// material, so durable local writes fail closed with `BodyKeyUnavailable`
+/// and all protected remote material stays opaque.
+struct NoBodyKeys;
+
+impl BodyKeySource for NoBodyKeys {
+    fn sealing_key(&self) -> Option<mechanics::crypto::AuthorizedBodyKey> {
+        None
+    }
+    fn opening_key(&self, _epoch: &[u8; 16]) -> Option<mechanics::crypto::AuthorizedBodyKey> {
         None
     }
 }
@@ -130,6 +144,10 @@ pub struct Runtime {
     /// The mechanics authority view principals are derived from. Sessions and
     /// Worlds cannot replace it; only the composition root supplies it.
     authority: Arc<dyn AuthorityView>,
+    /// The mechanics-owned Body key source: seals local commits and opens
+    /// protected material. Supplied by the composition root; absent keys fail
+    /// closed (local writes refuse, remote material stays opaque).
+    keys: Arc<dyn BodyKeySource>,
 }
 
 impl Runtime {
@@ -146,21 +164,25 @@ impl Runtime {
             registry,
             root: None,
             authority: Arc::new(DenyAllAuthority),
+            keys: Arc::new(NoBodyKeys),
         }
     }
 
     /// Open a Runtime rooted at a store directory, with the mechanics authority
-    /// view that principals are derived from. Orbits live under
+    /// view principals are derived from and the mechanics-owned Body key
+    /// source that seals/opens protected material. Orbits live under
     /// `<root>/<space-id>/`.
     pub fn open(
         root: impl Into<PathBuf>,
         registry: WorldRegistry,
         authority: Arc<dyn AuthorityView>,
+        keys: Arc<dyn BodyKeySource>,
     ) -> Self {
         Self {
             registry,
             root: Some(root.into()),
             authority,
+            keys,
         }
     }
 
@@ -198,6 +220,7 @@ impl Runtime {
             store,
             self.registry.clone(),
             self.authority.clone(),
+            self.keys.clone(),
             epoch,
             lock,
         ))
@@ -232,6 +255,7 @@ impl Runtime {
             store,
             self.registry.clone(),
             self.authority.clone(),
+            self.keys.clone(),
             epoch,
             lock,
         ))
@@ -250,6 +274,7 @@ impl Runtime {
             store,
             self.registry.clone(),
             self.authority.clone(),
+            self.keys.clone(),
             epoch,
             lock,
         ))
@@ -285,6 +310,7 @@ pub struct Orbit {
     store: OrbitStore,
     registry: WorldRegistry,
     authority: Arc<dyn AuthorityView>,
+    keys: Arc<dyn BodyKeySource>,
     epoch: StationEpoch,
     lock: StoreLock,
 }
@@ -303,6 +329,7 @@ impl Orbit {
         store: OrbitStore,
         registry: WorldRegistry,
         authority: Arc<dyn AuthorityView>,
+        keys: Arc<dyn BodyKeySource>,
         epoch: StationEpoch,
         lock: StoreLock,
     ) -> Self {
@@ -310,6 +337,7 @@ impl Orbit {
             store,
             registry,
             authority,
+            keys,
             epoch,
             lock,
         }
@@ -336,14 +364,39 @@ impl Orbit {
         // state), and from then on every acknowledged commit has completed the
         // full journal protocol before `submit` returns. A crash, kill, or
         // `wait` exit after an acknowledged commit loses nothing.
-        let replica = replica::Replica::open_journaled(self.store.dir()).map_err(|e| match e {
-            replica::ReplicaCommitError::Integrity(m) => LifecycleError::IntegrityFailure(m),
-            other => LifecycleError::StoreIo(other.to_string()),
-        })?;
+        let mut replica = replica::Replica::open_journaled(self.store.dir(), self.keys.clone())
+            .map_err(|e| match e {
+                replica::ReplicaCommitError::Integrity(m) => LifecycleError::IntegrityFailure(m),
+                other => LifecycleError::StoreIo(other.to_string()),
+            })?;
+        // Declare the registry's schemas so Convergence can classify remote
+        // material as interpretable versus opaque.
+        let mut supported = replica::SupportedSchemas::new();
+        for id in self.registry.ids() {
+            if let Some(reg) = self.registry.registration(id) {
+                for schema in &reg.schemas {
+                    let model = match schema.mutation {
+                        replica::body::MutationModel::Atomic => replica::MUTATION_ATOMIC,
+                        replica::body::MutationModel::Collaborative(_) => {
+                            replica::MUTATION_COLLABORATIVE
+                        }
+                    };
+                    supported.declare(
+                        id.clone(),
+                        schema.id.clone(),
+                        schema.version,
+                        schema.encoding.clone(),
+                        model,
+                    );
+                }
+            }
+        }
+        replica.set_supported(supported);
         Ok(Station {
             store: self.store,
             registry: self.registry,
             authority: self.authority,
+            keys: self.keys,
             epoch,
             lock: Some(self.lock),
             alive: Arc::new(AtomicBool::new(true)),
@@ -384,6 +437,7 @@ pub struct Station {
     store: OrbitStore,
     registry: WorldRegistry,
     authority: Arc<dyn AuthorityView>,
+    keys: Arc<dyn BodyKeySource>,
     epoch: StationEpoch,
     /// The exclusive store lock. `Some` while live; taken out (and either moved
     /// into the returned Orbit or dropped) exactly once at dormancy/exit, so it
@@ -489,6 +543,7 @@ impl Station {
             self.store.space().clone(),
             world_id.clone(),
             world,
+            identity.clone(),
             principal,
             self.epoch,
             registration.limits,
@@ -580,6 +635,7 @@ impl Station {
             self.store,
             self.registry,
             self.authority,
+            self.keys,
             self.epoch,
             lock,
         ))
@@ -605,7 +661,14 @@ impl Station {
         self.core.close();
         let lock = self.lock.take().expect("station holds its lock");
         StationExit {
-            orbit: Orbit::new(self.store, self.registry, self.authority, self.epoch, lock),
+            orbit: Orbit::new(
+                self.store,
+                self.registry,
+                self.authority,
+                self.keys,
+                self.epoch,
+                lock,
+            ),
             reason,
         }
     }
@@ -640,6 +703,12 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
 
+    pub(crate) fn test_keys() -> Arc<dyn BodyKeySource> {
+        Arc::new(replica::StaticBodyKeys::new(
+            mechanics::crypto::AuthorizedBodyKey::for_authorized_epoch([1u8; 16], [2u8; 32]),
+        ))
+    }
+
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_root() -> PathBuf {
@@ -656,6 +725,7 @@ mod tests {
             root.to_path_buf(),
             RuntimeBuilder::new().build().unwrap(),
             Arc::new(DenyAllAuthority),
+            test_keys(),
         )
     }
 

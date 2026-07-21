@@ -13,6 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use replica::BodyKeySource;
 use runtime::{AuthorityView, Runtime, WorldRegistry};
 
 /// Where the product keeps its orbital stores, under the lait home. Kept beside
@@ -22,13 +23,14 @@ pub fn orbital_store_root(home: &Path) -> PathBuf {
 }
 
 /// Compose the product's orbital [`Runtime`]: the store root convention plus a
-/// caller-supplied World registry and mechanics authority view. The product
-/// holds no privileged path — this is the same `Runtime::open` any consumer
-/// calls, at the product's store location.
+/// caller-supplied World registry, mechanics authority view, and mechanics-
+/// owned Body key source. The product holds no privileged path — this is the
+/// same `Runtime::open` any consumer calls, at the product's store location.
 pub fn open_orbital_runtime(
     home: &Path,
     registry: WorldRegistry,
     authority: Arc<dyn AuthorityView>,
+    keys: Arc<dyn BodyKeySource>,
 ) -> Runtime {
-    Runtime::open(orbital_store_root(home), registry, authority)
+    Runtime::open(orbital_store_root(home), registry, authority, keys)
 }

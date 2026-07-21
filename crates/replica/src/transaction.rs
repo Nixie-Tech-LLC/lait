@@ -107,6 +107,30 @@ pub enum TransactionError {
     AuthorityUnverified,
 }
 
+/// A device signing capability the committing layer supplies (runtime's
+/// `LocalIdentity` implements it). Replica builds the canonical preimage and
+/// hands it here — it never sees seed bytes.
+pub trait TransactionSigner: Send + Sync {
+    /// The raw ed25519 public key of the signing device.
+    fn signer_key(&self) -> [u8; 32];
+    /// Sign an already-built canonical preimage.
+    fn sign_preimage(&self, preimage: &[u8]) -> [u8; 64];
+}
+
+/// A seed-backed signer for tests and seed-holding callers.
+pub struct SeedSigner<'a>(pub &'a [u8; 32]);
+
+impl TransactionSigner for SeedSigner<'_> {
+    fn signer_key(&self) -> [u8; 32] {
+        mechanics::crypto::device_from_seed(self.0)
+            .key_bytes()
+            .expect("seed-derived device key")
+    }
+    fn sign_preimage(&self, preimage: &[u8]) -> [u8; 64] {
+        mechanics::crypto::sign_detached(self.0, preimage)
+    }
+}
+
 /// A mechanics-provided view of Space authority, consulted before a Body
 /// transaction is retained or incorporated. Replica owns no authority state; it
 /// asks this seam whether a signer was admitted with standing at a given
@@ -166,7 +190,25 @@ impl BodyTransactionV1 {
         descriptors: Vec<BodyDescriptorV1>,
         signer_seed: &[u8; 32],
     ) -> Option<Self> {
-        let signer = mechanics::crypto::device_from_seed(signer_seed).key_bytes()?;
+        Self::sign_with(
+            space,
+            transaction,
+            replica_frontier,
+            authority_frontier,
+            descriptors,
+            &SeedSigner(signer_seed),
+        )
+    }
+
+    /// Construct and sign a transaction through an opaque signing capability.
+    pub fn sign_with(
+        space: &SpaceId,
+        transaction: TransactionId,
+        replica_frontier: ReplicaFrontier,
+        authority_frontier: AuthorityFrontier,
+        descriptors: Vec<BodyDescriptorV1>,
+        signer: &dyn TransactionSigner,
+    ) -> Option<Self> {
         let mut tx = Self {
             version: 1,
             space: space_bytes(space)?,
@@ -174,11 +216,11 @@ impl BodyTransactionV1 {
             replica_frontier,
             authority_frontier,
             descriptors,
-            signer,
+            signer: signer.signer_key(),
             signature_algorithm: SIG_ALG_ED25519,
             signature: [0u8; 64],
         };
-        tx.signature = mechanics::crypto::sign_detached(signer_seed, &tx.preimage());
+        tx.signature = signer.sign_preimage(&tx.preimage());
         Some(tx)
     }
 

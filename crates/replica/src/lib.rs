@@ -27,6 +27,7 @@ pub mod frontier;
 pub mod ids;
 pub mod manifest;
 pub mod marker;
+pub mod protected;
 pub mod receipt;
 pub mod replica;
 pub mod transaction;
@@ -43,6 +44,16 @@ pub use manifest::{
     RootObservation,
 };
 pub use marker::{MarkerError, StoreMarkerV1};
+pub use protected::{
+    BodyKeySource, ProtectedBodyPayloadV1, ProtectedError, StaticBodyKeys, MAX_BODY_BYTES,
+    MAX_PROTECTED_PLAINTEXT,
+};
 pub use receipt::{ReceiptError, RequestReceiptV1, MAX_EFFECT_BYTES};
-pub use replica::{ActionOutcome, Replica, ReplicaCommitError};
-pub use transaction::{AuthoritySource, BodyDescriptorV1, BodyTransactionV1, TransactionError};
+pub use replica::{
+    ActionOutcome, BodyBinding, CommitContext, ExportedMaterial, Replica, ReplicaCommitError,
+    SupportedSchemas, MUTATION_ATOMIC, MUTATION_COLLABORATIVE,
+};
+pub use transaction::{
+    AuthoritySource, BodyDescriptorV1, BodyTransactionV1, SeedSigner, TransactionError,
+    TransactionSigner,
+};

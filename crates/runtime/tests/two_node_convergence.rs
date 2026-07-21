@@ -1,18 +1,27 @@
-//! Two-node convergence, end to end: one Replica exports a **signed** envelope,
-//! the material is framed as a Contact transfer and driven through the real
-//! initiator/accepter state machines, the received bytes are handed to
-//! mechanics-validated `Replica::incorporate`, and the two replicas converge.
+//! Two-node convergence, end to end: one Replica exports its **retained signed
+//! material** (the canonical BodyTransactionV1 records plus their sealed,
+//! descriptor-bound protected payloads), the material is framed as a Contact
+//! transfer and driven through the real initiator/accepter state machines, the
+//! received bytes are handed to mechanics-validated `Replica::incorporate`,
+//! and the two replicas converge.
 //!
 //! This ties the whole Convergence pipeline together — export → Contact frames
-//! → transcript-validated receipt → legitimacy check → durable incorporation —
-//! with no unbound merge path. (The only glue left for the live daemon is
-//! carrying these exact frames over a comms `Stream`; the framing, validation,
-//! and incorporation proven here are transport-independent.)
+//! → transcript-validated receipt → legitimacy check → exact per-Body durable
+//! incorporation — with no unbound merge path. (The only glue left for the
+//! live daemon is carrying these exact frames over a comms `Stream`; the
+//! framing, validation, and incorporation proven here are transport-
+//! independent.)
 
+use std::sync::Arc;
+
+use mechanics::crypto::AuthorizedBodyKey;
 use mechanics::ids::SpaceId;
 use replica::frontier::AuthorityFrontier;
 use replica::transaction::{AuthoritySource, BodyTransactionV1};
-use replica::{BodyId, BodyKey, BodyOp, Replica, WorldId};
+use replica::{
+    BodyBinding, BodyId, BodyKey, BodyOp, CommitContext, EncodingId, Replica, SchemaId, SeedSigner,
+    StaticBodyKeys, SupportedSchemas, WorldId, MUTATION_COLLABORATIVE,
+};
 use runtime::contact::{
     authority_record_hash, authority_set_hash, body_chunk_hash, manifest_page_hash,
     manifest_root_ref, ContactFrame, ContactId, InitiatorReceiver, InitiatorState, Progress,
@@ -20,6 +29,8 @@ use runtime::contact::{
 };
 
 const EXPORT_SEED: [u8; 32] = [88u8; 32];
+const EPOCH: [u8; 16] = [5u8; 16];
+const EPOCH_KEY: [u8; 32] = [6u8; 32];
 
 fn space() -> SpaceId {
     SpaceId::from_digest([16u8; 16])
@@ -47,9 +58,74 @@ fn note_key() -> BodyKey {
     )
 }
 
-/// Frame the signed export as a complete Contact transfer: the signed
-/// BodyTransactionV1 is the single authority record; its bound payload is the
-/// single body. Returns every raw frame in send order.
+fn keys() -> Arc<StaticBodyKeys> {
+    Arc::new(StaticBodyKeys::new(
+        AuthorizedBodyKey::for_authorized_epoch(EPOCH, EPOCH_KEY),
+    ))
+}
+
+fn supported() -> SupportedSchemas {
+    let mut s = SupportedSchemas::new();
+    s.declare(
+        note_key().world,
+        SchemaId::parse("note").unwrap(),
+        1,
+        EncodingId::parse("collab").unwrap(),
+        MUTATION_COLLABORATIVE,
+    );
+    s
+}
+
+fn binding() -> BodyBinding {
+    BodyBinding {
+        schema: SchemaId::parse("note").unwrap(),
+        schema_version: 1,
+        encoding: EncodingId::parse("collab").unwrap(),
+        mutation_model: MUTATION_COLLABORATIVE,
+    }
+}
+
+fn replica() -> Replica {
+    let mut r = Replica::loro().with_keys(keys());
+    r.set_supported(supported());
+    r
+}
+
+fn commit_votes(r: &mut Replica, request: [u8; 16], delta: i64) {
+    let space = space();
+    let signer = SeedSigner(&EXPORT_SEED);
+    let ctx = CommitContext {
+        space: &space,
+        signer: &signer,
+        authority_frontier: authority_frontier(),
+    };
+    r.commit_action(
+        &ctx,
+        &note_key().world,
+        &mechanics::crypto::device_from_seed(&EXPORT_SEED),
+        &request,
+        &[1u8; 32],
+        vec![],
+        vec![],
+        "bump",
+        &[
+            (note_key(), BodyOp::Create),
+            (
+                note_key(),
+                BodyOp::CounterAdd {
+                    path: "votes".into(),
+                    delta,
+                },
+            ),
+        ],
+        &[(note_key(), binding())],
+    )
+    .unwrap();
+}
+
+/// Frame the exported material as a complete Contact transfer: the signed
+/// BodyTransactionV1 is the single authority record; its bound protected
+/// payload is the single body. Returns every raw frame in send order.
 fn frame_transfer(contact: &ContactId, tx: &BodyTransactionV1, payload: &[u8]) -> Vec<Vec<u8>> {
     let record = tx.encode();
     let record_hashes = vec![authority_record_hash(&record)];
@@ -132,47 +208,51 @@ fn receive(contact: ContactId, frames: &[Vec<u8>]) -> ReceivedMaterial {
     rx.into_received().expect("clean transfer")
 }
 
+fn ctx_space() -> SpaceId {
+    space()
+}
+
 #[test]
 fn a_signed_export_converges_across_a_contact_transfer() {
-    // Node A commits some collaborative state.
-    let mut a = Replica::loro();
-    a.commit(
-        "created",
-        &[
-            (note_key(), BodyOp::Create),
-            (
-                note_key(),
-                BodyOp::CounterAdd {
-                    path: "votes".into(),
-                    delta: 4,
-                },
-            ),
-        ],
-    )
-    .unwrap();
+    // Node A commits some collaborative state through the attributed path.
+    let mut a = replica();
+    commit_votes(&mut a, [41u8; 16], 4);
 
-    // A signs its representation export and frames it as a Contact transfer.
-    let (tx, payload) = a
-        .export_signed(&space(), authority_frontier(), &EXPORT_SEED)
-        .unwrap();
+    // A exports its retained signed material and frames it as a transfer.
+    let material = a.export_material().unwrap();
+    assert_eq!(material.len(), 1);
+    let (tx, payloads) = &material[0];
+    let payload = &payloads[0].1;
     let contact = ContactId::from_bytes([5u8; 16]);
-    let frames = frame_transfer(&contact, &tx, &payload);
+    let frames = frame_transfer(&contact, tx, payload);
 
     // Node B receives the transfer through the real machine, then reconstructs
     // the signed transaction + payload from the received material.
-    let material = receive(contact, &frames);
-    assert_eq!(material.authority_records.len(), 1);
-    let received_tx = BodyTransactionV1::decode_canonical(&material.authority_records[0]).unwrap();
-    let received_payload = material
+    let received = receive(contact, &frames);
+    assert_eq!(received.authority_records.len(), 1);
+    let received_tx = BodyTransactionV1::decode_canonical(&received.authority_records[0]).unwrap();
+    let received_payload = received
         .bodies
         .get(&(tx.transaction, note_key()))
         .expect("body present");
 
     // Convergence: legitimacy is checked (signature + mechanics authority +
     // commitment binding) before anything reaches B's engine.
-    let mut b = Replica::loro();
+    let mut b = replica();
+    let space = ctx_space();
+    let signer = SeedSigner(&EXPORT_SEED);
+    let ctx = CommitContext {
+        space: &space,
+        signer: &signer,
+        authority_frontier: authority_frontier(),
+    };
     let outcome = b
-        .incorporate(&received_tx, received_payload, &ExporterAuthorized)
+        .incorporate(
+            &ctx,
+            &received_tx,
+            &[(note_key(), received_payload.clone())],
+            &ExporterAuthorized,
+        )
         .unwrap();
     assert_eq!(outcome.accepted, 1);
     assert!(outcome.advanced());
@@ -188,26 +268,16 @@ fn a_signed_export_converges_across_a_contact_transfer() {
 
 #[test]
 fn a_tampered_transfer_never_reaches_the_engine() {
-    let mut a = Replica::loro();
-    a.commit(
-        "created",
-        &[(
-            note_key(),
-            BodyOp::CounterAdd {
-                path: "votes".into(),
-                delta: 1,
-            },
-        )],
-    )
-    .unwrap();
-    let (tx, payload) = a
-        .export_signed(&space(), authority_frontier(), &EXPORT_SEED)
-        .unwrap();
+    let mut a = replica();
+    commit_votes(&mut a, [42u8; 16], 1);
+    let material = a.export_material().unwrap();
+    let (tx, payloads) = &material[0];
+    let payload = &payloads[0].1;
     let contact = ContactId::from_bytes([6u8; 16]);
-    let frames = frame_transfer(&contact, &tx, &payload);
-    let material = receive(contact, &frames);
-    let received_tx = BodyTransactionV1::decode_canonical(&material.authority_records[0]).unwrap();
-    let received_payload = material.bodies.get(&(tx.transaction, note_key())).unwrap();
+    let frames = frame_transfer(&contact, tx, payload);
+    let received = receive(contact, &frames);
+    let received_tx = BodyTransactionV1::decode_canonical(&received.authority_records[0]).unwrap();
+    let received_payload = received.bodies.get(&(tx.transaction, note_key())).unwrap();
 
     // An importer whose mechanics view does not authorize the exporter refuses
     // the material even though the Contact transfer itself was well-formed.
@@ -217,9 +287,21 @@ fn a_tampered_transfer_never_reaches_the_engine() {
             false
         }
     }
-    let mut b = Replica::loro();
+    let mut b = replica();
+    let space = ctx_space();
+    let signer = SeedSigner(&EXPORT_SEED);
+    let ctx = CommitContext {
+        space: &space,
+        signer: &signer,
+        authority_frontier: authority_frontier(),
+    };
     assert!(b
-        .incorporate(&received_tx, received_payload, &DenyAll)
+        .incorporate(
+            &ctx,
+            &received_tx,
+            &[(note_key(), received_payload.clone())],
+            &DenyAll,
+        )
         .is_err());
     assert!(
         b.read_collaborative(&note_key()).is_none(),
