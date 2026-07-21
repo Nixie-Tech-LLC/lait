@@ -1,12 +1,13 @@
 //! The Orbit's durable on-disk footprint and its exclusive lock.
 //!
-//! An Orbit lives under `<root>/<space-id>/`. S3 owns three of that store's
-//! files: the [`replica::StoreMarkerV1`] `marker` (what Space this is, and that
-//! it is a Replica store at all), an `epoch` counter durably incremented before
-//! each activation, and a `lock` file carrying the OS advisory exclusive lock
-//! that is the typed double-lock — only one operational owner at a time. The
-//! `current-manifest`, `transactions/`, `bodies/`, and `journal/` that S5 adds
-//! sit alongside these; nothing here forecloses that layout.
+//! An Orbit lives under `<root>/<space-id>/`. This module owns three of that
+//! store's files: the [`replica::StoreMarkerV1`] `marker` (what Space this is,
+//! and that it is a Replica store at all), an `epoch` counter durably
+//! incremented before each activation, and a `lock` file carrying the OS
+//! advisory exclusive lock that is the typed double-lock — only one
+//! operational owner at a time. The Fabric journaled store's files (`counter`,
+//! `current-manifest`, `objects/`, `journal/`) live alongside these in the
+//! same directory; the two touch disjoint names.
 //!
 //! Technical file/lock terms are correct at this layer — it is below the domain
 //! boundary.
@@ -29,11 +30,29 @@ fn io_err(e: std::io::Error) -> LifecycleError {
     LifecycleError::StoreIo(e.to_string())
 }
 
+/// A test seam mirroring the Fabric journal's: called with a named fault point
+/// *before* the named operation executes; returning `true` makes the operation
+/// fail there, modelling a crash or an I/O failure.
+pub type StoreFaultInjector = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// The named store fault points, in epoch-bump order.
+pub const STORE_FAULT_POINTS: [&str; 3] = ["epoch-temp", "epoch-rename", "epoch-dir-sync"];
+
 /// A handle to an Orbit's store directory.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OrbitStore {
     dir: PathBuf,
     space: SpaceId,
+    injector: Option<StoreFaultInjector>,
+}
+
+impl std::fmt::Debug for OrbitStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrbitStore")
+            .field("dir", &self.dir)
+            .field("space", &self.space)
+            .finish_non_exhaustive()
+    }
 }
 
 impl OrbitStore {
@@ -55,12 +74,14 @@ impl OrbitStore {
         ))?;
         write_sync(&dir.join(MARKER_FILE), &marker.encode())?;
         write_sync(&dir.join(EPOCH_FILE), &0u64.to_le_bytes())?;
-        // Make the new directory entries themselves durable.
-        sync_dir(&dir);
-        sync_dir(root);
+        // Make the new directory entries themselves durable — a formation whose
+        // directory entries could vanish on power loss must not report success.
+        sync_dir(&dir).map_err(io_err)?;
+        sync_dir(root).map_err(io_err)?;
         Ok(Self {
             dir,
             space: space.clone(),
+            injector: None,
         })
     }
 
@@ -83,7 +104,23 @@ impl OrbitStore {
         Ok(Self {
             dir,
             space: space.clone(),
+            injector: None,
         })
+    }
+
+    /// Attach a fault injector (test seam; see [`STORE_FAULT_POINTS`]).
+    pub fn with_fault_injector(mut self, injector: StoreFaultInjector) -> Self {
+        self.injector = Some(injector);
+        self
+    }
+
+    fn point(&self, name: &str) -> Result<(), LifecycleError> {
+        if let Some(injector) = &self.injector {
+            if injector(name) {
+                return Err(LifecycleError::StoreIo(format!("injected fault at {name}")));
+            }
+        }
+        Ok(())
     }
 
     pub fn space(&self) -> &SpaceId {
@@ -117,26 +154,25 @@ impl OrbitStore {
     /// Atomically increment the epoch, returning the new value. The new value is
     /// written to a temp sibling, fsynced, and atomically renamed over the epoch
     /// file — a crash at any point leaves either the complete old or the
-    /// complete new value, never a partial one. A failure aborts activation, and
-    /// a committed epoch is never reused.
+    /// complete new value, never a partial one. Every phase **including the
+    /// directory synchronization** is fallible and fault-injected: activation
+    /// must not report success while durable epoch establishment is unknown,
+    /// because Beacon freshness depends on never reusing an epoch a live
+    /// Station acted under. A failure aborts activation; the un-acknowledged
+    /// epoch was never used, so re-deriving it later is safe.
     pub fn bump_epoch(&self) -> Result<u64, LifecycleError> {
         let next = self
             .read_epoch()?
             .checked_add(1)
             .ok_or(LifecycleError::EpochOverflow)?;
-        self.atomic_write(EPOCH_FILE, &next.to_le_bytes())?;
+        let tmp = self.dir.join(format!("{EPOCH_FILE}.tmp"));
+        self.point("epoch-temp")?;
+        write_sync(&tmp, &next.to_le_bytes())?;
+        self.point("epoch-rename")?;
+        atomic_replace(&tmp, &self.dir.join(EPOCH_FILE)).map_err(io_err)?;
+        self.point("epoch-dir-sync")?;
+        sync_dir(&self.dir).map_err(io_err)?;
         Ok(next)
-    }
-
-    /// Write a store file durably and atomically: temp sibling → fsync → atomic
-    /// rename over the destination → best-effort directory sync. A crash at any
-    /// point leaves either the complete old or the complete new content.
-    fn atomic_write(&self, name: &str, bytes: &[u8]) -> Result<(), LifecycleError> {
-        let tmp = self.dir.join(format!("{name}.tmp"));
-        write_sync(&tmp, bytes)?;
-        atomic_replace(&tmp, &self.dir.join(name)).map_err(io_err)?;
-        sync_dir(&self.dir);
-        Ok(())
     }
 
     /// Acquire the exclusive store lock (the operational-ownership / double-lock
@@ -274,25 +310,40 @@ fn atomic_replace(tmp: &Path, dst: &Path) -> std::io::Result<()> {
     Err(last.expect("at least one attempt"))
 }
 
-/// Best-effort directory durability after a rename/create, so the directory
-/// entry itself survives a crash. On unix this is a real fsync of the directory.
-/// On Windows directories need `FILE_FLAG_BACKUP_SEMANTICS` to open at all and
-/// NTFS journals metadata; the flush is attempted and a failure is tolerated.
+/// Directory durability after a rename/create, so the directory entry itself
+/// survives a crash. On unix this is a real fsync of the directory, and a
+/// failure fails the calling phase. On Windows a directory handle needs
+/// `FILE_FLAG_BACKUP_SEMANTICS` to open; if no handle can be opened at all the
+/// platform does not expose directory sync and NTFS's metadata journaling is
+/// the documented durability contract — but a handle that opens and then fails
+/// to flush is a real error and fails the phase. (The same contract as the
+/// Fabric journal's directory sync.)
 #[cfg(unix)]
-fn sync_dir(dir: &Path) {
-    let _ = File::open(dir).and_then(|d| d.sync_all());
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    File::open(dir).and_then(|d| d.sync_all())
 }
 
 #[cfg(windows)]
-fn sync_dir(dir: &Path) {
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    let _ = OpenOptions::new()
+    let handle = OpenOptions::new()
         .read(true)
         .write(true)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(dir)
-        .and_then(|d| d.sync_all());
+        .or_else(|_| {
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(dir)
+        });
+    match handle {
+        // No directory handle at all: sync is unsupported here; NTFS metadata
+        // journaling is the stated contract (documented, not silent).
+        Err(_) => Ok(()),
+        Ok(d) => d.sync_all(),
+    }
 }
 
 fn marker_err(e: MarkerError) -> LifecycleError {
@@ -310,5 +361,70 @@ fn marker_err(e: MarkerError) -> LifecycleError {
             LifecycleError::IntegrityFailure("replica integrity failure".into())
         }
         MarkerError::ReplicaLocked => LifecycleError::IntegrityFailure("replica locked".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_root() -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("lait-store-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_epoch_fault_at_every_point_aborts_without_acknowledging() {
+        // Durable epoch establishment must be all-or-nothing from the caller's
+        // view: a fault at ANY bump phase — including the directory sync —
+        // fails the bump, and the durable epoch remains readable as either the
+        // complete old or the complete new value (never acknowledged-but-lost).
+        for &point in STORE_FAULT_POINTS.iter() {
+            let root = temp_root();
+            let space = SpaceId::from_digest([7u8; 16]);
+            let store = OrbitStore::create(&root, &space).unwrap();
+            assert_eq!(store.read_epoch().unwrap(), 0);
+            let armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let armed2 = armed.clone();
+            let faulty = store.clone().with_fault_injector(Arc::new(move |name| {
+                name == point && armed2.load(Ordering::SeqCst)
+            }));
+            let err = faulty.bump_epoch().unwrap_err();
+            assert!(
+                matches!(err, LifecycleError::StoreIo(_)),
+                "fault at {point} must abort the bump"
+            );
+            // The store is intact: the epoch reads as a complete value and the
+            // next (un-faulted) bump succeeds and never reuses an acknowledged
+            // epoch.
+            armed.store(false, Ordering::SeqCst);
+            let read = store.read_epoch().unwrap();
+            assert!(read == 0 || read == 1, "complete old or complete new");
+            let next = store.bump_epoch().unwrap();
+            assert!(next > read, "the bump advances past whatever was durable");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn consecutive_epoch_bumps_are_monotone() {
+        let root = temp_root();
+        let space = SpaceId::from_digest([8u8; 16]);
+        let store = OrbitStore::create(&root, &space).unwrap();
+        let mut last = 0;
+        for _ in 0..10 {
+            let next = store.bump_epoch().unwrap();
+            assert_eq!(next, last + 1);
+            last = next;
+        }
+        assert_eq!(store.read_epoch().unwrap(), 10);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

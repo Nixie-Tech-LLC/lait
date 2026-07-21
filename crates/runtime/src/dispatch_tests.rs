@@ -54,6 +54,15 @@ fn reader() -> LocalIdentity {
     Runtime::identity_from_seed(&READER_SEED)
 }
 
+/// Sign and submit an intent through the frozen public action API.
+fn submit_as(
+    session: &crate::session::Session,
+    identity: &LocalIdentity,
+    intent: WorldIntent,
+) -> Result<crate::session::CommittedEffect, WorldError> {
+    session.submit(identity.sign_action(session, crate::action::RequestId::mint(), intent)?)
+}
+
 /// A minimal note World: intents carry UTF-8 text; `submit` stages an atomic
 /// replacement and reports the touched scope; `query` echoes a deterministic
 /// projection derived only from its inputs.
@@ -183,17 +192,19 @@ fn test_world_submits_and_queries_through_dispatch() {
     assert_eq!(empty.bytes, b"");
 
     // Submit an intent: it is durably committed and advances the frontier.
-    let committed = session
-        .submit(WorldIntent {
+    let committed = submit_as(
+        &session,
+        &writer(),
+        WorldIntent {
             schema: SchemaId::parse("note").unwrap(),
             schema_version: 1,
             payload: b"hello".to_vec(),
-        })
-        .unwrap();
+        },
+    )
+    .unwrap();
     assert_eq!(committed.effect, b"hello");
     assert_eq!(committed.frontier.transaction_count, 1);
-    assert_eq!(committed.observation.sequence, 1);
-    assert_eq!(committed.observation.scopes.len(), 1);
+    assert_eq!(committed.scopes.len(), 1);
     assert_ne!(committed.frontier, ReplicaFrontier::EMPTY);
 
     // The query now reads back the committed Body.
@@ -213,11 +224,15 @@ fn authorization_is_checked_per_request() {
     let world_id = WorldId::parse("com.example.notes").unwrap();
     // A principal with no Write standing is denied at submit, not at dock.
     let session = station.dock(&world_id, &reader()).unwrap();
-    let denied = session.submit(WorldIntent {
-        schema: SchemaId::parse("note").unwrap(),
-        schema_version: 1,
-        payload: b"x".to_vec(),
-    });
+    let denied = submit_as(
+        &session,
+        &reader(),
+        WorldIntent {
+            schema: SchemaId::parse("note").unwrap(),
+            schema_version: 1,
+            payload: b"x".to_vec(),
+        },
+    );
     assert_eq!(denied, Err(WorldError::Denied));
 }
 
@@ -333,11 +348,15 @@ fn a_world_panic_is_contained_and_does_not_end_the_station() {
     });
     let station = station_with(reg, world);
     let session = station.dock(&id, &writer()).unwrap();
-    let r = session.submit(WorldIntent {
-        schema: SchemaId::parse("note").unwrap(),
-        schema_version: 1,
-        payload: b"x".to_vec(),
-    });
+    let r = submit_as(
+        &session,
+        &writer(),
+        WorldIntent {
+            schema: SchemaId::parse("note").unwrap(),
+            schema_version: 1,
+            payload: b"x".to_vec(),
+        },
+    );
     assert_eq!(r, Err(WorldError::WorldImplementationFailed));
     // The Station survives the panic and can still go dormant cleanly.
     assert!(station.go_dormant().is_ok());
@@ -352,11 +371,15 @@ fn payload_over_the_declared_limit_is_rejected_before_the_callback() {
     let station = station_with(reg, world);
     let world_id = WorldId::parse("com.example.notes").unwrap();
     let session = station.dock(&world_id, &writer()).unwrap();
-    let r = session.submit(WorldIntent {
-        schema: SchemaId::parse("note").unwrap(),
-        schema_version: 1,
-        payload: b"toolong".to_vec(),
-    });
+    let r = submit_as(
+        &session,
+        &writer(),
+        WorldIntent {
+            schema: SchemaId::parse("note").unwrap(),
+            schema_version: 1,
+            payload: b"toolong".to_vec(),
+        },
+    );
     assert_eq!(r, Err(WorldError::LimitExceeded));
 }
 
@@ -367,20 +390,28 @@ fn unregistered_schema_and_version_are_rejected() {
     let session = station.dock(&world_id, &writer()).unwrap();
     // Unknown schema.
     assert_eq!(
-        session.submit(WorldIntent {
-            schema: SchemaId::parse("other").unwrap(),
-            schema_version: 1,
-            payload: b"x".to_vec(),
-        }),
+        submit_as(
+            &session,
+            &writer(),
+            WorldIntent {
+                schema: SchemaId::parse("other").unwrap(),
+                schema_version: 1,
+                payload: b"x".to_vec(),
+            }
+        ),
         Err(WorldError::UnsupportedSchema)
     );
     // Known schema, unknown version.
     assert_eq!(
-        session.submit(WorldIntent {
-            schema: SchemaId::parse("note").unwrap(),
-            schema_version: 9,
-            payload: b"x".to_vec(),
-        }),
+        submit_as(
+            &session,
+            &writer(),
+            WorldIntent {
+                schema: SchemaId::parse("note").unwrap(),
+                schema_version: 9,
+                payload: b"x".to_vec(),
+            }
+        ),
         Err(WorldError::UnsupportedSchemaVersion)
     );
 }
@@ -401,13 +432,16 @@ fn an_acknowledged_commit_survives_a_crash_without_dormancy() {
     let space = orbit.space_id().clone();
     let station = orbit.activate(ActivationOptions::default()).unwrap();
     let session = station.dock(&world_id, &writer()).unwrap();
-    session
-        .submit(WorldIntent {
+    submit_as(
+        &session,
+        &writer(),
+        WorldIntent {
             schema: SchemaId::parse("note").unwrap(),
             schema_version: 1,
             payload: b"ack'd then crash".to_vec(),
-        })
-        .unwrap();
+        },
+    )
+    .unwrap();
     // Crash: no dormancy, no checkpoint.
     drop(session);
     drop(station);
@@ -444,13 +478,16 @@ fn commits_made_during_an_activation_survive_wait_exit() {
         .unwrap();
     let space = station.space_id().clone();
     let session = station.dock(&world_id, &writer()).unwrap();
-    session
-        .submit(WorldIntent {
+    submit_as(
+        &session,
+        &writer(),
+        WorldIntent {
             schema: SchemaId::parse("note").unwrap(),
             schema_version: 1,
             payload: b"survives wait".to_vec(),
-        })
-        .unwrap();
+        },
+    )
+    .unwrap();
     // Exit via wait (no dormancy checkpoint path).
     let exit = station.wait();
     drop(exit);
@@ -484,13 +521,16 @@ fn committed_bodies_survive_dormancy_and_reactivation() {
     let space = orbit.space_id().clone();
     let station = orbit.activate(ActivationOptions::default()).unwrap();
     let session = station.dock(&world_id, &writer()).unwrap();
-    session
-        .submit(WorldIntent {
+    submit_as(
+        &session,
+        &writer(),
+        WorldIntent {
             schema: SchemaId::parse("note").unwrap(),
             schema_version: 1,
             payload: b"durable".to_vec(),
-        })
-        .unwrap();
+        },
+    )
+    .unwrap();
     // Go dormant: this checkpoints the Replica to the store.
     let orbit = station.go_dormant().unwrap();
     drop(orbit);
@@ -577,11 +617,15 @@ fn a_world_cannot_write_outside_its_namespace() {
     let station = station_with(reg, world);
     let session = station.dock(&id, &writer()).unwrap();
     let before = station.frontier();
-    let r = session.submit(WorldIntent {
-        schema: SchemaId::parse("note").unwrap(),
-        schema_version: 1,
-        payload: b"overwrite you".to_vec(),
-    });
+    let r = submit_as(
+        &session,
+        &writer(),
+        WorldIntent {
+            schema: SchemaId::parse("note").unwrap(),
+            schema_version: 1,
+            payload: b"overwrite you".to_vec(),
+        },
+    );
     assert_eq!(r, Err(WorldError::ContractViolation));
     // Nothing was committed.
     assert_eq!(station.frontier(), before);
@@ -660,11 +704,15 @@ fn a_changed_authority_frontier_refuses_the_commit() {
         .unwrap();
     let session = station.dock(&id, &writer()).unwrap();
     let before = station.frontier();
-    let r = session.submit(WorldIntent {
-        schema: SchemaId::parse("note").unwrap(),
-        schema_version: 1,
-        payload: b"x".to_vec(),
-    });
+    let r = submit_as(
+        &session,
+        &writer(),
+        WorldIntent {
+            schema: SchemaId::parse("note").unwrap(),
+            schema_version: 1,
+            payload: b"x".to_vec(),
+        },
+    );
     assert_eq!(r, Err(WorldError::AuthorityChanged));
     assert_eq!(station.frontier(), before, "nothing committed");
 }
@@ -674,13 +722,16 @@ fn runtime_stamps_the_projection_frontier() {
     let station = station();
     let world_id = WorldId::parse("com.example.notes").unwrap();
     let session = station.dock(&world_id, &writer()).unwrap();
-    let committed = session
-        .submit(WorldIntent {
+    let committed = submit_as(
+        &session,
+        &writer(),
+        WorldIntent {
             schema: SchemaId::parse("note").unwrap(),
             schema_version: 1,
             payload: b"x".to_vec(),
-        })
-        .unwrap();
+        },
+    )
+    .unwrap();
     // The NoteWorld returns ReplicaFrontier::EMPTY from query; Runtime must
     // overwrite it with the real committed frontier of the held snapshot.
     let proj = session
@@ -818,8 +869,8 @@ fn a_collaborative_world_commits_and_reads_through_the_session() {
         payload: text.as_bytes().to_vec(),
     };
 
-    session.submit(intent("first comment")).unwrap();
-    session.submit(intent("second comment")).unwrap();
+    submit_as(&session, &writer(), intent("first comment")).unwrap();
+    submit_as(&session, &writer(), intent("second comment")).unwrap();
     let proj = session.query(query()).unwrap();
     assert_eq!(proj.bytes, b"2:first comment,second comment");
 
@@ -911,21 +962,139 @@ fn containment_is_bound_to_the_intent_schema_not_the_world() {
     let before = station.frontier();
     // An ATOMIC-schema intent staging a collaborative op is refused even though
     // the World also registers a collaborative schema.
-    let r = session.submit(WorldIntent {
-        schema: SchemaId::parse("atomicdoc").unwrap(),
-        schema_version: 1,
-        payload: vec![],
-    });
+    let r = submit_as(
+        &session,
+        &writer(),
+        WorldIntent {
+            schema: SchemaId::parse("atomicdoc").unwrap(),
+            schema_version: 1,
+            payload: vec![],
+        },
+    );
     assert_eq!(r, Err(WorldError::ContractViolation));
     assert_eq!(station.frontier(), before, "nothing committed");
     // The SAME staged ops under the collaborative schema are legal.
-    session
-        .submit(WorldIntent {
+    submit_as(
+        &session,
+        &writer(),
+        WorldIntent {
             schema: SchemaId::parse("collabdoc").unwrap(),
+            schema_version: 1,
+            payload: vec![],
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn an_identical_signed_replay_returns_the_original_result_without_reapplying() {
+    // A collaborative CounterAdd is the canonical non-idempotent operation:
+    // replaying the SAME signed action must return the original committed
+    // result and must NOT bump the counter again.
+    let world = BoardWorld::new();
+    let id = world.id();
+    let reg = WorldRegistration {
+        id: id.clone(),
+        implementation_version: WorldVersion(1),
+        schemas: world.schemas().to_vec(),
+        limits: WorldLimits::default(),
+    };
+    let station = station_with(reg, Arc::new(world));
+    let session = station.dock(&id, &writer()).unwrap();
+    let action = writer()
+        .sign_action(
+            &session,
+            crate::action::RequestId::mint(),
+            WorldIntent {
+                schema: SchemaId::parse("card").unwrap(),
+                schema_version: 1,
+                payload: b"a comment".to_vec(),
+            },
+        )
+        .unwrap();
+
+    let first = session.submit(action.clone()).unwrap();
+    let replay = session.submit(action.clone()).unwrap();
+    assert_eq!(
+        first, replay,
+        "identical replay returns the identical result"
+    );
+    assert_eq!(
+        station.frontier(),
+        first.frontier,
+        "the replay committed nothing"
+    );
+    let proj = session
+        .query(WorldQuery {
+            schema: SchemaId::parse("card").unwrap(),
             schema_version: 1,
             payload: vec![],
         })
         .unwrap();
+    assert_eq!(
+        proj.bytes, b"1:a comment",
+        "the counter bumped exactly once and the comment inserted exactly once"
+    );
+}
+
+#[test]
+fn reusing_a_request_id_with_a_different_payload_is_a_typed_conflict() {
+    let station = station();
+    let world_id = WorldId::parse("com.example.notes").unwrap();
+    let session = station.dock(&world_id, &writer()).unwrap();
+    let request = crate::action::RequestId::from_bytes([77u8; 16]);
+    let intent = |text: &[u8]| WorldIntent {
+        schema: SchemaId::parse("note").unwrap(),
+        schema_version: 1,
+        payload: text.to_vec(),
+    };
+    session
+        .submit(
+            writer()
+                .sign_action(&session, request, intent(b"first"))
+                .unwrap(),
+        )
+        .unwrap();
+    let after_first = station.frontier();
+    let err = session
+        .submit(
+            writer()
+                .sign_action(&session, request, intent(b"second"))
+                .unwrap(),
+        )
+        .unwrap_err();
+    assert_eq!(err, WorldError::RequestIdConflict);
+    assert_eq!(station.frontier(), after_first, "nothing committed");
+}
+
+#[test]
+fn an_action_for_another_space_or_world_is_refused() {
+    let station = station();
+    let world_id = WorldId::parse("com.example.notes").unwrap();
+    let session = station.dock(&world_id, &writer()).unwrap();
+    let good = writer()
+        .sign_action(
+            &session,
+            crate::action::RequestId::mint(),
+            WorldIntent {
+                schema: SchemaId::parse("note").unwrap(),
+                schema_version: 1,
+                payload: b"x".to_vec(),
+            },
+        )
+        .unwrap();
+    // Rebind the header to a different Space: the (re-signed) action no longer
+    // addresses this Session and is refused before the World runs.
+    let mut header = good.header.clone();
+    header.space = mechanics::ids::SpaceId::from_digest([0xAB; 16]);
+    let foreign =
+        crate::action::SignedWorldActionV1::sign(header, good.payload.clone(), &WRITER_SEED);
+    assert_eq!(session.submit(foreign), Err(WorldError::InvalidRequest));
+    // A tampered (unsigned) mutation of the same header fails signature
+    // verification outright.
+    let mut tampered = good.clone();
+    tampered.header.world = WorldId::parse("com.example.other").unwrap();
+    assert_eq!(session.submit(tampered), Err(WorldError::InvalidRequest));
 }
 
 #[test]

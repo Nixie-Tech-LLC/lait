@@ -6,13 +6,15 @@
 //! cloneable and owns configuration + registrations; it owns no active Space
 //! state. Orbit and Station are **not** cloneable.
 //!
-//! S3 makes the durable footprint real: an Orbit is backed by an on-disk store
+//! The durable footprint is real: an Orbit is backed by an on-disk store
 //! ([`crate::store`]) and holds the exclusive store lock (operational
-//! ownership). Activation durably increments the store epoch and moves the lock
-//! into the Station, which owns a cancellation token and a tracked task set.
-//! Dormancy drains those tasks in a fixed order and releases the lock **last**.
-//! Replica content materialization, transports, and Contact land in S5; the
-//! lifecycle, lock, epoch, task drain, and Session isolation here are real.
+//! ownership). Activation durably increments the store epoch, opens the
+//! journaled Replica (running crash recovery), and moves the lock into the
+//! Station, which owns a cancellation token and a tracked task set. Dormancy
+//! drains those tasks in a fixed order and releases the lock **last**.
+//! [`Station::neighbors`] and [`Station::contact`] are incomplete surfaces
+//! until completion package C2 (`docs/plans/02-runtime-world-carve.md`)
+//! delivers the persistent Neighbor registry and Contact orchestration.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -94,7 +96,8 @@ impl Default for ActivationOptions {
     }
 }
 
-/// Options for an administrative/test Contact. Reserved shape; S5.
+/// Options for an administrative/test Contact. Reserved shape until completion
+/// package C2 wires Contact transport and deadlines.
 #[derive(Debug, Clone, Default)]
 pub struct ContactOptions;
 
@@ -180,8 +183,9 @@ impl Runtime {
 
     /// Form a new Space and its founding Orbit: mint a fresh SpaceId, create the
     /// store (marker + zero epoch), and acquire the exclusive lock. The full
-    /// founding proof and Coordinates minting land in S5; the durable Orbit and
-    /// its lock are real here.
+    /// mechanics founding proof and Coordinates minting arrive with the product
+    /// cutover (completion package C5); the durable Orbit and its lock are real
+    /// here.
     pub fn form_space(&self, _options: SpaceFormationOptions) -> Result<Orbit, LifecycleError> {
         let root = self.root()?;
         let mut digest = [0u8; 16];
@@ -201,9 +205,10 @@ impl Runtime {
 
     /// Materialize this device's Orbit from Coordinates. The Coordinates are
     /// fully verified (version, founding self-proof, approach-Station signature,
-    /// admission structure); a pre-carve `SpaceTicket` fails with
+    /// admission structure); pre-carve invitation bytes fail with
     /// [`LifecycleError::UnsupportedCoordinatesVersion`]. The store is created if
-    /// absent and locked. Replica **content** import lands in S5.
+    /// absent and locked. Admission redemption and initial authority/Replica
+    /// import arrive with the product cutover (completion package C5).
     pub fn enter_orbit(
         &self,
         coordinates: &crate::coordinates::SignedCoordinatesV1,
@@ -345,7 +350,7 @@ impl Orbit {
             cancel: CancelToken::new(),
             handles: Mutex::new(Vec::new()),
             drain_deadline: options.drain_deadline,
-            core: Arc::new(crate::session::StationCore::new(epoch, replica)),
+            core: Arc::new(crate::session::StationCore::new(replica)),
         })
     }
 
@@ -475,12 +480,13 @@ impl Station {
         let world = self
             .registry
             .world(world_id)
-            .ok_or(LifecycleError::NotYetWired("unknown world at dock"))?;
+            .ok_or_else(|| LifecycleError::UnknownWorld(world_id.clone()))?;
         let registration = self
             .registry
             .registration(world_id)
-            .ok_or(LifecycleError::NotYetWired("unknown world at dock"))?;
+            .ok_or_else(|| LifecycleError::UnknownWorld(world_id.clone()))?;
         Ok(Session::new(
+            self.store.space().clone(),
             world_id.clone(),
             world,
             principal,
@@ -498,13 +504,19 @@ impl Station {
         self.core.frontier()
     }
 
-    /// Known/discoverable Neighbors. Reachability is advisory. Populated in S4/S5.
+    /// Known/discoverable Neighbors. Reachability is advisory. **Incomplete
+    /// surface**: the persistent Neighbor registry is completion package C2 of
+    /// `docs/plans/02-runtime-world-carve.md`; until it lands this returns an
+    /// empty snapshot and the public lifecycle is not claimed complete.
     pub fn neighbors(&self) -> Vec<Neighbor> {
         Vec::new()
     }
 
     /// An explicitly privileged administrative/test Contact. Not exposed on
-    /// ordinary Session handles. Wired in S5.
+    /// ordinary Session handles. **Incomplete surface**: Contact transport and
+    /// scheduling are completion package C2 of
+    /// `docs/plans/02-runtime-world-carve.md`; until it lands every Neighbor is
+    /// reported `Unreachable` and the public lifecycle is not claimed complete.
     pub fn contact(
         &self,
         _neighbor: &StationId,
@@ -638,10 +650,10 @@ mod tests {
         dir
     }
 
-    fn runtime(root: &PathBuf) -> Runtime {
+    fn runtime(root: &std::path::Path) -> Runtime {
         // These lifecycle tests never dock, so the deny-all authority suffices.
         Runtime::open(
-            root.clone(),
+            root.to_path_buf(),
             RuntimeBuilder::new().build().unwrap(),
             Arc::new(DenyAllAuthority),
         )
@@ -737,8 +749,9 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let orbit = rt.form_space(SpaceFormationOptions::default()).unwrap();
         let space = orbit.space_id().clone();
-        let mut opts = ActivationOptions::default();
-        opts.drain_deadline = Duration::from_millis(20);
+        let opts = ActivationOptions {
+            drain_deadline: Duration::from_millis(20),
+        };
         let station = orbit.activate(opts).unwrap();
         let stop2 = stop.clone();
         // A task that ignores cancellation until we let it go.

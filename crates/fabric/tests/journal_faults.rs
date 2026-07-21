@@ -209,11 +209,7 @@ fn orphans_and_temps_are_collected_on_open() {
 
     // Litter: a stray temp and an unreferenced (fake) object.
     std::fs::write(root.join("objects").join("deadbeef.tmp"), b"junk").unwrap();
-    std::fs::write(
-        root.join("objects").join(format!("{}", "ab".repeat(32))),
-        b"junk",
-    )
-    .unwrap();
+    std::fs::write(root.join("objects").join("ab".repeat(32)), b"junk").unwrap();
 
     let store = JournaledStore::open(&root).unwrap();
     let names: Vec<String> = std::fs::read_dir(root.join("objects"))

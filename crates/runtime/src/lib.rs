@@ -55,8 +55,9 @@ pub use coordinates::{
 };
 pub use error::{ContactError, DormancyError, LifecycleError, StationExit, WorldError};
 pub use lifecycle::{
-    ActivationOptions, CancelToken, ContactOutcome, DeorbitConfirmation, EnterOptions, Neighbor,
-    Orbit, OrbitObservation, Reachability, Runtime, SpaceFormationOptions, Station,
+    ActivationOptions, CancelToken, ContactOptions, ContactOutcome, DeorbitConfirmation,
+    EnterOptions, Neighbor, Orbit, OrbitObservation, Reachability, Runtime, SpaceFormationOptions,
+    Station,
 };
 pub use neighbor_presence::{AckV1, PresenceError, ProbeV1};
 pub use registry::{RuntimeBuilder, WorldRegistry};

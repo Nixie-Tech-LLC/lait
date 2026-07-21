@@ -56,7 +56,7 @@ filter = '''
     + binary(seed_registry)
     + binary(control_plane)
     + binary(cli_safety)
-    + (package(lait-net) & kind(test))
+    + (package(comms) & kind(test))
 '''
 test-group = 'network'
 retries = 1

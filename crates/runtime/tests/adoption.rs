@@ -54,6 +54,15 @@ fn reader() -> LocalIdentity {
     Runtime::identity_from_seed(&READER_SEED)
 }
 
+/// Sign and submit an intent through the frozen public action API.
+fn submit_as(
+    session: &runtime::Session,
+    identity: &LocalIdentity,
+    intent: WorldIntent,
+) -> Result<runtime::CommittedEffect, WorldError> {
+    session.submit(identity.sign_action(session, runtime::RequestId::mint(), intent)?)
+}
+
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn temp_root() -> PathBuf {
@@ -139,7 +148,7 @@ impl World for KvWorld {
     }
 }
 
-fn kv_runtime(root: &PathBuf) -> Runtime {
+fn kv_runtime(root: &std::path::Path) -> Runtime {
     let world = KvWorld::new();
     let reg = WorldRegistration {
         id: world.id(),
@@ -151,7 +160,7 @@ fn kv_runtime(root: &PathBuf) -> Runtime {
         .register(reg, Arc::new(world))
         .build()
         .unwrap();
-    Runtime::open(root.clone(), registry, Arc::new(ConsumerAuthority))
+    Runtime::open(root.to_path_buf(), registry, Arc::new(ConsumerAuthority))
 }
 
 fn world_id() -> WorldId {
@@ -175,23 +184,29 @@ fn a_consumer_drives_the_whole_lifecycle_through_the_public_api() {
 
     // Dock and durably submit two entries.
     let session = station.dock(&world_id(), &writer()).unwrap();
-    let c1 = session
-        .submit(WorldIntent {
+    let c1 = submit_as(
+        &session,
+        &writer(),
+        WorldIntent {
             schema: SchemaId::parse("entry").unwrap(),
             schema_version: 1,
             payload: b"greeting=hello".to_vec(),
-        })
-        .unwrap();
-    assert_eq!(c1.observation.sequence, 1);
+        },
+    )
+    .unwrap();
+    assert_eq!(c1.scopes.len(), 1);
     assert_ne!(c1.frontier, ReplicaFrontier::EMPTY);
-    let c2 = session
-        .submit(WorldIntent {
+    let c2 = submit_as(
+        &session,
+        &writer(),
+        WorldIntent {
             schema: SchemaId::parse("entry").unwrap(),
             schema_version: 1,
             payload: b"farewell=bye".to_vec(),
-        })
-        .unwrap();
-    assert_eq!(c2.observation.sequence, 2);
+        },
+    )
+    .unwrap();
+    assert_eq!(c2.scopes.len(), 1);
     assert_ne!(c1.frontier, c2.frontier);
     assert_eq!(station.frontier(), c2.frontier);
 
@@ -229,11 +244,15 @@ fn a_consumer_drives_the_whole_lifecycle_through_the_public_api() {
     // Per-request authorization: a read-only principal cannot write.
     let readonly = station.dock(&world_id(), &reader()).unwrap();
     assert_eq!(
-        readonly.submit(WorldIntent {
-            schema: SchemaId::parse("entry").unwrap(),
-            schema_version: 1,
-            payload: b"x=y".to_vec(),
-        }),
+        submit_as(
+            &readonly,
+            &reader(),
+            WorldIntent {
+                schema: SchemaId::parse("entry").unwrap(),
+                schema_version: 1,
+                payload: b"x=y".to_vec(),
+            }
+        ),
         Err(WorldError::Denied)
     );
 

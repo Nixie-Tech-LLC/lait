@@ -12,11 +12,13 @@
 //! names neither `loro` nor any product/consumer vocabulary — the dependency
 //! edge is the seal, and the guard suite proves the vocabulary boundary.
 //!
-//! S0 establishes the sealed contract surface: Body identity ([`ids`]), Body
-//! schemas/operations/descriptors ([`body`]), semantic/authority frontiers
-//! ([`frontier`]), and Convergence outcomes ([`convergence`]). The transaction
-//! planning and Fabric translation land in later stages (S5); the algebra is
-//! frozen as an S1 fixture.
+//! The sealed contract surface: Body identity ([`ids`]), Body schemas/
+//! operations/descriptors ([`body`]), semantic/authority frontiers
+//! ([`frontier`]), Convergence outcomes ([`convergence`]), signed transactions
+//! and manifests ([`transaction`], [`manifest`]), persistent-idempotency
+//! receipts ([`receipt`]), and the committing [`replica`] itself, which
+//! translates validated Body operations into Fabric operations and advances
+//! only from durable Fabric receipts.
 
 pub mod algebra;
 pub mod body;
@@ -25,6 +27,7 @@ pub mod frontier;
 pub mod ids;
 pub mod manifest;
 pub mod marker;
+pub mod receipt;
 pub mod replica;
 pub mod transaction;
 
@@ -40,5 +43,6 @@ pub use manifest::{
     RootObservation,
 };
 pub use marker::{MarkerError, StoreMarkerV1};
-pub use replica::{Replica, ReplicaCommitError};
+pub use receipt::{ReceiptError, RequestReceiptV1, MAX_EFFECT_BYTES};
+pub use replica::{ActionOutcome, Replica, ReplicaCommitError};
 pub use transaction::{AuthoritySource, BodyDescriptorV1, BodyTransactionV1, TransactionError};

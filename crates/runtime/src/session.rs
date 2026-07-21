@@ -69,13 +69,16 @@ pub struct Observation {
 
 /// The result of a durable [`Session::submit`]: the application-defined effect
 /// bytes, the **committed** Replica frontier the change advanced to, and the
-/// Observation Runtime published. A `CommittedEffect` is proof of durability —
+/// Observation scopes it touched. A `CommittedEffect` is proof of durability —
 /// it is returned only after the Replica advanced from a real Fabric receipt.
+/// An identical replay of the same request returns the identical
+/// `CommittedEffect` without reapplying anything; invalidation delivery is the
+/// job of [`Session::observe`], not of this return value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommittedEffect {
     pub effect: Vec<u8>,
     pub frontier: ReplicaFrontier,
-    pub observation: Observation,
+    pub scopes: Vec<BodyKey>,
 }
 
 /// The single mutex-guarded committing state: the Replica writer plus the
@@ -95,18 +98,16 @@ struct CoreInner {
 pub(crate) struct StationCore {
     inner: std::sync::Mutex<CoreInner>,
     obs_seq: std::sync::atomic::AtomicU64,
-    epoch: StationEpoch,
 }
 
 impl StationCore {
-    pub(crate) fn new(epoch: StationEpoch, replica: replica::Replica) -> Self {
+    pub(crate) fn new(replica: replica::Replica) -> Self {
         Self {
             inner: std::sync::Mutex::new(CoreInner {
                 replica,
                 closed: false,
             }),
             obs_seq: std::sync::atomic::AtomicU64::new(0),
-            epoch,
         }
     }
 
@@ -141,6 +142,7 @@ impl crate::world::BodyReader for ReplicaReader<'_> {
 
 /// A local caller's handle to a hosted World.
 pub struct Session {
+    space: mechanics::ids::SpaceId,
     world_id: WorldId,
     world: Arc<dyn World>,
     principal: PrincipalFacts,
@@ -162,6 +164,7 @@ pub struct Session {
 impl Session {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+        space: mechanics::ids::SpaceId,
         world_id: WorldId,
         world: Arc<dyn World>,
         principal: PrincipalFacts,
@@ -173,6 +176,7 @@ impl Session {
         authority: Arc<dyn AuthorityView>,
     ) -> Self {
         Self {
+            space,
             world_id,
             world,
             principal,
@@ -183,6 +187,23 @@ impl Session {
             core,
             authority,
         }
+    }
+
+    /// The Space this Session's Station serves.
+    pub fn space_id(&self) -> &mechanics::ids::SpaceId {
+        &self.space
+    }
+
+    /// Resolve fresh mechanics facts for `sign_action` — only the docked
+    /// device resolves through this Session's authority view.
+    pub(crate) fn resolve_for_signing(
+        &self,
+        device: &mechanics::ids::DeviceId,
+    ) -> Option<crate::world::PrincipalResolution> {
+        if device != &self.principal.device {
+            return None;
+        }
+        self.authority.resolve(device)
     }
 
     /// Fresh principal facts for THIS request: standing and the authority
@@ -304,35 +325,92 @@ impl Session {
         self.epoch
     }
 
-    /// Submit an application intent and **durably commit** its effect. Runtime
-    /// derives the principal facts (the caller cannot assert them), validates the
-    /// request, runs the World to stage Body operations, then commits them
-    /// through the Station's exclusive Replica writer and publishes an
-    /// Observation. The returned [`CommittedEffect`] is proof of durability: it
-    /// exists only after the committed state was durably written (the Replica's
-    /// per-commit durability sink). A refused request commits nothing.
-    pub fn submit(&self, intent: WorldIntent) -> Result<CommittedEffect, WorldError> {
+    /// Submit a canonical signed action and **durably commit** its effect under
+    /// the persistent-idempotency scope `(Space, World, Device, RequestId)`.
+    ///
+    /// The action is verified (canonical form, payload binding, signer
+    /// self-signature) and must name this Session's Space and World; the signer
+    /// must be the docked principal, re-resolved through mechanics for this
+    /// request; and the header's authority frontier must still be current at
+    /// commit (a change refuses with [`WorldError::AuthorityChanged`]). An
+    /// identical replay returns the original [`CommittedEffect`] without
+    /// reapplying any operation; reusing the request id with a different
+    /// payload is [`WorldError::RequestIdConflict`]. A refused request commits
+    /// nothing. The returned [`CommittedEffect`] is proof of durability: it
+    /// exists only after the journaled store committed the transaction.
+    pub fn submit(
+        &self,
+        action: crate::action::SignedWorldActionV1,
+    ) -> Result<CommittedEffect, WorldError> {
         self.ensure_live()?;
+        // Opaque verification first: version, algorithm, bounds, payload hash,
+        // signer identity, self-signature.
+        action.verify_self().map_err(|e| match e {
+            crate::action::ActionError::PayloadTooLarge => WorldError::LimitExceeded,
+            _ => WorldError::InvalidRequest,
+        })?;
+        // The action must address exactly this Session.
+        if action.header.space != self.space || action.header.world != self.world_id {
+            return Err(WorldError::InvalidRequest);
+        }
+        let intent = WorldIntent {
+            schema: action.header.intent_schema.clone(),
+            schema_version: action.header.intent_version,
+            payload: action.payload,
+        };
         self.ensure_within_limit(intent.payload.len())?;
         self.ensure_writable_schema(&intent.schema, intent.schema_version)?;
         let world = &self.world;
         let label = intent.schema.as_str().to_string();
         let intent_schema = intent.schema.clone();
+        let request = action.header.request.as_bytes();
+        let payload_hash = action.header.payload_hash;
         // Hold the exclusive writer across the WHOLE transaction — including
-        // both authority resolutions. Authorization, the World callback, the
-        // frontier compare-and-swap, and the durable commit all run inside one
-        // critical section, so any authority mutation that itself serializes
-        // through this Station's writer (as orbital authority mutations do —
-        // membership changes are Replica commits) cannot interleave between
-        // the comparison and the commit. External `AuthorityView`
-        // implementations owe the linearizable-read contract documented on
-        // the trait.
+        // both authority resolutions. Authorization, the idempotency lookup,
+        // the World callback, the frontier compare-and-swap, and the durable
+        // commit all run inside one critical section, so any authority
+        // mutation that itself serializes through this Station's writer (as
+        // orbital authority mutations do — membership changes are Replica
+        // commits) cannot interleave between the comparison and the commit.
+        // External `AuthorityView` implementations owe the linearizable-read
+        // contract documented on the trait.
         let mut inner = self.core.lock();
         if inner.closed {
             return Err(WorldError::StationDormant);
         }
-        // Per-request authorization, resolved under the writer lock.
+        // Per-request authorization, resolved under the writer lock. The
+        // signer must BE the docked principal.
         let principal = self.fresh_principal()?;
+        if action.header.actor != principal.actor || action.header.device != principal.device {
+            return Err(WorldError::Denied);
+        }
+        // Idempotency: an identical replay returns the original committed
+        // result before the World runs again; a conflicting reuse is refused.
+        match inner.replica.lookup_action(
+            &self.space,
+            &self.world_id,
+            &principal.device,
+            &request,
+            &payload_hash,
+        ) {
+            Ok(None) => {}
+            Ok(Some(receipt)) => {
+                return Ok(CommittedEffect {
+                    effect: receipt.effect,
+                    frontier: receipt.frontier,
+                    scopes: receipt.scopes,
+                });
+            }
+            Err(replica::ReplicaCommitError::RequestIdConflict) => {
+                return Err(WorldError::RequestIdConflict)
+            }
+            Err(_) => return Err(WorldError::Persistence),
+        }
+        // The frontier the action was signed against must still be current —
+        // the same compare the commit-side CAS re-checks after the callback.
+        if action.header.authority_frontier != principal.authority_frontier {
+            return Err(WorldError::AuthorityChanged);
+        }
         let effect: WorldEffect = {
             let reader = ReplicaReader(&inner.replica);
             let principal = &principal;
@@ -353,19 +431,31 @@ impl Session {
             .authority
             .resolve(&principal.device)
             .ok_or(WorldError::Denied)?;
-        if current.authority_frontier != principal.authority_frontier {
+        if current.authority_frontier != action.header.authority_frontier {
             return Err(WorldError::AuthorityChanged);
         }
-        let frontier = inner
+        let outcome = inner
             .replica
-            .commit(&label, &effect.operations)
+            .commit_action(
+                &self.space,
+                &self.world_id,
+                &principal.device,
+                &request,
+                &payload_hash,
+                effect.effect,
+                effect.scopes,
+                &label,
+                &effect.operations,
+            )
             .map_err(|e| match e {
                 // A staged op the engine cannot express is a World bug.
                 replica::ReplicaCommitError::UnsupportedOp => WorldError::ContractViolation,
                 replica::ReplicaCommitError::PathInvalid
                 | replica::ReplicaCommitError::InvalidOp(_) => WorldError::InvalidRequest,
                 replica::ReplicaCommitError::OpLimit => WorldError::LimitExceeded,
+                replica::ReplicaCommitError::EffectTooLarge => WorldError::LimitExceeded,
                 replica::ReplicaCommitError::TypeConflict => WorldError::Conflict,
+                replica::ReplicaCommitError::RequestIdConflict => WorldError::RequestIdConflict,
                 // Illegitimate is an incorporation-path error; a local commit
                 // never produces it, but the match stays exhaustive.
                 replica::ReplicaCommitError::Illegitimate(_)
@@ -376,24 +466,18 @@ impl Session {
                 | replica::ReplicaCommitError::Poisoned => WorldError::Persistence,
             })?;
         drop(inner);
-
-        // Publish the Observation for the committed change.
-        let sequence = self
-            .core
+        let receipt = match outcome {
+            replica::ActionOutcome::Committed(r) | replica::ActionOutcome::Replayed(r) => r,
+        };
+        // Count the committed change for the Observation sequence (the C3
+        // stream surface publishes from this counter).
+        self.core
             .obs_seq
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(CommittedEffect {
-            effect: effect.effect,
-            frontier,
-            observation: Observation {
-                epoch: self.core.epoch,
-                sequence,
-                reset: false,
-                world: self.world_id.clone(),
-                scopes: effect.scopes,
-                frontier,
-            },
+            effect: receipt.effect,
+            frontier: receipt.frontier,
+            scopes: receipt.scopes,
         })
     }
 
@@ -427,8 +511,11 @@ impl Session {
         Ok(projection)
     }
 
-    /// Begin observing from a cursor. The streaming surface lands in S5; S0
-    /// returns the reset-bearing starting Observation position.
+    /// Begin observing from a cursor. **Incomplete surface**: the bounded
+    /// Observation stream (ring buffer, reset semantics, backpressure) is
+    /// completion package C3 of `docs/plans/02-runtime-world-carve.md`; until
+    /// it lands this echoes the input cursor and delivers nothing, and the
+    /// public lifecycle is not claimed complete.
     pub fn observe(&self, cursor: ObservationCursor) -> ObservationCursor {
         cursor
     }

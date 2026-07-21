@@ -122,6 +122,15 @@ impl World for TallyWorld {
     }
 }
 
+/// Sign and submit an intent through the frozen public action API.
+fn submit_as(
+    session: &runtime::Session,
+    identity: &runtime::LocalIdentity,
+    intent: WorldIntent,
+) -> Result<runtime::CommittedEffect, WorldError> {
+    session.submit(identity.sign_action(session, runtime::RequestId::mint(), intent)?)
+}
+
 #[test]
 fn the_product_composes_the_orbital_runtime_for_an_independent_world() {
     let home = temp_home();
@@ -149,22 +158,28 @@ fn the_product_composes_the_orbital_runtime_for_an_independent_world() {
     let session = station.dock(&world_id, &writer).unwrap();
 
     // Two increments: 5 then 3 bytes.
-    session
-        .submit(WorldIntent {
+    submit_as(
+        &session,
+        &writer,
+        WorldIntent {
             schema: SchemaId::parse("tally").unwrap(),
             schema_version: 1,
             payload: b"hello".to_vec(),
-        })
-        .unwrap();
-    let second = session
-        .submit(WorldIntent {
+        },
+    )
+    .unwrap();
+    let second = submit_as(
+        &session,
+        &writer,
+        WorldIntent {
             schema: SchemaId::parse("tally").unwrap(),
             schema_version: 1,
             payload: b"add".to_vec(),
-        })
-        .unwrap();
+        },
+    )
+    .unwrap();
     assert_eq!(second.effect, b"8");
-    assert_eq!(second.observation.sequence, 2);
+    assert_eq!(second.scopes.len(), 1);
 
     // The store lives under the product's orbital root.
     assert!(orbital_store_root(&home).join(space.as_str()).is_dir());

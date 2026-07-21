@@ -75,6 +75,12 @@ pub enum ReplicaCommitError {
     /// A previous durability failure poisoned this Replica; reopen from the
     /// durable store.
     Poisoned,
+    /// A request id was reused with a different payload hash. Nothing was
+    /// committed; the original receipt is untouched.
+    RequestIdConflict,
+    /// The application effect exceeded [`crate::receipt::MAX_EFFECT_BYTES`].
+    /// Nothing was committed.
+    EffectTooLarge,
 }
 
 impl std::fmt::Display for ReplicaCommitError {
@@ -83,6 +89,26 @@ impl std::fmt::Display for ReplicaCommitError {
     }
 }
 impl std::error::Error for ReplicaCommitError {}
+
+/// The outcome of committing a request through the persistent-idempotency
+/// scope: either a fresh commit or a replay of the original receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionOutcome {
+    /// The request committed now; the receipt records its result.
+    Committed(crate::receipt::RequestReceiptV1),
+    /// The identical request had already committed; the original receipt is
+    /// returned and **nothing was reapplied**.
+    Replayed(crate::receipt::RequestReceiptV1),
+}
+
+impl ActionOutcome {
+    /// The receipt either way.
+    pub fn receipt(&self) -> &crate::receipt::RequestReceiptV1 {
+        match self {
+            ActionOutcome::Committed(r) | ActionOutcome::Replayed(r) => r,
+        }
+    }
+}
 
 /// The Orbit's durable local materialization, over a Fabric engine.
 pub struct Replica {
@@ -95,6 +121,11 @@ pub struct Replica {
     /// Set after a durability failure: the in-memory engine has state the store
     /// does not, so no further commit may be acknowledged.
     poisoned: bool,
+    /// The persistent-idempotency index, keyed by the canonical scope key.
+    /// The packet and lookup semantics are frozen (C0); its durable
+    /// content-addressed representation joins the canonical store in C1.3,
+    /// sharing the transaction's journal linearization point.
+    receipts: std::collections::BTreeMap<Vec<u8>, crate::receipt::RequestReceiptV1>,
 }
 
 /// The serialized durable state of a Replica: the engine snapshot and the
@@ -135,6 +166,7 @@ impl Replica {
             frontier: ReplicaFrontier::EMPTY,
             durable: None,
             poisoned: false,
+            receipts: std::collections::BTreeMap::new(),
         }
     }
 
@@ -183,6 +215,7 @@ impl Replica {
             frontier,
             durable: Some(store),
             poisoned: false,
+            receipts: std::collections::BTreeMap::new(),
         })
     }
 
@@ -212,12 +245,23 @@ impl Replica {
             frontier: cp.frontier,
             durable: None,
             poisoned: false,
+            receipts: std::collections::BTreeMap::new(),
         })
     }
 
     /// The current semantic frontier.
     pub fn frontier(&self) -> ReplicaFrontier {
         self.frontier
+    }
+
+    /// Test seam: attach a fault injector to the underlying journaled store
+    /// (see [`fabric::journal::FAULT_POINTS`]). No effect without a durable
+    /// store.
+    pub fn with_store_fault_injector(mut self, injector: fabric::journal::FaultInjector) -> Self {
+        if let Some(store) = self.durable.take() {
+            self.durable = Some(store.with_fault_injector(injector));
+        }
+        self
     }
 
     /// Commit a set of staged Body operations. With a durability sink attached,
@@ -260,6 +304,69 @@ impl Replica {
             }
         };
         self.persist_and_advance(receipt.causal().as_bytes())
+    }
+
+    /// Look up a request in the persistent-idempotency scope
+    /// `(Space, World, Device, RequestId)`. An identical payload hash returns
+    /// the original receipt — the caller must **not** reapply; a different
+    /// payload hash under the same scope is a typed conflict; an unknown scope
+    /// is `None` (commit may proceed).
+    pub fn lookup_action(
+        &self,
+        space: &mechanics::ids::SpaceId,
+        world: &crate::ids::WorldId,
+        device: &mechanics::ids::DeviceId,
+        request: &[u8; 16],
+        payload_hash: &[u8; 32],
+    ) -> Result<Option<crate::receipt::RequestReceiptV1>, ReplicaCommitError> {
+        let key = crate::receipt::scope_key(space, world, device, request);
+        match self.receipts.get(&key) {
+            None => Ok(None),
+            Some(r) if &r.payload_hash == payload_hash => Ok(Some(r.clone())),
+            Some(_) => Err(ReplicaCommitError::RequestIdConflict),
+        }
+    }
+
+    /// Commit a request's staged operations under its persistent-idempotency
+    /// scope. Identical replay returns the original receipt **without
+    /// reapplying** a single operation; reuse with a different payload hash is
+    /// [`ReplicaCommitError::RequestIdConflict`]; a fresh request commits
+    /// durably and records its receipt with the transaction. The effect bytes
+    /// are bounded by [`crate::receipt::MAX_EFFECT_BYTES`] **before** anything
+    /// is applied.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_action(
+        &mut self,
+        space: &mechanics::ids::SpaceId,
+        world: &crate::ids::WorldId,
+        device: &mechanics::ids::DeviceId,
+        request: &[u8; 16],
+        payload_hash: &[u8; 32],
+        effect: Vec<u8>,
+        scopes: Vec<BodyKey>,
+        request_label: &str,
+        ops: &[(BodyKey, BodyOp)],
+    ) -> Result<ActionOutcome, ReplicaCommitError> {
+        if let Some(receipt) = self.lookup_action(space, world, device, request, payload_hash)? {
+            return Ok(ActionOutcome::Replayed(receipt));
+        }
+        if effect.len() > crate::receipt::MAX_EFFECT_BYTES {
+            return Err(ReplicaCommitError::EffectTooLarge);
+        }
+        let frontier = self.commit(request_label, ops)?;
+        let receipt = crate::receipt::RequestReceiptV1 {
+            version: 1,
+            space: space.clone(),
+            world: world.clone(),
+            device: device.clone(),
+            request: *request,
+            payload_hash: *payload_hash,
+            effect,
+            scopes,
+            frontier,
+        };
+        self.receipts.insert(receipt.scope_key(), receipt.clone());
+        Ok(ActionOutcome::Committed(receipt))
     }
 
     /// Export this Replica's representation as a **signed, authority-bound
@@ -1139,6 +1246,217 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.read_collaborative(&k).unwrap().counters["votes"], 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn action_scope() -> (
+        mechanics::ids::SpaceId,
+        WorldId,
+        mechanics::ids::DeviceId,
+        [u8; 16],
+    ) {
+        (
+            mechanics::ids::SpaceId::from_digest([21u8; 16]),
+            WorldId::parse("com.example.notes").unwrap(),
+            mechanics::crypto::device_from_seed(&[22u8; 32]),
+            [23u8; 16],
+        )
+    }
+
+    #[test]
+    fn identical_replay_returns_the_original_receipt_without_reapplying() {
+        let (space, world, device, request) = action_scope();
+        let mut r = Replica::loro();
+        let k = key(10);
+        let ops = vec![(
+            k.clone(),
+            BodyOp::CounterAdd {
+                path: "votes".into(),
+                delta: 5,
+            },
+        )];
+        let hash = [1u8; 32];
+        let first = r
+            .commit_action(
+                &space,
+                &world,
+                &device,
+                &request,
+                &hash,
+                b"bumped".to_vec(),
+                vec![k.clone()],
+                "bump",
+                &ops,
+            )
+            .unwrap();
+        let ActionOutcome::Committed(receipt) = &first else {
+            panic!("first commit must be fresh");
+        };
+        assert_eq!(r.read_collaborative(&k).unwrap().counters["votes"], 5);
+
+        // The identical retry replays the receipt; the non-idempotent
+        // CounterAdd is NOT reapplied and the frontier does not move.
+        let again = r
+            .commit_action(
+                &space,
+                &world,
+                &device,
+                &request,
+                &hash,
+                b"bumped".to_vec(),
+                vec![k.clone()],
+                "bump",
+                &ops,
+            )
+            .unwrap();
+        assert_eq!(again, ActionOutcome::Replayed(receipt.clone()));
+        assert_eq!(r.read_collaborative(&k).unwrap().counters["votes"], 5);
+        assert_eq!(r.frontier(), receipt.frontier);
+    }
+
+    #[test]
+    fn conflicting_request_reuse_is_refused_and_commits_nothing() {
+        let (space, world, device, request) = action_scope();
+        let mut r = Replica::loro();
+        let k = key(11);
+        r.commit_action(
+            &space,
+            &world,
+            &device,
+            &request,
+            &[1u8; 32],
+            vec![],
+            vec![],
+            "one",
+            &[(
+                k.clone(),
+                BodyOp::CounterAdd {
+                    path: "votes".into(),
+                    delta: 1,
+                },
+            )],
+        )
+        .unwrap();
+        let before = r.frontier();
+        // Same scope, DIFFERENT payload hash: refused, nothing applied.
+        let err = r
+            .commit_action(
+                &space,
+                &world,
+                &device,
+                &request,
+                &[2u8; 32],
+                vec![],
+                vec![],
+                "two",
+                &[(
+                    k.clone(),
+                    BodyOp::CounterAdd {
+                        path: "votes".into(),
+                        delta: 100,
+                    },
+                )],
+            )
+            .unwrap_err();
+        assert_eq!(err, ReplicaCommitError::RequestIdConflict);
+        assert_eq!(r.frontier(), before);
+        assert_eq!(r.read_collaborative(&k).unwrap().counters["votes"], 1);
+    }
+
+    #[test]
+    fn an_oversized_effect_is_refused_before_anything_is_applied() {
+        let (space, world, device, request) = action_scope();
+        let mut r = Replica::loro();
+        let k = key(12);
+        let err = r
+            .commit_action(
+                &space,
+                &world,
+                &device,
+                &request,
+                &[1u8; 32],
+                vec![0u8; crate::receipt::MAX_EFFECT_BYTES + 1],
+                vec![],
+                "big",
+                &[(
+                    k.clone(),
+                    BodyOp::CounterAdd {
+                        path: "votes".into(),
+                        delta: 1,
+                    },
+                )],
+            )
+            .unwrap_err();
+        assert_eq!(err, ReplicaCommitError::EffectTooLarge);
+        assert_eq!(r.frontier(), ReplicaFrontier::EMPTY);
+        assert!(r.read_collaborative(&k).is_none());
+    }
+
+    #[test]
+    fn a_failure_before_linearization_is_retryable_and_commits_exactly_once() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let (space, world, device, request) = action_scope();
+        let dir = temp_store("retryable");
+        let arm = Arc::new(AtomicBool::new(true));
+        let arm2 = arm.clone();
+        // Fail the first attempt BEFORE the manifest linearization point (at
+        // the objects write), then let the retry through.
+        let mut r = Replica::open_journaled(&dir)
+            .unwrap()
+            .with_store_fault_injector(Box::new(move |point| {
+                point == "objects" && arm2.swap(false, Ordering::SeqCst)
+            }));
+        let k = key(13);
+        let ops = vec![(
+            k.clone(),
+            BodyOp::CounterAdd {
+                path: "votes".into(),
+                delta: 3,
+            },
+        )];
+        let err = r
+            .commit_action(
+                &space,
+                &world,
+                &device,
+                &request,
+                &[1u8; 32],
+                b"e".to_vec(),
+                vec![],
+                "bump",
+                &ops,
+            )
+            .unwrap_err();
+        // A pre-linearization durable failure poisons this handle (the
+        // in-memory engine advanced); the caller reopens and retries.
+        assert!(matches!(err, ReplicaCommitError::Durability(_)));
+        drop(r);
+        let mut r = Replica::open_journaled(&dir).unwrap();
+        assert_eq!(
+            r.frontier(),
+            ReplicaFrontier::EMPTY,
+            "nothing durable before the linearization point"
+        );
+        let outcome = r
+            .commit_action(
+                &space,
+                &world,
+                &device,
+                &request,
+                &[1u8; 32],
+                b"e".to_vec(),
+                vec![],
+                "bump",
+                &ops,
+            )
+            .unwrap();
+        assert!(matches!(outcome, ActionOutcome::Committed(_)));
+        assert_eq!(
+            r.read_collaborative(&k).unwrap().counters["votes"],
+            3,
+            "the retried operation applied exactly once"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

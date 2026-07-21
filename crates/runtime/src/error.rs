@@ -46,10 +46,8 @@ pub enum LifecycleError {
     StationDormant,
     /// The mechanics authority view resolved no standing for the docking device.
     PrincipalDenied,
-    /// The operation is not yet wired at this stage of the carve. Present only so
-    /// the sealed lifecycle surface compiles; production never routes through
-    /// these paths until the owning stage lands.
-    NotYetWired(&'static str),
+    /// The named World is not registered with this Runtime.
+    UnknownWorld(replica::ids::WorldId),
 }
 
 /// Why dormancy failed to cleanly return the Orbit. Dormancy drains tasks,

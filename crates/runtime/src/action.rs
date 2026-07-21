@@ -1,7 +1,7 @@
 //! `SignedWorldActionV1` — the canonical, signed application-action envelope.
 //!
-//! A World intent that must be authorized and (in S5) durably committed rides
-//! this envelope. Runtime derives [`PrincipalFacts`](crate::world::PrincipalFacts)
+//! A World intent that must be authorized and durably committed rides this
+//! envelope. Runtime derives [`PrincipalFacts`](crate::world::PrincipalFacts)
 //! from the docked identity; a caller cannot assert them. The envelope binds the
 //! request to a Space, World, actor/device, authority frontier, and intent
 //! schema/version, and commits to the payload by hash.
@@ -11,11 +11,13 @@
 //! version, header, payload, and signer. Exact postcard decode/re-encode
 //! equality is required — a non-canonical encoding is rejected, not tolerated.
 //!
-//! S1a freezes this contract with golden positive and negative fixtures. The
-//! mechanics authority proof (signer ∈ header.actor, standing at the authority
-//! frontier) and persistent idempotency land in S5; here the envelope's
-//! self-signature, canonical form, payload binding, and version rejection are
-//! real.
+//! The envelope's self-signature, canonical form, payload binding, and version
+//! rejection are validated here ([`SignedWorldActionV1::verify_self`]); the
+//! mechanics authority proof (the signer is the docked principal, with standing
+//! at the header's authority frontier) and the persistent-idempotency scope are
+//! enforced by [`Session::submit`](crate::session::Session::submit), which is
+//! the only local commit entry. Imported signed actions enter through
+//! Contact/Convergence, never a second submit API.
 
 use mechanics::ids::{ActorId, DeviceId, SpaceId};
 use replica::frontier::AuthorityFrontier;
@@ -37,6 +39,14 @@ pub const MAX_PAYLOAD: usize = 1024 * 1024;
 pub struct RequestId([u8; 16]);
 
 impl RequestId {
+    /// Mint a fresh random request id from the OS CSPRNG. Deterministic
+    /// callers may instead supply their own 128 random bits via
+    /// [`RequestId::from_bytes`].
+    pub fn mint() -> Self {
+        let mut raw = [0u8; 16];
+        getrandom::fill(&mut raw).expect("OS CSPRNG");
+        Self(raw)
+    }
     pub fn from_bytes(raw: [u8; 16]) -> Self {
         Self(raw)
     }

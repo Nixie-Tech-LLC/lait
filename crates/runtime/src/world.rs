@@ -87,22 +87,70 @@ pub trait AuthorityView: Send + Sync {
 /// An authenticated local caller: proof-of-possession of a device seed. Minted
 /// only by [`Runtime::identity_from_seed`](crate::lifecycle::Runtime::identity_from_seed),
 /// which derives the device key from the seed — a caller cannot assert an
-/// arbitrary device id, let alone standing.
-#[derive(Debug, Clone)]
+/// arbitrary device id, let alone standing. The identity owns the device
+/// signing capability opaquely; it never exposes the seed bytes (no accessor,
+/// no serialization, and `Debug` prints only the derived device).
+#[derive(Clone)]
 pub struct LocalIdentity {
     device: DeviceId,
+    seed: [u8; 32],
+}
+
+impl std::fmt::Debug for LocalIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalIdentity")
+            .field("device", &self.device)
+            .finish_non_exhaustive()
+    }
 }
 
 impl LocalIdentity {
     pub(crate) fn from_seed(seed: &[u8; 32]) -> Self {
         Self {
             device: mechanics::crypto::device_from_seed(seed),
+            seed: *seed,
         }
     }
 
     /// The device this identity proved possession of.
     pub fn device(&self) -> &DeviceId {
         &self.device
+    }
+
+    /// Construct and sign the canonical [`SignedWorldActionV1`]
+    /// (`crate::action`) for an intent against a docked Session: the header is
+    /// built from the Session's Space/World and **fresh mechanics facts**
+    /// resolved for this device (the caller cannot assert them), the payload is
+    /// hash-bound, and the whole envelope is signed by this device.
+    ///
+    /// [`Session::submit`](crate::session::Session::submit) verifies and
+    /// durably commits the action under the persistent-idempotency scope
+    /// `(Space, World, Device, RequestId)`.
+    pub fn sign_action(
+        &self,
+        session: &crate::session::Session,
+        request: crate::action::RequestId,
+        intent: WorldIntent,
+    ) -> Result<crate::action::SignedWorldActionV1, crate::error::WorldError> {
+        let resolution = session
+            .resolve_for_signing(&self.device)
+            .ok_or(crate::error::WorldError::Denied)?;
+        let header = crate::action::WorldActionHeader {
+            request,
+            space: session.space_id().clone(),
+            world: session.world_id().clone(),
+            actor: resolution.actor,
+            device: self.device.clone(),
+            authority_frontier: resolution.authority_frontier,
+            intent_schema: intent.schema,
+            intent_version: intent.schema_version,
+            payload_hash: crate::action::payload_hash(&intent.payload),
+        };
+        Ok(crate::action::SignedWorldActionV1::sign(
+            header,
+            intent.payload,
+            &self.seed,
+        ))
     }
 }
 
