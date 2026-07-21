@@ -174,23 +174,41 @@ fn atomic_replace(tmp: &Path, dst: &Path) -> Result<(), FabricError> {
     Err(io_err("rename", last.expect("at least one attempt")))
 }
 
-/// Best-effort directory durability (real fsync on unix; backup-semantics
-/// handle flush on Windows, tolerated on failure — NTFS journals metadata).
+/// Directory durability after a rename/create. On unix this is a real fsync of
+/// the directory, and a failure fails the calling phase. On Windows, a
+/// directory handle needs `FILE_FLAG_BACKUP_SEMANTICS` to open; if no handle
+/// can be opened at all the platform does not expose directory sync to us and
+/// NTFS's metadata journaling is the documented durability contract — but a
+/// handle that opens and then fails to flush is a real error and fails the
+/// phase.
 #[cfg(unix)]
-fn sync_dir(dir: &Path) {
-    let _ = File::open(dir).and_then(|d| d.sync_all());
+fn sync_dir(dir: &Path) -> Result<(), FabricError> {
+    File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| io_err("fsync dir", e))
 }
 
 #[cfg(windows)]
-fn sync_dir(dir: &Path) {
+fn sync_dir(dir: &Path) -> Result<(), FabricError> {
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    let _ = OpenOptions::new()
+    let handle = OpenOptions::new()
         .read(true)
         .write(true)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(dir)
-        .and_then(|d| d.sync_all());
+        .or_else(|_| {
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(dir)
+        });
+    match handle {
+        // No directory handle at all: sync is unsupported here; NTFS metadata
+        // journaling is the stated contract (documented, not silent).
+        Err(_) => Ok(()),
+        Ok(d) => d.sync_all().map_err(|e| io_err("flush dir", e)),
+    }
 }
 
 impl JournaledStore {
@@ -260,7 +278,7 @@ impl JournaledStore {
         let tmp = dir.join("active.tmp");
         write_sync(&tmp, &bytes)?;
         atomic_replace(&tmp, &self.journal_path())?;
-        sync_dir(&dir);
+        sync_dir(&dir)?;
         Ok(())
     }
 
@@ -282,7 +300,8 @@ impl JournaledStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(io_err("remove journal", e)),
         }
-        sync_dir(&self.root.join(JOURNAL_DIR));
+        // Cleanup only: a lost removal is re-resolved by recovery.
+        let _ = sync_dir(&self.root.join(JOURNAL_DIR));
         Ok(())
     }
 
@@ -334,7 +353,7 @@ impl JournaledStore {
         let tmp = self.root.join(format!("{COUNTER_FILE}.tmp"));
         write_sync(&tmp, &next.to_le_bytes())?;
         atomic_replace(&tmp, &self.root.join(COUNTER_FILE))?;
-        sync_dir(&self.root);
+        sync_dir(&self.root)?;
         Ok(next)
     }
 
@@ -409,17 +428,41 @@ impl JournaledStore {
         Ok(())
     }
 
+    /// Whether the injector requests a crash at a **post-authoritative** point
+    /// (where a crash may only lose cleanup, never the acknowledgment).
+    fn crash_requested(&self, name: &str) -> bool {
+        self.injector.as_ref().is_some_and(|i| i(name))
+    }
+
     /// Execute one journaled commit: `new_objects` are written content-addressed,
-    /// `keep` names already-stored objects to carry forward, and `meta` is the
-    /// caller's opaque metadata. Returns the reserved sequence. On error the
-    /// exposed state is unchanged (the next open recovers to the complete old
-    /// state — or the complete new one if only the acknowledgment was lost).
+    /// `keep` names already-stored objects to carry forward (validated to exist
+    /// and match their content addresses), and `meta` is the caller's opaque
+    /// metadata. Returns the reserved sequence.
+    ///
+    /// **Acknowledgment discipline.** The manifest rename is the authoritative
+    /// switch. Every failure *before* it leaves the old state exposed and
+    /// returns an error; once the rename (and the store-directory sync that
+    /// makes it power-loss durable) has succeeded, the commit **is** committed
+    /// and this method returns `Ok` — journal cleanup failures after that point
+    /// are absorbed, because recovery finalizes a `MaterialReady` journal with
+    /// the new manifest as committed. A failure raised *by the directory sync
+    /// itself* after the rename is the one genuinely ambiguous case and is
+    /// reported as [`FabricError::OutcomeUnknown`]: the caller must fail stop
+    /// and reopen — recovery then resolves the outcome deterministically (the
+    /// manifest on disk decides). A durably committed operation is therefore
+    /// never reported as a plain retryable failure.
     pub fn commit(
         &mut self,
         new_objects: &[Vec<u8>],
         keep: &[ObjectRef],
         meta: Vec<u8>,
     ) -> Result<u64, FabricError> {
+        // 0. Carried references must already be present and content-valid —
+        //    otherwise a "successful" commit would fail integrity on next open.
+        for obj in keep {
+            self.read_object(obj)?;
+        }
+
         // 1. Reserve the transaction counter (gaps allowed, reuse forbidden).
         self.point("counter")?;
         let sequence = self.reserve_sequence()?;
@@ -472,7 +515,7 @@ impl JournaledStore {
                 atomic_replace(&final_path.with_extension("tmp"), &final_path)?;
             }
         }
-        sync_dir(&self.root.join(OBJECTS_DIR));
+        sync_dir(&self.root.join(OBJECTS_DIR))?;
 
         // 5. Manifest temp, then rename over current-manifest LAST.
         self.point("manifest-temp")?;
@@ -480,17 +523,30 @@ impl JournaledStore {
         write_sync(&manifest_tmp, &manifest_bytes)?;
         self.point("manifest-rename")?;
         atomic_replace(&manifest_tmp, &self.root.join(MANIFEST_FILE))?;
-        sync_dir(&self.root);
+        if sync_dir(&self.root).is_err() {
+            // The rename happened but its directory-entry durability is
+            // unconfirmed: the one ambiguous outcome. Fail stop; reopening
+            // resolves it (the on-disk manifest decides).
+            return Err(FabricError::OutcomeUnknown);
+        }
 
-        // 6. Journal Committed, acknowledge, then remove the journal.
-        self.point("journal-committed")?;
-        self.write_journal(&JournalRecord::Committed {
-            sequence,
-            new_manifest_hash,
-        })?;
+        // --- The commit is now authoritative: nothing below may fail it. ---
         self.manifest = Some(manifest);
-        self.point("journal-remove")?;
-        self.remove_journal()?;
+
+        // 6. Journal Committed + removal are pure cleanup: recovery finalizes a
+        //    MaterialReady journal with the new manifest as committed, so a
+        //    crash or error here loses nothing and MUST NOT fail the call.
+        if !self.crash_requested("journal-committed") {
+            let wrote = self
+                .write_journal(&JournalRecord::Committed {
+                    sequence,
+                    new_manifest_hash,
+                })
+                .is_ok();
+            if wrote && !self.crash_requested("journal-remove") {
+                let _ = self.remove_journal();
+            }
+        }
         Ok(sequence)
     }
 }

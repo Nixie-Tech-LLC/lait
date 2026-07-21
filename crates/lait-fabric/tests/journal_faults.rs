@@ -80,27 +80,35 @@ fn a_crash_at_every_fault_point_recovers_to_a_complete_state() {
             .commit(&[b"old-object".to_vec()], &[], b"old-meta".to_vec())
             .unwrap();
 
-        // Attempt a second commit that "crashes" at the named point.
+        // Attempt a second commit that "crashes" at the named point. The
+        // acknowledgment discipline: every point before the manifest rename
+        // fails the call and leaves the old state; the two post-authoritative
+        // cleanup points lose only cleanup — the call MUST still succeed,
+        // because a durably committed operation may never be reported as a
+        // retryable failure (a retry would apply it twice).
+        let expect_new = matches!(point, "journal-committed" | "journal-remove");
         let mut faulty = JournaledStore::open(&root)
             .unwrap()
             .with_fault_injector(Box::new(move |name| name == point));
-        let err = faulty
-            .commit(&[b"new-object".to_vec()], &[], b"new-meta".to_vec())
-            .unwrap_err();
-        assert!(
-            matches!(err, FabricError::Durability(_)),
-            "{point}: injected crash surfaces as Durability"
-        );
+        let result = faulty.commit(&[b"new-object".to_vec()], &[], b"new-meta".to_vec());
+        if expect_new {
+            result.unwrap_or_else(|e| {
+                panic!("{point}: post-authoritative cleanup crash must not fail the commit: {e}")
+            });
+        } else {
+            assert!(
+                matches!(result.unwrap_err(), FabricError::Durability(_)),
+                "{point}: pre-authoritative crash surfaces as Durability"
+            );
+        }
         drop(faulty);
 
-        // Recovery must expose ONE complete state: old for every point before
-        // the manifest rename lands, new once it has (only the ack was lost).
+        // Recovery must expose ONE complete state matching the acknowledgment.
         let store =
             JournaledStore::open(&root).unwrap_or_else(|e| panic!("{point}: recovery failed: {e}"));
         let manifest = store
             .manifest()
             .unwrap_or_else(|| panic!("{point}: a committed store never loses its manifest"));
-        let expect_new = matches!(point, "journal-committed" | "journal-remove");
         let (want_meta, want_obj): (&[u8], &[u8]) = if expect_new {
             (b"new-meta", b"new-object")
         } else {
@@ -126,6 +134,30 @@ fn a_crash_at_every_fault_point_recovers_to_a_complete_state() {
         assert!(s3 > s1, "{point}: sequence must move strictly forward");
         let _ = std::fs::remove_dir_all(&root);
     }
+}
+
+#[test]
+fn a_bogus_carried_reference_fails_the_commit_up_front() {
+    let root = temp_root("bogus-keep");
+    let mut store = JournaledStore::open(&root).unwrap();
+    store
+        .commit(&[b"real".to_vec()], &[], b"m1".to_vec())
+        .unwrap();
+    // A keep ref naming an object that does not exist must refuse the commit
+    // BEFORE anything lands — otherwise a "successful" commit would fail
+    // integrity on the next open.
+    let bogus = ObjectRef {
+        hash: [0xEE; 32],
+        len: 4,
+    };
+    let err = store
+        .commit(&[b"newer".to_vec()], &[bogus], b"m2".to_vec())
+        .unwrap_err();
+    assert!(matches!(err, FabricError::Integrity(_)));
+    // The store is untouched and still healthy.
+    drop(store);
+    let store = JournaledStore::open(&root).unwrap();
+    assert_eq!(store.manifest().unwrap().meta, b"m1");
 }
 
 #[test]

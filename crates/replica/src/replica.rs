@@ -57,6 +57,12 @@ pub enum ReplicaCommitError {
     /// frontier did not advance, and the Replica is poisoned (fail-stop) so the
     /// diverged in-memory representation can never acknowledge further commits.
     Durability(String),
+    /// The durable commit's authoritative switch happened but its durability
+    /// confirmation failed: the outcome is unknown until the store is reopened
+    /// (recovery resolves it from the on-disk manifest). The Replica is
+    /// poisoned; NEVER retry the operation through this error — reopen and
+    /// re-query instead, or a durably applied operation could be duplicated.
+    OutcomeUnknown,
     /// A previous durability failure poisoned this Replica; reopen from the
     /// durable store.
     Poisoned,
@@ -233,6 +239,10 @@ impl Replica {
             Err(FabricError::TypeConflict) => return Err(ReplicaCommitError::TypeConflict),
             Err(FabricError::InvalidOp(m)) => return Err(ReplicaCommitError::InvalidOp(m)),
             Err(FabricError::Integrity(m)) => return Err(ReplicaCommitError::Integrity(m)),
+            Err(FabricError::OutcomeUnknown) => {
+                self.poisoned = true;
+                return Err(ReplicaCommitError::OutcomeUnknown);
+            }
             Err(FabricError::Durability(m)) => {
                 // The engine could not restore itself after a failed apply: its
                 // in-memory state may have diverged. Fail stop.
@@ -267,6 +277,10 @@ impl Replica {
             Err(FabricError::TypeConflict) => return Err(ReplicaCommitError::TypeConflict),
             Err(FabricError::InvalidOp(m)) => return Err(ReplicaCommitError::InvalidOp(m)),
             Err(FabricError::Integrity(m)) => return Err(ReplicaCommitError::Integrity(m)),
+            Err(FabricError::OutcomeUnknown) => {
+                self.poisoned = true;
+                return Err(ReplicaCommitError::OutcomeUnknown);
+            }
             Err(FabricError::Durability(m)) => {
                 self.poisoned = true;
                 return Err(ReplicaCommitError::Durability(m));
@@ -318,9 +332,19 @@ impl Replica {
                 .map_err(|e| ReplicaCommitError::Fabric(e.to_string()))?;
             // The full journaled protocol runs here: counter reserve → journal
             // Prepared → objects → MaterialReady → manifest rename → Committed.
-            if let Err(e) = store.commit(&[engine], &[], meta) {
-                self.poisoned = true;
-                return Err(ReplicaCommitError::Durability(e.to_string()));
+            // Post-authoritative cleanup failures are absorbed inside the store
+            // (the call still succeeds); only OutcomeUnknown is ambiguous, and
+            // it demands reopen-not-retry.
+            match store.commit(&[engine], &[], meta) {
+                Ok(_) => {}
+                Err(FabricError::OutcomeUnknown) => {
+                    self.poisoned = true;
+                    return Err(ReplicaCommitError::OutcomeUnknown);
+                }
+                Err(e) => {
+                    self.poisoned = true;
+                    return Err(ReplicaCommitError::Durability(e.to_string()));
+                }
             }
         }
         self.frontier = next;

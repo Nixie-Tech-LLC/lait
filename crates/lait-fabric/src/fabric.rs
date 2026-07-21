@@ -205,6 +205,11 @@ pub enum FabricError {
     /// or corrupt objects, a corrupt journal, a missing transaction counter).
     /// Never repaired heuristically — recreation guidance is the caller's.
     Integrity(String),
+    /// The authoritative switch happened but its durability confirmation
+    /// failed: the commit may or may not survive power loss. Fail stop and
+    /// reopen — recovery resolves the outcome deterministically from the
+    /// on-disk manifest. Never retry through this error.
+    OutcomeUnknown,
 }
 
 /// A canonical, Loro-free view of one collaborative Body, keyed by path. This

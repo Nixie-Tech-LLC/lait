@@ -356,6 +356,7 @@ impl Session {
                 replica::ReplicaCommitError::Fabric(_)
                 | replica::ReplicaCommitError::Integrity(_)
                 | replica::ReplicaCommitError::Durability(_)
+                | replica::ReplicaCommitError::OutcomeUnknown
                 | replica::ReplicaCommitError::Poisoned => WorldError::Persistence,
             })?;
         drop(inner);
