@@ -23,6 +23,7 @@ pub mod catalog;
 pub mod fabric;
 pub mod history;
 pub mod issue;
+pub mod journal;
 mod loro_ext;
 pub mod membership;
 pub mod op;
@@ -32,3 +33,4 @@ pub use fabric::{
     CausalToken, CollaborativeView, Fabric, FabricCommitReceipt, FabricError, FabricKey, FabricOp,
     FabricTransactionRequest, ListElement, LoroFabric, MemFabric,
 };
+pub use journal::{FaultInjector, JournaledStore, ObjectRef, StoreManifestV1, FAULT_POINTS};

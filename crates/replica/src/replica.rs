@@ -16,7 +16,7 @@
 
 use lait_fabric::{
     CollaborativeView, Fabric, FabricError, FabricKey, FabricOp, FabricTransactionRequest,
-    LoroFabric, MemFabric,
+    JournaledStore, LoroFabric, MemFabric,
 };
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +48,9 @@ pub enum ReplicaCommitError {
     /// The operation was structurally invalid at apply time (out-of-bounds
     /// index, unknown element id, counter overflow). Nothing was committed.
     InvalidOp(String),
+    /// The durable store failed integrity validation on open — never repaired
+    /// heuristically; recreation guidance is the caller's.
+    Integrity(String),
     /// The Fabric engine failed to apply the transaction.
     Fabric(String),
     /// The durable write of the committed state failed. The acknowledged
@@ -58,11 +61,6 @@ pub enum ReplicaCommitError {
     /// durable store.
     Poisoned,
 }
-
-/// Where a Replica durably lands each committed state before acknowledging it.
-/// Supplied by the runtime (which owns the Orbit store); the write must be
-/// atomic-replace + fsync so a crash leaves the previous complete checkpoint.
-pub type DurabilitySink = Box<dyn Fn(&[u8]) -> std::io::Result<()> + Send>;
 
 impl std::fmt::Display for ReplicaCommitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -75,9 +73,10 @@ impl std::error::Error for ReplicaCommitError {}
 pub struct Replica {
     fabric: Box<dyn Fabric + Send>,
     frontier: ReplicaFrontier,
-    /// When set, every commit is durably written here **before** it is
-    /// acknowledged — checkpoint-on-shutdown is not durable commit semantics.
-    sink: Option<DurabilitySink>,
+    /// When set, every commit runs the journaled store's full commit protocol
+    /// **before** it is acknowledged — checkpoint-on-shutdown is not durable
+    /// commit semantics.
+    durable: Option<JournaledStore>,
     /// Set after a durability failure: the in-memory engine has state the store
     /// does not, so no further commit may be acknowledged.
     poisoned: bool,
@@ -114,23 +113,14 @@ fn advance(prev: ReplicaFrontier, causal: &[u8]) -> ReplicaFrontier {
 }
 
 impl Replica {
-    /// Build a Replica over a given Fabric engine.
+    /// Build a Replica over a given Fabric engine (no durability).
     pub fn new(fabric: Box<dyn Fabric + Send>) -> Self {
         Self {
             fabric,
             frontier: ReplicaFrontier::EMPTY,
-            sink: None,
+            durable: None,
             poisoned: false,
         }
-    }
-
-    /// Attach a durability sink: from now on, every commit is written through it
-    /// **before** the commit is acknowledged, so a crash after acknowledgment
-    /// never loses the commit. Runtime attaches the Orbit store's atomic
-    /// checkpoint write here.
-    pub fn with_durability(mut self, sink: DurabilitySink) -> Self {
-        self.sink = Some(sink);
-        self
     }
 
     /// Build a Replica over the in-memory reference engine.
@@ -138,9 +128,47 @@ impl Replica {
         Self::new(Box::new(MemFabric::new()))
     }
 
-    /// Build a durable Replica over the Loro-backed engine.
+    /// Build a Loro-backed Replica with **no** durable store (tests/scratch).
     pub fn loro() -> Self {
         Self::new(Box::new(LoroFabric::new()))
+    }
+
+    /// Open the durable Replica at a journaled store root: run crash recovery,
+    /// restore the committed engine state and semantic frontier (the store
+    /// manifest's opaque metadata), and from then on run the journaled commit
+    /// protocol before acknowledging every commit/incorporation.
+    pub fn open_journaled(root: impl Into<std::path::PathBuf>) -> Result<Self, ReplicaCommitError> {
+        let store = match JournaledStore::open(root) {
+            Ok(s) => s,
+            Err(FabricError::Integrity(m)) => return Err(ReplicaCommitError::Integrity(m)),
+            Err(e) => return Err(ReplicaCommitError::Durability(e.to_string())),
+        };
+        let (fabric, frontier) = match store.manifest() {
+            None => (LoroFabric::new(), ReplicaFrontier::EMPTY),
+            Some(manifest) => {
+                let frontier: ReplicaFrontier = postcard::from_bytes(&manifest.meta)
+                    .map_err(|e| ReplicaCommitError::Integrity(format!("manifest meta: {e}")))?;
+                // The interim representation is one engine-snapshot object; the
+                // per-Body object split arrives with the representation cutover.
+                let [engine_ref] = manifest.objects.as_slice() else {
+                    return Err(ReplicaCommitError::Integrity(
+                        "expected exactly one engine object".into(),
+                    ));
+                };
+                let engine = store
+                    .read_object(engine_ref)
+                    .map_err(|e| ReplicaCommitError::Integrity(e.to_string()))?;
+                let fabric = LoroFabric::from_snapshot(&engine)
+                    .map_err(|e| ReplicaCommitError::Integrity(e.to_string()))?;
+                (fabric, frontier)
+            }
+        };
+        Ok(Self {
+            fabric: Box::new(fabric),
+            frontier,
+            durable: Some(store),
+            poisoned: false,
+        })
     }
 
     /// Serialize the full durable state — the engine snapshot plus the semantic
@@ -167,7 +195,7 @@ impl Replica {
         Ok(Self {
             fabric: Box::new(fabric),
             frontier: cp.frontier,
-            sink: None,
+            durable: None,
             poisoned: false,
         })
     }
@@ -204,6 +232,7 @@ impl Replica {
             Err(FabricError::Unsupported) => return Err(ReplicaCommitError::UnsupportedOp),
             Err(FabricError::TypeConflict) => return Err(ReplicaCommitError::TypeConflict),
             Err(FabricError::InvalidOp(m)) => return Err(ReplicaCommitError::InvalidOp(m)),
+            Err(FabricError::Integrity(m)) => return Err(ReplicaCommitError::Integrity(m)),
             Err(FabricError::Durability(m)) => {
                 // The engine could not restore itself after a failed apply: its
                 // in-memory state may have diverged. Fail stop.
@@ -237,6 +266,7 @@ impl Replica {
             Err(FabricError::Unsupported) => return Err(ReplicaCommitError::UnsupportedOp),
             Err(FabricError::TypeConflict) => return Err(ReplicaCommitError::TypeConflict),
             Err(FabricError::InvalidOp(m)) => return Err(ReplicaCommitError::InvalidOp(m)),
+            Err(FabricError::Integrity(m)) => return Err(ReplicaCommitError::Integrity(m)),
             Err(FabricError::Durability(m)) => {
                 self.poisoned = true;
                 return Err(ReplicaCommitError::Durability(m));
@@ -279,17 +309,16 @@ impl Replica {
         causal: &[u8],
     ) -> Result<ReplicaFrontier, ReplicaCommitError> {
         let next = advance(self.frontier, causal);
-        if let Some(sink) = &self.sink {
+        if let Some(store) = &mut self.durable {
             let engine = self
                 .fabric
                 .snapshot()
                 .map_err(|e| ReplicaCommitError::Fabric(e.to_string()))?;
-            let bytes = postcard::to_stdvec(&Checkpoint {
-                engine,
-                frontier: next,
-            })
-            .map_err(|e| ReplicaCommitError::Fabric(e.to_string()))?;
-            if let Err(e) = sink(&bytes) {
+            let meta = postcard::to_stdvec(&next)
+                .map_err(|e| ReplicaCommitError::Fabric(e.to_string()))?;
+            // The full journaled protocol runs here: counter reserve → journal
+            // Prepared → objects → MaterialReady → manifest rename → Committed.
+            if let Err(e) = store.commit(&[engine], &[], meta) {
                 self.poisoned = true;
                 return Err(ReplicaCommitError::Durability(e.to_string()));
             }
@@ -829,9 +858,16 @@ mod tests {
         assert_eq!(a.frontier(), before);
     }
 
+    fn temp_store(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("lait-replica-journal-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
-    fn incorporation_is_durable_before_acknowledgment() {
-        use std::sync::{Arc, Mutex};
+    fn journaled_commits_and_incorporation_are_durable_before_acknowledgment() {
         let k = key(7);
         let mut a = Replica::loro();
         a.commit(
@@ -846,25 +882,65 @@ mod tests {
         )
         .unwrap();
 
-        // B has a capturing durability sink: the checkpoint written during
-        // incorporation must already contain the incorporated material.
-        let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink_captured = captured.clone();
-        let mut b = Replica::loro().with_durability(Box::new(move |bytes| {
-            sink_captured.lock().unwrap().push(bytes.to_vec());
-            Ok(())
-        }));
-        b.incorporate_trusted(&a.export_all().unwrap()).unwrap();
+        // B runs over a journaled store. As soon as incorporation returns, the
+        // store on disk — reopened cold, as after a crash — already holds the
+        // incorporated material and the advanced frontier.
+        let dir = temp_store("incorporate");
+        let mut b = Replica::open_journaled(&dir).unwrap();
+        let outcome = b.incorporate_trusted(&a.export_all().unwrap()).unwrap();
+        assert_eq!(outcome.accepted, 1);
+        let frontier = b.frontier();
+        drop(b); // crash: no dormancy, no checkpoint call
 
-        let writes = captured.lock().unwrap();
-        assert_eq!(writes.len(), 1, "one durable write per incorporation");
-        let restored = Replica::restore_loro(&writes[0]).unwrap();
+        let reopened = Replica::open_journaled(&dir).unwrap();
+        assert_eq!(reopened.frontier(), frontier);
         assert_eq!(
-            restored.read_collaborative(&k).unwrap().registers["title"],
+            reopened.read_collaborative(&k).unwrap().registers["title"],
             b"remote".to_vec(),
-            "the durable checkpoint already holds the incorporated material"
+            "the journaled store already held the material at acknowledgment"
         );
-        assert_eq!(restored.frontier(), b.frontier());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_journaled_replica_survives_restart_with_collaborative_state() {
+        let dir = temp_store("restart");
+        let k = key(8);
+        let mut r = Replica::open_journaled(&dir).unwrap();
+        r.commit(
+            "created",
+            &[
+                (k.clone(), BodyOp::Create),
+                (
+                    k.clone(),
+                    BodyOp::CounterAdd {
+                        path: "votes".into(),
+                        delta: 3,
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+        let f1 = r.frontier();
+        drop(r);
+
+        let mut r = Replica::open_journaled(&dir).unwrap();
+        assert_eq!(r.frontier(), f1);
+        assert_eq!(r.read_collaborative(&k).unwrap().counters["votes"], 3);
+        // And it keeps committing after restart.
+        r.commit(
+            "edited",
+            &[(
+                k.clone(),
+                BodyOp::CounterAdd {
+                    path: "votes".into(),
+                    delta: 2,
+                },
+            )],
+        )
+        .unwrap();
+        assert_eq!(r.read_collaborative(&k).unwrap().counters["votes"], 5);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

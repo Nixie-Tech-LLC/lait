@@ -201,6 +201,10 @@ pub enum FabricError {
     /// The operation was structurally invalid at apply time (out-of-bounds
     /// index, unknown element id, counter overflow). The batch is rolled back.
     InvalidOp(String),
+    /// The durable store failed integrity validation (a manifest naming absent
+    /// or corrupt objects, a corrupt journal, a missing transaction counter).
+    /// Never repaired heuristically — recreation guidance is the caller's.
+    Integrity(String),
 }
 
 /// A canonical, Loro-free view of one collaborative Body, keyed by path. This

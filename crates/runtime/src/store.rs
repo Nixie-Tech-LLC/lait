@@ -24,10 +24,6 @@ use crate::error::LifecycleError;
 const MARKER_FILE: &str = "marker";
 const EPOCH_FILE: &str = "epoch";
 const LOCK_FILE: &str = "lock";
-/// The Replica content checkpoint (engine snapshot + frontier). The full S5
-/// store adds `current-manifest`, `transactions/`, and `journal/`; this single
-/// atomically-replaced file is the S5a durable-content seam.
-const CONTENT_FILE: &str = "replica-content";
 
 fn io_err(e: std::io::Error) -> LifecycleError {
     LifecycleError::StoreIo(e.to_string())
@@ -182,20 +178,12 @@ impl OrbitStore {
         }
     }
 
-    /// The Replica content checkpoint bytes, if a checkpoint has been written.
-    pub fn read_content(&self) -> Result<Option<Vec<u8>>, LifecycleError> {
-        match std::fs::read(self.dir.join(CONTENT_FILE)) {
-            Ok(b) => Ok(Some(b)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(io_err(e)),
-        }
-    }
-
-    /// Durably and atomically replace the Replica content checkpoint. Called on
-    /// **every** commit (the durability sink), so a crash after an acknowledged
-    /// commit never loses it, and repeated replacement is safe.
-    pub fn write_content(&self, bytes: &[u8]) -> Result<(), LifecycleError> {
-        self.atomic_write(CONTENT_FILE, bytes)
+    /// The store directory. The Fabric journaled store (`counter`,
+    /// `current-manifest`, `objects/`, `journal/`) lives inside it, alongside
+    /// the runtime-owned lifecycle files (`marker`, `epoch`, `lock`) — the two
+    /// touch disjoint names.
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     /// Destroy the store directory. The caller must hold the lock (i.e. be the

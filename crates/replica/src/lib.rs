@@ -39,5 +39,5 @@ pub use manifest::{
     ManifestBook, ManifestEntryV1, ManifestError, ManifestPageV1, ManifestRootV1, RootObservation,
 };
 pub use marker::{MarkerError, StoreMarkerV1};
-pub use replica::{DurabilitySink, Replica, ReplicaCommitError};
+pub use replica::{Replica, ReplicaCommitError};
 pub use transaction::{AuthoritySource, BodyDescriptorV1, BodyTransactionV1, TransactionError};

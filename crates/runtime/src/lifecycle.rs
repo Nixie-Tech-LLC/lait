@@ -326,22 +326,15 @@ impl Orbit {
     /// offline; grants no new Space authority.
     pub fn activate(self, options: ActivationOptions) -> Result<Station, LifecycleError> {
         let epoch = StationEpoch::from_u64(self.store.bump_epoch()?);
-        // Restore the durable Replica from the store's content checkpoint, or
-        // start fresh over the Loro-backed engine — then attach the store's
-        // atomic checkpoint write as the per-commit durability sink, so every
-        // acknowledged commit is recoverable before `submit` returns. A crash,
-        // kill, or `wait` exit after an acknowledged commit loses nothing.
-        let replica = match self.store.read_content()? {
-            Some(bytes) => replica::Replica::restore_loro(&bytes)
-                .map_err(|e| LifecycleError::IntegrityFailure(e.to_string()))?,
-            None => replica::Replica::loro(),
-        };
-        let sink_store = self.store.clone();
-        let replica = replica.with_durability(Box::new(move |bytes| {
-            sink_store
-                .write_content(bytes)
-                .map_err(|e| std::io::Error::other(e.to_string()))
-        }));
+        // Open the durable Replica at the Orbit store's journaled Fabric store:
+        // crash recovery runs here (exposing the complete old or complete new
+        // state), and from then on every acknowledged commit has completed the
+        // full journal protocol before `submit` returns. A crash, kill, or
+        // `wait` exit after an acknowledged commit loses nothing.
+        let replica = replica::Replica::open_journaled(self.store.dir()).map_err(|e| match e {
+            replica::ReplicaCommitError::Integrity(m) => LifecycleError::IntegrityFailure(m),
+            other => LifecycleError::StoreIo(other.to_string()),
+        })?;
         Ok(Station {
             store: self.store,
             registry: self.registry,
@@ -558,17 +551,12 @@ impl Station {
         // 3) cancel and drain tracked tasks within the deadline.
         let deadline = Instant::now() + self.drain_deadline;
         let (timed_out, _panicked) = self.drain_tasks(deadline);
-        // 4) close the committing core and take the final checkpoint as ONE
-        //    transition under the writer mutex — an in-flight submit either
-        //    committed (durably, via the per-commit sink) before the close or is
-        //    refused; none can land after this checkpoint.
-        let checkpoint = self
-            .core
-            .close_and_checkpoint()
-            .map_err(|e| DormancyError::Checkpoint(e.to_string()))?;
-        self.store
-            .write_content(&checkpoint)
-            .map_err(|e| DormancyError::Checkpoint(format!("{e}")))?;
+        // 4) close the committing core under the writer mutex — an in-flight
+        //    submit either completed its journaled durable commit before the
+        //    close or observes it and is refused. Every acknowledged commit is
+        //    already on disk (the journal protocol ran at commit time), so
+        //    dormancy needs no separate checkpoint.
+        self.core.close();
         // 5) build the recovered Orbit and release the lock last.
         let lock = self.lock.take().expect("station holds its lock");
         if timed_out {

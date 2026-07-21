@@ -118,17 +118,10 @@ impl StationCore {
         self.lock().replica.frontier()
     }
 
-    /// Close the core to further commits and serialize the Replica's durable
-    /// state, as one transition under the writer mutex. After this returns, no
-    /// admitted submit can commit — the checkpoint is final for this activation.
-    pub(crate) fn close_and_checkpoint(&self) -> Result<Vec<u8>, replica::ReplicaCommitError> {
-        let mut inner = self.lock();
-        inner.closed = true;
-        inner.replica.checkpoint()
-    }
-
-    /// Close the core to further commits without checkpointing (used by `wait`;
-    /// every acknowledged commit is already durable via the per-commit sink).
+    /// Close the core to further commits, as one transition under the writer
+    /// mutex: an in-flight submit either completed its journaled durable commit
+    /// before the close or observes it and is refused. Every acknowledged
+    /// commit is already on disk, so closing needs no checkpoint.
     pub(crate) fn close(&self) {
         self.lock().closed = true;
     }
@@ -361,6 +354,7 @@ impl Session {
                 replica::ReplicaCommitError::OpLimit => WorldError::LimitExceeded,
                 replica::ReplicaCommitError::TypeConflict => WorldError::Conflict,
                 replica::ReplicaCommitError::Fabric(_)
+                | replica::ReplicaCommitError::Integrity(_)
                 | replica::ReplicaCommitError::Durability(_)
                 | replica::ReplicaCommitError::Poisoned => WorldError::Persistence,
             })?;
