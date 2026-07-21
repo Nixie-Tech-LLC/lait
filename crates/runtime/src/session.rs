@@ -141,6 +141,9 @@ impl crate::world::BodyReader for ReplicaReader<'_> {
     fn read_body(&self, key: &BodyKey) -> Option<Vec<u8>> {
         self.0.read(key)
     }
+    fn read_collaborative_body(&self, key: &BodyKey) -> Option<replica::CollaborativeView> {
+        self.0.read_collaborative(key)
+    }
 }
 
 /// A local caller's handle to a hosted World.
@@ -350,7 +353,17 @@ impl Session {
         let frontier = inner
             .replica
             .commit(&label, &effect.operations)
-            .map_err(|_| WorldError::Persistence)?;
+            .map_err(|e| match e {
+                // A staged op the engine cannot express is a World bug.
+                replica::ReplicaCommitError::UnsupportedOp => WorldError::ContractViolation,
+                replica::ReplicaCommitError::PathInvalid
+                | replica::ReplicaCommitError::InvalidOp(_) => WorldError::InvalidRequest,
+                replica::ReplicaCommitError::OpLimit => WorldError::LimitExceeded,
+                replica::ReplicaCommitError::TypeConflict => WorldError::Conflict,
+                replica::ReplicaCommitError::Fabric(_)
+                | replica::ReplicaCommitError::Durability(_)
+                | replica::ReplicaCommitError::Poisoned => WorldError::Persistence,
+            })?;
         drop(inner);
 
         // Publish the Observation for the committed change.

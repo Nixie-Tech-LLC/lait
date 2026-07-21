@@ -29,6 +29,6 @@ pub mod op;
 pub mod store;
 
 pub use fabric::{
-    CausalToken, Fabric, FabricCommitReceipt, FabricError, FabricKey, FabricOp,
-    FabricTransactionRequest, LoroFabric, MemFabric,
+    CausalToken, CollaborativeView, Fabric, FabricCommitReceipt, FabricError, FabricKey, FabricOp,
+    FabricTransactionRequest, ListElement, LoroFabric, MemFabric,
 };

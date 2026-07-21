@@ -694,6 +694,148 @@ fn runtime_stamps_the_projection_frontier() {
     assert_ne!(proj.frontier, ReplicaFrontier::EMPTY);
 }
 
+/// A collaborative World: intents append a comment (list) and bump a counter;
+/// queries project the collaborative view.
+struct BoardWorld {
+    id: WorldId,
+    schemas: Vec<BodySchema>,
+}
+
+impl BoardWorld {
+    fn new() -> Self {
+        Self {
+            id: WorldId::parse("com.example.board").unwrap(),
+            schemas: vec![BodySchema {
+                id: SchemaId::parse("card").unwrap(),
+                version: 1,
+                encoding: EncodingId::parse("collab").unwrap(),
+                mutation: MutationModel::Collaborative(
+                    replica::body::CollaborativeSchema::default(),
+                ),
+                readable_predecessors: vec![],
+            }],
+        }
+    }
+    fn body(&self) -> BodyKey {
+        BodyKey::new(self.id.clone(), BodyId::from_bytes([7u8; 16]))
+    }
+}
+
+impl World for BoardWorld {
+    fn id(&self) -> WorldId {
+        self.id.clone()
+    }
+    fn schemas(&self) -> &[BodySchema] {
+        &self.schemas
+    }
+    fn submit(
+        &self,
+        ctx: &mut WorldContext<'_>,
+        intent: WorldIntent,
+    ) -> Result<WorldEffect, WorldError> {
+        if !ctx.principal().standing.has(&Grant::Write) {
+            return Err(WorldError::Denied);
+        }
+        let key = self.body();
+        Ok(WorldEffect {
+            operations: vec![
+                (
+                    key.clone(),
+                    BodyOp::ListInsert {
+                        path: "comments".into(),
+                        index: ctx
+                            .read_collaborative(&key)
+                            .map(|v| v.lists.get("comments").map(|l| l.len()).unwrap_or(0))
+                            .unwrap_or(0) as u64,
+                        value: intent.payload,
+                    },
+                ),
+                (
+                    key.clone(),
+                    BodyOp::CounterAdd {
+                        path: "activity".into(),
+                        delta: 1,
+                    },
+                ),
+            ],
+            scopes: vec![key],
+            effect: vec![],
+        })
+    }
+    fn query(
+        &self,
+        ctx: &WorldContext<'_>,
+        _query: WorldQuery,
+    ) -> Result<WorldProjection, WorldError> {
+        let view = ctx.read_collaborative(&self.body()).unwrap_or_default();
+        let comments: Vec<String> = view
+            .lists
+            .get("comments")
+            .map(|l| {
+                l.iter()
+                    .map(|e| String::from_utf8_lossy(&e.value).into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let activity = view.counters.get("activity").copied().unwrap_or(0);
+        Ok(WorldProjection {
+            schema: SchemaId::parse("card").unwrap(),
+            schema_version: 1,
+            bytes: format!("{activity}:{}", comments.join(",")).into_bytes(),
+            frontier: ReplicaFrontier::EMPTY,
+        })
+    }
+}
+
+#[test]
+fn a_collaborative_world_commits_and_reads_through_the_session() {
+    let world = BoardWorld::new();
+    let id = world.id();
+    let reg = WorldRegistration {
+        id: id.clone(),
+        implementation_version: WorldVersion(1),
+        schemas: world.schemas().to_vec(),
+        limits: WorldLimits::default(),
+    };
+    let registry = RuntimeBuilder::new()
+        .register(reg, Arc::new(world))
+        .build()
+        .unwrap();
+    let rt = Runtime::open(temp_root(), registry, Arc::new(SeedAuthority));
+    let orbit = rt.form_space(SpaceFormationOptions::default()).unwrap();
+    let space = orbit.space_id().clone();
+    let station = orbit.activate(ActivationOptions::default()).unwrap();
+    let session = station.dock(&id, &writer()).unwrap();
+
+    let query = || WorldQuery {
+        schema: SchemaId::parse("card").unwrap(),
+        schema_version: 1,
+        payload: vec![],
+    };
+    let intent = |text: &str| WorldIntent {
+        schema: SchemaId::parse("card").unwrap(),
+        schema_version: 1,
+        payload: text.as_bytes().to_vec(),
+    };
+
+    session.submit(intent("first comment")).unwrap();
+    session.submit(intent("second comment")).unwrap();
+    let proj = session.query(query()).unwrap();
+    assert_eq!(proj.bytes, b"2:first comment,second comment");
+
+    // Collaborative Bodies survive dormancy + reactivation like atomic ones.
+    let orbit = station.go_dormant().unwrap();
+    drop(orbit);
+    let station = rt
+        .orbit(&space)
+        .unwrap()
+        .activate(ActivationOptions::default())
+        .unwrap();
+    let session = station.dock(&id, &writer()).unwrap();
+    let proj = session.query(query()).unwrap();
+    assert_eq!(proj.bytes, b"2:first comment,second comment");
+}
+
 #[test]
 fn observation_cursor_starts_at_a_reset_boundary() {
     let station = station();

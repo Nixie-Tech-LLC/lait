@@ -11,9 +11,13 @@
 //! ([`Replica::in_memory`]); the Loro-backed engine and the collaborative
 //! operation set land in the S5 store cutover, behind this same API.
 
-use lait_fabric::{Fabric, FabricKey, FabricOp, FabricTransactionRequest, LoroFabric, MemFabric};
+use lait_fabric::{
+    CollaborativeView, Fabric, FabricError, FabricKey, FabricOp, FabricTransactionRequest,
+    LoroFabric, MemFabric,
+};
 use serde::{Deserialize, Serialize};
 
+use crate::algebra;
 use crate::body::BodyOp;
 use crate::frontier::ReplicaFrontier;
 use crate::ids::BodyKey;
@@ -26,9 +30,20 @@ const FRONTIER_DOMAIN: &[u8] = b"lait/replica-frontier/1";
 /// Why a Replica commit failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplicaCommitError {
-    /// A staged operation is not yet supported by the current engine (the
-    /// collaborative algebra lands with the Loro engine in S5).
+    /// A staged operation is not supported by the current engine (the in-memory
+    /// reference engine is atomic-only).
     UnsupportedOp,
+    /// An operation's path violates the frozen path grammar.
+    PathInvalid,
+    /// An operation exceeds a frozen algebra limit (value/key/insert size).
+    OpLimit,
+    /// The operation's type conflicts with what its target is already bound to
+    /// (atomic vs collaborative Body, or a second collaborative type at a
+    /// bound path).
+    TypeConflict,
+    /// The operation was structurally invalid at apply time (out-of-bounds
+    /// index, unknown element id, counter overflow). Nothing was committed.
+    InvalidOp(String),
     /// The Fabric engine failed to apply the transaction.
     Fabric(String),
     /// The durable write of the committed state failed. The acknowledged
@@ -175,25 +190,23 @@ impl Replica {
         }
         let mut fabric_ops = Vec::with_capacity(ops.len());
         for (key, op) in ops {
-            let fkey = fabric_key(key);
-            match op {
-                BodyOp::ReplaceAtomic { value } => fabric_ops.push(FabricOp::PutCanonical {
-                    key: fkey,
-                    value: value.clone(),
-                }),
-                BodyOp::Create => fabric_ops.push(FabricOp::PutCanonical {
-                    key: fkey,
-                    value: Vec::new(),
-                }),
-                BodyOp::Tombstone => fabric_ops.push(FabricOp::Remove { key: fkey }),
-                // Collaborative ops require the Loro engine (S5).
-                _ => return Err(ReplicaCommitError::UnsupportedOp),
-            }
+            fabric_ops.push(translate(fabric_key(key), op)?);
         }
-        let receipt = self
+        let receipt = match self
             .fabric
             .commit(FabricTransactionRequest::new(request_label, fabric_ops))
-            .map_err(|e| ReplicaCommitError::Fabric(e.to_string()))?;
+        {
+            Ok(r) => r,
+            Err(FabricError::Unsupported) => return Err(ReplicaCommitError::UnsupportedOp),
+            Err(FabricError::TypeConflict) => return Err(ReplicaCommitError::TypeConflict),
+            Err(FabricError::InvalidOp(m)) => return Err(ReplicaCommitError::InvalidOp(m)),
+            Err(FabricError::Durability(m)) => {
+                // The engine could not restore itself after a failed apply: its
+                // in-memory state may have diverged. Fail stop.
+                self.poisoned = true;
+                return Err(ReplicaCommitError::Durability(m));
+            }
+        };
         let next = advance(self.frontier, receipt.causal().as_bytes());
 
         // Durability BEFORE acknowledgment: land the post-commit state in the
@@ -217,10 +230,156 @@ impl Replica {
         Ok(self.frontier)
     }
 
-    /// Read the committed canonical bytes of a Body, if present.
+    /// Read the committed canonical bytes of an atomic Body, if present.
     pub fn read(&self, key: &BodyKey) -> Option<Vec<u8>> {
         self.fabric.read(&fabric_key(key))
     }
+
+    /// Read the committed collaborative view of a Body, if the key holds one.
+    /// List elements carry the stable ids `ListRemove`/`ListMove` take.
+    pub fn read_collaborative(&self, key: &BodyKey) -> Option<CollaborativeView> {
+        self.fabric.read_collaborative(&fabric_key(key))
+    }
+}
+
+/// Validate one staged Body operation against the frozen algebra (path grammar
+/// and limits) and translate it into its Fabric operation. Replica owns this
+/// translation; a World never authors Fabric operations, and Fabric never sees
+/// an op Replica has not validated.
+fn translate(key: FabricKey, op: &BodyOp) -> Result<FabricOp, ReplicaCommitError> {
+    let path_ok = |p: &str| {
+        algebra::valid_path(p)
+            .then_some(())
+            .ok_or(ReplicaCommitError::PathInvalid)
+    };
+    let value_ok = |v: &[u8]| {
+        (v.len() <= algebra::MAX_VALUE_BYTES)
+            .then_some(())
+            .ok_or(ReplicaCommitError::OpLimit)
+    };
+    Ok(match op {
+        BodyOp::ReplaceAtomic { value } => FabricOp::PutCanonical {
+            key,
+            value: value.clone(),
+        },
+        BodyOp::Create => FabricOp::CreateBody { key },
+        BodyOp::Tombstone => FabricOp::Remove { key },
+        BodyOp::RegisterSet { path, value } => {
+            path_ok(path)?;
+            value_ok(value)?;
+            FabricOp::RegisterSet {
+                key,
+                path: path.clone(),
+                value: value.clone(),
+            }
+        }
+        BodyOp::RegisterClear { path } => {
+            path_ok(path)?;
+            FabricOp::RegisterClear {
+                key,
+                path: path.clone(),
+            }
+        }
+        BodyOp::MapSet {
+            path,
+            key: entry,
+            value,
+        } => {
+            path_ok(path)?;
+            value_ok(value)?;
+            if entry.len() > algebra::MAX_MAP_KEY_BYTES {
+                return Err(ReplicaCommitError::OpLimit);
+            }
+            FabricOp::MapSet {
+                key,
+                path: path.clone(),
+                entry: entry.clone(),
+                value: value.clone(),
+            }
+        }
+        BodyOp::MapRemove { path, key: entry } => {
+            path_ok(path)?;
+            FabricOp::MapRemove {
+                key,
+                path: path.clone(),
+                entry: entry.clone(),
+            }
+        }
+        BodyOp::ListInsert { path, index, value } => {
+            path_ok(path)?;
+            value_ok(value)?;
+            FabricOp::ListInsert {
+                key,
+                path: path.clone(),
+                index: *index,
+                value: value.clone(),
+            }
+        }
+        BodyOp::ListRemove { path, element } => {
+            path_ok(path)?;
+            FabricOp::ListRemove {
+                key,
+                path: path.clone(),
+                element: element.clone(),
+            }
+        }
+        BodyOp::ListMove {
+            path,
+            element,
+            index,
+        } => {
+            path_ok(path)?;
+            FabricOp::ListMove {
+                key,
+                path: path.clone(),
+                element: element.clone(),
+                index: *index,
+            }
+        }
+        BodyOp::TextSplice {
+            path,
+            index,
+            delete,
+            insert,
+        } => {
+            path_ok(path)?;
+            if insert.len() > algebra::MAX_TEXT_INSERT_BYTES {
+                return Err(ReplicaCommitError::OpLimit);
+            }
+            FabricOp::TextSplice {
+                key,
+                path: path.clone(),
+                index: *index,
+                delete: *delete,
+                insert: insert.clone(),
+            }
+        }
+        BodyOp::SetAdd { path, value } => {
+            path_ok(path)?;
+            value_ok(value)?;
+            FabricOp::SetAdd {
+                key,
+                path: path.clone(),
+                value: value.clone(),
+            }
+        }
+        BodyOp::SetRemove { path, value } => {
+            path_ok(path)?;
+            FabricOp::SetRemove {
+                key,
+                path: path.clone(),
+                value: value.clone(),
+            }
+        }
+        BodyOp::CounterAdd { path, delta } => {
+            path_ok(path)?;
+            FabricOp::CounterAdd {
+                key,
+                path: path.clone(),
+                delta: *delta,
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -284,7 +443,274 @@ mod tests {
     }
 
     #[test]
-    fn collaborative_ops_are_unsupported_until_the_loro_engine() {
+    fn the_full_collaborative_algebra_roundtrips() {
+        let mut r = Replica::loro();
+        let k = key(3);
+        r.commit(
+            "created",
+            &[
+                (k.clone(), BodyOp::Create),
+                (
+                    k.clone(),
+                    BodyOp::RegisterSet {
+                        path: "title".into(),
+                        value: b"a title".to_vec(),
+                    },
+                ),
+                (
+                    k.clone(),
+                    BodyOp::MapSet {
+                        path: "fields".into(),
+                        key: "status".into(),
+                        value: b"open".to_vec(),
+                    },
+                ),
+                (
+                    k.clone(),
+                    BodyOp::ListInsert {
+                        path: "items".into(),
+                        index: 0,
+                        value: b"one".to_vec(),
+                    },
+                ),
+                (
+                    k.clone(),
+                    BodyOp::ListInsert {
+                        path: "items".into(),
+                        index: 1,
+                        value: b"two".to_vec(),
+                    },
+                ),
+                (
+                    k.clone(),
+                    BodyOp::TextSplice {
+                        path: "notes".into(),
+                        index: 0,
+                        delete: 0,
+                        insert: "hello world".into(),
+                    },
+                ),
+                (
+                    k.clone(),
+                    BodyOp::SetAdd {
+                        path: "tags".into(),
+                        value: b"bug".to_vec(),
+                    },
+                ),
+                (
+                    k.clone(),
+                    BodyOp::CounterAdd {
+                        path: "votes".into(),
+                        delta: 7,
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+
+        let v = r.read_collaborative(&k).unwrap();
+        assert_eq!(v.registers["title"], b"a title");
+        assert_eq!(v.maps["fields"]["status"], b"open");
+        assert_eq!(v.lists["items"].len(), 2);
+        assert_eq!(v.texts["notes"], "hello world");
+        assert_eq!(v.sets["tags"], vec![b"bug".to_vec()]);
+        assert_eq!(v.counters["votes"], 7);
+
+        // Mutate through every remaining verb, using the stable element id the
+        // view exposed.
+        let first = v.lists["items"][0].element.clone();
+        let second = v.lists["items"][1].element.clone();
+        r.commit(
+            "edited",
+            &[
+                (
+                    k.clone(),
+                    BodyOp::ListRemove {
+                        path: "items".into(),
+                        element: first,
+                    },
+                ),
+                (
+                    k.clone(),
+                    BodyOp::ListInsert {
+                        path: "items".into(),
+                        index: 1,
+                        value: b"three".to_vec(),
+                    },
+                ),
+                (
+                    k.clone(),
+                    BodyOp::ListMove {
+                        path: "items".into(),
+                        element: second.clone(),
+                        index: 1,
+                    },
+                ),
+                (
+                    k.clone(),
+                    BodyOp::TextSplice {
+                        path: "notes".into(),
+                        index: 5,
+                        delete: 6,
+                        insert: "!".into(),
+                    },
+                ),
+                (
+                    k.clone(),
+                    BodyOp::RegisterClear {
+                        path: "title".into(),
+                    },
+                ),
+                (
+                    k.clone(),
+                    BodyOp::MapRemove {
+                        path: "fields".into(),
+                        key: "status".into(),
+                    },
+                ),
+                (
+                    k.clone(),
+                    BodyOp::SetRemove {
+                        path: "tags".into(),
+                        value: b"bug".to_vec(),
+                    },
+                ),
+                (
+                    k.clone(),
+                    BodyOp::CounterAdd {
+                        path: "votes".into(),
+                        delta: -2,
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+
+        let v = r.read_collaborative(&k).unwrap();
+        assert!(!v.registers.contains_key("title"));
+        assert!(v.maps["fields"].is_empty());
+        let values: Vec<&[u8]> = v.lists["items"]
+            .iter()
+            .map(|e| e.value.as_slice())
+            .collect();
+        assert_eq!(values, vec![&b"three"[..], &b"two"[..]], "moved by id");
+        assert_eq!(v.texts["notes"], "hello!");
+        assert!(v.sets["tags"].is_empty());
+        assert_eq!(v.counters["votes"], 5);
+
+        // Checkpoint/restore preserves the collaborative state and ids.
+        let bytes = r.checkpoint().unwrap();
+        let restored = Replica::restore_loro(&bytes).unwrap();
+        assert_eq!(restored.read_collaborative(&k), r.read_collaborative(&k));
+        assert_eq!(restored.frontier(), r.frontier());
+    }
+
+    #[test]
+    fn a_type_conflict_rolls_back_the_whole_batch() {
+        let mut r = Replica::loro();
+        let k = key(4);
+        r.commit(
+            "created",
+            &[(
+                k.clone(),
+                BodyOp::RegisterSet {
+                    path: "title".into(),
+                    value: b"x".to_vec(),
+                },
+            )],
+        )
+        .unwrap();
+        let before = r.frontier();
+
+        // A batch whose FIRST op is valid and whose SECOND rebinds the path to
+        // another type: the whole batch must vanish, including the valid op.
+        let err = r
+            .commit(
+                "edited",
+                &[
+                    (
+                        k.clone(),
+                        BodyOp::CounterAdd {
+                            path: "votes".into(),
+                            delta: 1,
+                        },
+                    ),
+                    (
+                        k.clone(),
+                        BodyOp::MapSet {
+                            path: "title".into(),
+                            key: "no".into(),
+                            value: b"y".to_vec(),
+                        },
+                    ),
+                ],
+            )
+            .unwrap_err();
+        assert_eq!(err, ReplicaCommitError::TypeConflict);
+        assert_eq!(r.frontier(), before, "frontier unchanged");
+        let v = r.read_collaborative(&k).unwrap();
+        assert!(
+            !v.counters.contains_key("votes"),
+            "the valid first op was rolled back with the batch"
+        );
+        assert_eq!(v.registers["title"], b"x");
+    }
+
+    #[test]
+    fn frozen_algebra_limits_and_paths_are_enforced() {
+        let mut r = Replica::loro();
+        let k = key(5);
+        // Bad path grammar.
+        assert_eq!(
+            r.commit(
+                "x",
+                &[(
+                    k.clone(),
+                    BodyOp::RegisterSet {
+                        path: "Bad Path".into(),
+                        value: vec![1],
+                    },
+                )],
+            )
+            .unwrap_err(),
+            ReplicaCommitError::PathInvalid
+        );
+        // Oversized value.
+        assert_eq!(
+            r.commit(
+                "x",
+                &[(
+                    k.clone(),
+                    BodyOp::RegisterSet {
+                        path: "p".into(),
+                        value: vec![0u8; crate::algebra::MAX_VALUE_BYTES + 1],
+                    },
+                )],
+            )
+            .unwrap_err(),
+            ReplicaCommitError::OpLimit
+        );
+        // Out-of-bounds list index is a typed apply error, nothing committed.
+        assert!(matches!(
+            r.commit(
+                "x",
+                &[(
+                    k.clone(),
+                    BodyOp::ListInsert {
+                        path: "items".into(),
+                        index: 5,
+                        value: vec![1],
+                    },
+                )],
+            )
+            .unwrap_err(),
+            ReplicaCommitError::InvalidOp(_)
+        ));
+        assert_eq!(r.frontier(), ReplicaFrontier::EMPTY);
+    }
+
+    #[test]
+    fn the_reference_engine_refuses_collaborative_ops() {
         let mut r = Replica::in_memory();
         let err = r
             .commit(

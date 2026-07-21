@@ -33,6 +33,7 @@ pub use body::{
 pub use convergence::{ConvergenceOutcome, IncorporationClass};
 pub use frontier::{AuthorityFrontier, ReplicaFrontier, TransactionId};
 pub use ids::{BodyId, BodyKey, EncodingId, SchemaId, WorldId};
+pub use lait_fabric::{CollaborativeView, ListElement};
 pub use marker::{MarkerError, StoreMarkerV1};
 pub use replica::{DurabilitySink, Replica, ReplicaCommitError};
 pub use transaction::{AuthoritySource, BodyDescriptorV1, BodyTransactionV1, TransactionError};

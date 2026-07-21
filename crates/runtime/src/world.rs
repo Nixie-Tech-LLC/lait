@@ -161,8 +161,11 @@ pub struct WorldProjection {
 /// It exposes only authorized canonical reads — no Loro, no mutation, no keys.
 /// Runtime backs it with the Station's Replica.
 pub trait BodyReader {
-    /// The committed canonical bytes of a Body, if present.
+    /// The committed canonical bytes of an atomic Body, if present.
     fn read_body(&self, key: &BodyKey) -> Option<Vec<u8>>;
+    /// The committed collaborative view of a Body, if the key holds one. List
+    /// elements carry the stable ids `ListRemove`/`ListMove` take.
+    fn read_collaborative_body(&self, key: &BodyKey) -> Option<replica::CollaborativeView>;
 }
 
 /// The bounded capability handed to World callbacks. It exposes the principal
@@ -199,10 +202,15 @@ impl<'a> WorldContext<'a> {
         self.principal
     }
 
-    /// Read a Body from the stable committed snapshot. Returns `None` if the
-    /// Body is absent or this context has no read access (e.g. during submit).
+    /// Read an atomic Body from the stable committed snapshot. Returns `None`
+    /// if the Body is absent or this context has no read access.
     pub fn read_body(&self, key: &BodyKey) -> Option<Vec<u8>> {
         self.reads.and_then(|r| r.read_body(key))
+    }
+
+    /// Read a collaborative Body's view from the stable committed snapshot.
+    pub fn read_collaborative(&self, key: &BodyKey) -> Option<replica::CollaborativeView> {
+        self.reads.and_then(|r| r.read_collaborative_body(key))
     }
 }
 
