@@ -1,11 +1,17 @@
-//! The journaled durable store — Fabric's on-disk commit protocol.
+//! The journaled durable store — the semantics-free on-disk commit protocol.
 //!
-//! Layout, under one store root (which may also hold runtime-owned lifecycle
-//! files — this module touches only its own names):
+//! This crate knows only immutable content-addressed objects, object
+//! references, an atomically swapped manifest with opaque caller metadata,
+//! fsync/directory-sync discipline, fault injection, and recovery. It knows
+//! nothing about Bodies, authority, Worlds, or any product — both the Fabric
+//! Body store and the mechanics authority ledger commit through it.
+//!
+//! Layout, under one store root (which may also hold caller-owned lifecycle
+//! files — this crate touches only its own names):
 //!
 //! ```text
 //! counter            // the local transaction counter (reserved + fsynced first)
-//! current-manifest   // postcard StoreManifestV1, atomically replaced
+//! current-manifest   // postcard StoreManifest, atomically replaced
 //! objects/<hex64>    // immutable content-addressed objects
 //! journal/active     // the active journal record, atomically replaced
 //! ```
@@ -40,8 +46,6 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::fabric::FabricError;
-
 const COUNTER_FILE: &str = "counter";
 const MANIFEST_FILE: &str = "current-manifest";
 const OBJECTS_DIR: &str = "objects";
@@ -53,6 +57,36 @@ const OBJECT_DOMAIN: &[u8] = b"lait/store-object/1";
 /// Domain for a manifest's identity hash (referenced by the journal).
 const MANIFEST_DOMAIN: &[u8] = b"lait/store-manifest/1";
 
+/// Why a journal operation failed. The taxonomy is deliberately small: a
+/// durable-write failure (retry may help after the cause clears), an integrity
+/// failure (never repaired heuristically), and the one genuinely ambiguous
+/// post-switch outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JournalError {
+    /// A durable write (open/write/fsync/rename) failed before the
+    /// authoritative manifest switch. The old state is still exposed.
+    Durability(String),
+    /// The store failed integrity validation (a manifest naming absent or
+    /// corrupt objects, a corrupt journal, a missing transaction counter).
+    Integrity(String),
+    /// The authoritative switch happened but its durability confirmation
+    /// failed: the commit may or may not survive power loss. Fail stop and
+    /// reopen — recovery resolves the outcome deterministically from the
+    /// on-disk manifest. Never retry through this error.
+    OutcomeUnknown,
+}
+
+impl std::fmt::Display for JournalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JournalError::Durability(m) => write!(f, "durability: {m}"),
+            JournalError::Integrity(m) => write!(f, "integrity: {m}"),
+            JournalError::OutcomeUnknown => write!(f, "outcome unknown"),
+        }
+    }
+}
+impl std::error::Error for JournalError {}
+
 /// One immutable object reference: content address and length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectRef {
@@ -61,9 +95,10 @@ pub struct ObjectRef {
 }
 
 /// The store's manifest: the current object set plus opaque caller metadata
-/// (Replica stores its semantic frontier there — Fabric does not interpret it).
+/// (the caller stores its semantic index there — the journal does not
+/// interpret it). The encoded `version` field is the store-format version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoreManifestV1 {
+pub struct StoreManifest {
     pub version: u8,
     pub sequence: u64,
     pub objects: Vec<ObjectRef>,
@@ -109,7 +144,7 @@ pub const FAULT_POINTS: [&str; 9] = [
 /// The journaled store engine.
 pub struct JournaledStore {
     root: PathBuf,
-    manifest: Option<StoreManifestV1>,
+    manifest: Option<StoreManifest>,
     injector: Option<FaultInjector>,
 }
 
@@ -132,7 +167,7 @@ fn object_hash(bytes: &[u8]) -> [u8; 32] {
 
 /// The content address the store gives a byte object — public so a caller can
 /// predict the [`ObjectRef`] of material it hands to [`JournaledStore::commit`]
-/// (e.g. Replica's meta index referencing the objects of the same commit).
+/// (e.g. a caller's meta index referencing the objects of the same commit).
 pub fn object_content_hash(bytes: &[u8]) -> [u8; 32] {
     object_hash(bytes)
 }
@@ -148,11 +183,11 @@ fn hex(hash: &[u8; 32]) -> String {
     data_encoding::HEXLOWER.encode(hash)
 }
 
-fn io_err(what: &str, e: std::io::Error) -> FabricError {
-    FabricError::Durability(format!("{what}: {e}"))
+fn io_err(what: &str, e: std::io::Error) -> JournalError {
+    JournalError::Durability(format!("{what}: {e}"))
 }
 
-fn write_sync(path: &Path, bytes: &[u8]) -> Result<(), FabricError> {
+fn write_sync(path: &Path, bytes: &[u8]) -> Result<(), JournalError> {
     let mut f = OpenOptions::new()
         .create(true)
         .write(true)
@@ -165,7 +200,7 @@ fn write_sync(path: &Path, bytes: &[u8]) -> Result<(), FabricError> {
 }
 
 /// Atomic replace with a brief retry for Windows sharing violations.
-fn atomic_replace(tmp: &Path, dst: &Path) -> Result<(), FabricError> {
+fn atomic_replace(tmp: &Path, dst: &Path) -> Result<(), JournalError> {
     let mut last = None;
     for attempt in 0..5 {
         match std::fs::rename(tmp, dst) {
@@ -189,14 +224,14 @@ fn atomic_replace(tmp: &Path, dst: &Path) -> Result<(), FabricError> {
 /// handle that opens and then fails to flush is a real error and fails the
 /// phase.
 #[cfg(unix)]
-fn sync_dir(dir: &Path) -> Result<(), FabricError> {
+fn sync_dir(dir: &Path) -> Result<(), JournalError> {
     File::open(dir)
         .and_then(|d| d.sync_all())
         .map_err(|e| io_err("fsync dir", e))
 }
 
 #[cfg(windows)]
-fn sync_dir(dir: &Path) -> Result<(), FabricError> {
+fn sync_dir(dir: &Path) -> Result<(), JournalError> {
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     let handle = OpenOptions::new()
@@ -222,7 +257,7 @@ impl JournaledStore {
     /// Open a store root, running crash recovery, and return the store plus its
     /// current manifest (`None` for a fresh store). The exposed state is always
     /// the complete old or complete new one.
-    pub fn open(root: impl Into<PathBuf>) -> Result<Self, FabricError> {
+    pub fn open(root: impl Into<PathBuf>) -> Result<Self, JournalError> {
         let root = root.into();
         std::fs::create_dir_all(root.join(OBJECTS_DIR)).map_err(|e| io_err("objects dir", e))?;
         std::fs::create_dir_all(root.join(JOURNAL_DIR)).map_err(|e| io_err("journal dir", e))?;
@@ -242,18 +277,18 @@ impl JournaledStore {
     }
 
     /// The current manifest, if any commit has completed.
-    pub fn manifest(&self) -> Option<&StoreManifestV1> {
+    pub fn manifest(&self) -> Option<&StoreManifest> {
         self.manifest.as_ref()
     }
 
     /// Read an immutable object, verifying its content address.
-    pub fn read_object(&self, obj: &ObjectRef) -> Result<Vec<u8>, FabricError> {
+    pub fn read_object(&self, obj: &ObjectRef) -> Result<Vec<u8>, JournalError> {
         let path = self.object_path(&obj.hash);
         let bytes = std::fs::read(&path).map_err(|e| {
-            FabricError::Integrity(format!("object {} unreadable: {e}", hex(&obj.hash)))
+            JournalError::Integrity(format!("object {} unreadable: {e}", hex(&obj.hash)))
         })?;
         if bytes.len() as u64 != obj.len || object_hash(&bytes) != obj.hash {
-            return Err(FabricError::Integrity(format!(
+            return Err(JournalError::Integrity(format!(
                 "object {} fails its content address",
                 hex(&obj.hash)
             )));
@@ -269,18 +304,20 @@ impl JournaledStore {
         self.root.join(JOURNAL_DIR).join(JOURNAL_FILE)
     }
 
-    fn point(&self, name: &str) -> Result<(), FabricError> {
+    fn point(&self, name: &str) -> Result<(), JournalError> {
         if let Some(injector) = &self.injector {
             if injector(name) {
-                return Err(FabricError::Durability(format!("injected crash at {name}")));
+                return Err(JournalError::Durability(format!(
+                    "injected crash at {name}"
+                )));
             }
         }
         Ok(())
     }
 
-    fn write_journal(&self, record: &JournalRecord) -> Result<(), FabricError> {
+    fn write_journal(&self, record: &JournalRecord) -> Result<(), JournalError> {
         let bytes = postcard::to_stdvec(record)
-            .map_err(|e| FabricError::Durability(format!("encode journal: {e}")))?;
+            .map_err(|e| JournalError::Durability(format!("encode journal: {e}")))?;
         let dir = self.root.join(JOURNAL_DIR);
         let tmp = dir.join("active.tmp");
         write_sync(&tmp, &bytes)?;
@@ -289,19 +326,19 @@ impl JournaledStore {
         Ok(())
     }
 
-    fn read_journal(&self) -> Result<Option<JournalRecord>, FabricError> {
+    fn read_journal(&self) -> Result<Option<JournalRecord>, JournalError> {
         match std::fs::read(self.journal_path()) {
             Ok(bytes) => postcard::from_bytes(&bytes)
                 .map(Some)
                 // An unreadable journal record is corruption we do not repair
                 // heuristically.
-                .map_err(|e| FabricError::Integrity(format!("journal corrupt: {e}"))),
+                .map_err(|e| JournalError::Integrity(format!("journal corrupt: {e}"))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(io_err("read journal", e)),
         }
     }
 
-    fn remove_journal(&self) -> Result<(), FabricError> {
+    fn remove_journal(&self) -> Result<(), JournalError> {
         match std::fs::remove_file(self.journal_path()) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -312,13 +349,13 @@ impl JournaledStore {
         Ok(())
     }
 
-    fn read_manifest_file(&self) -> Result<Option<(StoreManifestV1, [u8; 32])>, FabricError> {
+    fn read_manifest_file(&self) -> Result<Option<(StoreManifest, [u8; 32])>, JournalError> {
         match std::fs::read(self.root.join(MANIFEST_FILE)) {
             Ok(bytes) => {
-                let manifest: StoreManifestV1 = postcard::from_bytes(&bytes)
-                    .map_err(|e| FabricError::Integrity(format!("manifest corrupt: {e}")))?;
+                let manifest: StoreManifest = postcard::from_bytes(&bytes)
+                    .map_err(|e| JournalError::Integrity(format!("manifest corrupt: {e}")))?;
                 if manifest.version != 1 {
-                    return Err(FabricError::Integrity(format!(
+                    return Err(JournalError::Integrity(format!(
                         "unsupported store manifest version {}",
                         manifest.version
                     )));
@@ -330,19 +367,19 @@ impl JournaledStore {
         }
     }
 
-    fn read_counter(&self) -> Result<u64, FabricError> {
+    fn read_counter(&self) -> Result<u64, JournalError> {
         match File::open(self.root.join(COUNTER_FILE)) {
             Ok(mut f) => {
                 let mut buf = [0u8; 8];
                 f.read_exact(&mut buf)
-                    .map_err(|_| FabricError::Integrity("transaction counter truncated".into()))?;
+                    .map_err(|_| JournalError::Integrity("transaction counter truncated".into()))?;
                 Ok(u64::from_le_bytes(buf))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // A fresh store has no counter — but a store with a manifest
                 // and no counter could reuse sequences: fail closed.
                 if self.root.join(MANIFEST_FILE).exists() {
-                    return Err(FabricError::Integrity(
+                    return Err(JournalError::Integrity(
                         "transaction counter missing from a committed store".into(),
                     ));
                 }
@@ -352,11 +389,11 @@ impl JournaledStore {
         }
     }
 
-    fn reserve_sequence(&self) -> Result<u64, FabricError> {
+    fn reserve_sequence(&self) -> Result<u64, JournalError> {
         let next = self
             .read_counter()?
             .checked_add(1)
-            .ok_or_else(|| FabricError::Integrity("transaction counter overflow".into()))?;
+            .ok_or_else(|| JournalError::Integrity("transaction counter overflow".into()))?;
         let tmp = self.root.join(format!("{COUNTER_FILE}.tmp"));
         write_sync(&tmp, &next.to_le_bytes())?;
         atomic_replace(&tmp, &self.root.join(COUNTER_FILE))?;
@@ -365,7 +402,7 @@ impl JournaledStore {
     }
 
     /// Crash recovery, then integrity verification, then orphan GC.
-    fn recover(&mut self) -> Result<(), FabricError> {
+    fn recover(&mut self) -> Result<(), JournalError> {
         match self.read_journal()? {
             None => {}
             Some(JournalRecord::Committed { .. }) => {
@@ -407,7 +444,7 @@ impl JournaledStore {
             }
             let counter = self.read_counter()?;
             if counter < manifest.sequence {
-                return Err(FabricError::Integrity(
+                return Err(JournalError::Integrity(
                     "transaction counter behind the committed manifest — \
                      sequence reuse is forbidden"
                         .into(),
@@ -454,7 +491,7 @@ impl JournaledStore {
     /// are absorbed, because recovery finalizes a `MaterialReady` journal with
     /// the new manifest as committed. A failure raised *by the directory sync
     /// itself* after the rename is the one genuinely ambiguous case and is
-    /// reported as [`FabricError::OutcomeUnknown`]: the caller must fail stop
+    /// reported as [`JournalError::OutcomeUnknown`]: the caller must fail stop
     /// and reopen — recovery then resolves the outcome deterministically (the
     /// manifest on disk decides). A durably committed operation is therefore
     /// never reported as a plain retryable failure.
@@ -463,7 +500,7 @@ impl JournaledStore {
         new_objects: &[Vec<u8>],
         keep: &[ObjectRef],
         meta: Vec<u8>,
-    ) -> Result<u64, FabricError> {
+    ) -> Result<u64, JournalError> {
         // 0. Carried references must already be present and content-valid —
         //    otherwise a "successful" commit would fail integrity on next open.
         for obj in keep {
@@ -483,14 +520,14 @@ impl JournaledStore {
             .collect();
         let mut objects = keep.to_vec();
         objects.extend(new_refs.iter().copied());
-        let manifest = StoreManifestV1 {
+        let manifest = StoreManifest {
             version: 1,
             sequence,
             objects,
             meta,
         };
         let manifest_bytes = postcard::to_stdvec(&manifest)
-            .map_err(|e| FabricError::Durability(format!("encode manifest: {e}")))?;
+            .map_err(|e| JournalError::Durability(format!("encode manifest: {e}")))?;
         let new_manifest_hash = manifest_hash(&manifest_bytes);
 
         // 2. Journal Prepared.
@@ -534,7 +571,7 @@ impl JournaledStore {
             // The rename happened but its directory-entry durability is
             // unconfirmed: the one ambiguous outcome. Fail stop; reopening
             // resolves it (the on-disk manifest decides).
-            return Err(FabricError::OutcomeUnknown);
+            return Err(JournalError::OutcomeUnknown);
         }
 
         // --- The commit is now authoritative: nothing below may fail it. ---

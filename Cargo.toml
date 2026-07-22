@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/journal",
     "crates/mechanics",
     "crates/fabric",
     "crates/comms",

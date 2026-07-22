@@ -244,6 +244,16 @@ impl std::fmt::Display for FabricError {
 }
 impl std::error::Error for FabricError {}
 
+impl From<journal::JournalError> for FabricError {
+    fn from(e: journal::JournalError) -> Self {
+        match e {
+            journal::JournalError::Durability(m) => FabricError::Durability(m),
+            journal::JournalError::Integrity(m) => FabricError::Integrity(m),
+            journal::JournalError::OutcomeUnknown => FabricError::OutcomeUnknown,
+        }
+    }
+}
+
 /// The Fabric engine: the durable, canonical collaborative representation
 /// Replica drives. It accepts semantic operations and returns a receipt whose
 /// construction is Fabric-private, serves committed reads, and exports/imports

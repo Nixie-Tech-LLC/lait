@@ -472,7 +472,9 @@ impl Replica {
     ) -> Result<Self, ReplicaCommitError> {
         let store = match JournaledStore::open(root) {
             Ok(s) => s,
-            Err(FabricError::Integrity(m)) => return Err(ReplicaCommitError::Integrity(m)),
+            Err(fabric::journal::JournalError::Integrity(m)) => {
+                return Err(ReplicaCommitError::Integrity(m))
+            }
             Err(e) => return Err(ReplicaCommitError::Durability(e.to_string())),
         };
         let mut replica = Self::new(Box::new(LoroFabric::new())).with_keys(keys.clone());
@@ -1628,7 +1630,7 @@ impl Replica {
         let store = self.durable.as_mut().expect("durable path");
         match store.commit(std::slice::from_ref(&receipt_bytes), &keep, meta_bytes) {
             Ok(_) => {}
-            Err(FabricError::OutcomeUnknown) => {
+            Err(fabric::journal::JournalError::OutcomeUnknown) => {
                 self.poisoned = true;
                 return Err(ReplicaCommitError::OutcomeUnknown);
             }
@@ -1798,7 +1800,7 @@ impl Replica {
         let store = self.durable.as_mut().expect("durable path");
         match store.commit(&new_objects, &keep, meta_bytes) {
             Ok(_) => {}
-            Err(FabricError::OutcomeUnknown) => {
+            Err(fabric::journal::JournalError::OutcomeUnknown) => {
                 self.poisoned = true;
                 return Err(ReplicaCommitError::OutcomeUnknown);
             }

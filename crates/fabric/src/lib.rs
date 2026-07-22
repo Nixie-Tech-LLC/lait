@@ -23,14 +23,21 @@ pub mod catalog;
 pub mod fabric;
 pub mod history;
 pub mod issue;
-pub mod journal;
 mod loro_ext;
 pub mod membership;
 pub mod op;
 pub mod store;
 
+/// The semantics-free durable commit protocol, extracted into the lower
+/// `journal` crate (mechanics commits its authority ledger through the same
+/// machinery). Re-exported here so Fabric consumers keep one durability
+/// namespace.
+pub mod journal {
+    pub use ::journal::*;
+}
+
 pub use fabric::{
     BodyExport, CausalToken, CollaborativeView, Fabric, FabricCommitReceipt, FabricError,
     FabricKey, FabricOp, FabricTransactionRequest, ListElement, LoroFabric,
 };
-pub use journal::{FaultInjector, JournaledStore, ObjectRef, StoreManifestV1, FAULT_POINTS};
+pub use journal::{FaultInjector, JournaledStore, ObjectRef, StoreManifest, FAULT_POINTS};

@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use fabric::journal::JournaledStore;
+use journal::JournaledStore;
 
 const ENV_DIR: &str = "LAIT_JOURNAL_CRASH_DIR";
 const ENV_POINT: &str = "LAIT_JOURNAL_CRASH_POINT";

@@ -7,7 +7,6 @@ crates/fabric/src/history.rs	fabric-product-module	M5
 crates/fabric/src/history.rs	product-doc-wrapper	M5
 crates/fabric/src/issue.rs	fabric-product-module	M5
 crates/fabric/src/issue.rs	product-doc-wrapper	M5
-crates/fabric/src/journal.rs	version-suffixed-ident	M6
 crates/fabric/src/lib.rs	product-doc-wrapper	M5
 crates/fabric/src/membership.rs	fabric-product-module	M5
 crates/fabric/src/membership.rs	product-doc-wrapper	M5

@@ -9,6 +9,10 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 # lait's roots — the fabric wraps the scaffold in lait's own types.
 mechanics = { path = "../mechanics" }
+# The semantics-free crash-safe object/manifest journal (re-exported as
+# `fabric::journal`). Extracted so mechanics can commit its authority ledger
+# through the same durability machinery without depending on Fabric.
+journal = { path = "../journal" }
 # The convergence scaffold. This is the only crate in this Cargo workspace that
 # lists it, so `loro::*` is nameable here and nowhere else — the seal is the
 # manifest.

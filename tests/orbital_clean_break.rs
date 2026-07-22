@@ -40,7 +40,14 @@ fn production_files() -> Vec<PathBuf> {
     let root = workspace_root();
     let mut out = Vec::new();
     walk(&root.join("src"), &mut out);
-    for crate_dir in ["mechanics", "fabric", "comms", "replica", "runtime"] {
+    for crate_dir in [
+        "journal",
+        "mechanics",
+        "fabric",
+        "comms",
+        "replica",
+        "runtime",
+    ] {
         walk(&root.join("crates").join(crate_dir).join("src"), &mut out);
         let manifest = root.join("crates").join(crate_dir).join("Cargo.toml");
         if manifest.exists() {

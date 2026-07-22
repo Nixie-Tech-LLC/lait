@@ -4,8 +4,8 @@
 //! mixture. Plus integrity classification, orphan GC, counter monotonicity,
 //! and carried-object semantics.
 
-use fabric::journal::{JournaledStore, ObjectRef, FAULT_POINTS};
-use fabric::FabricError;
+use journal::{JournalError, JournaledStore, ObjectRef, FAULT_POINTS};
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -97,7 +97,7 @@ fn a_crash_at_every_fault_point_recovers_to_a_complete_state() {
             });
         } else {
             assert!(
-                matches!(result.unwrap_err(), FabricError::Durability(_)),
+                matches!(result.unwrap_err(), JournalError::Durability(_)),
                 "{point}: pre-authoritative crash surfaces as Durability"
             );
         }
@@ -153,7 +153,7 @@ fn a_bogus_carried_reference_fails_the_commit_up_front() {
     let err = store
         .commit(&[b"newer".to_vec()], &[bogus], b"m2".to_vec())
         .unwrap_err();
-    assert!(matches!(err, FabricError::Integrity(_)));
+    assert!(matches!(err, JournalError::Integrity(_)));
     // The store is untouched and still healthy.
     drop(store);
     let store = JournaledStore::open(&root).unwrap();
@@ -179,7 +179,7 @@ fn a_corrupt_object_is_an_integrity_failure_not_a_repair() {
     std::fs::write(entry.path(), b"tampered").unwrap();
 
     match JournaledStore::open(&root) {
-        Err(FabricError::Integrity(_)) => {}
+        Err(JournalError::Integrity(_)) => {}
         other => panic!("expected Integrity, got {other:?}"),
     }
 }
@@ -193,7 +193,7 @@ fn a_missing_counter_on_a_committed_store_fails_closed() {
 
     std::fs::remove_file(root.join("counter")).unwrap();
     match JournaledStore::open(&root) {
-        Err(FabricError::Integrity(_)) => {}
+        Err(JournalError::Integrity(_)) => {}
         other => panic!("expected Integrity (no sequence reuse), got {other:?}"),
     }
 }

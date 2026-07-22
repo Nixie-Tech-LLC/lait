@@ -71,7 +71,7 @@ fn only_fabric_names_loro_in_its_manifest() {
         manifest_lists_dep("fabric", "loro"),
         "fabric must list loro — it is the sealed Loro boundary"
     );
-    for crate_dir in ["mechanics", "comms", "replica", "runtime"] {
+    for crate_dir in ["journal", "mechanics", "comms", "replica", "runtime"] {
         assert!(
             !manifest_lists_dep(crate_dir, "loro"),
             "{crate_dir} must NOT name loro — the dependency edge is the seal"
@@ -145,7 +145,14 @@ fn concept_crates_are_free_of_product_vocabulary() {
 #[test]
 fn every_concept_crate_is_prefix_free() {
     // After S8 all five concept crates carry their prefix-free canonical names.
-    for crate_dir in ["mechanics", "fabric", "comms", "replica", "runtime"] {
+    for crate_dir in [
+        "journal",
+        "mechanics",
+        "fabric",
+        "comms",
+        "replica",
+        "runtime",
+    ] {
         let manifest = read(
             &workspace_root()
                 .join("crates")
@@ -177,7 +184,14 @@ fn no_legacy_crate_name_or_directory_remains() {
         );
     }
     // No source or manifest may still name a legacy crate path.
-    for crate_dir in ["mechanics", "fabric", "comms", "replica", "runtime"] {
+    for crate_dir in [
+        "journal",
+        "mechanics",
+        "fabric",
+        "comms",
+        "replica",
+        "runtime",
+    ] {
         for src in rust_sources(crate_dir) {
             let text = read(&src);
             for legacy in ["lait_kernel", "lait_fabric", "lait_net"] {
