@@ -65,6 +65,12 @@ fn discover_space(home: &Path) -> Result<SpaceId> {
 pub struct OrbitalDaemon {
     mechanics: OrbitalMechanics,
     station: Station,
+    /// The canonical [`ApproachRoute`]s this Station advertises, resolved from
+    /// the retained transport handle at activation (an Isolated endpoint's own
+    /// bound direct addresses) — the composition root's route source, kept
+    /// beside the Station (which never exposes its own transport). Invite
+    /// creation signs exactly these into Coordinates.
+    advertised_routes: Vec<runtime::coordinates::ApproachRoute>,
     /// The routing Session. `None` until this device holds standing — an
     /// un-admitted joiner serves control (Status/Connect/Members) and drives
     /// Contact before it can dock, then docks lazily once admission lands.
@@ -115,6 +121,9 @@ impl OrbitalDaemon {
                 &[runtime::contact::CONTACT_ALPN, runtime::PRESENCE_ALPN_V1],
             )
             .await?;
+        // Retain a transport clone for invite route advertisement before the
+        // Station consumes one into its Comms.
+        let retained_transport = transport.clone();
         let station = rt
             .orbit(&space)
             .map_err(|e| anyhow!("acquire orbit: {e:?}"))?
@@ -125,6 +134,32 @@ impl OrbitalDaemon {
             })
             .map_err(|e| anyhow!("activate: {e:?}"))?;
         let identity = Runtime::identity_from_seed(&device_seed);
+        // Resolve the routes this Station will advertise in invites: the
+        // transport's currently-dialable direct addresses (bounded wait for a
+        // fresh iroh endpoint), canonicalized. A relay/discovery transport
+        // returns none — its invites are address-free (bare ids resolve).
+        let advertised_routes = runtime::coordinates::canonical_routes(
+            &retained_transport
+                .advertised_routes(Duration::from_secs(3))
+                .await
+                .unwrap_or_default(),
+        );
+        // Joiner bootstrap: if we are not yet admitted and entered with
+        // Coordinates, teach the transport the approach Station's signed direct
+        // routes so the first Contact dial resolves — Coordinates-only, no
+        // shared registry, no MemNet learn.
+        if !mechanics.am_i_member() {
+            if let Some(coords) = mechanics.pending_coordinates() {
+                if let Ok(verified) = coords.verify() {
+                    if !verified.approach_routes.is_empty() {
+                        // PeerId is a DeviceId — the approach Station's key is
+                        // its dialable peer id.
+                        retained_transport
+                            .learn(verified.approach_station.clone(), &verified.approach_routes);
+                    }
+                }
+            }
+        }
         // Dock now if we already hold standing (founder / re-opened member);
         // otherwise defer until admission lands (an un-admitted joiner cannot
         // dock, but must still serve control to drive its own Contact).
@@ -135,6 +170,7 @@ impl OrbitalDaemon {
         Ok(Self {
             mechanics,
             station,
+            advertised_routes,
             session: Mutex::new(session),
             identity,
             device_seed,
@@ -338,10 +374,12 @@ impl OrbitalDaemon {
             Ok(a) => a,
             Err(e) => return Response::err(format!("mint admission: {e}")),
         };
-        match self
-            .mechanics
-            .mint_coordinates(&self.device_seed, "", vec![], Some(admission))
-        {
+        match self.mechanics.mint_coordinates(
+            &self.device_seed,
+            "",
+            self.advertised_routes.clone(),
+            Some(admission),
+        ) {
             Ok(coords) => Response::Ref {
                 reff: coords.render(),
             },

@@ -52,7 +52,7 @@ pub use contact::{
 };
 pub use contact_driver::{CommsOptions, ContactMechanics, GossipOptions, MAX_CONTACTS_IN_FLIGHT};
 pub use coordinates::{
-    AdmissionCapabilityV1, ApproachAddr, CoordinatesAdmission, CoordinatesError,
+    canonical_routes, AdmissionCapabilityV1, ApproachRoute, CoordinatesAdmission, CoordinatesError,
     CoordinatesPayloadV1, SignedCoordinatesV1, VerifiedCoordinates,
 };
 pub use error::{ContactError, DormancyError, LifecycleError, StationExit, WorldError};

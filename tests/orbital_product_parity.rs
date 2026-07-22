@@ -47,7 +47,7 @@ fn temp_root(tag: &str) -> std::path::PathBuf {
 }
 
 fn coordinates() -> runtime::SignedCoordinatesV1 {
-    use runtime::coordinates::{ApproachAddr, CoordinatesAdmission, CoordinatesPayloadV1};
+    use runtime::coordinates::{ApproachRoute, CoordinatesAdmission, CoordinatesPayloadV1};
     let rc = mechanics::space::recovery_commit(&mechanics::space::recovery_pub_of(&RECOVERY_SEED))
         .unwrap();
     let device = mechanics::space::recovery_pub_of(&FOUNDER_SEED);
@@ -64,7 +64,7 @@ fn coordinates() -> runtime::SignedCoordinatesV1 {
             .key_bytes()
             .unwrap(),
         approach_nick_hint: "a".into(),
-        approach_addrs: vec![ApproachAddr::V4 {
+        approach_routes: vec![ApproachRoute::DirectV4 {
             ip: [127, 0, 0, 1],
             port: 4242,
         }],

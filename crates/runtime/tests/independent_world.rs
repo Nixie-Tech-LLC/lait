@@ -20,7 +20,7 @@ use mechanics::ids::{ActorId, DeviceId, SpaceId, StationId};
 use replica::body::{BodyOp, BodySchema, CollaborativeSchema, MutationModel};
 use replica::frontier::{AuthorityFrontier, ReplicaFrontier};
 use replica::ids::{BodyId, BodyKey, EncodingId, SchemaId, WorldId};
-use runtime::coordinates::{ApproachAddr, CoordinatesAdmission, CoordinatesPayloadV1};
+use runtime::coordinates::{ApproachRoute, CoordinatesAdmission, CoordinatesPayloadV1};
 
 #[allow(dead_code)]
 fn any_demand() -> Vec<u8> {
@@ -76,7 +76,7 @@ fn coordinates() -> (SpaceId, SignedCoordinatesV1) {
             .key_bytes()
             .unwrap(),
         approach_nick_hint: "a".into(),
-        approach_addrs: vec![ApproachAddr::V4 {
+        approach_routes: vec![ApproachRoute::DirectV4 {
             ip: [127, 0, 0, 1],
             port: 4242,
         }],

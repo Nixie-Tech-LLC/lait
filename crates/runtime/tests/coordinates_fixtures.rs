@@ -3,7 +3,7 @@
 
 use mechanics::ids::SpaceId;
 use runtime::coordinates::{
-    AdmissionCapabilityV1, ApproachAddr, CoordinatesAdmission, CoordinatesError,
+    AdmissionCapabilityV1, ApproachRoute, CoordinatesAdmission, CoordinatesError,
     CoordinatesPayloadV1, SignedCoordinatesV1, MAX_INCEPTION, MAX_NAME,
 };
 
@@ -43,7 +43,7 @@ fn valid_payload() -> (SpaceId, CoordinatesPayloadV1) {
         display_name_hint: "My Space".into(),
         approach_station: station_pubkey(),
         approach_nick_hint: "host".into(),
-        approach_addrs: vec![ApproachAddr::V4 {
+        approach_routes: vec![ApproachRoute::DirectV4 {
             ip: [10, 0, 0, 1],
             port: 4242,
         }],
@@ -65,7 +65,7 @@ fn valid_coordinates_verify() {
     assert_eq!(verified.space, ws);
     assert_eq!(verified.display_name_hint, "My Space");
     assert_eq!(verified.approach_nick_hint, "host");
-    assert_eq!(verified.approach_addrs.len(), 1);
+    assert_eq!(verified.approach_routes.len(), 1);
     assert!(verified.admission.is_none());
 }
 
@@ -88,12 +88,60 @@ fn signing_is_deterministic() {
 
 #[test]
 fn unsupported_version_is_rejected_like_a_spaceticket() {
+    // Coordinates v1 (and the pre-carve SpaceTicket tag) are rejected — only
+    // wire version 2 is accepted, never negotiated.
     let mut coords = valid_coordinates();
-    coords.version = 2;
+    coords.version = 1;
     assert_eq!(
         coords.verify(),
-        Err(CoordinatesError::UnsupportedVersion(2))
+        Err(CoordinatesError::UnsupportedVersion(1))
     );
+    let mut coords = valid_coordinates();
+    coords.version = 3;
+    assert_eq!(
+        coords.verify(),
+        Err(CoordinatesError::UnsupportedVersion(3))
+    );
+}
+
+#[test]
+fn unusable_routes_are_rejected() {
+    use runtime::coordinates::canonical_routes;
+    // A signed route that is unspecified, multicast, or zero-port fails verify.
+    for bad in [
+        ApproachRoute::DirectV4 {
+            ip: [0, 0, 0, 0],
+            port: 4242,
+        },
+        ApproachRoute::DirectV4 {
+            ip: [224, 0, 0, 1],
+            port: 4242,
+        },
+        ApproachRoute::DirectV4 {
+            ip: [10, 0, 0, 1],
+            port: 0,
+        },
+    ] {
+        assert!(!bad.is_usable());
+        let (_ws, mut payload) = valid_payload();
+        payload.approach_routes = vec![bad];
+        let coords = SignedCoordinatesV1::sign(payload, &STATION_SEED);
+        assert_eq!(coords.verify(), Err(CoordinatesError::BadAddresses));
+    }
+    // Canonicalization drops the unusable ones and sorts/dedups the rest.
+    let socks: Vec<std::net::SocketAddr> = [
+        "0.0.0.0:4242",
+        "10.0.0.2:1",
+        "10.0.0.1:1",
+        "10.0.0.1:1",
+        "224.0.0.1:5",
+    ]
+    .iter()
+    .map(|s| s.parse().unwrap())
+    .collect();
+    let routes = canonical_routes(&socks);
+    assert_eq!(routes.len(), 2, "unusable dropped, duplicate deduped");
+    assert!(routes.windows(2).all(|w| w[0] < w[1]), "sorted, unique");
 }
 
 #[test]
@@ -124,12 +172,12 @@ fn tampered_payload_breaks_the_outer_signature() {
 #[test]
 fn unsorted_or_duplicate_addresses_are_rejected() {
     let (_ws, mut payload) = valid_payload();
-    payload.approach_addrs = vec![
-        ApproachAddr::V4 {
+    payload.approach_routes = vec![
+        ApproachRoute::DirectV4 {
             ip: [10, 0, 0, 2],
             port: 1,
         },
-        ApproachAddr::V4 {
+        ApproachRoute::DirectV4 {
             ip: [10, 0, 0, 1],
             port: 1,
         },

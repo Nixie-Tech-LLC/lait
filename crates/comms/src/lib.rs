@@ -199,6 +199,39 @@ pub trait Transport: Send + Sync {
     /// ids), so the policy test lives here, not in the daemon.
     fn advertised_addrs(&self) -> Vec<std::net::SocketAddr>;
 
+    /// The **currently dialable** direct addresses, waiting up to `deadline`
+    /// for the transport to discover them (a fresh iroh endpoint learns its
+    /// direct addresses asynchronously after binding). Isolated transports
+    /// must return at least one usable route or a `NoAdvertisedRoute` error;
+    /// Public/Local transports may return an empty vector (bare ids resolve).
+    /// This never consults a shared node-id registry — the routes are the
+    /// endpoint's own bound addresses. The default polls
+    /// [`advertised_addrs`](Transport::advertised_addrs) until non-empty or
+    /// the deadline elapses.
+    async fn advertised_routes(
+        &self,
+        deadline: std::time::Duration,
+    ) -> Result<Vec<std::net::SocketAddr>> {
+        let start = std::time::Instant::now();
+        loop {
+            let addrs = self.advertised_addrs();
+            if !addrs.is_empty() || !self.is_isolated() {
+                return Ok(addrs);
+            }
+            if start.elapsed() >= deadline {
+                anyhow::bail!("no advertised route within the deadline");
+            }
+            n0_future::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Whether this transport is Isolated (no relay/discovery): peers can reach
+    /// it only by carried direct routes. Public/Local transports return `false`
+    /// (bare ids resolve through discovery/the relay).
+    fn is_isolated(&self) -> bool {
+        false
+    }
+
     /// Join a gossip room, bootstrapping from `bootstrap` peers (which the
     /// transport also [`learn`](Transport::learn)s, so bare-id dials to them
     /// resolve). Non-waiting — a solo founder must not block; callers wanting a

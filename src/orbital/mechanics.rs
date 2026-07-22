@@ -44,6 +44,9 @@ use runtime::coordinates::AdmissionCapabilityV1;
 const GENESIS_FILE: &str = "mech-genesis.json";
 const PENDING_INCEPTION_FILE: &str = "mech-pending-inception.bin";
 const PENDING_ADMISSION_FILE: &str = "mech-pending-admission.bin";
+/// The verified bootstrap Coordinates a joiner entered with (routes + approach
+/// Station), persisted so the daemon can teach its transport and dial.
+const COORDINATES_FILE: &str = "mech-coordinates.bin";
 /// The authority ledger's journal root, under the Space's mechanics dir.
 const LEDGER_DIR: &str = "authority";
 
@@ -342,7 +345,7 @@ impl OrbitalMechanics {
         root: &Path,
         device_seed: &[u8; 32],
         display_name: &str,
-        approach_addrs: Vec<runtime::coordinates::ApproachAddr>,
+        approach_routes: Vec<runtime::coordinates::ApproachRoute>,
     ) -> Result<(Self, runtime::SignedCoordinatesV1)> {
         let me = crypto::device_from_seed(device_seed);
         let salt = super::rand16();
@@ -430,7 +433,7 @@ impl OrbitalMechanics {
         let mech = Self {
             inner: Arc::new(Mutex::new(inner)),
         };
-        let coords = mech.mint_coordinates(device_seed, display_name, approach_addrs, None)?;
+        let coords = mech.mint_coordinates(device_seed, display_name, approach_routes, None)?;
         Ok((mech, coords))
     }
 
@@ -513,6 +516,10 @@ impl OrbitalMechanics {
                 postcard::to_stdvec(admission)?,
             )?;
         }
+        // Persist the verified Coordinates so the daemon can teach its
+        // transport the approach Station's signed routes and bootstrap the
+        // first Contact — Coordinates-only, no shared registry.
+        std::fs::write(inner.dir.join(COORDINATES_FILE), coordinates.encode())?;
         inner.refresh_keyring();
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -554,7 +561,7 @@ impl OrbitalMechanics {
         &self,
         station_seed: &[u8; 32],
         display_name: &str,
-        approach_addrs: Vec<runtime::coordinates::ApproachAddr>,
+        approach_routes: Vec<runtime::coordinates::ApproachRoute>,
         admission: Option<AdmissionCapabilityV1>,
     ) -> Result<runtime::SignedCoordinatesV1> {
         let inner = self.lock();
@@ -580,7 +587,7 @@ impl OrbitalMechanics {
                 .key_bytes()
                 .ok_or_else(|| anyhow!("station key"))?,
             approach_nick_hint: String::new(),
-            approach_addrs,
+            approach_routes,
             admission: match admission {
                 Some(a) => runtime::coordinates::CoordinatesAdmission::Some(a),
                 None => runtime::coordinates::CoordinatesAdmission::None,
@@ -771,6 +778,16 @@ impl OrbitalMechanics {
     /// The current authority frontier (for signing manifests/attribution).
     pub fn current_frontier(&self) -> AuthorityFrontier {
         self.lock().frontier()
+    }
+
+    /// The verified bootstrap Coordinates a joiner entered with, if one is
+    /// persisted and this device is not yet admitted — the daemon reads it to
+    /// teach the transport the approach Station's routes and dial. `None` once
+    /// admitted (the pending material is cleaned up).
+    pub fn pending_coordinates(&self) -> Option<runtime::SignedCoordinatesV1> {
+        let inner = self.lock();
+        let bytes = std::fs::read(inner.dir.join(COORDINATES_FILE)).ok()?;
+        runtime::SignedCoordinatesV1::decode_canonical(&bytes).ok()
     }
 
     /// Activate a World implementation id for this Space — an admin-authored
@@ -1040,6 +1057,7 @@ impl replica::AuthorityIncorporator for OrbitalMechanics {
             if inner.pending_inception.take().is_some() {
                 let _ = std::fs::remove_file(inner.dir.join(PENDING_INCEPTION_FILE));
             }
+            let _ = std::fs::remove_file(inner.dir.join(COORDINATES_FILE));
         }
         Ok(replica::AuthorityBatchReceipt {
             space: inner.space.clone(),

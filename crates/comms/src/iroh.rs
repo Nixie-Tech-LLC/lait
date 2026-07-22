@@ -430,6 +430,10 @@ impl Transport for IrohTransport {
         }
     }
 
+    fn is_isolated(&self) -> bool {
+        self.peers.is_isolated()
+    }
+
     /// Bootstrap ids are converted AND pre-learned (so bare-id dials to them
     /// resolve under Local), then the topic is joined non-waiting.
     async fn subscribe(
