@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "description": "IssuesWorld reference performance corpus (plan 50). Frozen shape: one Space, evenly distributed issues, per-issue semantic events and labels, distinct per-project policy context, and an incremental sync tail. The harness (tests/issues_reference_perf.rs) builds it exclusively through the public daemon/control surface; direct Fabric/Replica fixtures do not satisfy this gate.",
+  "corpus": {
+    "projects": 20,
+    "issues": 50000,
+    "eventsPerIssue": 20,
+    "labelsPerIssue": 8,
+    "actors": 32,
+    "incrementalOps": 1000
+  },
+  "measurement": {
+    "warmups": 10,
+    "coldIterations": 5,
+    "warmIterations": 100
+  },
+  "budgets": {
+    "warmFocusP95Ms": 50,
+    "maxRequestMs": 2000,
+    "coldRebuildMs": 60000,
+    "peakRssBytes": 1073741824,
+    "warmQueryRegressionPct": 10,
+    "writeRegressionPct": 15
+  },
+  "baselines": null,
+  "baselinesNote": "p95 baselines are frozen from the first full-scale run on the pinned CI runner image and require reviewer approval in the same change that freezes them; a budget update alone cannot green a regression. Until frozen, the absolute budgets above are enforced and the regression comparison is recorded but not gated."
+}
