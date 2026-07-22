@@ -293,9 +293,12 @@ impl replica::AuthorityIncorporator for AcceptingIncorporator {
     fn incorporate_authority(
         &mut self,
         _records: &[Vec<u8>],
-    ) -> Result<replica::AuthorityReceipt, String> {
-        Ok(replica::AuthorityReceipt {
-            frontier: AuthorityFrontier::from_canonical_bytes(vec![6]),
+    ) -> Result<replica::AuthorityBatchReceipt, String> {
+        Ok(replica::AuthorityBatchReceipt {
+            space: coordinates().0,
+            prior_frontier: replica::frontier::AuthorityFrontier::from_canonical_bytes(vec![]),
+            resulting_frontier: AuthorityFrontier::from_canonical_bytes(vec![6]),
+            batch_digest: *blake3::hash(&_records.concat()).as_bytes(),
         })
     }
 }

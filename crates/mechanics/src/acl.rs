@@ -118,7 +118,7 @@ impl AclAction {
 
 /// One authorized key-epoch, materialized from a valid [`AclAction::MintEpoch`].
 /// The trusted record other planes/selection read — never the raw synced doc.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EpochAuth {
     pub id: [u8; 16],
     pub gen: u32,
@@ -163,7 +163,7 @@ pub struct EpochAuth {
 /// is lazy revocation, the same accepted residual [`crate::actor`] names — it
 /// cannot be closed by any amount of re-keying, and callers reporting a fence
 /// must say so rather than implying the invite was un-rung.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RekeyFence {
     /// Op hash of the `RevokeInvite` that fenced the admission.
     pub fence: String,
@@ -206,7 +206,7 @@ pub fn sign_op(seed: &[u8; 32], op: &AclOp, parents: Vec<String>, space_id: &Spa
 }
 
 /// The materialized ACL state after replay.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AclState {
     /// Every actor sealed into the space, humans and agents alike, with
     /// their grants. Agents carry no grants.
@@ -363,6 +363,21 @@ pub fn replay_with_audit(
     actor_events: &[SignedEvent],
     ops: &[SignedOp],
 ) -> (AclState, Vec<AuditEntry>) {
+    let (cp, audit) = replay_checkpointed(genesis, actor_events, ops);
+    (cp.state, audit)
+}
+
+/// Complete replay that additionally returns the [`ReplayCheckpoint`] — the
+/// canonical durable materialization the authority ledger persists at every
+/// journal commit. The checkpoint carries the public state plus the private
+/// replay provenance (verdict order, pass-1 continuation state, epoch mints,
+/// heads) required by the strict-descendant continuation path
+/// ([`replay_continue`]).
+pub fn replay_checkpointed(
+    genesis: &Genesis,
+    actor_events: &[SignedEvent],
+    ops: &[SignedOp],
+) -> (ReplayCheckpoint, Vec<AuditEntry>) {
     let ws = &genesis.space_id;
 
     // Index signature-valid ops by hash. Undecodable ops stay as opaque DAG
@@ -448,87 +463,389 @@ pub fn replay_with_audit(
 
         // Agents have no membership authority, even when their signing device is bound.
         let ok = bound
-            && !agents_now.contains_key(by)
-            && match &op.action {
-                AclAction::AddMember { .. } | AclAction::SetGrants { .. } => admins.contains(by),
-                // Admins remove anyone; a sponsor may retire their own agent.
-                AclAction::RemoveMember { actor } => {
-                    admins.contains(by) || agents_now.get(actor) == Some(by)
-                }
-                // Any human member may sponsor an agent for themselves; the
-                // agent actor must be fresh (not already a principal).
-                AclAction::AddAgent { actor } => {
-                    humans.contains(by)
-                        && actor != by
-                        && !humans.contains(actor)
-                        && !agents_now.contains_key(actor)
-                }
-                // Minting a key epoch requires **admin standing**:
-                // re-keying decides who reads future content, a membership-
-                // authority action — so a viewer, plain writer, agent, or
-                // non-member cannot mint. This is the fence that stops an
-                // injected epoch from going live, and it keeps the key lifecycle
-                // exclusive to the same principals that add/remove members, so a
-                // departed member cannot mint itself continued read access.
-                //
-                // The generation is additionally bounded to `max(ancestor mint
-                // gen) + 1` — an admin cannot jump the generation to pin the
-                // active tip (overflow / permanent non-supersession); concurrent mints off
-                // the same tip still share a generation and coexist by id.
-                AclAction::MintEpoch { gen, .. } => {
-                    admins.contains(by) && {
-                        let ceiling = epoch_gens
-                            .iter()
-                            .filter(|(mh, _)| ancestors.get(h).is_some_and(|anc| anc.contains(*mh)))
-                            .map(|(_, g)| *g)
-                            .max()
-                            .map(|g| g.saturating_add(1))
-                            .unwrap_or(0);
-                        *gen <= ceiling
-                    }
-                }
-                // Revoking an invite is a membership-authority action — admin only.
-                AclAction::RevokeInvite { .. } => admins.contains(by),
-            };
+            && judge_op(
+                op,
+                h,
+                &admins,
+                &humans,
+                &agents_now,
+                &epoch_gens,
+                &ancestors,
+            );
         entry.authorized = ok;
         audit.push(entry);
         if !ok {
             continue;
         }
         authorized.push(h.clone());
-        match &op.action {
-            AclAction::AddMember { actor, grants } | AclAction::SetGrants { actor, grants } => {
-                humans.insert(actor.clone());
-                agents_now.remove(actor);
-                if grants.contains(&Grant::Admin) {
-                    admins.insert(actor.clone());
-                } else {
-                    admins.remove(actor);
+        apply_authorized(
+            op,
+            h,
+            &mut admins,
+            &mut humans,
+            &mut agents_now,
+            &mut epoch_gens,
+        );
+    }
+
+    let state = materialize_authorized(genesis, &decoded, &ancestors, &authorized);
+    let checkpoint = ReplayCheckpoint {
+        state,
+        verdicts: audit
+            .iter()
+            .map(|e| (e.hash.clone(), e.authorized))
+            .collect(),
+        heads: heads_of(&nodes),
+        admins,
+        humans,
+        agents_now,
+        epoch_gens: epoch_gens.into_iter().collect(),
+    };
+    (checkpoint, audit)
+}
+
+/// The pass-1 authorization predicate for one decoded op whose device→actor
+/// binding has already been proven. Shared verbatim by the complete replay and
+/// the strict-descendant continuation — the rules exist exactly once.
+#[allow(clippy::too_many_arguments)]
+fn judge_op(
+    op: &AclOp,
+    h: &str,
+    admins: &BTreeSet<ActorId>,
+    humans: &BTreeSet<ActorId>,
+    agents_now: &BTreeMap<ActorId, ActorId>,
+    epoch_gens: &HashMap<String, u32>,
+    ancestors: &HashMap<String, std::collections::HashSet<String>>,
+) -> bool {
+    let by = &op.by;
+    // Agents have no membership authority, even when their signing device is bound.
+    !agents_now.contains_key(by)
+        && match &op.action {
+            AclAction::AddMember { .. } | AclAction::SetGrants { .. } => admins.contains(by),
+            // Admins remove anyone; a sponsor may retire their own agent.
+            AclAction::RemoveMember { actor } => {
+                admins.contains(by) || agents_now.get(actor) == Some(by)
+            }
+            // Any human member may sponsor an agent for themselves; the
+            // agent actor must be fresh (not already a principal).
+            AclAction::AddAgent { actor } => {
+                humans.contains(by)
+                    && actor != by
+                    && !humans.contains(actor)
+                    && !agents_now.contains_key(actor)
+            }
+            // Minting a key epoch requires **admin standing**:
+            // re-keying decides who reads future content, a membership-
+            // authority action — so a viewer, plain writer, agent, or
+            // non-member cannot mint. This is the fence that stops an
+            // injected epoch from going live, and it keeps the key lifecycle
+            // exclusive to the same principals that add/remove members, so a
+            // departed member cannot mint itself continued read access.
+            //
+            // The generation is additionally bounded to `max(ancestor mint
+            // gen) + 1` — an admin cannot jump the generation to pin the
+            // active tip (overflow / permanent non-supersession); concurrent mints off
+            // the same tip still share a generation and coexist by id.
+            AclAction::MintEpoch { gen, .. } => {
+                admins.contains(by) && {
+                    let ceiling = epoch_gens
+                        .iter()
+                        .filter(|(mh, _)| ancestors.get(h).is_some_and(|anc| anc.contains(*mh)))
+                        .map(|(_, g)| *g)
+                        .max()
+                        .map(|g| g.saturating_add(1))
+                        .unwrap_or(0);
+                    *gen <= ceiling
                 }
             }
-            AclAction::AddAgent { actor } => {
-                agents_now.insert(actor.clone(), op.by.clone());
-            }
-            AclAction::RemoveMember { actor } => {
-                humans.remove(actor);
+            // Revoking an invite is a membership-authority action — admin only.
+            AclAction::RevokeInvite { .. } => admins.contains(by),
+        }
+}
+
+/// Fold one authorized op into the pass-1 standing state. Shared verbatim by
+/// the complete replay and the strict-descendant continuation.
+fn apply_authorized(
+    op: &AclOp,
+    h: &str,
+    admins: &mut BTreeSet<ActorId>,
+    humans: &mut BTreeSet<ActorId>,
+    agents_now: &mut BTreeMap<ActorId, ActorId>,
+    epoch_gens: &mut HashMap<String, u32>,
+) {
+    match &op.action {
+        AclAction::AddMember { actor, grants } | AclAction::SetGrants { actor, grants } => {
+            humans.insert(actor.clone());
+            agents_now.remove(actor);
+            if grants.contains(&Grant::Admin) {
+                admins.insert(actor.clone());
+            } else {
                 admins.remove(actor);
-                agents_now.remove(actor);
-                // in-pass sponsor cascade so an orphaned agent cannot author
-                // (nothing to author anyway) nor be counted as standing.
-                agents_now.retain(|_, sponsor| sponsor != actor);
             }
-            // Record the generation for the ancestor bound above; the epoch is
-            // materialized in pass 2. Member set is untouched.
-            AclAction::MintEpoch { gen, .. } => {
-                epoch_gens.insert(h.clone(), *gen);
+        }
+        AclAction::AddAgent { actor } => {
+            agents_now.insert(actor.clone(), op.by.clone());
+        }
+        AclAction::RemoveMember { actor } => {
+            humans.remove(actor);
+            admins.remove(actor);
+            agents_now.remove(actor);
+            // in-pass sponsor cascade so an orphaned agent cannot author
+            // (nothing to author anyway) nor be counted as standing.
+            agents_now.retain(|_, sponsor| sponsor != actor);
+        }
+        // Record the generation for the ancestor bound above; the epoch is
+        // materialized in pass 2. Member set is untouched.
+        AclAction::MintEpoch { gen, .. } => {
+            epoch_gens.insert(h.to_string(), *gen);
+        }
+        // Invite revocation touches neither the member set nor epochs;
+        // materialized in pass 2.
+        AclAction::RevokeInvite { .. } => {}
+    }
+}
+
+/// The maximal ops of a node set: hashes no other present node names as a
+/// parent. These are the DAG heads the continuation's domination test uses.
+fn heads_of(nodes: &HashMap<String, &SignedOp>) -> Vec<String> {
+    let mut referenced: std::collections::HashSet<&String> = std::collections::HashSet::new();
+    for node in nodes.values() {
+        for p in &node.parents {
+            if nodes.contains_key(p) {
+                referenced.insert(p);
             }
-            // Invite revocation touches neither the member set nor epochs;
-            // materialized in pass 2.
-            AclAction::RevokeInvite { .. } => {}
+        }
+    }
+    let mut heads: Vec<String> = nodes
+        .keys()
+        .filter(|h| !referenced.contains(h))
+        .cloned()
+        .collect();
+    heads.sort();
+    heads
+}
+
+/// The complete replay materialization plus the private provenance the
+/// authority ledger persists as its durable checkpoint. The provenance cannot
+/// introduce facts absent from the signed effects — it is a cache of their
+/// deterministic replay, and [`replay_continue`] extends it only under the
+/// exact conditions where extension is provably order-equivalent to complete
+/// replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayCheckpoint {
+    /// The materialized public ACL state.
+    pub state: AclState,
+    /// Every op's pass-1 verdict, in deterministic topo order.
+    pub verdicts: Vec<(String, bool)>,
+    /// The op-DAG heads (maximal elements) of the replayed set.
+    pub heads: Vec<String>,
+    /// Pass-1 continuation state: current admins after the full pass.
+    pub admins: BTreeSet<ActorId>,
+    /// Pass-1 continuation state: current human members after the full pass.
+    pub humans: BTreeSet<ActorId>,
+    /// Pass-1 continuation state: agent → sponsor after the full pass.
+    pub agents_now: BTreeMap<ActorId, ActorId>,
+    /// Authorized epoch mints: op hash → claimed generation.
+    pub epoch_gens: BTreeMap<String, u32>,
+}
+
+/// Strict-descendant continuation: extend a prior [`ReplayCheckpoint`] by the
+/// causal suffix only, skipping re-verification and re-judgment of every
+/// already-checkpointed op. Returns `None` — the caller must run the complete
+/// replay — unless the extension is provably order-equivalent:
+///
+/// - every suffix op with a parent outside the suffix names **all** prior
+///   heads among its parents (so every prior op is its causal ancestor, all
+///   prior ops precede all suffix ops in the union's deterministic topo order,
+///   and no prior verdict can change);
+/// - the actor-event set is unchanged (new actor events can resolve a
+///   previously-unresolvable `actor_asof` — or reveal a revocation inside one
+///   — flipping prior verdicts, so any actor-plane change falls back to the
+///   complete replay).
+///
+/// Pass 2 (materialization + remove-wins + nonce races + fences) runs over the
+/// combined authorized order through the same [`materialize_authorized`] the
+/// complete replay uses — the override semantics exist exactly once.
+pub fn replay_continue(
+    prior: &ReplayCheckpoint,
+    prior_actor_event_hashes: &BTreeSet<String>,
+    genesis: &Genesis,
+    actor_events: &[SignedEvent],
+    ops: &[SignedOp],
+) -> Option<(ReplayCheckpoint, Vec<AuditEntry>)> {
+    let ws = &genesis.space_id;
+
+    // Any actor-plane change invalidates prior verdicts: fall back.
+    let current_events: BTreeSet<String> = actor_events.iter().map(|e| e.hash()).collect();
+    if current_events != *prior_actor_event_hashes {
+        return None;
+    }
+
+    let prior_set: std::collections::HashSet<&String> =
+        prior.verdicts.iter().map(|(h, _)| h).collect();
+
+    // Split and index. Prior ops are trusted from the checkpoint (they were
+    // signature-verified when first committed); suffix ops verify now.
+    let mut nodes: HashMap<String, &SignedOp> = HashMap::new();
+    let mut decoded: HashMap<String, Option<AclOp>> = HashMap::new();
+    let mut suffix: HashMap<String, &SignedOp> = HashMap::new();
+    for so in ops {
+        let h = so.hash();
+        if prior_set.contains(&h) {
+            decoded.insert(h.clone(), postcard::from_bytes(&so.op).ok());
+            nodes.insert(h, so);
+            continue;
+        }
+        if !so.verify_sig(ACL_DOMAIN, ws.as_str()) {
+            continue;
+        }
+        decoded.insert(h.clone(), postcard::from_bytes(&so.op).ok());
+        nodes.insert(h.clone(), so);
+        suffix.insert(h, so);
+    }
+    // The checkpointed set must be exactly present — a truncated or
+    // substituted input is not a descendant extension.
+    if nodes.len() != prior.verdicts.len() + suffix.len() {
+        return None;
+    }
+
+    // Domination: every suffix op reaching outside the suffix must name all
+    // prior heads, so the whole prior closure is among its ancestors.
+    let prior_heads: std::collections::HashSet<&String> = prior.heads.iter().collect();
+    for so in suffix.values() {
+        let reaches_out = so
+            .parents
+            .iter()
+            .any(|p| !suffix.contains_key(p) || prior_set.contains(p));
+        let is_root = so.parents.is_empty();
+        if reaches_out || is_root {
+            let named: std::collections::HashSet<&String> = so.parents.iter().collect();
+            if !prior_heads.iter().all(|h| named.contains(*h)) {
+                return None;
+            }
+        }
+        // Parents must resolve within the union — an op naming an unknown
+        // parent is not provably a descendant.
+        if so.parents.iter().any(|p| !nodes.contains_key(p)) {
+            return None;
         }
     }
 
-    // ---- pass 2: materialize membership from authorized ops in topo order ----
+    let ancestors = sigdag::compute_ancestors(&nodes);
+    let suffix_order = sigdag::topo_order(&suffix);
+
+    // Resume pass 1 from the checkpointed continuation state.
+    let mut planes: HashMap<Vec<String>, ActorPlane> = HashMap::new();
+    let mut device_speaks_for = |device: &DeviceId, by: &ActorId, asof: &[String]| -> bool {
+        let mut key: Vec<String> = asof.to_vec();
+        key.sort();
+        let plane = planes
+            .entry(key)
+            .or_insert_with(|| actor::replay_at(ws, actor_events, asof));
+        plane.is_device_of(by, device)
+    };
+    let mut admins = prior.admins.clone();
+    let mut humans = prior.humans.clone();
+    let mut agents_now = prior.agents_now.clone();
+    let mut epoch_gens: HashMap<String, u32> = prior
+        .epoch_gens
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    let mut verdicts = prior.verdicts.clone();
+    let mut authorized: Vec<String> = prior
+        .verdicts
+        .iter()
+        .filter(|(_, ok)| *ok)
+        .map(|(h, _)| h.clone())
+        .collect();
+    for h in &suffix_order {
+        let so = suffix[h];
+        let ok = match &decoded[h] {
+            None => false,
+            Some(op) => {
+                device_speaks_for(&so.author, &op.by, &op.actor_asof)
+                    && judge_op(
+                        op,
+                        h,
+                        &admins,
+                        &humans,
+                        &agents_now,
+                        &epoch_gens,
+                        &ancestors,
+                    )
+            }
+        };
+        verdicts.push((h.clone(), ok));
+        if !ok {
+            continue;
+        }
+        let op = decoded[h].as_ref().expect("authorized ops decoded");
+        authorized.push(h.clone());
+        apply_authorized(
+            op,
+            h,
+            &mut admins,
+            &mut humans,
+            &mut agents_now,
+            &mut epoch_gens,
+        );
+    }
+
+    let state = materialize_authorized(genesis, &decoded, &ancestors, &authorized);
+    let audit = verdicts
+        .iter()
+        .map(|(h, ok)| {
+            let so = nodes[h];
+            let op = decoded[h].as_ref();
+            AuditEntry {
+                hash: h.clone(),
+                author: so.author.clone(),
+                by: op.map(|o| o.by.clone()),
+                kind: op
+                    .map(|o| match &o.action {
+                        AclAction::AddMember { .. } => "add_member",
+                        AclAction::RemoveMember { .. } => "remove_member",
+                        AclAction::SetGrants { .. } => "set_grants",
+                        AclAction::AddAgent { .. } => "add_agent",
+                        AclAction::MintEpoch { .. } => "mint_epoch",
+                        AclAction::RevokeInvite { .. } => "revoke_invite",
+                    })
+                    .unwrap_or("unknown"),
+                subject: op.and_then(|o| o.action.actor().cloned()),
+                grants: op.and_then(|o| match &o.action {
+                    AclAction::AddMember { grants, .. } | AclAction::SetGrants { grants, .. } => {
+                        Some(grants.clone())
+                    }
+                    _ => None,
+                }),
+                authorized: *ok,
+            }
+        })
+        .collect();
+    let checkpoint = ReplayCheckpoint {
+        state,
+        verdicts,
+        heads: heads_of(&nodes),
+        admins,
+        humans,
+        agents_now,
+        epoch_gens: epoch_gens.into_iter().collect(),
+    };
+    Some((checkpoint, audit))
+}
+
+/// Pass 2 — materialize the public ACL state from the authorized op order:
+/// membership application, remove-wins override, single-use nonce races,
+/// revoke fences, sponsor cascade, and fence discharge. Shared verbatim by the
+/// complete replay and the strict-descendant continuation — the override
+/// semantics exist exactly once.
+fn materialize_authorized(
+    genesis: &Genesis,
+    decoded: &HashMap<String, Option<AclOp>>,
+    ancestors: &HashMap<String, std::collections::HashSet<String>>,
+    authorized: &[String],
+) -> AclState {
     let founding: BTreeSet<Grant> = [Grant::Admin, Grant::Write].into();
     let mut members: BTreeMap<ActorId, BTreeSet<Grant>> = genesis
         .founding_actors
@@ -544,7 +861,7 @@ pub fn replay_with_audit(
     // *signed* record of redemption (replaces the unsigned `C_REDEEMED` doc).
     let mut spent_nonces: BTreeSet<[u8; 16]> = BTreeSet::new();
 
-    for h in &authorized {
+    for h in authorized {
         let op = decoded[h].as_ref().expect("authorized ops decoded");
         if let (AclAction::AddMember { .. }, Some(nonce)) = (&op.action, &op.nonce) {
             spent_nonces.insert(*nonce);
@@ -641,7 +958,7 @@ pub fn replay_with_audit(
     // the same nonce for a different actor; after merge both ops are valid, so
     // pick the winner deterministically (lowest op hash) and evict the rest.
     let mut by_nonce: BTreeMap<[u8; 16], Vec<(String, ActorId)>> = BTreeMap::new();
-    for h in &authorized {
+    for h in authorized {
         if let Some(AclOp {
             action: AclAction::AddMember { actor, .. },
             nonce: Some(n),
@@ -811,17 +1128,14 @@ pub fn replay_with_audit(
         })
     });
 
-    (
-        AclState {
-            members,
-            agents,
-            epochs,
-            revoked_invites,
-            spent_nonces,
-            rekey_fences,
-        },
-        audit,
-    )
+    AclState {
+        members,
+        agents,
+        epochs,
+        revoked_invites,
+        spent_nonces,
+        rekey_fences,
+    }
 }
 
 #[cfg(test)]

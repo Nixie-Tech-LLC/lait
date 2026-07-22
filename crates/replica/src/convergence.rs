@@ -85,24 +85,40 @@ pub struct StagedContactMaterial {
 }
 
 /// The durable receipt of an authority-batch incorporation — the explicit
-/// **first** durable phase of Convergence. Mechanics commits the canonical
-/// authority batch idempotently and names the resulting historical frontier;
-/// the Body/Manifest phase then requires this receipt, so Bodies never commit
-/// under authority that is not durably established. A replay of the same
-/// batch returns the same receipt.
+/// **first** durable phase of Convergence, and the binding a validated bundle
+/// carries. Mechanics validates the complete canonical batch in memory, then
+/// commits it atomically (no prefix survives an invalid later record) and
+/// names the exact incorporation: the Space, the frontier before, the frontier
+/// after, and a digest over the ordered canonical batch bytes — so a
+/// reordered, substituted, or truncated batch can never ride an honest
+/// receipt. The Body/Manifest phase requires this receipt, so Bodies never
+/// commit under authority that is not durably established. A replay of the
+/// identical batch returns the identical receipt.
+///
+/// This proves **history incorporation** only. It is not World authorization
+/// evidence (that is the per-transaction authorization receipt) and not a
+/// request-replay receipt.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthorityReceipt {
-    pub frontier: crate::frontier::AuthorityFrontier,
+pub struct AuthorityBatchReceipt {
+    pub space: mechanics::ids::SpaceId,
+    pub prior_frontier: crate::frontier::AuthorityFrontier,
+    pub resulting_frontier: crate::frontier::AuthorityFrontier,
+    pub batch_digest: [u8; 32],
 }
 
 /// The mechanics-owned authority incorporation seam. The composition root
-/// implements it over the durable signed-history store; the fixture
+/// implements it over the durable signed-history ledger; the fixture
 /// implementation for tests records batches in memory.
 pub trait AuthorityIncorporator {
-    /// Durably, idempotently commit a canonical authority batch. Legitimate
-    /// authority advancement may survive a later Body failure — it is
-    /// independently valid Space history.
-    fn incorporate_authority(&mut self, records: &[Vec<u8>]) -> Result<AuthorityReceipt, String>;
+    /// Durably, atomically, idempotently commit a canonical authority batch.
+    /// The complete batch validates in memory first — one invalid record
+    /// refuses the whole batch with nothing persisted. Legitimate authority
+    /// advancement may survive a later Body failure — it is independently
+    /// valid Space history.
+    fn incorporate_authority(
+        &mut self,
+        records: &[Vec<u8>],
+    ) -> Result<AuthorityBatchReceipt, String>;
 }
 
 /// A **sealed** validated Contact bundle: constructible only by
@@ -112,7 +128,7 @@ pub trait AuthorityIncorporator {
 /// descriptor-bound payloads, and no received object outside the verified
 /// graph. [`crate::Replica::incorporate_bundle`] accepts only this.
 pub struct ValidatedContactBundle {
-    pub(crate) authority_receipt: AuthorityReceipt,
+    pub(crate) authority_receipt: AuthorityBatchReceipt,
     pub(crate) units: BundleUnits,
 }
 
@@ -124,7 +140,7 @@ pub(crate) type BundleUnits = Vec<(
 
 impl ValidatedContactBundle {
     /// The durable authority receipt this bundle's Body phase rests on.
-    pub fn authority_receipt(&self) -> &AuthorityReceipt {
+    pub fn authority_receipt(&self) -> &AuthorityBatchReceipt {
         &self.authority_receipt
     }
     /// How many validated transactions the bundle carries.

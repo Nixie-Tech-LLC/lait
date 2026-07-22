@@ -551,22 +551,34 @@ async fn serve_contact(
         .map_err(|_| ContactError::Unreachable)?
         .map_err(|e| ContactError::Transfer(e.to_string()))?;
 
-    // Snapshot the served material under the writer lock.
+    // Snapshot the served material under the writer lock. A Station whose
+    // device holds no authoring standing at its own current frontier (an
+    // unadmitted joiner) cannot sign an authorized Manifest advertisement —
+    // it serves an **authority-only** Contact: its mechanics records (its
+    // admission request rides there), an empty Manifest root, and no Bodies.
     let signer = crate::world::LocalIdentity::from_seed(&ctx.options.station_seed);
     let frontier = (ctx.options.mechanics.frontier)();
-    let (material, manifest) = ctx
-        .core
-        .with_replica(|replica| {
-            let commit_ctx = replica::CommitContext {
-                space: &ctx.space,
-                signer: &signer,
-                authority_frontier: frontier.clone(),
-            };
-            let material = replica.export_material()?;
-            let manifest = replica.export_manifest(&commit_ctx)?;
-            Ok((material, manifest))
-        })
-        .map_err(|e: replica::ReplicaCommitError| ContactError::Transfer(e.to_string()))?;
+    let advertise = ctx
+        .options
+        .mechanics
+        .source
+        .signer_authorized(&ctx.station_key, &frontier);
+    let (material, manifest) = if advertise {
+        ctx.core
+            .with_replica(|replica| {
+                let commit_ctx = replica::CommitContext {
+                    space: &ctx.space,
+                    signer: &signer,
+                    authority_frontier: frontier.clone(),
+                };
+                let material = replica.export_material()?;
+                let manifest = replica.export_manifest(&commit_ctx)?;
+                Ok((material, manifest))
+            })
+            .map_err(|e: replica::ReplicaCommitError| ContactError::Transfer(e.to_string()))?
+    } else {
+        (Vec::new(), (Vec::new(), Vec::new()))
+    };
     let mut authority_records = (ctx.options.mechanics.export)();
     let mut bodies = Vec::new();
     for (tx, payloads) in &material {

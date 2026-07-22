@@ -276,6 +276,12 @@ impl JournaledStore {
         self
     }
 
+    /// Attach a fault injector by reference (test seam for callers embedding
+    /// the store; see [`FAULT_POINTS`]).
+    pub fn set_fault_injector(&mut self, injector: FaultInjector) {
+        self.injector = Some(injector);
+    }
+
     /// The current manifest, if any commit has completed.
     pub fn manifest(&self) -> Option<&StoreManifest> {
         self.manifest.as_ref()

@@ -1,28 +1,29 @@
-//! The product's mechanics composition for the orbital plane (C5).
+//! The product's mechanics composition for the orbital plane.
 //!
-//! `OrbitalMechanics` owns the Space's **signed authority material** — the
-//! genesis and the mechanics membership document (actor inceptions, signed ACL
-//! ops, sealed key-epoch envelopes) — persisted beside the orbital store, and
-//! implements every seam the runtime consumes:
+//! `OrbitalMechanics` owns the Space's **signed authority material** through
+//! the mechanics [`AuthorityLedger`] — the journaled effect store persisted
+//! beside the orbital store — and implements every seam the runtime consumes:
 //!
 //! - [`runtime::AuthorityView`]: device → actor/standing/authority frontier,
-//!   re-resolved per request from deterministic ACL replay;
-//! - [`replica::AuthoritySource`]: signer standing for retained/incorporated
-//!   material (replayed against the full current signed history — the
-//!   monotonicity of the signed DAG stands in for per-frontier replay);
+//!   resolved from the ledger's materialized checkpoint;
+//! - [`replica::AuthoritySource`]: signer standing **at the referenced
+//!   historical frontier** — the ledger resolves the exact effect closure the
+//!   frontier's heads name and evaluates standing there, never against
+//!   current state;
 //! - [`replica::BodyKeySource`]: authorized key epochs from the sealed
 //!   envelopes, opened with this device's seed, bound to the signed mint's
 //!   key commitment — the existing construction, no new cryptography;
-//! - [`replica::AuthorityIncorporator`] + the authority export: membership
-//!   material and admission redemptions ride Contact's authority records —
-//!   the explicit first durable Convergence phase.
+//! - [`replica::AuthorityIncorporator`] + the authority export: ledger
+//!   effects and admission redemptions ride Contact's authority records —
+//!   the explicit first durable Convergence phase, committed **atomically**
+//!   (an invalid record refuses the whole batch; no prefix survives).
 //!
-//! Formation mints the founding material exactly as the legacy path did
-//! (self-certifying SpaceId over founder device + salt + recovery root,
-//! founding inception, epoch-0 mint sealed to the founder); entry verifies
-//! Coordinates offline and establishes standing by having its inception (and
-//! any admission capability) pulled by an admin over Contact, whose
-//! incorporator validates and redeems it (AddMember + epoch sealing).
+//! Formation mints the founding material exactly as before (self-certifying
+//! SpaceId over founder device + salt + recovery root, founding inception,
+//! epoch-0 mint sealed to the founder); entry verifies Coordinates offline
+//! and establishes standing by having its inception (and any admission
+//! capability) pulled by an admin over Contact, whose incorporator validates
+//! and redeems it (AddMember + epoch sealing).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -36,25 +37,30 @@ use crate::actor;
 use crate::crypto::{self, SpaceKey};
 use crate::genesis::Genesis;
 use crate::ids::{ActorId, DeviceId, SpaceId};
-use crate::membership::MembershipDoc;
+use mechanics::ledger::{AuthorityLedger, LedgerEffect, SealedKeyRecord};
 use replica::frontier::AuthorityFrontier;
 use runtime::coordinates::AdmissionCapabilityV1;
 
-const MEMBERSHIP_FILE: &str = "mech-membership.loro";
 const GENESIS_FILE: &str = "mech-genesis.json";
 const PENDING_INCEPTION_FILE: &str = "mech-pending-inception.bin";
 const PENDING_ADMISSION_FILE: &str = "mech-pending-admission.bin";
+/// The authority ledger's journal root, under the Space's mechanics dir.
+const LEDGER_DIR: &str = "authority";
 
 /// One authority-record unit riding Contact's authority section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AuthorityRecord {
-    /// A full membership-document export (Loro snapshot); import is
-    /// idempotent and convergent.
-    Membership(Vec<u8>),
+    /// One canonical signed ledger effect (actor event, ACL op, or ceremony
+    /// event). Import validates the complete batch, then commits atomically.
+    Effect(Vec<u8>),
+    /// One sealed key-epoch envelope record (canonical
+    /// [`SealedKeyRecord`] bytes). Authorization is the signed mint;
+    /// a forged envelope is inert.
+    SealedKey(Vec<u8>),
     /// A joiner's admission redemption: the admin-signed capability plus the
     /// joiner's canonical inception bytes. An admin incorporator validates
     /// and redeems it (AddMember + epoch sealing); everyone else retains the
-    /// membership material it rides beside.
+    /// effect material it rides beside.
     Admission {
         admission: Vec<u8>,
         inception: Vec<u8>,
@@ -72,33 +78,25 @@ impl AuthorityRecord {
 
 struct Inner {
     space: SpaceId,
-    genesis: Genesis,
-    membership: MembershipDoc,
+    ledger: AuthorityLedger,
     seed: [u8; 32],
     me: DeviceId,
     keyring: BTreeMap<[u8; 16], SpaceKey>,
     dir: PathBuf,
     /// A joiner's own admission, served until standing is established.
     pending_admission: Option<AdmissionCapabilityV1>,
-    /// A joiner's self-inception, held OUT of the membership doc until the
-    /// founder's containers have been imported (writing into a bare doc would
-    /// mint conflicting containers the import then shadows — the legacy
-    /// joiner trap). It rides the Admission record; the signed AddMember path
-    /// brings it back into the doc.
+    /// A joiner's self-inception, held out of the replicated set until an
+    /// admin admits it (it rides the Admission record).
     pending_inception: Option<actor::SignedEvent>,
 }
 
 impl Inner {
-    fn acl(&self) -> AclState {
-        acl::replay(
-            &self.genesis,
-            &self.membership.actor_events(),
-            &self.membership.ops(),
-        )
+    fn acl(&mut self) -> AclState {
+        self.ledger.acl_state().unwrap_or_default()
     }
 
     fn actor_plane(&self) -> actor::ActorPlane {
-        actor::replay(&self.space, &self.membership.actor_events())
+        self.ledger.actor_plane()
     }
 
     fn my_actor(&self) -> Option<ActorId> {
@@ -106,15 +104,7 @@ impl Inner {
     }
 
     fn frontier(&self) -> AuthorityFrontier {
-        AuthorityFrontier::from_canonical_bytes(self.membership.head_bytes())
-    }
-
-    fn persist(&self) -> Result<()> {
-        let bytes = self.membership.snapshot()?;
-        let tmp = self.dir.join(format!("{MEMBERSHIP_FILE}.tmp"));
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, self.dir.join(MEMBERSHIP_FILE))?;
-        Ok(())
+        AuthorityFrontier::from_canonical_bytes(self.ledger.frontier())
     }
 
     /// Unseal every authorized epoch key addressed to this device, bound to
@@ -124,7 +114,7 @@ impl Inner {
             if self.keyring.contains_key(&e.id) {
                 continue;
             }
-            if let Some(sealed) = self.membership.get_sealed(&e.id, &self.me) {
+            if let Some(sealed) = self.ledger.sealed_for(&e.id, &self.me) {
                 if let Some(raw) = crypto::open_sealed(&self.seed, &self.me, &sealed) {
                     if let Ok(key) = <SpaceKey>::try_from(raw.as_slice()) {
                         if *blake3::hash(&key).as_bytes() == e.key_commit {
@@ -137,30 +127,47 @@ impl Inner {
     }
 
     /// The deterministic active epoch: highest authorized `(gen, id)`.
-    fn active_epoch(&self) -> Option<acl::EpochAuth> {
+    fn active_epoch(&mut self) -> Option<acl::EpochAuth> {
         self.acl()
             .epochs()
             .into_iter()
             .max_by(|a, b| a.gen.cmp(&b.gen).then_with(|| a.id.cmp(&b.id)))
     }
 
-    /// Seal every held epoch key to every device of `actor`.
-    fn seal_epochs_to_actor(&mut self, target: &ActorId) -> Result<()> {
+    /// The sealed records distributing every held epoch key to every device of
+    /// `actor` (for batching with the authority effect that admits them).
+    fn seal_records_for_actor(&mut self, target: &ActorId) -> Vec<Vec<u8>> {
         let devices = self.actor_plane().devices_of(target);
-        let epochs: Vec<([u8; 16], SpaceKey)> =
-            self.keyring.iter().map(|(e, k)| (*e, *k)).collect();
-        for (epoch, key) in epochs {
+        let mut out = Vec::new();
+        for (epoch, key) in self.keyring.iter() {
             for d in &devices {
-                if let Some(sealed) = crypto::seal_to(d, &key) {
-                    self.membership.put_sealed(&epoch, d, &sealed)?;
+                if self.ledger.sealed_for(epoch, d).is_some() {
+                    continue;
+                }
+                if let Some(sealed) = crypto::seal_to(d, key) {
+                    out.push(
+                        SealedKeyRecord {
+                            epoch: *epoch,
+                            device: d.clone(),
+                            sealed,
+                        }
+                        .encode(),
+                    );
                 }
             }
         }
-        Ok(())
+        out
     }
 
-    /// Author + apply one signed ACL op as this device's actor.
-    fn author(&mut self, action: AclAction, nonce: Option<[u8; 16]>, kind: &str) -> Result<()> {
+    /// Author one signed ACL op as this device's actor and commit it — with
+    /// any accompanying effects and sealed records — as one atomic batch.
+    fn author(
+        &mut self,
+        action: AclAction,
+        nonce: Option<[u8; 16]>,
+        extra_effects: Vec<Vec<u8>>,
+        sealed_records: Vec<Vec<u8>>,
+    ) -> Result<()> {
         let me = self
             .my_actor()
             .ok_or_else(|| anyhow!("no actor identity"))?;
@@ -169,22 +176,22 @@ impl Inner {
             &AclOp {
                 action,
                 by: me.clone(),
-                actor_asof: self.membership.actor_heads(&me),
+                actor_asof: self.ledger.actor_heads(&me),
                 nonce,
             },
-            self.membership.heads(),
+            self.ledger.acl_heads(),
             &self.space,
         );
-        self.membership.add_op(&op)?;
-        self.membership
-            .apply(&fabric::op::OpCtx::authority(kind, &self.me));
-        self.persist()?;
+        let mut effects = extra_effects;
+        effects.push(LedgerEffect::Acl(op).encode());
+        self.ledger
+            .commit_batch(&effects, &sealed_records)
+            .map_err(|e| anyhow!("authority commit: {e}"))?;
         Ok(())
     }
 
-    /// The admin-side admission redemption (the orbital heir of the legacy
-    /// `redeem_invite`): validate the capability and the joiner's inception,
-    /// then admit + seal.
+    /// The admin-side admission redemption: validate the capability and the
+    /// joiner's inception, then admit + seal in one atomic authority batch.
     fn redeem_admission(&mut self, admission_bytes: &[u8], inception_bytes: &[u8]) -> Result<()> {
         let admission: AdmissionCapabilityV1 =
             postcard::from_bytes(admission_bytes).context("admission decode")?;
@@ -195,7 +202,7 @@ impl Inner {
             postcard::from_bytes(inception_bytes).context("inception decode")?;
         let joiner_actor = ActorId::from_incept_hash(&inception.hash());
         // The inception must cleanly incept for THIS space.
-        let mut candidate = self.membership.actor_events();
+        let mut candidate = self.ledger.actor_events();
         candidate.push(inception.clone());
         if !actor::replay(&self.space, &candidate).exists(&joiner_actor) {
             return Err(anyhow!("invalid joiner inception"));
@@ -224,7 +231,26 @@ impl Inner {
         if acl_state.is_member(&joiner_actor) {
             return Ok(()); // idempotent
         }
-        self.membership.add_actor_event(&inception)?;
+        // Stage the joiner's inception + AddMember + sealed keys as ONE batch.
+        let inception_effect = LedgerEffect::Actor(inception.clone()).encode();
+        // Devices of the joiner: from the candidate plane (the inception is
+        // not yet committed, so resolve against the candidate set).
+        let devices = actor::replay(&self.space, &candidate).devices_of(&joiner_actor);
+        let mut sealed_records = Vec::new();
+        for (epoch, key) in self.keyring.iter() {
+            for d in &devices {
+                if let Some(sealed) = crypto::seal_to(d, key) {
+                    sealed_records.push(
+                        SealedKeyRecord {
+                            epoch: *epoch,
+                            device: d.clone(),
+                            sealed,
+                        }
+                        .encode(),
+                    );
+                }
+            }
+        }
         let nonce = admission.single_use.then_some(admission.nonce);
         self.author(
             AclAction::AddMember {
@@ -232,16 +258,15 @@ impl Inner {
                 grants: vec![Grant::Write],
             },
             nonce,
-            "invite_redeem",
+            vec![inception_effect],
+            sealed_records,
         )?;
-        self.seal_epochs_to_actor(&joiner_actor)?;
-        self.persist()?;
         Ok(())
     }
 }
 
 /// The shared, thread-safe mechanics composition handle. Clone freely; every
-/// clone shares the same durable membership state.
+/// clone shares the same durable authority ledger.
 #[derive(Clone)]
 pub struct OrbitalMechanics {
     inner: Arc<Mutex<Inner>>,
@@ -259,7 +284,8 @@ impl OrbitalMechanics {
 
     /// Found a fresh Space's mechanics material under `root` (the orbital
     /// store root): genesis, founding inception, epoch-0 mint sealed to the
-    /// founder. Returns the handle and the founder's signed Coordinates.
+    /// founder — one atomic founding batch. Returns the handle and the
+    /// founder's signed Coordinates.
     pub fn form(
         root: &Path,
         device_seed: &[u8; 32],
@@ -298,9 +324,11 @@ impl OrbitalMechanics {
             recovery_root,
         };
         std::fs::write(dir.join(GENESIS_FILE), serde_json::to_vec_pretty(&genesis)?)?;
-        let membership = MembershipDoc::create(&space, None, &me)?;
-        membership.add_actor_event(&inception)?;
-        // Epoch 0, sealed to the founder.
+        let mut ledger = AuthorityLedger::create(dir.join(LEDGER_DIR), genesis)
+            .map_err(|e| anyhow!("authority ledger: {e}"))?;
+
+        // Epoch 0, sealed to the founder — one atomic founding batch:
+        // inception + mint + sealed envelope.
         let key = crypto::random_key();
         let epoch0 = super::rand16();
         let key_commit = *blake3::hash(&key).as_bytes();
@@ -317,19 +345,28 @@ impl OrbitalMechanics {
                 actor_asof: vec![inception.hash()],
                 nonce: None,
             },
-            membership.heads(),
+            vec![],
             &space,
         );
-        membership.add_op(&mint)?;
-        if let Some(sealed) = crypto::seal_to(&me, &key) {
-            membership.put_sealed(&epoch0, &me, &sealed)?;
-        }
-        membership.apply(&fabric::op::OpCtx::authority("found", &me));
+        let sealed = crypto::seal_to(&me, &key).ok_or_else(|| anyhow!("seal epoch key"))?;
+        ledger
+            .commit_batch(
+                &[
+                    LedgerEffect::Actor(inception).encode(),
+                    LedgerEffect::Acl(mint).encode(),
+                ],
+                &[SealedKeyRecord {
+                    epoch: epoch0,
+                    device: me.clone(),
+                    sealed,
+                }
+                .encode()],
+            )
+            .map_err(|e| anyhow!("founding batch: {e}"))?;
 
         let mut inner = Inner {
             space: space.clone(),
-            genesis,
-            membership,
+            ledger,
             seed: *device_seed,
             me,
             keyring: BTreeMap::new(),
@@ -338,7 +375,6 @@ impl OrbitalMechanics {
             pending_inception: None,
         };
         inner.keyring.insert(epoch0, key);
-        inner.persist()?;
         let mech = Self {
             inner: Arc::new(Mutex::new(inner)),
         };
@@ -347,8 +383,8 @@ impl OrbitalMechanics {
     }
 
     /// Enter a Space from verified Coordinates: persist its genesis + founder
-    /// inception (empty membership otherwise), stash the admission for
-    /// redemption over Contact, and self-incept so an admin can admit us.
+    /// inception, stash the admission for redemption over Contact, and
+    /// self-incept so an admin can admit us.
     pub fn enter(
         root: &Path,
         device_seed: &[u8; 32],
@@ -371,19 +407,22 @@ impl OrbitalMechanics {
             salt: coordinates.payload.salt,
             recovery_root: coordinates.payload.recovery_root,
         };
-        let (membership, fresh) = match std::fs::read(dir.join(MEMBERSHIP_FILE)) {
-            Ok(bytes) => (MembershipDoc::from_snapshot(&bytes, None)?, false),
-            Err(_) => (MembershipDoc::empty(None), true),
-        };
-        if fresh {
+        let ledger_root = dir.join(LEDGER_DIR);
+        let mut ledger = if ledger_root.join("current-manifest").exists() {
+            AuthorityLedger::open(&ledger_root).map_err(|e| anyhow!("authority ledger: {e}"))?
+        } else {
             std::fs::write(dir.join(GENESIS_FILE), serde_json::to_vec_pretty(&genesis)?)?;
-            membership.add_actor_event(&founder_inception)?;
-            membership.apply(&fabric::op::OpCtx::authority("join", &me));
-        }
+            let mut fresh = AuthorityLedger::create(&ledger_root, genesis)
+                .map_err(|e| anyhow!("authority ledger: {e}"))?;
+            fresh
+                .commit_batch(&[LedgerEffect::Actor(founder_inception).encode()], &[])
+                .map_err(|e| anyhow!("founder inception: {e}"))?;
+            fresh
+        };
+        let _ = &mut ledger;
         let mut inner = Inner {
             space,
-            genesis,
-            membership,
+            ledger,
             seed: *device_seed,
             me,
             keyring: BTreeMap::new(),
@@ -391,8 +430,8 @@ impl OrbitalMechanics {
             pending_admission: verified.admission.clone(),
             pending_inception: None,
         };
-        // Self-incept so our identity can be admitted — held PENDING, never
-        // written into the pre-import doc (container adoption).
+        // Self-incept so our identity can be admitted — held PENDING, carried
+        // by the Admission record until an admin admits it.
         if inner.my_actor().is_none() && inner.pending_inception.is_none() {
             let (recovery_commit, _seed) = {
                 let mut seed = [0u8; 32];
@@ -423,7 +462,6 @@ impl OrbitalMechanics {
             )?;
         }
         inner.refresh_keyring();
-        inner.persist()?;
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
         })
@@ -432,15 +470,15 @@ impl OrbitalMechanics {
     /// Open existing mechanics material for a Space.
     pub fn open(root: &Path, space: &SpaceId, device_seed: &[u8; 32]) -> Result<Self> {
         let dir = Self::dir_for(root, space);
-        let genesis: Genesis = serde_json::from_slice(&std::fs::read(dir.join(GENESIS_FILE))?)
-            .context("mechanics genesis")?;
-        let membership =
-            MembershipDoc::from_snapshot(&std::fs::read(dir.join(MEMBERSHIP_FILE))?, None)?;
+        let ledger = AuthorityLedger::open(dir.join(LEDGER_DIR))
+            .map_err(|e| anyhow!("authority ledger: {e}"))?;
+        if ledger.space() != space {
+            return Err(anyhow!("authority ledger belongs to another Space"));
+        }
         let me = crypto::device_from_seed(device_seed);
         let mut inner = Inner {
             space: space.clone(),
-            genesis,
-            membership,
+            ledger,
             seed: *device_seed,
             me,
             keyring: BTreeMap::new(),
@@ -468,13 +506,13 @@ impl OrbitalMechanics {
         admission: Option<AdmissionCapabilityV1>,
     ) -> Result<runtime::SignedCoordinatesV1> {
         let inner = self.lock();
-        let founder = inner
-            .genesis
+        let genesis = inner.ledger.genesis().clone();
+        let founder = genesis
             .founding_actors
             .first()
             .ok_or_else(|| anyhow!("no founding actor"))?;
         let inception = inner
-            .membership
+            .ledger
             .actor_events()
             .into_iter()
             .find(|ev| ActorId::from_incept_hash(&ev.hash()) == *founder)
@@ -482,8 +520,8 @@ impl OrbitalMechanics {
         let payload = runtime::coordinates::CoordinatesPayloadV1 {
             space: <[u8; 29]>::try_from(inner.space.as_str().as_bytes())
                 .map_err(|_| anyhow!("space id shape"))?,
-            salt: inner.genesis.salt,
-            recovery_root: inner.genesis.recovery_root,
+            salt: genesis.salt,
+            recovery_root: genesis.recovery_root,
             founder_inception: postcard::to_stdvec(&inception)?,
             display_name_hint: display_name.to_string(),
             approach_station: crypto::device_from_seed(station_seed)
@@ -526,14 +564,16 @@ impl OrbitalMechanics {
 
     /// Whether this device's actor currently holds membership.
     pub fn am_i_member(&self) -> bool {
-        let inner = self.lock();
-        inner.my_actor().is_some_and(|a| inner.acl().is_member(&a))
+        let mut inner = self.lock();
+        let actor = inner.my_actor();
+        actor.is_some_and(|a| inner.acl().is_member(&a))
     }
 
     /// Whether this device's actor is an admin.
     pub fn am_i_admin(&self) -> bool {
-        let inner = self.lock();
-        inner.my_actor().is_some_and(|a| inner.acl().is_admin(&a))
+        let mut inner = self.lock();
+        let actor = inner.my_actor();
+        actor.is_some_and(|a| inner.acl().is_admin(&a))
     }
 
     /// This device's actor id, if established.
@@ -543,7 +583,7 @@ impl OrbitalMechanics {
 
     /// The membership roster as `control::MemberDto` rows.
     pub fn members(&self) -> Vec<crate::dto::MemberDto> {
-        let inner = self.lock();
+        let mut inner = self.lock();
         let acl = inner.acl();
         let me = inner.my_actor();
         let mut out: Vec<crate::dto::MemberDto> = acl
@@ -572,45 +612,19 @@ impl OrbitalMechanics {
     /// The signed ACL DAG replayed as an audit log.
     pub fn member_log(&self) -> Vec<crate::dto::MemberLogEntry> {
         let inner = self.lock();
-        inner
-            .membership
-            .ops()
+        let genesis = inner.ledger.genesis().clone();
+        let events = inner.ledger.actor_events();
+        let ops = inner.ledger.acl_ops();
+        let (_, audit) = acl::replay_with_audit(&genesis, &events, &ops);
+        audit
             .into_iter()
-            .map(|signed| {
-                let decoded: Option<AclOp> = postcard::from_bytes(&signed.op).ok();
-                let actor = decoded
-                    .as_ref()
-                    .map(|o| o.by.as_str().to_string())
-                    .unwrap_or_default();
-                let (kind, subject, role) = match decoded.as_ref().map(|o| &o.action) {
-                    Some(AclAction::AddMember { actor, grants }) => (
-                        "add_member",
-                        Some(actor.as_str().to_string()),
-                        Some(role_of(grants)),
-                    ),
-                    Some(AclAction::RemoveMember { actor }) => {
-                        ("remove_member", Some(actor.as_str().to_string()), None)
-                    }
-                    Some(AclAction::SetGrants { actor, grants }) => (
-                        "set_grants",
-                        Some(actor.as_str().to_string()),
-                        Some(role_of(grants)),
-                    ),
-                    Some(AclAction::AddAgent { actor }) => {
-                        ("add_agent", Some(actor.as_str().to_string()), None)
-                    }
-                    Some(AclAction::MintEpoch { .. }) => ("mint_epoch", None, None),
-                    Some(AclAction::RevokeInvite { .. }) => ("revoke_invite", None, None),
-                    None => ("unknown", None, None),
-                };
-                crate::dto::MemberLogEntry {
-                    op: signed.hash(),
-                    actor,
-                    kind: kind.into(),
-                    subject,
-                    role,
-                    authorized: decoded.is_some(),
-                }
+            .map(|entry| crate::dto::MemberLogEntry {
+                op: entry.hash,
+                actor: entry.by.map(|a| a.as_str().to_string()).unwrap_or_default(),
+                kind: entry.kind.to_string(),
+                subject: entry.subject.map(|a| a.as_str().to_string()),
+                role: entry.grants.as_deref().map(role_of),
+                authorized: entry.authorized,
             })
             .collect()
     }
@@ -635,16 +649,16 @@ impl OrbitalMechanics {
         } else {
             vec![Grant::Write]
         };
+        let sealed = inner.seal_records_for_actor(&actor);
         inner.author(
             AclAction::AddMember {
                 actor: actor.clone(),
                 grants,
             },
             None,
-            "member_add",
+            vec![],
+            sealed,
         )?;
-        inner.seal_epochs_to_actor(&actor)?;
-        inner.persist()?;
         Ok(())
     }
 
@@ -659,33 +673,44 @@ impl OrbitalMechanics {
         if !inner.acl().is_member(&actor) {
             return Ok(());
         }
-        inner.author(AclAction::RemoveMember { actor }, None, "member_remove")?;
+        inner.author(AclAction::RemoveMember { actor }, None, vec![], vec![])?;
         Ok(())
     }
 
     /// The authority records this Station serves in a Contact (the export
-    /// seam): its membership material, plus — while unadmitted — its
-    /// admission redemption request.
+    /// seam): its ledger effects and sealed envelopes, plus — while
+    /// unadmitted — its admission redemption request.
     pub fn export_records(&self) -> Vec<Vec<u8>> {
-        let inner = self.lock();
-        let mut records = Vec::new();
-        if let Ok(snapshot) = inner.membership.snapshot() {
-            records.push(AuthorityRecord::Membership(snapshot).encode());
+        let mut inner = self.lock();
+        let mut records: Vec<Vec<u8>> = Vec::new();
+        for effect in inner.ledger.export_effects() {
+            records.push(AuthorityRecord::Effect(effect).encode());
+        }
+        for sealed in inner.ledger.export_sealed() {
+            records.push(AuthorityRecord::SealedKey(sealed).encode());
         }
         if let (Some(admission), Some(inception)) =
             (&inner.pending_admission, &inner.pending_inception)
         {
-            let admitted = inner
-                .my_actor()
-                .is_some_and(|me| inner.acl().is_member(&me));
+            let admitted = {
+                let me = inner.my_actor();
+                let admission_check = admission.clone();
+                let inception_check = inception.clone();
+                let _ = (&admission_check, &inception_check);
+                me.map(|a| inner.acl().is_member(&a)).unwrap_or(false)
+            };
             if !admitted {
-                records.push(
-                    AuthorityRecord::Admission {
-                        admission: postcard::to_stdvec(admission).expect("admission bytes"),
-                        inception: postcard::to_stdvec(inception).expect("inception bytes"),
-                    }
-                    .encode(),
-                );
+                if let (Some(admission), Some(inception)) =
+                    (&inner.pending_admission, &inner.pending_inception)
+                {
+                    records.push(
+                        AuthorityRecord::Admission {
+                            admission: postcard::to_stdvec(admission).expect("admission bytes"),
+                            inception: postcard::to_stdvec(inception).expect("inception bytes"),
+                        }
+                        .encode(),
+                    );
+                }
             }
         }
         records
@@ -699,7 +724,7 @@ impl OrbitalMechanics {
 
 impl runtime::AuthorityView for OrbitalMechanics {
     fn resolve(&self, device: &DeviceId) -> Option<runtime::PrincipalResolution> {
-        let inner = self.lock();
+        let mut inner = self.lock();
         let actor = inner.actor_plane().actor_of_device(device).cloned()?;
         let acl_state = inner.acl();
         if !acl_state.is_member(&actor) {
@@ -715,24 +740,22 @@ impl runtime::AuthorityView for OrbitalMechanics {
 }
 
 impl replica::AuthoritySource for OrbitalMechanics {
-    fn signer_authorized(&self, signer: &[u8; 32], _frontier: &AuthorityFrontier) -> bool {
-        let inner = self.lock();
-        let device = DeviceId::from_key_bytes(signer);
-        let plane = inner.actor_plane();
-        let Some(actor) = plane.actor_of_device(&device) else {
-            return false;
-        };
-        // Signed-history replay is monotone: a signer admitted at the
-        // referenced frontier remains resolvable in the current replay (the
-        // signed DAG never forgets an admission op), so current-replay
-        // standing subsumes the historical check for retained material.
-        inner.acl().can_write(actor)
+    fn signer_authorized(&self, signer: &[u8; 32], frontier: &AuthorityFrontier) -> bool {
+        // Historical authorization: standing is evaluated at the transaction's
+        // **referenced** frontier — the exact effect closure its heads name —
+        // never against current state. An author authorized then and removed
+        // now remains legitimate; an author unauthorized then and authorized
+        // now is rejected; an unknown frontier is missing history, not a pass.
+        let mut inner = self.lock();
+        inner
+            .ledger
+            .signer_authorized_at(signer, frontier.as_bytes())
     }
 }
 
 impl replica::BodyKeySource for OrbitalMechanics {
     fn sealing_key(&self) -> Option<mechanics::crypto::AuthorizedBodyKey> {
-        let inner = self.lock();
+        let mut inner = self.lock();
         let epoch = inner.active_epoch()?;
         let key = inner.keyring.get(&epoch.id)?;
         Some(mechanics::crypto::AuthorizedBodyKey::for_authorized_epoch(
@@ -740,7 +763,7 @@ impl replica::BodyKeySource for OrbitalMechanics {
         ))
     }
     fn opening_key(&self, epoch: &[u8; 16]) -> Option<mechanics::crypto::AuthorizedBodyKey> {
-        let inner = self.lock();
+        let mut inner = self.lock();
         // Only an AUTHORIZED epoch's key may open material.
         inner.acl().epoch(epoch)?;
         let key = inner.keyring.get(epoch)?;
@@ -754,36 +777,45 @@ impl replica::AuthorityIncorporator for OrbitalMechanics {
     fn incorporate_authority(
         &mut self,
         records: &[Vec<u8>],
-    ) -> Result<replica::AuthorityReceipt, String> {
+    ) -> Result<replica::AuthorityBatchReceipt, String> {
         let mut inner = self.lock();
+        // Split the staged records: effects + sealed keys commit as ONE
+        // atomic ledger batch (an invalid record refuses the whole batch);
+        // admissions are redeemed after, each producing its own batch.
+        let mut effects: Vec<Vec<u8>> = Vec::new();
+        let mut sealed: Vec<Vec<u8>> = Vec::new();
+        let mut admissions: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for raw in records {
             match AuthorityRecord::decode(raw) {
-                Some(AuthorityRecord::Membership(snapshot)) => {
-                    inner
-                        .membership
-                        .import(&snapshot)
-                        .map_err(|e| format!("membership import: {e}"))?;
-                }
+                Some(AuthorityRecord::Effect(bytes)) => effects.push(bytes),
+                Some(AuthorityRecord::SealedKey(bytes)) => sealed.push(bytes),
                 Some(AuthorityRecord::Admission {
                     admission,
                     inception,
-                }) => {
-                    // Best-effort: only an admin holding the key can redeem;
-                    // everyone else carries the material onward.
-                    if let Err(e) = inner.redeem_admission(&admission, &inception) {
-                        tracing::debug!("admission not redeemed here: {e}");
-                    }
-                }
+                }) => admissions.push((admission, inception)),
                 None => return Err("unrecognized authority record".into()),
+            }
+        }
+        let prior = inner.frontier();
+        let receipt = inner
+            .ledger
+            .commit_batch(&effects, &sealed)
+            .map_err(|e| e.to_string())?;
+        for (admission, inception) in &admissions {
+            // Best-effort: only an admin holding the key can redeem;
+            // everyone else carries the material onward.
+            if let Err(e) = inner.redeem_admission(admission, inception) {
+                tracing::debug!("admission not redeemed here: {e}");
             }
         }
         inner.refresh_keyring();
         // Once our actor is admitted, the pending join material has served
         // its purpose.
-        if inner
-            .my_actor()
-            .is_some_and(|me| inner.acl().is_member(&me))
-        {
+        let admitted = {
+            let me = inner.my_actor();
+            me.map(|a| inner.acl().is_member(&a)).unwrap_or(false)
+        };
+        if admitted {
             if inner.pending_admission.take().is_some() {
                 let _ = std::fs::remove_file(inner.dir.join(PENDING_ADMISSION_FILE));
             }
@@ -791,9 +823,11 @@ impl replica::AuthorityIncorporator for OrbitalMechanics {
                 let _ = std::fs::remove_file(inner.dir.join(PENDING_INCEPTION_FILE));
             }
         }
-        inner.persist().map_err(|e| e.to_string())?;
-        Ok(replica::AuthorityReceipt {
-            frontier: inner.frontier(),
+        Ok(replica::AuthorityBatchReceipt {
+            space: inner.space.clone(),
+            prior_frontier: prior,
+            resulting_frontier: inner.frontier(),
+            batch_digest: receipt.batch_digest,
         })
     }
 }

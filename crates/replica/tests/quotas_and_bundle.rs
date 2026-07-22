@@ -21,9 +21,10 @@ use mechanics::crypto::AuthorizedBodyKey;
 use mechanics::ids::SpaceId;
 use replica::frontier::AuthorityFrontier;
 use replica::{
-    ActionOutcome, AuthorityIncorporator, AuthorityReceipt, BodyBinding, BodyId, BodyKey, BodyOp,
-    CommitContext, EncodingId, QuotaConfig, Replica, ReplicaCommitError, SchemaId, SeedSigner,
-    StagedContactMaterial, StaticBodyKeys, SupportedSchemas, WorldId, MUTATION_COLLABORATIVE,
+    ActionOutcome, AuthorityBatchReceipt, AuthorityIncorporator, BodyBinding, BodyId, BodyKey,
+    BodyOp, CommitContext, EncodingId, QuotaConfig, Replica, ReplicaCommitError, SchemaId,
+    SeedSigner, StagedContactMaterial, StaticBodyKeys, SupportedSchemas, WorldId,
+    MUTATION_COLLABORATIVE,
 };
 
 const WRITER_SEED: [u8; 32] = [71u8; 32];
@@ -150,10 +151,16 @@ struct RecordingIncorporator {
     batches: Vec<Vec<Vec<u8>>>,
 }
 impl AuthorityIncorporator for RecordingIncorporator {
-    fn incorporate_authority(&mut self, records: &[Vec<u8>]) -> Result<AuthorityReceipt, String> {
+    fn incorporate_authority(
+        &mut self,
+        records: &[Vec<u8>],
+    ) -> Result<AuthorityBatchReceipt, String> {
         self.batches.push(records.to_vec());
-        Ok(AuthorityReceipt {
-            frontier: authority_frontier(),
+        Ok(replica::AuthorityBatchReceipt {
+            space: space(),
+            prior_frontier: replica::frontier::AuthorityFrontier::from_canonical_bytes(vec![]),
+            resulting_frontier: authority_frontier(),
+            batch_digest: *blake3::hash(&records.concat()).as_bytes(),
         })
     }
 }
@@ -250,7 +257,10 @@ fn a_valid_staging_validates_and_incorporates_with_authority_first() {
         incorporator.batches[0],
         vec![b"mechanics-authority-record".to_vec()]
     );
-    assert_eq!(bundle.authority_receipt().frontier, authority_frontier());
+    assert_eq!(
+        bundle.authority_receipt().resulting_frontier,
+        authority_frontier()
+    );
     assert_eq!(bundle.transaction_count(), 1);
 
     let outcome = b

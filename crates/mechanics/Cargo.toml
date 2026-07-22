@@ -12,6 +12,9 @@ license = "MIT OR Apache-2.0"
 # boundary is the dependency edge, enforced by rustc, not by review.
 
 [dependencies]
+# The semantics-free crash-safe object/manifest journal the authority ledger
+# commits through (the same machinery Fabric's Body store uses).
+journal = { path = "../journal" }
 # identity + signatures
 ed25519-dalek = "2"
 x25519-dalek = { version = "2", features = ["static_secrets"] }

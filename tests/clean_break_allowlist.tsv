@@ -67,7 +67,6 @@ src/node.rs	peers-json	M5
 src/node.rs	space-ticket	M5
 src/orbital/daemon.rs	dual-mode-selection	M4
 src/orbital/daemon.rs	member-approval	M2
-src/orbital/mechanics.rs	legacy-loro-path	M5
 src/orbital/mechanics.rs	world-flat-standing	M0
 src/orbital/mod.rs	dual-mode-selection	M4
 src/orbital/mod.rs	legacy-loro-path	M5

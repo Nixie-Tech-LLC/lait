@@ -32,6 +32,7 @@ pub mod authz;
 pub mod compile;
 pub mod crypto;
 pub mod custody;
+
 pub mod dkg;
 pub mod dto;
 pub mod expand;
@@ -40,6 +41,7 @@ pub mod gdkg;
 pub mod genesis;
 pub mod handover;
 pub mod ids;
+pub mod ledger;
 pub mod policy;
 pub mod refresh;
 pub mod reshare;

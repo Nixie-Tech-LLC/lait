@@ -36,7 +36,7 @@ pub use body::{
     BodyDescriptor, BodyOp, BodySchema, CollaborativeSchema, ContentCommitment, MutationModel,
 };
 pub use convergence::{
-    AuthorityIncorporator, AuthorityReceipt, ConvergenceOutcome, IncorporationClass,
+    AuthorityBatchReceipt, AuthorityIncorporator, ConvergenceOutcome, IncorporationClass,
     StagedContactMaterial, ValidatedContactBundle,
 };
 pub use fabric::{CollaborativeView, ListElement};

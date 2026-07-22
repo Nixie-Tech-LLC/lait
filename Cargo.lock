@@ -3231,6 +3231,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "frost-ed25519",
  "getrandom 0.3.4",
+ "journal",
  "postcard",
  "rand_core 0.6.4",
  "serde",
