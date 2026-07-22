@@ -33,20 +33,6 @@ impl ReplicaFrontier {
     }
 }
 
-/// A transaction identity — 128 bits reserved by the committing Station under
-/// the Replica lock (S5). The zero id is reserved for "no transaction".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct TransactionId([u8; 16]);
-
-impl TransactionId {
-    pub fn from_bytes(raw: [u8; 16]) -> Self {
-        Self(raw)
-    }
-    pub fn as_bytes(&self) -> [u8; 16] {
-        self.0
-    }
-}
-
 /// An authority frontier — an opaque, canonical mechanics-owned commitment to
 /// the authority material a request was authorized against. Runtime and World
 /// code treat it as an equality token: authorization and commit compare-and-swap

@@ -20,10 +20,11 @@ use std::sync::{Arc, Mutex};
 
 use lait::orbital::{AuthorityRecord, OrbitalMechanics};
 use mechanics::ledger::LedgerEffect;
+use replica::transaction::NO_PARENT_ROOT;
 use replica::{
-    AuthorityIncorporator, BodyBinding, BodyId, BodyKey, BodyOp, CommitContext, EncodingId,
-    Replica, SchemaId, SeedSigner, StagedContactMaterial, SupportedSchemas, WorldId,
-    MUTATION_COLLABORATIVE,
+    AuthorityIncorporator, BodyBinding, BodyId, BodyKey, BodyOp, CommitAuthorization,
+    CommitContext, EncodingId, Replica, SchemaId, SeedSigner, StagedContactMaterial,
+    StaticAuthorizer, SupportedSchemas, WorldId, MUTATION_COLLABORATIVE,
 };
 
 const FOUNDER_SEED: [u8; 32] = [21u8; 32];
@@ -41,6 +42,22 @@ fn temp_home(tag: &str) -> PathBuf {
 
 fn world() -> WorldId {
     WorldId::parse("com.example.notes").unwrap()
+}
+
+fn commit_demand() -> Vec<u8> {
+    mechanics::demand::AuthorizationDemand::require(
+        mechanics::demand::PolicyCapability::new("com.example.notes", "write"),
+        mechanics::demand::PolicyResource::space("com.example.notes"),
+    )
+    .encode_canonical()
+    .unwrap()
+}
+
+fn static_auth() -> StaticAuthorizer {
+    StaticAuthorizer {
+        world: world(),
+        implementation_id: [0u8; 32],
+    }
 }
 
 fn body(n: u8) -> BodyKey {
@@ -97,7 +114,7 @@ fn signed_note_tx(
     frontier: replica::frontier::AuthorityFrontier,
     n: u8,
 ) -> (
-    replica::transaction::BodyTransactionV1,
+    replica::transaction::BodyTransaction,
     Vec<(BodyKey, Vec<u8>)>,
 ) {
     let space = mech.space();
@@ -112,6 +129,13 @@ fn signed_note_tx(
     let device = mechanics::crypto::device_from_seed(signer_seed);
     r.commit_action(
         &ctx,
+        &CommitAuthorization {
+            actor: "actor",
+            parent_manifest_root: NO_PARENT_ROOT,
+            demand: commit_demand(),
+            intent_digest: [7u8; 32],
+            authorizer: &static_auth(),
+        },
         &world(),
         &device,
         &[n; 16],
@@ -250,6 +274,13 @@ fn authority_survives_a_body_crash_and_the_retry_incorporates_exactly_once() {
     source
         .commit_action(
             &ctx,
+            &CommitAuthorization {
+                actor: "actor",
+                parent_manifest_root: NO_PARENT_ROOT,
+                demand: commit_demand(),
+                intent_digest: [7u8; 32],
+                authorizer: &static_auth(),
+            },
             &world(),
             &device,
             &[1u8; 16],
@@ -274,7 +305,7 @@ fn authority_survives_a_body_crash_and_the_retry_incorporates_exactly_once() {
     for (tx, payloads) in &material {
         authority_records.push(tx.encode());
         for (key, envelope) in payloads {
-            bodies.push((tx.transaction, key.clone(), envelope.clone()));
+            bodies.push((tx.id(), key.clone(), envelope.clone()));
         }
     }
     let staged = StagedContactMaterial {

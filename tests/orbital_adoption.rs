@@ -23,6 +23,16 @@ use ::replica::body::{BodyOp, BodySchema, MutationModel};
 use ::replica::frontier::{AuthorityFrontier, ReplicaFrontier};
 use ::replica::ids::{BodyId, BodyKey, EncodingId, SchemaId, WorldId};
 
+#[allow(dead_code)]
+fn any_demand() -> Vec<u8> {
+    mechanics::demand::AuthorizationDemand::require(
+        mechanics::demand::PolicyCapability::new("w", "c"),
+        mechanics::demand::PolicyResource::space("w"),
+    )
+    .encode_canonical()
+    .expect("canonical demand")
+}
+
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn temp_home() -> PathBuf {
@@ -98,6 +108,7 @@ impl World for TallyWorld {
         let next = self.current(ctx) + intent.payload.len() as u64;
         let key = self.body();
         Ok(WorldEffect {
+            demand: any_demand(),
             operations: vec![(
                 key.clone(),
                 BodyOp::ReplaceAtomic {
@@ -115,6 +126,7 @@ impl World for TallyWorld {
         _query: WorldQuery,
     ) -> Result<WorldProjection, WorldError> {
         Ok(WorldProjection {
+            demand: any_demand(),
             schema: SchemaId::parse("tally").unwrap(),
             schema_version: 1,
             bytes: self.current(ctx).to_string().into_bytes(),

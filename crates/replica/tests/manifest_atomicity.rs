@@ -18,9 +18,9 @@ use mechanics::ids::SpaceId;
 use replica::frontier::AuthorityFrontier;
 use replica::{
     ActionOutcome, AuthorityBatchReceipt, AuthorityIncorporator, BodyBinding, BodyId, BodyKey,
-    BodyOp, CommitContext, EncodingId, QuotaConfig, Replica, ReplicaCommitError, SchemaId,
-    SeedSigner, StagedContactMaterial, StaticBodyKeys, SupportedSchemas, WorldId,
-    MUTATION_COLLABORATIVE,
+    BodyOp, CommitAuthorization, CommitContext, EncodingId, QuotaConfig, Replica,
+    ReplicaCommitError, SchemaId, SeedSigner, StagedContactMaterial, StaticBodyKeys,
+    SupportedSchemas, WorldId, MUTATION_COLLABORATIVE,
 };
 
 const WRITER_SEED: [u8; 32] = [71u8; 32];
@@ -49,6 +49,25 @@ fn keys() -> Arc<StaticBodyKeys> {
 
 fn world() -> WorldId {
     WorldId::parse("com.example.notes").unwrap()
+}
+
+/// A test authorizer + commit-authorization helper (the machinery each commit
+/// needs now that authorization is bound into the signed transaction).
+fn test_auth() -> replica::StaticAuthorizer {
+    replica::StaticAuthorizer {
+        world: world(),
+        implementation_id: [0u8; 32],
+    }
+}
+
+fn test_demand() -> Vec<u8> {
+    use mechanics::demand::{AuthorizationDemand, PolicyCapability, PolicyResource};
+    AuthorizationDemand::require(
+        PolicyCapability::new("com.example.notes", "write"),
+        PolicyResource::space("com.example.notes"),
+    )
+    .encode_canonical()
+    .expect("canonical demand")
 }
 
 fn body(n: u8) -> BodyKey {
@@ -131,6 +150,13 @@ fn commit_note(
     };
     r.commit_action(
         &ctx,
+        &CommitAuthorization {
+            actor: "actor",
+            parent_manifest_root: [0u8; 32],
+            demand: test_demand(),
+            intent_digest: [7u8; 32],
+            authorizer: &test_auth(),
+        },
         &world(),
         &device(),
         &request,
@@ -164,7 +190,7 @@ fn stage(r: &Replica) -> StagedContactMaterial {
     for (tx, payloads) in &material {
         authority_records.push(tx.encode());
         for (key, envelope) in payloads {
-            bodies.push((tx.transaction, key.clone(), envelope.clone()));
+            bodies.push((tx.id(), key.clone(), envelope.clone()));
         }
     }
     StagedContactMaterial {
@@ -355,7 +381,7 @@ fn authority_bytes_cannot_ride_the_transaction_lane() {
 
     // A payload naming a transaction id that only exists as authority bytes.
     let (_a2, mut staged2) = multi_tx_staging();
-    let phantom_tx = [0xEEu8; 16];
+    let phantom_tx = [0xEEu8; 32];
     let envelope = staged2.bodies[0].2.clone();
     staged2.bodies.push((phantom_tx, body(9), envelope));
     let mut c = keyed_replica();

@@ -327,6 +327,37 @@ impl StationCore {
     }
 }
 
+/// The per-submit authorizer: captures the mechanics [`AuthorityView`] and the
+/// mutation's companion coordinates, and turns the built transaction-core
+/// digest into a signed [`mechanics::demand::AuthorizationReceipt`].
+struct SessionAuthorizer<'a> {
+    authority: &'a dyn AuthorityView,
+    space: &'a mechanics::ids::SpaceId,
+    world: &'a WorldId,
+    actor: &'a mechanics::ids::ActorId,
+    device: &'a mechanics::ids::DeviceId,
+    authority_frontier: &'a replica::frontier::AuthorityFrontier,
+    implementation_id: [u8; 32],
+}
+
+impl replica::TransactionAuthorizer for SessionAuthorizer<'_> {
+    fn authorize(&self, core: &replica::BodyTransactionCore) -> Result<Vec<u8>, String> {
+        self.authority.authorize_mutation(
+            self.space,
+            self.world,
+            self.actor,
+            self.device,
+            self.authority_frontier,
+            core.parent_manifest_root,
+            self.implementation_id,
+            core.intent_digest,
+            &core.demand,
+            core.operations_digest,
+            core.digest(),
+        )
+    }
+}
+
 /// A [`BodyReader`] over a locked Replica, handed to a World during a query.
 struct ReplicaReader<'a>(&'a replica::Replica);
 
@@ -680,15 +711,44 @@ impl Session {
         if current.authority_frontier != action.header.authority_frontier {
             return Err(WorldError::AuthorityChanged);
         }
+        // The mutation's canonical demand is mandatory and non-empty; the
+        // implementation must be active at the pinned frontier.
+        if effect.demand.is_empty() {
+            return Err(WorldError::ContractViolation);
+        }
+        let implementation_id = self
+            .authority
+            .active_implementation(&self.world_id, &action.header.authority_frontier)
+            .ok_or(WorldError::Denied)?;
+        let parent_manifest_root = inner.replica.manifest_root();
         let ctx = replica::CommitContext {
             space: &self.space,
             signer: &self.identity,
             authority_frontier: action.header.authority_frontier.clone(),
         };
+        // The authorizer produces the AuthorizationReceipt from the built core
+        // digest, binding every companion coordinate. A denial is a typed Err.
+        let authorizer = SessionAuthorizer {
+            authority: self.authority.as_ref(),
+            space: &self.space,
+            world: &self.world_id,
+            actor: &principal.actor,
+            device: &principal.device,
+            authority_frontier: &action.header.authority_frontier,
+            implementation_id,
+        };
+        let auth = replica::CommitAuthorization {
+            actor: principal.actor.as_str(),
+            parent_manifest_root,
+            demand: effect.demand.clone(),
+            intent_digest: payload_hash,
+            authorizer: &authorizer,
+        };
         let outcome = inner
             .replica
             .commit_action(
                 &ctx,
+                &auth,
                 &self.world_id,
                 &principal.device,
                 &request,
@@ -711,6 +771,10 @@ impl Session {
                 replica::ReplicaCommitError::RequestIdConflict => WorldError::RequestIdConflict,
                 replica::ReplicaCommitError::QuotaExceeded
                 | replica::ReplicaCommitError::OpaqueQuotaExceeded => WorldError::LimitExceeded,
+                // The mechanics authorizer refused: the demand was unsatisfied
+                // at the pinned frontier (a real Denied, not a bug).
+                replica::ReplicaCommitError::Unauthorized(_) => WorldError::Denied,
+                replica::ReplicaCommitError::ParentManifestUnavailable => WorldError::Conflict,
                 // Illegitimate is an incorporation-path error; a local commit
                 // never produces it, but the match stays exhaustive.
                 replica::ReplicaCommitError::Illegitimate(_)
@@ -767,6 +831,19 @@ impl Session {
             }))
             .unwrap_or(Err(WorldError::WorldImplementationFailed))?
         };
+        // The query's read demand is mandatory and evaluated at the pinned
+        // authority frontier — even publicly visible data requires an explicit
+        // read capability. No projection is returned on denial.
+        if projection.demand.is_empty() {
+            return Err(WorldError::ContractViolation);
+        }
+        if !self.authority.evaluate_read(
+            &principal.actor,
+            &principal.authority_frontier,
+            &projection.demand,
+        ) {
+            return Err(WorldError::Denied);
+        }
         // Runtime — not the World — stamps the projection's source frontier: the
         // snapshot it was derived from is the one held for this call.
         projection.frontier = inner.replica.frontier();

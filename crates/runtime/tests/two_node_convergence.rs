@@ -1,5 +1,5 @@
 //! Two-node convergence, end to end: one Replica exports its **retained signed
-//! material** (the canonical BodyTransactionV1 records plus their sealed,
+//! material** (the canonical BodyTransaction records plus their sealed,
 //! descriptor-bound protected payloads), the material is framed as a Contact
 //! transfer and driven through the real initiator/accepter state machines, the
 //! received bytes are handed to mechanics-validated `Replica::incorporate`,
@@ -17,11 +17,12 @@ use std::sync::Arc;
 use mechanics::crypto::AuthorizedBodyKey;
 use mechanics::ids::SpaceId;
 use replica::frontier::AuthorityFrontier;
-use replica::transaction::{AuthoritySource, BodyTransactionV1};
+use replica::transaction::{AuthoritySource, BodyTransaction, NO_PARENT_ROOT};
 use replica::{
     BodyBinding, BodyId, BodyKey, BodyOp, CommitContext, EncodingId, Replica, SchemaId, SeedSigner,
     StaticBodyKeys, SupportedSchemas, WorldId, MUTATION_COLLABORATIVE,
 };
+use replica::{CommitAuthorization, StaticAuthorizer};
 use runtime::contact::{
     authority_record_hash, authority_set_hash, body_chunk_hash, manifest_page_hash,
     manifest_root_ref, ContactFrame, ContactId, InitiatorReceiver, InitiatorState, Progress,
@@ -99,8 +100,25 @@ fn commit_votes(r: &mut Replica, request: [u8; 16], delta: i64) {
         signer: &signer,
         authority_frontier: authority_frontier(),
     };
+    let authorizer = StaticAuthorizer {
+        world: note_key().world,
+        implementation_id: [0u8; 32],
+    };
+    let demand = mechanics::demand::AuthorizationDemand::require(
+        mechanics::demand::PolicyCapability::new(note_key().world.as_str(), "write"),
+        mechanics::demand::PolicyResource::space(note_key().world.as_str()),
+    )
+    .encode_canonical()
+    .unwrap();
     r.commit_action(
         &ctx,
+        &CommitAuthorization {
+            actor: "actor",
+            parent_manifest_root: NO_PARENT_ROOT,
+            demand,
+            intent_digest: [1u8; 32],
+            authorizer: &authorizer,
+        },
         &note_key().world,
         &mechanics::crypto::device_from_seed(&EXPORT_SEED),
         &request,
@@ -124,9 +142,9 @@ fn commit_votes(r: &mut Replica, request: [u8; 16], delta: i64) {
 }
 
 /// Frame the exported material as a complete Contact transfer: the signed
-/// BodyTransactionV1 is the single authority record; its bound protected
+/// BodyTransaction is the single authority record; its bound protected
 /// payload is the single body. Returns every raw frame in send order.
-fn frame_transfer(contact: &ContactId, tx: &BodyTransactionV1, payload: &[u8]) -> Vec<Vec<u8>> {
+fn frame_transfer(contact: &ContactId, tx: &BodyTransaction, payload: &[u8]) -> Vec<Vec<u8>> {
     let record = tx.encode();
     let record_hashes = vec![authority_record_hash(&record)];
     let set_hash = authority_set_hash(&record_hashes);
@@ -161,7 +179,7 @@ fn frame_transfer(contact: &ContactId, tx: &BodyTransactionV1, payload: &[u8]) -
             page_bytes,
         },
         ContactFrame::BodyChunk {
-            transaction: tx.transaction,
+            transaction: tx.id(),
             body: note_key(),
             offset: 0,
             total: payload.len() as u64,
@@ -169,7 +187,7 @@ fn frame_transfer(contact: &ContactId, tx: &BodyTransactionV1, payload: &[u8]) -
             bytes: payload.to_vec(),
         },
         ContactFrame::BodyEnd {
-            transaction: tx.transaction,
+            transaction: tx.id(),
             body: note_key(),
             total: payload.len() as u64,
             content_commitment: commitment,
@@ -230,10 +248,10 @@ fn a_signed_export_converges_across_a_contact_transfer() {
     // the signed transaction + payload from the received material.
     let received = receive(contact, &frames);
     assert_eq!(received.authority_records.len(), 1);
-    let received_tx = BodyTransactionV1::decode_canonical(&received.authority_records[0]).unwrap();
+    let received_tx = BodyTransaction::decode_canonical(&received.authority_records[0]).unwrap();
     let received_payload = received
         .bodies
-        .get(&(tx.transaction, note_key()))
+        .get(&(tx.id(), note_key()))
         .expect("body present");
 
     // Convergence: legitimacy is checked (signature + mechanics authority +
@@ -276,8 +294,8 @@ fn a_tampered_transfer_never_reaches_the_engine() {
     let contact = ContactId::from_bytes([6u8; 16]);
     let frames = frame_transfer(&contact, tx, payload);
     let received = receive(contact, &frames);
-    let received_tx = BodyTransactionV1::decode_canonical(&received.authority_records[0]).unwrap();
-    let received_payload = received.bodies.get(&(tx.transaction, note_key())).unwrap();
+    let received_tx = BodyTransaction::decode_canonical(&received.authority_records[0]).unwrap();
+    let received_payload = received.bodies.get(&(tx.id(), note_key())).unwrap();
 
     // An importer whose mechanics view does not authorize the exporter refuses
     // the material even though the Contact transfer itself was well-formed.

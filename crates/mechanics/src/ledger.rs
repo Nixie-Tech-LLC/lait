@@ -220,6 +220,96 @@ impl FrontierBody {
     }
 }
 
+/// BLAKE3 derive-key context for the checkpoint commitment.
+const CHECKPOINT_CONTEXT: &str = "lait.authority-checkpoint.v1";
+
+/// The canonical commitment of one materialized checkpoint: every field of
+/// the object is deterministic across nodes holding the same effect closure
+/// (topo order, sorted sets, BTree maps), so the commitment is too.
+fn checkpoint_commitment(cp: &CheckpointObject) -> [u8; 32] {
+    let bytes = postcard::to_stdvec(cp).expect("encode checkpoint");
+    blake3::derive_key(CHECKPOINT_CONTEXT, &bytes)
+}
+
+/// The companion facts an authorization evaluation binds. Runtime supplies
+/// them; the receipt commits to every one.
+pub struct AuthorizationRequest<'a> {
+    pub world: &'a str,
+    pub actor: &'a str,
+    pub device: [u8; 32],
+    pub authority_frontier: &'a [u8],
+    pub parent_manifest_root: [u8; 32],
+    pub implementation_id: [u8; 32],
+    pub intent_digest: [u8; 32],
+    pub demand: &'a [u8],
+    pub effect_operations_digest: [u8; 32],
+    pub body_transaction_core_digest: [u8; 32],
+}
+
+/// Why an authorization evaluation refused. A denial is a typed result and
+/// never a receipt.
+#[derive(Debug)]
+pub enum AuthorizeError {
+    /// The demand is unsatisfied, the device resolves to no actor at the
+    /// frontier, or the resolved actor differs from the claimed one.
+    Denied,
+    /// The claimed implementation id is not active at the pinned frontier.
+    ImplementationNotActive,
+    /// The demand bytes are malformed/non-canonical.
+    Demand(crate::demand::DemandError),
+    /// Frontier resolution failed (missing history, malformed frontier, or a
+    /// durable failure).
+    Ledger(LedgerError),
+}
+
+impl std::fmt::Display for AuthorizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthorizeError::Denied => write!(f, "demand unsatisfied"),
+            AuthorizeError::ImplementationNotActive => {
+                write!(f, "implementation not active at the pinned frontier")
+            }
+            AuthorizeError::Demand(e) => write!(f, "{e}"),
+            AuthorizeError::Ledger(e) => write!(f, "{e}"),
+        }
+    }
+}
+impl std::error::Error for AuthorizeError {}
+
+/// The exact companion coordinates a remote receipt must bind.
+pub struct ReceiptExpectations<'a> {
+    pub device: &'a [u8; 32],
+    pub authority_frontier: &'a [u8],
+    pub parent_manifest_root: &'a [u8; 32],
+    pub intent_digest: &'a [u8; 32],
+    pub demand: &'a [u8],
+    pub effect_operations_digest: &'a [u8; 32],
+    pub body_transaction_core_digest: &'a [u8; 32],
+}
+
+/// Why remote receipt verification refused.
+#[derive(Debug)]
+pub enum VerifyError {
+    /// A bound field disagrees with the transaction (substitution).
+    Binding(&'static str),
+    /// The demand is not satisfied at the referenced frontier by the claimed
+    /// actor (or the actor does not resolve there).
+    Unsatisfied,
+    /// Frontier resolution failed (missing history is retryable).
+    Ledger(LedgerError),
+}
+
+impl std::fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VerifyError::Binding(field) => write!(f, "receipt binding mismatch: {field}"),
+            VerifyError::Unsatisfied => write!(f, "demand unsatisfied at the referenced frontier"),
+            VerifyError::Ledger(e) => write!(f, "{e}"),
+        }
+    }
+}
+impl std::error::Error for VerifyError {}
+
 /// The digest a checkpoint/receipt keys a frontier by.
 fn frontier_digest(space: &SpaceId, frontier_bytes: &[u8]) -> [u8; 32] {
     let mut input = Vec::with_capacity(space.as_str().len() + 1 + frontier_bytes.len());
@@ -693,6 +783,159 @@ impl AuthorityLedger {
         self.state_at(frontier_bytes)
             .map(|view| view.signer_can_write(signer))
             .unwrap_or(false)
+    }
+
+    /// The active World implementation id at a referenced frontier.
+    pub fn active_implementation_at(
+        &mut self,
+        frontier_bytes: &[u8],
+        world: &str,
+    ) -> Result<Option<[u8; 32]>, LedgerError> {
+        let cp = self.checkpoint_for(frontier_bytes)?;
+        Ok(cp.replay.state.active_implementation(world))
+    }
+
+    /// The canonical commitment of the materialized checkpoint at a frontier —
+    /// deterministic across every node holding the same effect closure.
+    pub fn checkpoint_commitment_at(
+        &mut self,
+        frontier_bytes: &[u8],
+    ) -> Result<[u8; 32], LedgerError> {
+        let cp = self.checkpoint_for(frontier_bytes)?;
+        Ok(checkpoint_commitment(&cp))
+    }
+
+    /// Derive the deterministic [`AuthorizationReceipt`] for a demand at a
+    /// pinned frontier, or a typed denial. This is the ONLY constructor of
+    /// World-authorization evidence: evaluation runs against the materialized
+    /// checkpoint (journaled first if this frontier was not yet
+    /// materialized), the canonical witness is selected per the frozen rules,
+    /// and every companion coordinate is bound in.
+    #[allow(clippy::too_many_arguments)]
+    pub fn authorize(
+        &mut self,
+        request: &AuthorizationRequest<'_>,
+    ) -> Result<crate::demand::AuthorizationReceipt, AuthorizeError> {
+        let demand = crate::demand::AuthorizationDemand::decode_canonical(request.demand)
+            .map_err(AuthorizeError::Demand)?;
+        let cp = self
+            .checkpoint_for(request.authority_frontier)
+            .map_err(AuthorizeError::Ledger)?;
+        // Resolve the device to its actor AT the pinned frontier.
+        let view = self
+            .state_at(request.authority_frontier)
+            .map_err(AuthorizeError::Ledger)?;
+        let device = DeviceId::from_key_bytes(&request.device);
+        let actor = view
+            .plane
+            .actor_of_device(&device)
+            .cloned()
+            .ok_or(AuthorizeError::Denied)?;
+        if actor.as_str() != request.actor {
+            return Err(AuthorizeError::Denied);
+        }
+        // The implementation id must be active at the pinned frontier.
+        match cp.replay.state.active_implementation(request.world) {
+            Some(active) if active == request.implementation_id => {}
+            _ => return Err(AuthorizeError::ImplementationNotActive),
+        }
+        let witness = cp
+            .replay
+            .state
+            .evaluate_demand(&actor, &demand)
+            .ok_or(AuthorizeError::Denied)?;
+        Ok(crate::demand::AuthorizationReceipt {
+            space: self.genesis.space_id.as_str().to_string(),
+            world: request.world.to_string(),
+            actor: actor.as_str().to_string(),
+            device: request.device,
+            authority_frontier: request.authority_frontier.to_vec(),
+            authority_checkpoint_commitment: checkpoint_commitment(&cp),
+            policy_evidence_digest: crate::demand::policy_evidence_digest(&witness),
+            parent_manifest_root: request.parent_manifest_root,
+            implementation_id: request.implementation_id,
+            intent_digest: request.intent_digest,
+            demand_digest: demand.digest().map_err(AuthorizeError::Demand)?,
+            effect_operations_digest: request.effect_operations_digest,
+            body_transaction_core_digest: request.body_transaction_core_digest,
+            decision: 1,
+        })
+    }
+
+    /// Verify a remote transaction's authorization receipt against historical
+    /// Mechanics state — **no World callback runs**. Recomputes the actor
+    /// resolution, checkpoint commitment, implementation activation, demand
+    /// evaluation, and witness digest at the receipt's referenced frontier,
+    /// and requires every binding to the supplied companion coordinates.
+    pub fn verify_receipt(
+        &mut self,
+        receipt: &crate::demand::AuthorizationReceipt,
+        expectations: &ReceiptExpectations<'_>,
+    ) -> Result<(), VerifyError> {
+        if receipt.space != self.genesis.space_id.as_str() {
+            return Err(VerifyError::Binding("space"));
+        }
+        if receipt.decision != 1 {
+            return Err(VerifyError::Binding("decision"));
+        }
+        if receipt.device != *expectations.device {
+            return Err(VerifyError::Binding("device"));
+        }
+        if receipt.authority_frontier != expectations.authority_frontier {
+            return Err(VerifyError::Binding("authority frontier"));
+        }
+        if receipt.parent_manifest_root != *expectations.parent_manifest_root {
+            return Err(VerifyError::Binding("parent manifest root"));
+        }
+        if receipt.intent_digest != *expectations.intent_digest {
+            return Err(VerifyError::Binding("intent digest"));
+        }
+        if receipt.effect_operations_digest != *expectations.effect_operations_digest {
+            return Err(VerifyError::Binding("operations digest"));
+        }
+        if receipt.body_transaction_core_digest != *expectations.body_transaction_core_digest {
+            return Err(VerifyError::Binding("core digest"));
+        }
+        let demand = crate::demand::AuthorizationDemand::decode_canonical(expectations.demand)
+            .map_err(|_| VerifyError::Binding("demand"))?;
+        if receipt.demand_digest
+            != demand
+                .digest()
+                .map_err(|_| VerifyError::Binding("demand"))?
+        {
+            return Err(VerifyError::Binding("demand digest"));
+        }
+        let cp = self
+            .checkpoint_for(&receipt.authority_frontier)
+            .map_err(VerifyError::Ledger)?;
+        if checkpoint_commitment(&cp) != receipt.authority_checkpoint_commitment {
+            return Err(VerifyError::Binding("checkpoint commitment"));
+        }
+        match cp.replay.state.active_implementation(&receipt.world) {
+            Some(active) if active == receipt.implementation_id => {}
+            _ => return Err(VerifyError::Binding("implementation id")),
+        }
+        let view = self
+            .state_at(&receipt.authority_frontier)
+            .map_err(VerifyError::Ledger)?;
+        let device = DeviceId::from_key_bytes(&receipt.device);
+        let actor = view
+            .plane
+            .actor_of_device(&device)
+            .cloned()
+            .ok_or(VerifyError::Unsatisfied)?;
+        if actor.as_str() != receipt.actor {
+            return Err(VerifyError::Binding("actor"));
+        }
+        let witness = cp
+            .replay
+            .state
+            .evaluate_demand(&actor, &demand)
+            .ok_or(VerifyError::Unsatisfied)?;
+        if crate::demand::policy_evidence_digest(&witness) != receipt.policy_evidence_digest {
+            return Err(VerifyError::Binding("policy evidence digest"));
+        }
+        Ok(())
     }
 
     /// The closure of a frontier: every effect hash reachable from its heads,

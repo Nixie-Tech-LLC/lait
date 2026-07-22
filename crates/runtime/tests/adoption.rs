@@ -16,6 +16,16 @@ use mechanics::ids::{ActorId, DeviceId};
 use replica::body::{BodyOp, BodySchema, MutationModel};
 use replica::frontier::{AuthorityFrontier, ReplicaFrontier};
 use replica::ids::{BodyId, BodyKey, EncodingId, SchemaId, WorldId};
+
+#[allow(dead_code)]
+fn any_demand() -> Vec<u8> {
+    mechanics::demand::AuthorizationDemand::require(
+        mechanics::demand::PolicyCapability::new("w", "c"),
+        mechanics::demand::PolicyResource::space("w"),
+    )
+    .encode_canonical()
+    .expect("canonical demand")
+}
 use runtime::{
     ActivationOptions, AuthorityView, DeorbitConfirmation, LifecycleError, LocalIdentity,
     PrincipalResolution, Runtime, RuntimeBuilder, SpaceFormationOptions, Standing, World,
@@ -128,6 +138,7 @@ impl World for KvWorld {
         let (key, value) = text.split_once('=').ok_or(WorldError::InvalidRequest)?;
         let body = self.body(key);
         Ok(WorldEffect {
+            demand: any_demand(),
             operations: vec![(
                 body.clone(),
                 BodyOp::ReplaceAtomic {
@@ -147,6 +158,7 @@ impl World for KvWorld {
         let key = String::from_utf8(query.payload).map_err(|_| WorldError::InvalidRequest)?;
         let value = ctx.read_body(&self.body(&key)).unwrap_or_default();
         Ok(WorldProjection {
+            demand: any_demand(),
             schema: SchemaId::parse("entry").unwrap(),
             schema_version: 1,
             bytes: value,

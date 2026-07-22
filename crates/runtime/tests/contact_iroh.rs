@@ -17,6 +17,16 @@ use replica::frontier::{AuthorityFrontier, ReplicaFrontier};
 use replica::ids::{BodyId, BodyKey, EncodingId, SchemaId, WorldId};
 use runtime::contact::CONTACT_ALPN;
 use runtime::coordinates::{ApproachAddr, CoordinatesAdmission, CoordinatesPayloadV1};
+
+#[allow(dead_code)]
+fn any_demand() -> Vec<u8> {
+    mechanics::demand::AuthorizationDemand::require(
+        mechanics::demand::PolicyCapability::new("w", "c"),
+        mechanics::demand::PolicyResource::space("w"),
+    )
+    .encode_canonical()
+    .expect("canonical demand")
+}
 use runtime::{
     ActivationOptions, CommsOptions, ContactMechanics, ContactOptions, EnterOptions, RequestId,
     Runtime, RuntimeBuilder, SignedCoordinatesV1, Station, World, WorldContext, WorldEffect,
@@ -114,6 +124,7 @@ impl World for KvWorld {
         let (key, value) = text.split_once('=').ok_or(WorldError::InvalidRequest)?;
         let body = self.body(key);
         Ok(WorldEffect {
+            demand: any_demand(),
             operations: vec![(
                 body.clone(),
                 BodyOp::ReplaceAtomic {
@@ -132,6 +143,7 @@ impl World for KvWorld {
     ) -> Result<WorldProjection, WorldError> {
         let key = String::from_utf8(query.payload).map_err(|_| WorldError::InvalidRequest)?;
         Ok(WorldProjection {
+            demand: any_demand(),
             schema: SchemaId::parse("entry").unwrap(),
             schema_version: 1,
             bytes: ctx.read_body(&self.body(&key)).unwrap_or_default(),

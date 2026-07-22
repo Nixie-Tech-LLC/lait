@@ -7,11 +7,9 @@
 //! fixture and implemented through Fabric in S5. This module defines the sealed
 //! contract shapes; S0 introduces no production routing.
 
-use mechanics::ids::{SpaceId, StationId};
 use serde::{Deserialize, Serialize};
 
-use crate::frontier::{AuthorityFrontier, ReplicaFrontier, TransactionId};
-use crate::ids::{BodyKey, EncodingId, SchemaId};
+use crate::ids::{EncodingId, SchemaId};
 
 /// Domain separator for the ciphertext-only content commitment.
 pub const BODY_CONTENT_DOMAIN: &[u8] = b"lait/body-content/1";
@@ -71,25 +69,6 @@ pub struct BodySchema {
     /// Earlier schema versions this version can read (deterministic upgrade
     /// declaration). Runtime rejects contradictory upgrade claims.
     pub readable_predecessors: Vec<u32>,
-}
-
-/// The public descriptor of a Body version. It binds Space, key, schema/version,
-/// encoding, semantic frontier, ciphertext commitment, transaction id, signer,
-/// and authority frontier — everything an opaque retainer validates *without* a
-/// World implementation or a decryption key. Signature binding is carried by the
-/// enclosing `BodyTransaction` (S5), not here.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BodyDescriptor {
-    pub space: SpaceId,
-    pub key: BodyKey,
-    pub schema: SchemaId,
-    pub schema_version: u32,
-    pub frontier: ReplicaFrontier,
-    pub content_commitment: ContentCommitment,
-    pub encoding: EncodingId,
-    pub transaction: TransactionId,
-    pub signer: StationId,
-    pub authority_frontier: AuthorityFrontier,
 }
 
 /// The LAIT-owned Body operation algebra. A World stages these; it cannot submit

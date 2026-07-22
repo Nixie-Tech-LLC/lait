@@ -32,15 +32,13 @@ pub mod receipt;
 pub mod replica;
 pub mod transaction;
 
-pub use body::{
-    BodyDescriptor, BodyOp, BodySchema, CollaborativeSchema, ContentCommitment, MutationModel,
-};
+pub use body::{BodyOp, BodySchema, CollaborativeSchema, ContentCommitment, MutationModel};
 pub use convergence::{
     AuthorityBatchReceipt, AuthorityIncorporator, ConvergenceOutcome, IncorporationClass,
     StagedContactMaterial, ValidatedContactBundle,
 };
 pub use fabric::{CollaborativeView, ListElement};
-pub use frontier::{AuthorityFrontier, ReplicaFrontier, TransactionId};
+pub use frontier::{AuthorityFrontier, ReplicaFrontier};
 pub use ids::{BodyId, BodyKey, EncodingId, SchemaId, WorldId};
 pub use manifest::{
     AuthorizedRoot, ManifestBook, ManifestEntryV1, ManifestError, ManifestPageV1, ManifestRootV1,
@@ -53,10 +51,11 @@ pub use protected::{
 };
 pub use receipt::{ReceiptError, RequestReceiptV1, MAX_EFFECT_BYTES};
 pub use replica::{
-    ActionOutcome, BodyBinding, CommitContext, ExportedMaterial, QuotaConfig, Replica,
-    ReplicaCommitError, SupportedSchemas, MUTATION_ATOMIC, MUTATION_COLLABORATIVE,
+    operations_digest_of, ActionOutcome, BodyBinding, CommitAuthorization, CommitContext,
+    ExportedMaterial, QuotaConfig, Replica, ReplicaCommitError, StaticAuthorizer, SupportedSchemas,
+    TransactionAuthorizer, MUTATION_ATOMIC, MUTATION_COLLABORATIVE,
 };
 pub use transaction::{
-    AuthoritySource, BodyDescriptorV1, BodyTransactionV1, SeedSigner, TransactionError,
-    TransactionSigner,
+    AuthoritySource, BodyDescriptor, BodyTransaction, BodyTransactionCore, SeedSigner,
+    TransactionError, TransactionSigner,
 };

@@ -422,6 +422,92 @@ impl AuthorizationDemand {
     }
 }
 
+/// BLAKE3 derive-key context for the policy-evidence digest (the sorted,
+/// deduplicated effective-grant-id witness set).
+const EVIDENCE_CONTEXT: &str = "lait.policy-evidence.v1";
+/// BLAKE3 derive-key context for the receipt digest.
+const RECEIPT_CONTEXT: &str = "lait.authorization-receipt.v1";
+
+/// Digest over a canonical witness: the sorted, deduplicated effective grant
+/// ids that satisfied the demand.
+pub fn policy_evidence_digest(witness: &[[u8; 32]]) -> [u8; 32] {
+    let mut input = Vec::with_capacity(8 + witness.len() * 32);
+    input.extend_from_slice(&(witness.len() as u64).to_be_bytes());
+    for id in witness {
+        input.extend_from_slice(id);
+    }
+    blake3::derive_key(EVIDENCE_CONTEXT, &input)
+}
+
+/// The deterministic World-authorization evidence Mechanics derives from the
+/// pinned checkpoint and a canonical witness. It is **not** an actor assertion
+/// or a separately signed token: authenticity comes from the signed authority
+/// history it is derived from plus the outer transaction signature that
+/// carries it. Denials are typed results and never receipts.
+///
+/// Distinct from the authority-batch receipt (history incorporation) and the
+/// request receipt (request-replay outcome).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorizationReceipt {
+    /// The Space (canonical SpaceId text).
+    pub space: String,
+    /// The World (canonical WorldId text).
+    pub world: String,
+    /// The authorized actor (canonical ActorId text).
+    pub actor: String,
+    /// The signing device's raw key.
+    pub device: [u8; 32],
+    /// The canonical authority-frontier bytes evaluation was pinned to.
+    pub authority_frontier: Vec<u8>,
+    /// The commitment of the materialized checkpoint at that frontier.
+    pub authority_checkpoint_commitment: [u8; 32],
+    /// Digest over the exact effective-grant witness set.
+    pub policy_evidence_digest: [u8; 32],
+    /// The parent Manifest root evaluation was pinned to.
+    pub parent_manifest_root: [u8; 32],
+    /// The authority-approved World implementation id active at the frontier.
+    pub implementation_id: [u8; 32],
+    /// Digest of the signed intent payload.
+    pub intent_digest: [u8; 32],
+    /// Digest of the canonical demand bytes.
+    pub demand_digest: [u8; 32],
+    /// Digest of the complete canonical staged effect/operation set.
+    pub effect_operations_digest: [u8; 32],
+    /// Digest of the complete canonical transaction core (excluding this
+    /// receipt, the outer signature, and the outer transaction id).
+    pub body_transaction_core_digest: [u8; 32],
+    /// Always `1` (Allow). A denial is a typed result, never a receipt.
+    pub decision: u8,
+}
+
+impl AuthorizationReceipt {
+    pub fn encode(&self) -> Vec<u8> {
+        postcard::to_stdvec(self).expect("encode authorization receipt")
+    }
+
+    /// Canonical decode with exact re-encode equality and the Allow pin.
+    pub fn decode(bytes: &[u8]) -> Result<Self, DemandError> {
+        let r: AuthorizationReceipt = postcard::from_bytes(bytes)
+            .map_err(|e| DemandError::BadEncoding(format!("receipt: {e}")))?;
+        if r.encode() != bytes {
+            return Err(DemandError::BadEncoding(
+                "non-canonical receipt encoding".into(),
+            ));
+        }
+        if r.decision != 1 {
+            return Err(DemandError::BadEncoding(
+                "a receipt is always an Allow".into(),
+            ));
+        }
+        Ok(r)
+    }
+
+    /// The receipt digest (referenced by the request receipt).
+    pub fn digest(&self) -> [u8; 32] {
+        blake3::derive_key(RECEIPT_CONTEXT, &self.encode())
+    }
+}
+
 fn push_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(&(s.len() as u16).to_be_bytes());
     out.extend_from_slice(s.as_bytes());

@@ -584,7 +584,7 @@ async fn serve_contact(
     for (tx, payloads) in &material {
         authority_records.push(tx.encode());
         for (key, envelope) in payloads {
-            bodies.push((tx.transaction, key.clone(), envelope.clone()));
+            bodies.push((tx.id(), key.clone(), envelope.clone()));
         }
     }
     let transfer = OutboundTransfer {

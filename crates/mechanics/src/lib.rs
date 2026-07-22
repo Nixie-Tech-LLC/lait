@@ -32,6 +32,7 @@ pub mod authz;
 pub mod compile;
 pub mod crypto;
 pub mod custody;
+pub mod demand;
 
 pub mod dkg;
 pub mod dto;

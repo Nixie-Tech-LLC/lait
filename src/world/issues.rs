@@ -86,6 +86,8 @@ struct Staging {
     ops: Vec<(BodyKey, BodyOp)>,
     scopes: Vec<BodyKey>,
     declarations: Vec<BodyDeclaration>,
+    /// The canonical demand this mutation requires (defaults to contributor).
+    demand: Option<Vec<u8>>,
 }
 
 impl Staging {
@@ -126,7 +128,14 @@ impl Staging {
         self.ops.push((catalog_key(), op));
     }
 
+    /// Set the demand this mutation requires (an admin-only intent overrides
+    /// the contributor default).
+    fn require(&mut self, demand: Vec<u8>) {
+        self.demand = Some(demand);
+    }
+
     fn into_effect(self, doc: Option<String>) -> WorldEffect {
+        let demand = self.demand.unwrap_or_else(contract::demand_contributor);
         WorldEffect {
             operations: self.ops,
             scopes: self.scopes,
@@ -136,6 +145,7 @@ impl Staging {
             }
             .to_json(),
             declarations: self.declarations,
+            demand,
         }
     }
 }
@@ -165,6 +175,9 @@ fn unchanged_effect(doc: Option<String>) -> WorldEffect {
         }
         .to_json(),
         declarations: vec![],
+        // A no-op still declares a demand (the read baseline every member
+        // holds); it commits nothing, so the receipt is over an empty tx.
+        demand: contract::demand_read(),
     }
 }
 
@@ -385,6 +398,8 @@ impl World for IssuesWorld {
                         value: serde_json::to_vec(&state).expect("workflow json"),
                     });
                 }
+                // Tracker initialization is a founder-composition admin action.
+                staging.require(contract::demand_admin());
                 Ok(staging.into_effect(None))
             }
             IssueIntent::IssueNew {
@@ -974,6 +989,7 @@ impl World for IssuesWorld {
             schema_version: contract::ISSUE_SCHEMA_VERSION,
             bytes,
             frontier: replica::ReplicaFrontier::EMPTY, // stamped by Runtime
+            demand: contract::demand_read(),
         };
         let load_issues = |ctx: &WorldContext<'_>| -> BTreeMap<String, IssueState> {
             catalog

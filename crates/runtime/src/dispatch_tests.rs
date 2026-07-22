@@ -21,6 +21,15 @@ use replica::body::{BodyOp, BodySchema, MutationModel};
 use replica::frontier::{AuthorityFrontier, ReplicaFrontier};
 use replica::ids::{BodyId, BodyKey, EncodingId, SchemaId, WorldId};
 
+fn any_demand() -> Vec<u8> {
+    mechanics::demand::AuthorizationDemand::require(
+        mechanics::demand::PolicyCapability::new("w", "c"),
+        mechanics::demand::PolicyResource::space("w"),
+    )
+    .encode_canonical()
+    .expect("canonical demand")
+}
+
 /// The writing test device (granted Write by [`SeedAuthority`]).
 const WRITER_SEED: [u8; 32] = [41u8; 32];
 /// A second device with no grants (resolves, but has empty standing).
@@ -114,6 +123,7 @@ impl World for NoteWorld {
         // Deterministic body key: same World, a fixed body for this test.
         let key = BodyKey::new(self.id.clone(), BodyId::from_bytes([0u8; 16]));
         Ok(WorldEffect {
+            demand: any_demand(),
             operations: vec![(
                 key.clone(),
                 BodyOp::ReplaceAtomic {
@@ -139,6 +149,7 @@ impl World for NoteWorld {
         let committed = ctx.read_body(&key).unwrap_or_default();
         let text = String::from_utf8(committed).map_err(|_| WorldError::InvalidRequest)?;
         Ok(WorldProjection {
+            demand: any_demand(),
             schema: SchemaId::parse("note").unwrap(),
             schema_version: 1,
             bytes: text.to_uppercase().into_bytes(),
@@ -582,6 +593,7 @@ impl World for RogueWorld {
             BodyId::from_bytes([0u8; 16]),
         );
         Ok(WorldEffect {
+            demand: any_demand(),
             operations: vec![(
                 foreign.clone(),
                 BodyOp::ReplaceAtomic {
@@ -797,6 +809,7 @@ impl World for BoardWorld {
         }
         let key = self.body();
         Ok(WorldEffect {
+            demand: any_demand(),
             operations: vec![
                 (
                     key.clone(),
@@ -839,6 +852,7 @@ impl World for BoardWorld {
             .unwrap_or_default();
         let activity = view.counters.get("activity").copied().unwrap_or(0);
         Ok(WorldProjection {
+            demand: any_demand(),
             schema: SchemaId::parse("card").unwrap(),
             schema_version: 1,
             bytes: format!("{activity}:{}", comments.join(",")).into_bytes(),
@@ -917,6 +931,7 @@ impl World for MixedWorld {
         // Regardless of which schema the intent named, stage a collaborative op.
         let key = BodyKey::new(self.id.clone(), BodyId::from_bytes([5u8; 16]));
         Ok(WorldEffect {
+            demand: any_demand(),
             operations: vec![(
                 key.clone(),
                 BodyOp::CounterAdd {

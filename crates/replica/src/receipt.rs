@@ -45,6 +45,9 @@ pub struct RequestReceiptV1 {
     pub scopes: Vec<BodyKey>,
     /// The committed Replica frontier the transaction advanced to.
     pub frontier: ReplicaFrontier,
+    /// The committed transaction's id (the full signed-envelope digest);
+    /// all-zero for an idempotent no-op that committed no transaction.
+    pub transaction: [u8; 32],
 }
 
 /// Why a receipt failed to decode or validate.
@@ -124,6 +127,7 @@ mod tests {
                 BodyId::from_bytes([1u8; 16]),
             )],
             frontier: ReplicaFrontier::new([3u8; 32], 4),
+            transaction: [8u8; 32],
         }
     }
 

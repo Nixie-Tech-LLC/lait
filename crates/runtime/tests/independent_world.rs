@@ -21,6 +21,16 @@ use replica::body::{BodyOp, BodySchema, CollaborativeSchema, MutationModel};
 use replica::frontier::{AuthorityFrontier, ReplicaFrontier};
 use replica::ids::{BodyId, BodyKey, EncodingId, SchemaId, WorldId};
 use runtime::coordinates::{ApproachAddr, CoordinatesAdmission, CoordinatesPayloadV1};
+
+#[allow(dead_code)]
+fn any_demand() -> Vec<u8> {
+    mechanics::demand::AuthorizationDemand::require(
+        mechanics::demand::PolicyCapability::new("w", "c"),
+        mechanics::demand::PolicyResource::space("w"),
+    )
+    .encode_canonical()
+    .expect("canonical demand")
+}
 use runtime::{
     ActivationOptions, CommsOptions, ContactMechanics, ContactOptions, EnterOptions, LocalIdentity,
     ObservationCursor, ObservationStreamError, RequestId, Runtime, RuntimeBuilder, Session,
@@ -224,6 +234,7 @@ impl World for MultiWorld {
             _ => return Err(WorldError::InvalidRequest),
         }
         Ok(WorldEffect {
+            demand: any_demand(),
             operations,
             scopes,
             effect: vec![],
@@ -249,6 +260,7 @@ impl World for MultiWorld {
             _ => return Err(WorldError::InvalidRequest),
         };
         Ok(WorldProjection {
+            demand: any_demand(),
             schema: SchemaId::parse("entry").unwrap(),
             schema_version: 1,
             bytes,

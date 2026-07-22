@@ -32,7 +32,6 @@ crates/replica/src/protected.rs	version-suffixed-ident	M6
 crates/replica/src/receipt.rs	version-suffixed-ident	M6
 crates/replica/src/replica.rs	loro-outside-fabric	M5
 crates/replica/src/replica.rs	version-suffixed-ident	M6
-crates/replica/src/transaction.rs	version-suffixed-ident	M6
 crates/runtime/Cargo.toml	loro-outside-fabric	M5
 crates/runtime/src/action.rs	version-suffixed-ident	M6
 crates/runtime/src/beacon.rs	version-suffixed-ident	M6

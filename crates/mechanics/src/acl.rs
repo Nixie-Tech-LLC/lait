@@ -100,6 +100,167 @@ pub enum AclAction {
     RevokeInvite {
         nonce: [u8; 16],
     },
+    /// Grant one exact scoped capability to an actor. `grant_id` commits the
+    /// canonical grant bytes plus `salt` ([`capability_grant_id`]); a mismatch
+    /// is unauthorized. Requires the author to hold the Mechanics-owned
+    /// policy-admin meta-capability, or an effective [`AclAction::GrantDelegation`]
+    /// for exactly this capability/resource (the meta-capability itself is
+    /// never grantable through delegation). Subjects are Actors; a grant is
+    /// effective at a frontier iff it is authorized there, unrevoked there,
+    /// and its subject is a member there. Version one has no wildcard or
+    /// expiry.
+    GrantCapability {
+        grant_id: [u8; 32],
+        actor: ActorId,
+        capability: crate::demand::PolicyCapability,
+        resource: crate::demand::PolicyResource,
+        salt: [u8; 16],
+    },
+    /// Revoke a capability grant by id. Requires policy-admin, or an effective
+    /// delegation for the revoked grant's exact capability/resource.
+    RevokeCapability {
+        grant_id: [u8; 32],
+    },
+    /// Grant delegation authority for one exact capability/resource: the
+    /// holder may grant/revoke ordinary grants of it but cannot manage
+    /// delegation. Policy-admin only. `delegation_id` commits the canonical
+    /// bytes plus `salt` ([`capability_delegation_id`]).
+    GrantDelegation {
+        delegation_id: [u8; 32],
+        actor: ActorId,
+        capability: crate::demand::PolicyCapability,
+        resource: crate::demand::PolicyResource,
+        salt: [u8; 16],
+    },
+    /// Revoke a delegation by id. Policy-admin only.
+    RevokeDelegation {
+        delegation_id: [u8; 32],
+    },
+    /// Activate a World implementation identity for this Space. Policy-admin
+    /// only; the id is an opaque authority-approved 32-byte digest. Upgrade
+    /// and rollback are further explicit activations; concurrent activations
+    /// resolve deterministically by topo order (last authorized activation
+    /// wins).
+    ActivateWorldImplementation {
+        world: String,
+        implementation_id: [u8; 32],
+    },
+}
+
+/// The Mechanics-owned meta-capability that manages policy: grants,
+/// delegations, administrator authority, and implementation activation. It is
+/// seeded implicitly for the Space founders at formation and grantable only by
+/// an existing policy admin — never through delegation.
+pub fn policy_admin_capability() -> crate::demand::PolicyCapability {
+    crate::demand::PolicyCapability::new("lait", "policy.admin")
+}
+
+/// The Space-level resource the meta-capability is granted on.
+pub fn policy_admin_resource() -> crate::demand::PolicyResource {
+    crate::demand::PolicyResource::space("lait")
+}
+
+/// One effective scoped assignment: subject, capability, exact resource.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyGrant {
+    pub actor: ActorId,
+    pub capability: crate::demand::PolicyCapability,
+    pub resource: crate::demand::PolicyResource,
+}
+
+/// The pass-1 policy state: authorized grants/delegations/revocations and the
+/// active implementation per World, as they evolve in topo order. Persisted
+/// in the [`ReplayCheckpoint`] for the strict-descendant continuation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyPass {
+    pub grants: BTreeMap<[u8; 32], PolicyGrant>,
+    pub revoked_grants: BTreeSet<[u8; 32]>,
+    pub delegations: BTreeMap<[u8; 32], PolicyGrant>,
+    pub revoked_delegations: BTreeSet<[u8; 32]>,
+    pub implementations: BTreeMap<String, [u8; 32]>,
+}
+
+impl PolicyPass {
+    /// Whether `actor` holds an effective (authorized, unrevoked) grant of the
+    /// meta policy-admin capability.
+    fn holds_meta(&self, actor: &ActorId) -> bool {
+        let meta_cap = policy_admin_capability();
+        let meta_res = policy_admin_resource();
+        self.grants.iter().any(|(id, g)| {
+            !self.revoked_grants.contains(id)
+                && &g.actor == actor
+                && g.capability == meta_cap
+                && g.resource == meta_res
+        })
+    }
+
+    /// Whether `actor` holds an effective delegation for exactly
+    /// `(capability, resource)`.
+    fn holds_delegation(
+        &self,
+        actor: &ActorId,
+        capability: &crate::demand::PolicyCapability,
+        resource: &crate::demand::PolicyResource,
+    ) -> bool {
+        self.delegations.iter().any(|(id, d)| {
+            !self.revoked_delegations.contains(id)
+                && &d.actor == actor
+                && &d.capability == capability
+                && &d.resource == resource
+        })
+    }
+}
+
+/// The canonical grant-id commitment: BLAKE3 derive-key over the exact grant
+/// bytes plus the salt, so an id can never alias a different grant.
+pub fn capability_grant_id(
+    actor: &ActorId,
+    capability: &crate::demand::PolicyCapability,
+    resource: &crate::demand::PolicyResource,
+    salt: &[u8; 16],
+) -> Option<[u8; 32]> {
+    grant_commitment(
+        "lait.capability-grant.v1",
+        actor,
+        capability,
+        resource,
+        salt,
+    )
+}
+
+/// The canonical delegation-id commitment.
+pub fn capability_delegation_id(
+    actor: &ActorId,
+    capability: &crate::demand::PolicyCapability,
+    resource: &crate::demand::PolicyResource,
+    salt: &[u8; 16],
+) -> Option<[u8; 32]> {
+    grant_commitment(
+        "lait.capability-delegation.v1",
+        actor,
+        capability,
+        resource,
+        salt,
+    )
+}
+
+fn grant_commitment(
+    context: &str,
+    actor: &ActorId,
+    capability: &crate::demand::PolicyCapability,
+    resource: &crate::demand::PolicyResource,
+    salt: &[u8; 16],
+) -> Option<[u8; 32]> {
+    let canonical =
+        crate::demand::AuthorizationDemand::require(capability.clone(), resource.clone())
+            .encode_canonical()
+            .ok()?;
+    let mut input = Vec::with_capacity(actor.as_str().len() + 1 + canonical.len() + 16);
+    input.extend_from_slice(actor.as_str().as_bytes());
+    input.push(0x00);
+    input.extend_from_slice(&canonical);
+    input.extend_from_slice(salt);
+    Some(blake3::derive_key(context, &input))
 }
 
 impl AclAction {
@@ -111,7 +272,30 @@ impl AclAction {
             | AclAction::RemoveMember { actor }
             | AclAction::SetGrants { actor, .. }
             | AclAction::AddAgent { actor } => Some(actor),
-            AclAction::MintEpoch { .. } | AclAction::RevokeInvite { .. } => None,
+            AclAction::MintEpoch { .. }
+            | AclAction::RevokeInvite { .. }
+            | AclAction::GrantCapability { .. }
+            | AclAction::RevokeCapability { .. }
+            | AclAction::GrantDelegation { .. }
+            | AclAction::RevokeDelegation { .. }
+            | AclAction::ActivateWorldImplementation { .. } => None,
+        }
+    }
+
+    /// The audit-log kind label.
+    pub fn kind_label(&self) -> &'static str {
+        match self {
+            AclAction::AddMember { .. } => "add_member",
+            AclAction::RemoveMember { .. } => "remove_member",
+            AclAction::SetGrants { .. } => "set_grants",
+            AclAction::AddAgent { .. } => "add_agent",
+            AclAction::MintEpoch { .. } => "mint_epoch",
+            AclAction::RevokeInvite { .. } => "revoke_invite",
+            AclAction::GrantCapability { .. } => "grant_capability",
+            AclAction::RevokeCapability { .. } => "revoke_capability",
+            AclAction::GrantDelegation { .. } => "grant_delegation",
+            AclAction::RevokeDelegation { .. } => "revoke_delegation",
+            AclAction::ActivateWorldImplementation { .. } => "activate_implementation",
         }
     }
 }
@@ -228,6 +412,12 @@ pub struct AclState {
     /// and deduped, so this is a pure function of the op set like everything else
     /// here — an admin discharges them by rotating; replay only names them.
     rekey_fences: Vec<RekeyFence>,
+    /// The materialized policy history: authorized capability/delegation
+    /// grants and revocations plus the active implementation per World.
+    policy: PolicyPass,
+    /// Policy administrators after every eviction: founders still holding
+    /// membership plus effective meta-grant holders still holding membership.
+    policy_admins: BTreeSet<ActorId>,
 }
 
 impl AclState {
@@ -326,6 +516,143 @@ impl AclState {
     pub fn is_empty(&self) -> bool {
         self.members.is_empty()
     }
+
+    // ---- scoped policy (plan 01: World-defined, Mechanics-enforced) --------
+
+    /// Whether `a` holds Space policy administration (founder-seeded or an
+    /// effective meta-capability grant, and currently a member).
+    pub fn is_policy_admin(&self, a: &ActorId) -> bool {
+        self.policy_admins.contains(a)
+    }
+
+    /// The effective grant ids of exactly `(capability, resource)` held by
+    /// `a`: authorized, unrevoked, and the subject currently a member. Sorted
+    /// (the canonical `Require` witness is the first).
+    pub fn effective_capability_grants(
+        &self,
+        a: &ActorId,
+        capability: &crate::demand::PolicyCapability,
+        resource: &crate::demand::PolicyResource,
+    ) -> Vec<[u8; 32]> {
+        if !self.members.contains_key(a) {
+            return Vec::new();
+        }
+        self.policy
+            .grants
+            .iter()
+            .filter(|(id, g)| {
+                !self.policy.revoked_grants.contains(*id)
+                    && &g.actor == a
+                    && &g.capability == capability
+                    && &g.resource == resource
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Whether `a` holds an effective grant of exactly `(capability, resource)`.
+    pub fn has_capability(
+        &self,
+        a: &ActorId,
+        capability: &crate::demand::PolicyCapability,
+        resource: &crate::demand::PolicyResource,
+    ) -> bool {
+        !self
+            .effective_capability_grants(a, capability, resource)
+            .is_empty()
+    }
+
+    /// Whether `a` holds an effective delegation for exactly
+    /// `(capability, resource)` (and is currently a member).
+    pub fn has_delegation(
+        &self,
+        a: &ActorId,
+        capability: &crate::demand::PolicyCapability,
+        resource: &crate::demand::PolicyResource,
+    ) -> bool {
+        self.members.contains_key(a)
+            && self.policy.delegations.iter().any(|(id, d)| {
+                !self.policy.revoked_delegations.contains(id)
+                    && &d.actor == a
+                    && &d.capability == capability
+                    && &d.resource == resource
+            })
+    }
+
+    /// The active implementation id for a World, if one was activated.
+    pub fn active_implementation(&self, world: &str) -> Option<[u8; 32]> {
+        self.policy.implementations.get(world).copied()
+    }
+
+    /// Every effective assignment of `a` (audit/projection surface): sorted by
+    /// grant id.
+    pub fn effective_assignments(&self, a: &ActorId) -> Vec<([u8; 32], PolicyGrant)> {
+        if !self.members.contains_key(a) {
+            return Vec::new();
+        }
+        self.policy
+            .grants
+            .iter()
+            .filter(|(id, g)| !self.policy.revoked_grants.contains(*id) && &g.actor == a)
+            .map(|(id, g)| (*id, g.clone()))
+            .collect()
+    }
+
+    /// Evaluate a canonical demand for `a` at this state, deterministically
+    /// deriving the canonical witness: `Require` chooses the lexicographically
+    /// smallest effective grant id; `All` unions child witnesses; `Any`
+    /// chooses the satisfied child with the lexicographically smallest
+    /// complete canonical demand bytes. The final id set sorts and
+    /// deduplicates. `None` is a denial — there is no fallback to membership
+    /// or coarse grants.
+    pub fn evaluate_demand(
+        &self,
+        a: &ActorId,
+        demand: &crate::demand::AuthorizationDemand,
+    ) -> Option<Vec<[u8; 32]>> {
+        let mut witness = self.evaluate_node(a, demand)?;
+        witness.sort();
+        witness.dedup();
+        Some(witness)
+    }
+
+    fn evaluate_node(
+        &self,
+        a: &ActorId,
+        demand: &crate::demand::AuthorizationDemand,
+    ) -> Option<Vec<[u8; 32]>> {
+        use crate::demand::AuthorizationDemand as D;
+        match demand {
+            D::Require {
+                capability,
+                resource,
+            } => {
+                let grants = self.effective_capability_grants(a, capability, resource);
+                grants.first().map(|id| vec![*id])
+            }
+            D::All(children) => {
+                let mut out = Vec::new();
+                for child in children {
+                    out.extend(self.evaluate_node(a, child)?);
+                }
+                Some(out)
+            }
+            D::Any(children) => {
+                // The satisfied child with the smallest canonical bytes wins.
+                let mut best: Option<(Vec<u8>, Vec<[u8; 32]>)> = None;
+                for child in children {
+                    if let Some(w) = self.evaluate_node(a, child) {
+                        let bytes = child.encode_canonical().ok()?;
+                        match &best {
+                            Some((b, _)) if b <= &bytes => {}
+                            _ => best = Some((bytes, w)),
+                        }
+                    }
+                }
+                best.map(|(_, w)| w)
+            }
+        }
+    }
 }
 
 /// One rendered row of the membership audit log (`lait members log`): the op
@@ -409,9 +736,11 @@ pub fn replay_checkpointed(
     };
 
     // ---- pass 1 (topo): authorize ops, tracking standing as it evolves ----
-    let mut admins: BTreeSet<ActorId> = genesis.founding_actors.iter().cloned().collect();
+    let founders: BTreeSet<ActorId> = genesis.founding_actors.iter().cloned().collect();
+    let mut admins: BTreeSet<ActorId> = founders.clone();
     let mut humans: BTreeSet<ActorId> = admins.clone();
     let mut agents_now: BTreeMap<ActorId, ActorId> = BTreeMap::new();
+    let mut policy = PolicyPass::default();
     // Generation of each authorized key-epoch mint (op hash → gen), for the
     // monotonicity bound: a mint may claim at most `max(ancestor mint gen) + 1`,
     // so no author can jump the generation (e.g. to `u32::MAX`) and pin the
@@ -439,14 +768,7 @@ pub fn replay_checkpointed(
         };
         entry.by = Some(op.by.clone());
         entry.subject = op.action.actor().cloned();
-        entry.kind = match &op.action {
-            AclAction::AddMember { .. } => "add_member",
-            AclAction::RemoveMember { .. } => "remove_member",
-            AclAction::SetGrants { .. } => "set_grants",
-            AclAction::AddAgent { .. } => "add_agent",
-            AclAction::MintEpoch { .. } => "mint_epoch",
-            AclAction::RevokeInvite { .. } => "revoke_invite",
-        };
+        entry.kind = op.action.kind_label();
         if let AclAction::AddMember { grants, .. } | AclAction::SetGrants { grants, .. } =
             &op.action
         {
@@ -466,10 +788,12 @@ pub fn replay_checkpointed(
             && judge_op(
                 op,
                 h,
+                &founders,
                 &admins,
                 &humans,
                 &agents_now,
                 &epoch_gens,
+                &policy,
                 &ancestors,
             );
         entry.authorized = ok;
@@ -485,6 +809,7 @@ pub fn replay_checkpointed(
             &mut humans,
             &mut agents_now,
             &mut epoch_gens,
+            &mut policy,
         );
     }
 
@@ -500,6 +825,7 @@ pub fn replay_checkpointed(
         humans,
         agents_now,
         epoch_gens: epoch_gens.into_iter().collect(),
+        policy,
     };
     (checkpoint, audit)
 }
@@ -511,13 +837,22 @@ pub fn replay_checkpointed(
 fn judge_op(
     op: &AclOp,
     h: &str,
+    founders: &BTreeSet<ActorId>,
     admins: &BTreeSet<ActorId>,
     humans: &BTreeSet<ActorId>,
     agents_now: &BTreeMap<ActorId, ActorId>,
     epoch_gens: &HashMap<String, u32>,
+    policy: &PolicyPass,
     ancestors: &HashMap<String, std::collections::HashSet<String>>,
 ) -> bool {
     let by = &op.by;
+    // Policy administration: a founder still holding human membership, or a
+    // human member holding an effective meta-capability grant. Agents never.
+    let is_policy_admin = |a: &ActorId| -> bool {
+        humans.contains(a)
+            && !agents_now.contains_key(a)
+            && (founders.contains(a) || policy.holds_meta(a))
+    };
     // Agents have no membership authority, even when their signing device is bound.
     !agents_now.contains_key(by)
         && match &op.action {
@@ -560,6 +895,68 @@ fn judge_op(
             }
             // Revoking an invite is a membership-authority action — admin only.
             AclAction::RevokeInvite { .. } => admins.contains(by),
+            // ---- scoped policy effects (plan 01) ------------------------------
+            // Granting requires policy administration or an effective exact
+            // delegation; the meta-capability is never grantable through
+            // delegation ("administrator authority" stays with policy admins).
+            AclAction::GrantCapability {
+                grant_id,
+                actor,
+                capability,
+                resource,
+                salt,
+            } => {
+                let structural = capability.validate().is_ok()
+                    && resource.validate().is_ok()
+                    && capability.world == resource.world
+                    && capability_grant_id(actor, capability, resource, salt) == Some(*grant_id);
+                let is_meta = capability == &policy_admin_capability()
+                    && resource == &policy_admin_resource();
+                structural
+                    && (is_policy_admin(by)
+                        || (!is_meta
+                            && humans.contains(by)
+                            && !agents_now.contains_key(by)
+                            && policy.holds_delegation(by, capability, resource)))
+            }
+            // Revoking mirrors granting: policy admin, or a delegation for the
+            // revoked grant's exact capability/resource (which requires the
+            // grant to be known at this causal position).
+            AclAction::RevokeCapability { grant_id } => {
+                is_policy_admin(by)
+                    || (humans.contains(by)
+                        && !agents_now.contains_key(by)
+                        && policy.grants.get(grant_id).is_some_and(|g| {
+                            policy.holds_delegation(by, &g.capability, &g.resource)
+                        }))
+            }
+            // Delegation management is policy-admin only, and the meta
+            // capability itself is never delegable.
+            AclAction::GrantDelegation {
+                delegation_id,
+                actor,
+                capability,
+                resource,
+                salt,
+            } => {
+                let is_meta = capability == &policy_admin_capability()
+                    && resource == &policy_admin_resource();
+                capability.validate().is_ok()
+                    && resource.validate().is_ok()
+                    && capability.world == resource.world
+                    && !is_meta
+                    && capability_delegation_id(actor, capability, resource, salt)
+                        == Some(*delegation_id)
+                    && is_policy_admin(by)
+            }
+            AclAction::RevokeDelegation { .. } => is_policy_admin(by),
+            // Implementation activation is an explicit authority operation.
+            AclAction::ActivateWorldImplementation { world, .. } => {
+                crate::demand::PolicyResource::space(world)
+                    .validate()
+                    .is_ok()
+                    && is_policy_admin(by)
+            }
         }
 }
 
@@ -572,6 +969,7 @@ fn apply_authorized(
     humans: &mut BTreeSet<ActorId>,
     agents_now: &mut BTreeMap<ActorId, ActorId>,
     epoch_gens: &mut HashMap<String, u32>,
+    policy: &mut PolicyPass,
 ) {
     match &op.action {
         AclAction::AddMember { actor, grants } | AclAction::SetGrants { actor, grants } => {
@@ -602,6 +1000,53 @@ fn apply_authorized(
         // Invite revocation touches neither the member set nor epochs;
         // materialized in pass 2.
         AclAction::RevokeInvite { .. } => {}
+        AclAction::GrantCapability {
+            grant_id,
+            actor,
+            capability,
+            resource,
+            ..
+        } => {
+            policy.grants.insert(
+                *grant_id,
+                PolicyGrant {
+                    actor: actor.clone(),
+                    capability: capability.clone(),
+                    resource: resource.clone(),
+                },
+            );
+        }
+        AclAction::RevokeCapability { grant_id } => {
+            policy.revoked_grants.insert(*grant_id);
+        }
+        AclAction::GrantDelegation {
+            delegation_id,
+            actor,
+            capability,
+            resource,
+            ..
+        } => {
+            policy.delegations.insert(
+                *delegation_id,
+                PolicyGrant {
+                    actor: actor.clone(),
+                    capability: capability.clone(),
+                    resource: resource.clone(),
+                },
+            );
+        }
+        AclAction::RevokeDelegation { delegation_id } => {
+            policy.revoked_delegations.insert(*delegation_id);
+        }
+        AclAction::ActivateWorldImplementation {
+            world,
+            implementation_id,
+        } => {
+            // Deterministic last-authorized-in-topo-order wins.
+            policy
+                .implementations
+                .insert(world.clone(), *implementation_id);
+        }
     }
 }
 
@@ -647,6 +1092,9 @@ pub struct ReplayCheckpoint {
     pub agents_now: BTreeMap<ActorId, ActorId>,
     /// Authorized epoch mints: op hash → claimed generation.
     pub epoch_gens: BTreeMap<String, u32>,
+    /// Pass-1 policy state: authorized grants/delegations/revocations and the
+    /// active implementation per World.
+    pub policy: PolicyPass,
 }
 
 /// Strict-descendant continuation: extend a prior [`ReplayCheckpoint`] by the
@@ -747,6 +1195,8 @@ pub fn replay_continue(
     let mut admins = prior.admins.clone();
     let mut humans = prior.humans.clone();
     let mut agents_now = prior.agents_now.clone();
+    let founders: BTreeSet<ActorId> = genesis.founding_actors.iter().cloned().collect();
+    let mut policy = prior.policy.clone();
     let mut epoch_gens: HashMap<String, u32> = prior
         .epoch_gens
         .iter()
@@ -768,10 +1218,12 @@ pub fn replay_continue(
                     && judge_op(
                         op,
                         h,
+                        &founders,
                         &admins,
                         &humans,
                         &agents_now,
                         &epoch_gens,
+                        &policy,
                         &ancestors,
                     )
             }
@@ -789,6 +1241,7 @@ pub fn replay_continue(
             &mut humans,
             &mut agents_now,
             &mut epoch_gens,
+            &mut policy,
         );
     }
 
@@ -802,16 +1255,7 @@ pub fn replay_continue(
                 hash: h.clone(),
                 author: so.author.clone(),
                 by: op.map(|o| o.by.clone()),
-                kind: op
-                    .map(|o| match &o.action {
-                        AclAction::AddMember { .. } => "add_member",
-                        AclAction::RemoveMember { .. } => "remove_member",
-                        AclAction::SetGrants { .. } => "set_grants",
-                        AclAction::AddAgent { .. } => "add_agent",
-                        AclAction::MintEpoch { .. } => "mint_epoch",
-                        AclAction::RevokeInvite { .. } => "revoke_invite",
-                    })
-                    .unwrap_or("unknown"),
+                kind: op.map(|o| o.action.kind_label()).unwrap_or("unknown"),
                 subject: op.and_then(|o| o.action.actor().cloned()),
                 grants: op.and_then(|o| match &o.action {
                     AclAction::AddMember { grants, .. } | AclAction::SetGrants { grants, .. } => {
@@ -831,6 +1275,7 @@ pub fn replay_continue(
         humans,
         agents_now,
         epoch_gens: epoch_gens.into_iter().collect(),
+        policy,
     };
     Some((checkpoint, audit))
 }
@@ -860,6 +1305,7 @@ fn materialize_authorized(
     // Single-use invite nonces already spent by an authorized AddMember — the
     // *signed* record of redemption (replaces the unsigned `C_REDEEMED` doc).
     let mut spent_nonces: BTreeSet<[u8; 16]> = BTreeSet::new();
+    let mut policy = PolicyPass::default();
 
     for h in authorized {
         let op = decoded[h].as_ref().expect("authorized ops decoded");
@@ -899,6 +1345,52 @@ fn materialize_authorized(
             }
             AclAction::RevokeInvite { nonce } => {
                 revoked_invites.insert(*nonce);
+            }
+            AclAction::GrantCapability {
+                grant_id,
+                actor,
+                capability,
+                resource,
+                ..
+            } => {
+                policy.grants.insert(
+                    *grant_id,
+                    PolicyGrant {
+                        actor: actor.clone(),
+                        capability: capability.clone(),
+                        resource: resource.clone(),
+                    },
+                );
+            }
+            AclAction::RevokeCapability { grant_id } => {
+                policy.revoked_grants.insert(*grant_id);
+            }
+            AclAction::GrantDelegation {
+                delegation_id,
+                actor,
+                capability,
+                resource,
+                ..
+            } => {
+                policy.delegations.insert(
+                    *delegation_id,
+                    PolicyGrant {
+                        actor: actor.clone(),
+                        capability: capability.clone(),
+                        resource: resource.clone(),
+                    },
+                );
+            }
+            AclAction::RevokeDelegation { delegation_id } => {
+                policy.revoked_delegations.insert(*delegation_id);
+            }
+            AclAction::ActivateWorldImplementation {
+                world,
+                implementation_id,
+            } => {
+                policy
+                    .implementations
+                    .insert(world.clone(), *implementation_id);
             }
         }
     }
@@ -1128,6 +1620,26 @@ fn materialize_authorized(
         })
     });
 
+    // Policy administrators after every eviction: founders still holding
+    // membership, plus effective meta-grant holders still holding membership.
+    let meta_cap = policy_admin_capability();
+    let meta_res = policy_admin_resource();
+    let mut policy_admins: BTreeSet<ActorId> = genesis
+        .founding_actors
+        .iter()
+        .filter(|a| members.contains_key(*a))
+        .cloned()
+        .collect();
+    for (id, g) in &policy.grants {
+        if !policy.revoked_grants.contains(id)
+            && g.capability == meta_cap
+            && g.resource == meta_res
+            && members.contains_key(&g.actor)
+        {
+            policy_admins.insert(g.actor.clone());
+        }
+    }
+
     AclState {
         members,
         agents,
@@ -1135,6 +1647,8 @@ fn materialize_authorized(
         revoked_invites,
         spent_nonces,
         rekey_fences,
+        policy,
+        policy_admins,
     }
 }
 

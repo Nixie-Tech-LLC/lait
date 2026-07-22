@@ -82,6 +82,72 @@ pub trait AuthorityView: Send + Sync {
     /// Resolve a local device's principal, or `None` when the device has no
     /// standing in the Space.
     fn resolve(&self, device: &DeviceId) -> Option<PrincipalResolution>;
+
+    /// The active World implementation id at `authority_frontier`. The default
+    /// treats every implementation as active (fixtures without a policy
+    /// history); the orbital composition overrides it with the ledger's
+    /// activation state, refusing an unapproved id.
+    fn active_implementation(
+        &self,
+        _world: &WorldId,
+        _authority_frontier: &AuthorityFrontier,
+    ) -> Option<[u8; 32]> {
+        Some([0u8; 32])
+    }
+
+    /// Produce canonical [`mechanics::demand::AuthorizationReceipt`] bytes for
+    /// a mutation whose transaction core hashes to `core_digest`, binding every
+    /// companion coordinate, or a typed denial. No World callback runs. The
+    /// default builds a structurally-valid receipt without a real policy
+    /// evaluation (fixtures); the orbital composition overrides it to evaluate
+    /// the demand at the pinned frontier against signed history.
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_mutation(
+        &self,
+        space: &mechanics::ids::SpaceId,
+        world: &WorldId,
+        actor: &ActorId,
+        device: &DeviceId,
+        authority_frontier: &AuthorityFrontier,
+        parent_manifest_root: [u8; 32],
+        implementation_id: [u8; 32],
+        intent_digest: [u8; 32],
+        demand: &[u8],
+        operations_digest: [u8; 32],
+        core_digest: [u8; 32],
+    ) -> Result<Vec<u8>, String> {
+        let parsed = mechanics::demand::AuthorizationDemand::decode_canonical(demand)
+            .map_err(|e| format!("demand: {e}"))?;
+        let receipt = mechanics::demand::AuthorizationReceipt {
+            space: space.as_str().to_string(),
+            world: world.as_str().to_string(),
+            actor: actor.as_str().to_string(),
+            device: device.key_bytes().ok_or("device key")?,
+            authority_frontier: authority_frontier.as_bytes().to_vec(),
+            authority_checkpoint_commitment: [0u8; 32],
+            policy_evidence_digest: mechanics::demand::policy_evidence_digest(&[]),
+            parent_manifest_root,
+            implementation_id,
+            intent_digest,
+            demand_digest: parsed.digest().map_err(|e| format!("demand digest: {e}"))?,
+            effect_operations_digest: operations_digest,
+            body_transaction_core_digest: core_digest,
+            decision: 1,
+        };
+        Ok(receipt.encode())
+    }
+
+    /// Whether `actor` satisfies a read `demand` at `authority_frontier`. The
+    /// default permits every read (fixtures); the orbital composition
+    /// evaluates the demand against signed history.
+    fn evaluate_read(
+        &self,
+        _actor: &ActorId,
+        _authority_frontier: &AuthorityFrontier,
+        _demand: &[u8],
+    ) -> bool {
+        true
+    }
 }
 
 /// An authenticated local caller: proof-of-possession of a device seed. Minted
@@ -218,7 +284,10 @@ pub struct BodyDeclaration {
 }
 
 /// The result a World returns from `submit`: the staged Body operations, the
-/// Observation scopes they touch, and an opaque application effect payload.
+/// Observation scopes they touch, an opaque application effect payload, and the
+/// **canonical non-empty authorization demand** the mutation requires. There
+/// is no implicit `Write` fallback — Runtime evaluates this exact demand at the
+/// pinned authority frontier and commits nothing if it is unsatisfied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorldEffect {
     /// Body operations staged this transaction, each keyed to the Body it
@@ -231,16 +300,25 @@ pub struct WorldEffect {
     /// Schema declarations for Bodies this transaction creates (multi-schema
     /// transactions declare each non-intent-schema Body explicitly).
     pub declarations: Vec<BodyDeclaration>,
+    /// The canonical [`mechanics::demand::AuthorizationDemand`] bytes this
+    /// mutation requires (mandatory, non-empty).
+    pub demand: Vec<u8>,
 }
 
 /// A canonical, versioned Projection a World returns from `query`, plus the
-/// committed frontier it was derived at.
+/// committed frontier it was derived at, and the read demand it required. Even
+/// publicly visible product data uses an explicit read capability granted by
+/// policy — there is no implicit-read fallback.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorldProjection {
     pub schema: replica::ids::SchemaId,
     pub schema_version: u32,
     pub bytes: Vec<u8>,
     pub frontier: replica::frontier::ReplicaFrontier,
+    /// The canonical read demand this query required (mandatory, non-empty).
+    /// Runtime evaluates it at the pinned frontier and returns no projection
+    /// on denial.
+    pub demand: Vec<u8>,
 }
 
 /// A read view of the committed Body snapshot, handed to a World during a query.

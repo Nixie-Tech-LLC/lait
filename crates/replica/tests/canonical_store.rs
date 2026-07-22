@@ -17,8 +17,8 @@ use mechanics::crypto::AuthorizedBodyKey;
 use mechanics::ids::SpaceId;
 use replica::frontier::AuthorityFrontier;
 use replica::{
-    ActionOutcome, BodyBinding, BodyId, BodyKey, BodyOp, BodyTransactionV1, CommitContext,
-    EncodingId, Replica, ReplicaCommitError, SchemaId, SeedSigner, StaticBodyKeys,
+    ActionOutcome, BodyBinding, BodyId, BodyKey, BodyOp, BodyTransaction, CommitAuthorization,
+    CommitContext, EncodingId, Replica, ReplicaCommitError, SchemaId, SeedSigner, StaticBodyKeys,
     SupportedSchemas, WorldId, MUTATION_ATOMIC, MUTATION_COLLABORATIVE,
 };
 
@@ -48,6 +48,25 @@ fn keys() -> Arc<StaticBodyKeys> {
 
 fn world() -> WorldId {
     WorldId::parse("com.example.notes").unwrap()
+}
+
+/// A test authorizer + commit-authorization helper (the machinery each commit
+/// needs now that authorization is bound into the signed transaction).
+fn test_auth() -> replica::StaticAuthorizer {
+    replica::StaticAuthorizer {
+        world: world(),
+        implementation_id: [0u8; 32],
+    }
+}
+
+fn test_demand() -> Vec<u8> {
+    use mechanics::demand::{AuthorizationDemand, PolicyCapability, PolicyResource};
+    AuthorizationDemand::require(
+        PolicyCapability::new("com.example.notes", "write"),
+        PolicyResource::space("com.example.notes"),
+    )
+    .encode_canonical()
+    .expect("canonical demand")
 }
 
 fn body(n: u8) -> BodyKey {
@@ -123,6 +142,13 @@ fn commit(
     };
     r.commit_action(
         &ctx,
+        &CommitAuthorization {
+            actor: "actor",
+            parent_manifest_root: [0u8; 32],
+            demand: test_demand(),
+            intent_digest: [7u8; 32],
+            authorizer: &test_auth(),
+        },
         &world(),
         &device(),
         &request,
@@ -200,6 +226,13 @@ fn a_durable_commit_survives_cold_reopen_with_receipts_and_replay() {
     let err = r
         .commit_action(
             &ctx,
+            &CommitAuthorization {
+                actor: "actor",
+                parent_manifest_root: [0u8; 32],
+                demand: test_demand(),
+                intent_digest: [7u8; 32],
+                authorizer: &test_auth(),
+            },
             &world(),
             &device(),
             &request,
@@ -249,7 +282,7 @@ fn the_store_addresses_canonical_objects_not_an_engine_snapshot() {
     let mut classified = 0;
     for obj in &manifest.objects {
         let bytes = store.read_object(obj).unwrap();
-        let is_tx = replica::BodyTransactionV1::decode_canonical(&bytes).is_ok();
+        let is_tx = replica::BodyTransaction::decode_canonical(&bytes).is_ok();
         let is_receipt = replica::RequestReceiptV1::decode_canonical(&bytes).is_ok();
         let is_root = replica::ManifestRootV1::decode_canonical(&bytes).is_ok();
         let is_page = replica::ManifestPageV1::decode_canonical(&bytes).is_ok();
@@ -648,7 +681,7 @@ fn the_engine_export_envelope_is_gone() {
     let _: fn(
         &mut Replica,
         &CommitContext<'_>,
-        &BodyTransactionV1,
+        &BodyTransaction,
         &[(BodyKey, Vec<u8>)],
         &dyn replica::AuthoritySource,
     ) -> Result<replica::ConvergenceOutcome, ReplicaCommitError> = Replica::incorporate;

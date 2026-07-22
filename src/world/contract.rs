@@ -32,6 +32,58 @@ pub fn world_id() -> WorldId {
     WorldId::parse(PRODUCT_WORLD).expect("product world id")
 }
 
+// ---- Authorization demands (plan 04 policy vocabulary) --------------------
+//
+// The World declares a canonical non-empty demand for every mutation and
+// query; Mechanics evaluates it at the pinned authority frontier. These are
+// the frozen constructors from plan 04's routing table.
+
+use mechanics::demand::{AuthorizationDemand, PolicyCapability, PolicyResource};
+
+/// The Space-level resource of the Issues World.
+fn space_resource() -> PolicyResource {
+    PolicyResource::space(PRODUCT_WORLD)
+}
+
+/// A Space-scoped capability of the Issues World.
+fn space_cap(name: &str) -> PolicyCapability {
+    PolicyCapability::new(PRODUCT_WORLD, name)
+}
+
+/// `Require(space.admin, Space)` — the admin demand.
+pub fn demand_admin() -> Vec<u8> {
+    AuthorizationDemand::require(space_cap("space.admin"), space_resource())
+        .encode_canonical()
+        .expect("canonical admin demand")
+}
+
+/// `Any(Require(space.contributor, Space), Require(space.admin, Space))` — the
+/// ordinary contributor demand, with admin as an explicit override.
+pub fn demand_contributor() -> Vec<u8> {
+    AuthorizationDemand::Any(vec![
+        AuthorizationDemand::require(space_cap("space.contributor"), space_resource()),
+        AuthorizationDemand::require(space_cap("space.admin"), space_resource()),
+    ])
+    .encode_canonical()
+    .expect("canonical contributor demand")
+}
+
+/// `Require(space.issue.read, Space)` — every query's read demand.
+pub fn demand_read() -> Vec<u8> {
+    AuthorizationDemand::require(space_cap("space.issue.read"), space_resource())
+        .encode_canonical()
+        .expect("canonical read demand")
+}
+
+/// The full Space capability set the founder is granted at formation:
+/// `(capability, resource)` pairs, plus the Mechanics meta policy-admin grant.
+pub fn founder_capabilities() -> Vec<(PolicyCapability, PolicyResource)> {
+    ["space.admin", "space.contributor", "space.issue.read"]
+        .into_iter()
+        .map(|c| (space_cap(c), space_resource()))
+        .collect()
+}
+
 pub fn issue_schema() -> SchemaId {
     SchemaId::parse(ISSUE_SCHEMA).expect("issue schema id")
 }

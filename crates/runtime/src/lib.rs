@@ -34,6 +34,7 @@ pub mod coordinates;
 mod dispatch_tests;
 pub mod dto;
 pub mod error;
+pub mod implementation;
 pub mod lifecycle;
 pub mod neighbor_presence;
 pub mod neighbors;

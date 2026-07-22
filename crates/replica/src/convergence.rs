@@ -81,7 +81,8 @@ pub struct StagedContactMaterial {
     /// The manifest pages, ordered by page index, byte-canonical.
     pub manifest_pages: Vec<Vec<u8>>,
     /// Received protected Body payloads: `(transaction id, key, envelope)`.
-    pub bodies: Vec<([u8; 16], crate::ids::BodyKey, Vec<u8>)>,
+    /// The transaction id is the full signed-envelope digest.
+    pub bodies: Vec<([u8; 32], crate::ids::BodyKey, Vec<u8>)>,
 }
 
 /// The durable receipt of an authority-batch incorporation — the explicit
@@ -134,7 +135,7 @@ pub struct ValidatedContactBundle {
 
 /// The bundle's validated transactions with their per-Body payloads.
 pub(crate) type BundleUnits = Vec<(
-    crate::transaction::BodyTransactionV1,
+    crate::transaction::BodyTransaction,
     Vec<(crate::ids::BodyKey, Vec<u8>)>,
 )>;
 

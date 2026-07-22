@@ -1,23 +1,26 @@
-//! S5b fixtures: BodyTransactionV1 protection-boundary matrix and store-marker
-//! classification.
+//! BodyTransaction envelope protection-boundary matrix and store-marker
+//! classification (the semantic-named transaction, `lait/body-transaction/2`).
 
+use mechanics::demand::{AuthorizationDemand, PolicyCapability, PolicyResource};
 use mechanics::ids::SpaceId;
 use replica::body::ContentCommitment;
 use replica::frontier::AuthorityFrontier as AF;
-use replica::frontier::{AuthorityFrontier, ReplicaFrontier, TransactionId};
+use replica::frontier::{AuthorityFrontier, ReplicaFrontier};
 use replica::ids::{BodyId, EncodingId, SchemaId, WorldId};
 use replica::marker::{MarkerError, StoreMarkerV1, STORE_MAGIC};
 use replica::transaction::{
-    AuthoritySource, BodyDescriptorV1, BodyTransactionV1, TransactionError,
+    AuthoritySource, BodyDescriptor, BodyTransaction, SeedSigner, TransactionError,
+    TransactionSignRequest, NO_PARENT_ROOT,
 };
+use replica::{StaticAuthorizer, TransactionAuthorizer};
 
 const SIGNER_SEED: [u8; 32] = [12u8; 32];
 
 fn space() -> SpaceId {
     SpaceId::from_digest([6u8; 16])
 }
-fn space_bytes() -> [u8; 29] {
-    <[u8; 29]>::try_from(space().as_str().as_bytes()).unwrap()
+fn world() -> WorldId {
+    WorldId::parse("com.example.issues").unwrap()
 }
 fn signer_key() -> [u8; 32] {
     mechanics::crypto::device_from_seed(&SIGNER_SEED)
@@ -27,35 +30,54 @@ fn signer_key() -> [u8; 32] {
 fn auth() -> AuthorityFrontier {
     AuthorityFrontier::from_canonical_bytes(vec![0xA1, 0xB2])
 }
+fn demand() -> Vec<u8> {
+    AuthorizationDemand::require(
+        PolicyCapability::new("com.example.issues", "write"),
+        PolicyResource::space("com.example.issues"),
+    )
+    .encode_canonical()
+    .unwrap()
+}
 
-fn descriptor(body: [u8; 16], payload: &[u8]) -> BodyDescriptorV1 {
-    BodyDescriptorV1 {
-        space: space_bytes(),
-        world: WorldId::parse("com.example.issues").unwrap(),
+fn descriptor(body: [u8; 16], payload: &[u8]) -> BodyDescriptor {
+    BodyDescriptor {
+        world: world(),
         body: BodyId::from_bytes(body),
         schema: SchemaId::parse("issue").unwrap(),
         schema_version: 1,
         encoding: EncodingId::parse("lait.body.v1").unwrap(),
-        replica_frontier: ReplicaFrontier::new([1u8; 32], 1),
         content_commitment: ContentCommitment::over_protected_payload(payload).as_bytes(),
-        transaction: [3u8; 16],
-        signer: signer_key(),
-        authority_frontier: auth(),
     }
 }
 
-/// A valid two-descriptor transaction (descriptors sorted by BodyId).
-fn valid_tx() -> BodyTransactionV1 {
-    let d0 = descriptor([0u8; 16], b"cipher-0");
-    let d1 = descriptor([1u8; 16], b"cipher-1");
-    BodyTransactionV1::sign(
-        &space(),
-        TransactionId::from_bytes([3u8; 16]),
-        ReplicaFrontier::new([1u8; 32], 1),
-        auth(),
-        vec![d0, d1],
-        &SIGNER_SEED,
+fn sign(descriptors: Vec<BodyDescriptor>) -> Result<BodyTransaction, String> {
+    let authorizer = StaticAuthorizer {
+        world: world(),
+        implementation_id: [0u8; 32],
+    };
+    BodyTransaction::sign_with(
+        TransactionSignRequest {
+            space: &space(),
+            parent_manifest_root: NO_PARENT_ROOT,
+            replica_frontier: ReplicaFrontier::new([1u8; 32], 1),
+            authority_frontier: auth(),
+            actor: "actor",
+            intent_digest: [4u8; 32],
+            operations_digest: [5u8; 32],
+            demand: demand(),
+            descriptors,
+        },
+        &SeedSigner(&SIGNER_SEED),
+        |core| authorizer.authorize(core),
     )
+}
+
+/// A valid two-descriptor transaction (descriptors sorted by BodyId).
+fn valid_tx() -> BodyTransaction {
+    sign(vec![
+        descriptor([0u8; 16], b"cipher-0"),
+        descriptor([1u8; 16], b"cipher-1"),
+    ])
     .unwrap()
 }
 
@@ -64,8 +86,10 @@ fn valid_transaction_verifies_and_roundtrips() {
     let tx = valid_tx();
     tx.verify().unwrap();
     let bytes = tx.encode();
-    let back = BodyTransactionV1::decode_canonical(&bytes).unwrap();
+    let back = BodyTransaction::decode_canonical(&bytes).unwrap();
     assert_eq!(tx, back);
+    // The id is the full signed-envelope digest and is stable across decode.
+    assert_eq!(tx.id(), back.id());
 }
 
 #[test]
@@ -80,7 +104,7 @@ fn opaque_ciphertext_commitment_check_needs_no_key() {
 #[test]
 fn version_and_algorithm_rejection() {
     let mut tx = valid_tx();
-    tx.version = 2;
+    tx.core.version = 2;
     assert_eq!(tx.verify(), Err(TransactionError::UnsupportedVersion(2)));
     let mut tx = valid_tx();
     tx.signature_algorithm = 9;
@@ -92,31 +116,17 @@ fn version_and_algorithm_rejection() {
 
 #[test]
 fn empty_descriptor_set_is_rejected() {
-    let tx = BodyTransactionV1::sign(
-        &space(),
-        TransactionId::from_bytes([3u8; 16]),
-        ReplicaFrontier::new([1u8; 32], 1),
-        auth(),
-        vec![],
-        &SIGNER_SEED,
-    )
-    .unwrap();
+    let tx = sign(vec![]).unwrap();
     assert_eq!(tx.verify(), Err(TransactionError::BadDescriptorCount));
 }
 
 #[test]
 fn unsorted_or_duplicate_descriptors_are_rejected() {
-    let mut tx = valid_tx();
-    tx.descriptors.reverse();
-    // Re-sign so the signature is valid but ordering is wrong.
-    let resigned = BodyTransactionV1::sign(
-        &space(),
-        TransactionId::from_bytes([3u8; 16]),
-        ReplicaFrontier::new([1u8; 32], 1),
-        auth(),
-        tx.descriptors.clone(),
-        &SIGNER_SEED,
-    )
+    // Re-signed with reversed order: the signature is valid but ordering wrong.
+    let resigned = sign(vec![
+        descriptor([1u8; 16], b"cipher-1"),
+        descriptor([0u8; 16], b"cipher-0"),
+    ])
     .unwrap();
     assert_eq!(
         resigned.verify(),
@@ -125,33 +135,24 @@ fn unsorted_or_duplicate_descriptors_are_rejected() {
 
     // Duplicate key.
     let d = descriptor([0u8; 16], b"x");
-    let dup = BodyTransactionV1::sign(
-        &space(),
-        TransactionId::from_bytes([3u8; 16]),
-        ReplicaFrontier::new([1u8; 32], 1),
-        auth(),
-        vec![d.clone(), d],
-        &SIGNER_SEED,
-    )
-    .unwrap();
+    let dup = sign(vec![d.clone(), d]).unwrap();
     assert_eq!(dup.verify(), Err(TransactionError::UnsortedOrDuplicate));
 }
 
 #[test]
-fn a_transplanted_descriptor_is_rejected() {
-    // A descriptor bound to a different transaction id cannot ride this one.
-    let mut foreign = descriptor([0u8; 16], b"c");
-    foreign.transaction = [9u8; 16];
-    let tx = BodyTransactionV1::sign(
-        &space(),
-        TransactionId::from_bytes([3u8; 16]),
-        ReplicaFrontier::new([1u8; 32], 1),
-        auth(),
-        vec![foreign],
-        &SIGNER_SEED,
-    )
-    .unwrap();
-    assert_eq!(tx.verify(), Err(TransactionError::Transplanted));
+fn a_tampered_receipt_binding_is_rejected() {
+    // The receipt is byte-bound to the core: flip the receipt's core-digest
+    // binding and verify refuses (the envelope-positional heir of the old
+    // "transplanted descriptor" rule).
+    let mut tx = valid_tx();
+    let mut receipt =
+        mechanics::demand::AuthorizationReceipt::decode(&tx.authorization_receipt).unwrap();
+    receipt.body_transaction_core_digest[0] ^= 0xff;
+    tx.authorization_receipt = receipt.encode();
+    assert!(matches!(
+        tx.verify(),
+        Err(TransactionError::ReceiptUnbound(_)) | Err(TransactionError::BadSignature)
+    ));
 }
 
 /// A stub mechanics authority view: authorizes only a named signer key.
@@ -182,7 +183,8 @@ fn structural_verify_is_not_an_authority_check() {
         Err(TransactionError::AuthorityUnverified)
     );
 
-    // A view that authorizes the actual signer: accepted.
+    // A view that authorizes the actual signer: accepted (the default
+    // verify_transaction checks signer standing at the referenced frontier).
     assert!(tx.verify_authorized(&OnlyAuthorizes(signer_key())).is_ok());
 }
 
@@ -198,7 +200,7 @@ fn trailing_bytes_are_non_canonical() {
     let mut bytes = valid_tx().encode();
     bytes.push(0);
     assert_eq!(
-        BodyTransactionV1::decode_canonical(&bytes),
+        BodyTransaction::decode_canonical(&bytes),
         Err(TransactionError::NonCanonical)
     );
 }

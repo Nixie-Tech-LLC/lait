@@ -182,7 +182,7 @@ fn frame_tags_are_the_canonical_wire_values() {
         (
             7,
             ContactFrame::BodyRequest {
-                transaction: [0u8; 16],
+                transaction: [0u8; 32],
                 body: body_key(),
                 offset: 0,
                 length: 1,
@@ -191,7 +191,7 @@ fn frame_tags_are_the_canonical_wire_values() {
         (
             8,
             ContactFrame::BodyChunk {
-                transaction: [0u8; 16],
+                transaction: [0u8; 32],
                 body: body_key(),
                 offset: 0,
                 total: 1,
@@ -202,7 +202,7 @@ fn frame_tags_are_the_canonical_wire_values() {
         (
             9,
             ContactFrame::BodyEnd {
-                transaction: [0u8; 16],
+                transaction: [0u8; 32],
                 body: body_key(),
                 total: 0,
                 content_commitment: [0u8; 32],
@@ -302,7 +302,7 @@ fn happy_frames() -> Vec<Vec<u8>> {
             page_bytes,
         },
         ContactFrame::BodyChunk {
-            transaction: [2u8; 16],
+            transaction: [2u8; 32],
             body: body_key(),
             offset: 0,
             total: payload.len() as u64,
@@ -310,7 +310,7 @@ fn happy_frames() -> Vec<Vec<u8>> {
             bytes: c0.to_vec(),
         },
         ContactFrame::BodyChunk {
-            transaction: [2u8; 16],
+            transaction: [2u8; 32],
             body: body_key(),
             offset: c0.len() as u64,
             total: payload.len() as u64,
@@ -318,7 +318,7 @@ fn happy_frames() -> Vec<Vec<u8>> {
             bytes: c1.to_vec(),
         },
         ContactFrame::BodyEnd {
-            transaction: [2u8; 16],
+            transaction: [2u8; 32],
             body: body_key(),
             total: payload.len() as u64,
             content_commitment: commitment,
@@ -378,7 +378,7 @@ fn a_complete_transfer_stages_acks_and_yields_the_material() {
     assert_eq!(material.manifest_root_bytes, b"canonical-manifest-root");
     assert_eq!(material.manifest_pages[&0], b"canonical-page-0");
     assert_eq!(
-        material.bodies[&([2u8; 16], body_key())],
+        material.bodies[&([2u8; 32], body_key())],
         b"protected-body-payload"
     );
 }
@@ -402,7 +402,7 @@ fn wrong_state_and_unknown_tag_abort() {
     // A body chunk before any authority material is wrong-state.
     let mut rx = InitiatorReceiver::new(contact());
     let stray = ContactFrame::BodyChunk {
-        transaction: [2u8; 16],
+        transaction: [2u8; 32],
         body: body_key(),
         offset: 0,
         total: 1,
@@ -457,7 +457,7 @@ fn chunk_rules_exact_dup_ok_conflict_and_overlap_abort() {
         }
     };
     let chunk = |bytes: &[u8], offset: u64| ContactFrame::BodyChunk {
-        transaction: [2u8; 16],
+        transaction: [2u8; 32],
         body: body_key(),
         offset,
         total: 8,
@@ -527,7 +527,7 @@ fn a_gap_at_body_end_aborts_and_a_bad_commitment_aborts() {
     }
     rx.on_frame(
         &ContactFrame::BodyChunk {
-            transaction: [2u8; 16],
+            transaction: [2u8; 32],
             body: body_key(),
             offset: 0,
             total: 8,
@@ -540,7 +540,7 @@ fn a_gap_at_body_end_aborts_and_a_bad_commitment_aborts() {
     assert_eq!(
         rx.on_frame(
             &ContactFrame::BodyEnd {
-                transaction: [2u8; 16],
+                transaction: [2u8; 32],
                 body: body_key(),
                 total: 8,
                 content_commitment: [0u8; 32],
@@ -557,7 +557,7 @@ fn a_gap_at_body_end_aborts_and_a_bad_commitment_aborts() {
     }
     rx.on_frame(
         &ContactFrame::BodyChunk {
-            transaction: [2u8; 16],
+            transaction: [2u8; 32],
             body: body_key(),
             offset: 0,
             total: 4,
@@ -570,7 +570,7 @@ fn a_gap_at_body_end_aborts_and_a_bad_commitment_aborts() {
     assert_eq!(
         rx.on_frame(
             &ContactFrame::BodyEnd {
-                transaction: [2u8; 16],
+                transaction: [2u8; 32],
                 body: body_key(),
                 total: 4,
                 content_commitment: [0u8; 32],

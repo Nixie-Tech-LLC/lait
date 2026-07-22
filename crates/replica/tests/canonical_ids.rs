@@ -4,7 +4,7 @@
 //! extraction; S5 installs the signed Body/store formats that make them contracts.
 
 use replica::body::ContentCommitment;
-use replica::frontier::{ReplicaFrontier, TransactionId};
+use replica::frontier::ReplicaFrontier;
 use replica::ids::{BodyId, SchemaId, WorldId};
 
 #[test]
@@ -35,13 +35,6 @@ fn empty_replica_frontier_is_33_zero_bytes() {
     assert_eq!(bytes, vec![0u8; 33]);
     let back: ReplicaFrontier = postcard::from_bytes(&bytes).unwrap();
     assert_eq!(back, ReplicaFrontier::EMPTY);
-}
-
-#[test]
-fn transaction_id_is_16_raw_bytes() {
-    let tx = TransactionId::from_bytes([7u8; 16]);
-    let bytes = postcard::to_stdvec(&tx).unwrap();
-    assert_eq!(bytes, vec![7u8; 16]);
 }
 
 #[test]

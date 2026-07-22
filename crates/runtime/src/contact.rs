@@ -432,13 +432,13 @@ pub enum ContactFrame {
         page_bytes: Vec<u8>,
     },
     BodyRequest {
-        transaction: [u8; 16],
+        transaction: [u8; 32],
         body: BodyKey,
         offset: u64,
         length: u32,
     },
     BodyChunk {
-        transaction: [u8; 16],
+        transaction: [u8; 32],
         body: BodyKey,
         offset: u64,
         total: u64,
@@ -446,7 +446,7 @@ pub enum ContactFrame {
         bytes: Vec<u8>,
     },
     BodyEnd {
-        transaction: [u8; 16],
+        transaction: [u8; 32],
         body: BodyKey,
         total: u64,
         content_commitment: [u8; 32],
@@ -578,7 +578,7 @@ pub struct ReceivedMaterial {
     /// page index → canonical page bytes.
     pub manifest_pages: BTreeMap<u32, Vec<u8>>,
     /// (transaction, BodyKey) → assembled protected payload.
-    pub bodies: BTreeMap<([u8; 16], BodyKey), Vec<u8>>,
+    pub bodies: BTreeMap<([u8; 32], BodyKey), Vec<u8>>,
 }
 
 /// The initiator's pure receiving state machine: feed it every received frame's
@@ -596,7 +596,7 @@ pub struct InitiatorReceiver {
     manifest_root_ref: Option<[u8; 32]>,
     manifest_root_bytes: Vec<u8>,
     manifest_pages: BTreeMap<u32, ([u8; 32], Vec<u8>)>,
-    bodies: BTreeMap<([u8; 16], BodyKey), BodyStaging>,
+    bodies: BTreeMap<([u8; 32], BodyKey), BodyStaging>,
     ended_bodies: u32,
 }
 
@@ -972,7 +972,7 @@ pub struct OutboundTransfer {
     /// Ordered canonical page bytes.
     pub manifest_pages: Vec<Vec<u8>>,
     /// `(transaction id, key, protected payload bytes)`.
-    pub bodies: Vec<([u8; 16], BodyKey, Vec<u8>)>,
+    pub bodies: Vec<([u8; 32], BodyKey, Vec<u8>)>,
 }
 
 /// Build the complete, canonical, ordered frame sequence for a transfer:
@@ -1086,7 +1086,7 @@ pub enum AccepterEvent {
         page_count: u16,
     },
     BodyRequest {
-        transaction: [u8; 16],
+        transaction: [u8; 32],
         body: BodyKey,
         offset: u64,
         length: u32,
