@@ -149,6 +149,47 @@ impl SubmitRequestDto {
 }
 json_codec!(SubmitRequestDto);
 
+/// A **signed** submit DTO: the canonical signed World action (postcard bytes,
+/// opaque, produced and verified only by the Rust protocol layer) together
+/// with the coordinates a consumer can read without decoding postcard. Every
+/// spelled coordinate is validated against its identifier grammar; the signed
+/// bytes are size-bounded and never interpreted at this layer — signature and
+/// header verification happen in [`crate::action`], not in JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SignedSubmitDto {
+    pub protocol_version: u32,
+    /// The Space the action addresses (`ws_` + 26 base32 chars).
+    pub space_id: String,
+    /// The World the action addresses (reverse-domain form).
+    pub world: String,
+    /// The acting principal (`act_` + 64 lowercase hex chars).
+    pub actor_id: String,
+    /// The signing device key (64 lowercase hex chars).
+    pub device_hex: String,
+    /// Hex (lowercase) of the action's 16-byte request id.
+    pub request_id_hex: String,
+    /// Base64 (standard, padded) of the complete signed action bytes.
+    pub signed_action_b64: String,
+}
+
+impl SignedSubmitDto {
+    fn validate(&self) -> Result<(), DtoError> {
+        check_version(self.protocol_version)?;
+        check_len(&self.space_id)?;
+        mechanics::ids::SpaceId::parse(&self.space_id).ok_or(DtoError::BadIdentifier)?;
+        check_world(&self.world)?;
+        check_len(&self.actor_id)?;
+        mechanics::ids::ActorId::parse(&self.actor_id).ok_or(DtoError::BadIdentifier)?;
+        check_len(&self.device_hex)?;
+        mechanics::ids::DeviceId::parse(&self.device_hex).ok_or(DtoError::BadIdentifier)?;
+        check_len(&self.request_id_hex)?;
+        check_hex16(&self.request_id_hex)?;
+        check_b64_payload(&self.signed_action_b64)
+    }
+}
+json_codec!(SignedSubmitDto);
+
 /// A query request DTO.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -340,6 +381,7 @@ pub fn schema_bundle() -> serde_json::Value {
         };
     }
     add!(SubmitRequestDto, "SubmitRequestDto");
+    add!(SignedSubmitDto, "SignedSubmitDto");
     add!(QueryRequestDto, "QueryRequestDto");
     add!(CommittedEffectDto, "CommittedEffectDto");
     add!(ProjectionDto, "ProjectionDto");
@@ -351,6 +393,64 @@ pub fn schema_bundle() -> serde_json::Value {
         "$id": "https://lait.dev/schema/dto/v1",
         "title": "LAIT external DTO surface v1",
         "$defs": defs,
+        // Every identifier grammar the surface speaks, as language-neutral
+        // string schemas. The Rust parsers are authoritative; the patterns
+        // are drift-checked against them by `tests/dto_schema.rs`.
+        "identifiers": identifier_schemas(),
+    })
+}
+
+/// Language-neutral string schemas for every identifier grammar the external
+/// surface carries. Each pattern mirrors the authoritative Rust parser.
+pub fn identifier_schemas() -> serde_json::Value {
+    serde_json::json!({
+        "SpaceId": {
+            "type": "string",
+            "description": "Space id: ws_ + 26 base32 chars (case-insensitive)",
+            "pattern": "^ws_[0-9A-Va-v]{26}$",
+        },
+        "ActorId": {
+            "type": "string",
+            "description": "Actor id: act_ + 64 lowercase hex chars (incept-event content address)",
+            "pattern": "^act_[0-9a-f]{64}$",
+        },
+        "DeviceId": {
+            "type": "string",
+            "description": "Device id: 64 lowercase hex chars (an ed25519 public key)",
+            "pattern": "^[0-9a-f]{64}$",
+        },
+        "StationId": {
+            "type": "string",
+            "description": "Station id in display form: 64 lowercase hex chars (the same key bytes as its DeviceId)",
+            "pattern": "^[0-9a-f]{64}$",
+        },
+        "WorldId": {
+            "type": "string",
+            "description": "World id: reverse-domain, >=2 labels of [a-z0-9-] with no leading/trailing hyphen, 3-63 chars",
+            "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$",
+            "minLength": 3,
+            "maxLength": 63,
+        },
+        "SchemaId": {
+            "type": "string",
+            "description": "Schema/encoding id: 1-63 lowercase ASCII, [a-z0-9][a-z0-9._-]*",
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,62}$",
+        },
+        "BodyIdHex": {
+            "type": "string",
+            "description": "Body id: 32 lowercase hex chars (16 canonical bytes)",
+            "pattern": "^[0-9a-f]{32}$",
+        },
+        "RequestIdHex": {
+            "type": "string",
+            "description": "Request id: 32 lowercase hex chars (16-byte idempotency scope component)",
+            "pattern": "^[0-9a-f]{32}$",
+        },
+        "FrontierRootHex": {
+            "type": "string",
+            "description": "Manifest frontier root: 64 lowercase hex chars (32 bytes)",
+            "pattern": "^[0-9a-f]{64}$",
+        },
     })
 }
 

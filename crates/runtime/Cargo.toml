@@ -44,6 +44,7 @@ getrandom = "0.3"
 anyhow = "1"
 
 [dev-dependencies]
+regex = "1.13.1"
 # The real-iroh Contact gate test builds two loopback endpoints on a
 # multi-thread runtime that outlives the Stations driving them.
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }

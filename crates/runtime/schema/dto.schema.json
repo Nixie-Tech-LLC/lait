@@ -228,6 +228,53 @@
       "title": "QueryRequestDto",
       "type": "object"
     },
+    "SignedSubmitDto": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "A **signed** submit DTO: the canonical signed World action (postcard bytes,\nopaque, produced and verified only by the Rust protocol layer) together\nwith the coordinates a consumer can read without decoding postcard. Every\nspelled coordinate is validated against its identifier grammar; the signed\nbytes are size-bounded and never interpreted at this layer — signature and\nheader verification happen in [`crate::action`], not in JSON.",
+      "properties": {
+        "actorId": {
+          "description": "The acting principal (`act_` + 64 lowercase hex chars).",
+          "type": "string"
+        },
+        "deviceHex": {
+          "description": "The signing device key (64 lowercase hex chars).",
+          "type": "string"
+        },
+        "protocolVersion": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requestIdHex": {
+          "description": "Hex (lowercase) of the action's 16-byte request id.",
+          "type": "string"
+        },
+        "signedActionB64": {
+          "description": "Base64 (standard, padded) of the complete signed action bytes.",
+          "type": "string"
+        },
+        "spaceId": {
+          "description": "The Space the action addresses (`ws_` + 26 base32 chars).",
+          "type": "string"
+        },
+        "world": {
+          "description": "The World the action addresses (reverse-domain form).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "spaceId",
+        "world",
+        "actorId",
+        "deviceHex",
+        "requestIdHex",
+        "signedActionB64"
+      ],
+      "title": "SignedSubmitDto",
+      "type": "object"
+    },
     "SubmitRequestDto": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -272,5 +319,54 @@
   },
   "$id": "https://lait.dev/schema/dto/v1",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "identifiers": {
+    "ActorId": {
+      "description": "Actor id: act_ + 64 lowercase hex chars (incept-event content address)",
+      "pattern": "^act_[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "BodyIdHex": {
+      "description": "Body id: 32 lowercase hex chars (16 canonical bytes)",
+      "pattern": "^[0-9a-f]{32}$",
+      "type": "string"
+    },
+    "DeviceId": {
+      "description": "Device id: 64 lowercase hex chars (an ed25519 public key)",
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "FrontierRootHex": {
+      "description": "Manifest frontier root: 64 lowercase hex chars (32 bytes)",
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "RequestIdHex": {
+      "description": "Request id: 32 lowercase hex chars (16-byte idempotency scope component)",
+      "pattern": "^[0-9a-f]{32}$",
+      "type": "string"
+    },
+    "SchemaId": {
+      "description": "Schema/encoding id: 1-63 lowercase ASCII, [a-z0-9][a-z0-9._-]*",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,62}$",
+      "type": "string"
+    },
+    "SpaceId": {
+      "description": "Space id: ws_ + 26 base32 chars (case-insensitive)",
+      "pattern": "^ws_[0-9A-Va-v]{26}$",
+      "type": "string"
+    },
+    "StationId": {
+      "description": "Station id in display form: 64 lowercase hex chars (the same key bytes as its DeviceId)",
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "WorldId": {
+      "description": "World id: reverse-domain, >=2 labels of [a-z0-9-] with no leading/trailing hyphen, 3-63 chars",
+      "maxLength": 63,
+      "minLength": 3,
+      "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$",
+      "type": "string"
+    }
+  },
   "title": "LAIT external DTO surface v1"
 }

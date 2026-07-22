@@ -251,6 +251,14 @@ jobs:
           tool: nextest
       - name: Run gate
         run: cargo nextest run --locked --all-features -E '${{ matrix.filter }}'
+      # The formats gate additionally replays the committed schema examples
+      # through a NON-Rust JSON Schema 2020-12 validator, so the external
+      # contract is proven language-neutral, not merely serde-consistent.
+      - name: Language-neutral schema validation
+        if: matrix.job == 'orbital-formats'
+        run: |
+          python3 -m pip install --quiet "jsonschema>=4"
+          python3 ci/validate-dto-schema.py
 
   # Aggregate required check: green only when every orbital gate (and the
   # cross-platform workspace matrix) is green. Branch protection points here so

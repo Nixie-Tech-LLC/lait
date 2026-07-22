@@ -1,0 +1,87 @@
+{
+  "negative": [
+    {
+      "def": "SubmitRequestDto",
+      "reason": "unknown field",
+      "schemaExpressible": true,
+      "value": {
+        "payloadB64": "",
+        "protocolVersion": 1,
+        "requestIdHex": "00000000000000000000000000000000",
+        "schema": "s",
+        "schemaVersion": 1,
+        "surprise": true,
+        "world": "w.x"
+      }
+    },
+    {
+      "def": "SubmitRequestDto",
+      "reason": "missing required fields",
+      "schemaExpressible": true,
+      "value": {
+        "protocolVersion": 1,
+        "world": "w.x"
+      }
+    },
+    {
+      "def": "SignedSubmitDto",
+      "reason": "space id fails its grammar (Rust parser; schema patterns live under `identifiers`)",
+      "schemaExpressible": false,
+      "value": {
+        "actorId": "act_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "deviceHex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "protocolVersion": 1,
+        "requestIdHex": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+        "signedActionB64": "",
+        "spaceId": "ws_short",
+        "world": "com.example.notes"
+      }
+    },
+    {
+      "def": "SubmitRequestDto",
+      "reason": "request id decodes to 17 bytes, not 16 (decoded length is Rust-side)",
+      "schemaExpressible": false,
+      "value": {
+        "payloadB64": "",
+        "protocolVersion": 1,
+        "requestIdHex": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+        "schema": "s",
+        "schemaVersion": 1,
+        "world": "w.x"
+      }
+    }
+  ],
+  "positive": [
+    {
+      "def": "SubmitRequestDto",
+      "value": {
+        "payloadB64": "aGVsbG8=",
+        "protocolVersion": 1,
+        "requestIdHex": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+        "schema": "note",
+        "schemaVersion": 1,
+        "world": "com.example.notes"
+      }
+    },
+    {
+      "def": "SignedSubmitDto",
+      "value": {
+        "actorId": "act_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "deviceHex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "protocolVersion": 1,
+        "requestIdHex": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+        "signedActionB64": "c2lnbmVk",
+        "spaceId": "ws_00000000000000000000000000",
+        "world": "com.example.notes"
+      }
+    },
+    {
+      "def": "ErrorDto",
+      "value": {
+        "code": "denied",
+        "message": "the demand was not satisfied at the pinned frontier",
+        "protocolVersion": 1
+      }
+    }
+  ]
+}

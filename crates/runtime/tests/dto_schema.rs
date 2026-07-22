@@ -9,7 +9,7 @@
 
 use runtime::dto::{
     CommittedEffectDto, DtoError, ErrorDto, ObservationCursorDto, ObservationDto, ProjectionDto,
-    QueryRequestDto, SubmitRequestDto, DTO_PROTOCOL_VERSION,
+    QueryRequestDto, SignedSubmitDto, SubmitRequestDto, DTO_PROTOCOL_VERSION,
 };
 
 fn schema_path() -> std::path::PathBuf {
@@ -47,7 +47,7 @@ fn the_schema_declares_draft_2020_12_and_strict_objects() {
     // Every DTO definition rejects unknown fields and lists required members —
     // the language-neutral mirror of deny_unknown_fields.
     let defs = bundle["$defs"].as_object().unwrap();
-    assert_eq!(defs.len(), 7);
+    assert_eq!(defs.len(), 8);
     for (name, def) in defs {
         assert_eq!(
             def["additionalProperties"],
@@ -59,6 +59,101 @@ fn the_schema_declares_draft_2020_12_and_strict_objects() {
                 .as_array()
                 .is_some_and(|r| r.iter().any(|f| f == "protocolVersion")),
             "{name} must require protocolVersion"
+        );
+    }
+}
+
+#[test]
+fn identifier_patterns_agree_with_the_rust_parsers() {
+    // Each language-neutral identifier pattern must accept exactly what the
+    // authoritative Rust parser accepts, over positive and negative samples
+    // covering length, alphabet, prefix, and case edges.
+    let ids = runtime::dto::identifier_schemas();
+    let pattern = |name: &str| {
+        let p = ids[name]["pattern"].as_str().expect("pattern string");
+        regex::Regex::new(&format!("{p}")).expect("valid regex")
+    };
+
+    let space = pattern("SpaceId");
+    for (s, ok) in [
+        ("ws_00000000000000000000000000", true),
+        ("ws_0123456789abcdefghijkmnpqv", true),
+        ("ws_short", false),
+        ("act_00000000000000000000000000", false),
+        ("ws_0000000000000000000000000!", false),
+    ] {
+        assert_eq!(space.is_match(s), ok, "SpaceId pattern on {s}");
+        assert_eq!(
+            mechanics::ids::SpaceId::parse(s).is_some(),
+            ok,
+            "SpaceId parser on {s}"
+        );
+    }
+
+    let actor = pattern("ActorId");
+    for (s, ok) in [
+        (format!("act_{}", "a".repeat(64)), true),
+        (format!("act_{}", "a".repeat(63)), false),
+        ("a".repeat(68), false),
+    ] {
+        assert_eq!(actor.is_match(&s), ok, "ActorId pattern on {s}");
+        assert_eq!(
+            mechanics::ids::ActorId::parse(&s).is_some(),
+            ok,
+            "ActorId parser on {s}"
+        );
+    }
+    // The canonical wire form is lowercase; the Rust parser additionally
+    // tolerates uppercase hex input and normalizes it. The pattern pins the
+    // canonical form only.
+    let shouting = format!("act_{}", "A".repeat(64));
+    assert!(!actor.is_match(&shouting));
+    assert!(mechanics::ids::ActorId::parse(&shouting).is_some());
+
+    let device = pattern("DeviceId");
+    for (s, ok) in [
+        ("a".repeat(64), true),
+        ("g".repeat(64), false),
+        ("a".repeat(63), false),
+    ] {
+        assert_eq!(device.is_match(&s), ok, "DeviceId pattern on {s}");
+        assert_eq!(
+            mechanics::ids::DeviceId::parse(&s).is_some(),
+            ok,
+            "DeviceId parser on {s}"
+        );
+    }
+
+    let world = pattern("WorldId");
+    for (s, ok) in [
+        ("com.example.notes", true),
+        ("a.b", true),
+        ("single", false),
+        ("Upper.case", false),
+        ("-bad.label", false),
+        ("bad-.label", false),
+    ] {
+        assert_eq!(world.is_match(s), ok, "WorldId pattern on {s}");
+        assert_eq!(
+            replica::ids::WorldId::parse(s).is_some(),
+            ok,
+            "WorldId parser on {s}"
+        );
+    }
+
+    let schema = pattern("SchemaId");
+    for (s, ok) in [
+        ("note", true),
+        ("issues.catalog-v", true),
+        ("_leading", false),
+        ("", false),
+        (&"a".repeat(64), false),
+    ] {
+        assert_eq!(schema.is_match(s), ok, "SchemaId pattern on {s}");
+        assert_eq!(
+            replica::ids::SchemaId::parse(s).is_some(),
+            ok,
+            "SchemaId parser on {s}"
         );
     }
 }
@@ -87,6 +182,7 @@ fn canonical_positive_examples_roundtrip_bidirectionally() {
         }};
     }
     roundtrip!(submit_example(), SubmitRequestDto);
+    roundtrip!(signed_submit_example(), SignedSubmitDto);
     roundtrip!(
         QueryRequestDto {
             protocol_version: DTO_PROTOCOL_VERSION,
@@ -146,6 +242,132 @@ fn canonical_positive_examples_roundtrip_bidirectionally() {
             message: "the request id was reused with a different payload".into(),
         },
         ErrorDto
+    );
+}
+
+fn signed_submit_example() -> SignedSubmitDto {
+    SignedSubmitDto {
+        protocol_version: DTO_PROTOCOL_VERSION,
+        space_id: "ws_00000000000000000000000000".into(),
+        world: "com.example.notes".into(),
+        actor_id: format!("act_{}", "a".repeat(64)),
+        device_hex: "b".repeat(64),
+        request_id_hex: "0a".repeat(16),
+        signed_action_b64: "c2lnbmVk".into(), // "signed"
+    }
+}
+
+#[test]
+fn a_signed_submit_dto_validates_every_spelled_coordinate() {
+    // bad space id
+    let mut bad = signed_submit_example();
+    bad.space_id = "ws_short".into();
+    assert_eq!(
+        SignedSubmitDto::from_json(&bad.to_json()),
+        Err(DtoError::BadIdentifier)
+    );
+    // bad actor id
+    let mut bad = signed_submit_example();
+    bad.actor_id = "act_nothex".into();
+    assert_eq!(
+        SignedSubmitDto::from_json(&bad.to_json()),
+        Err(DtoError::BadIdentifier)
+    );
+    // bad device key
+    let mut bad = signed_submit_example();
+    bad.device_hex = "z".repeat(64);
+    assert_eq!(
+        SignedSubmitDto::from_json(&bad.to_json()),
+        Err(DtoError::BadIdentifier)
+    );
+    // oversize decoded signed action
+    let mut bad = signed_submit_example();
+    bad.signed_action_b64 =
+        data_encoding::BASE64.encode(&vec![0u8; runtime::dto::MAX_DTO_PAYLOAD + 1]);
+    assert_eq!(
+        SignedSubmitDto::from_json(&bad.to_json()),
+        Err(DtoError::PayloadTooLarge)
+    );
+    // unknown field
+    assert!(matches!(
+        SignedSubmitDto::from_json(br#"{"protocolVersion":1,"surprise":true}"#),
+        Err(DtoError::Malformed(_))
+    ));
+}
+
+/// The committed canonical-example corpus: every positive example named by its
+/// `$defs` entry, plus negatives with their rejection reason. A neutral
+/// (non-Rust) JSON Schema validator replays this corpus against the committed
+/// schema in CI (`ci/validate-dto-schema.py`); reasons only Rust-side
+/// validation can see (decoded lengths, protocol pinning) are marked
+/// `schemaExpressible: false` and skipped there.
+fn canonical_examples() -> serde_json::Value {
+    let positive = |def: &str, json: Vec<u8>| {
+        serde_json::json!({
+            "def": def,
+            "value": serde_json::from_slice::<serde_json::Value>(&json).unwrap(),
+        })
+    };
+    let positives = vec![
+        positive("SubmitRequestDto", submit_example().to_json()),
+        positive("SignedSubmitDto", signed_submit_example().to_json()),
+        positive(
+            "ErrorDto",
+            ErrorDto {
+                protocol_version: DTO_PROTOCOL_VERSION,
+                code: "denied".into(),
+                message: "the demand was not satisfied at the pinned frontier".into(),
+            }
+            .to_json(),
+        ),
+    ];
+    let negatives = serde_json::json!([
+        {
+            "def": "SubmitRequestDto",
+            "reason": "unknown field",
+            "schemaExpressible": true,
+            "value": {"protocolVersion": 1, "world": "w.x", "schema": "s", "schemaVersion": 1,
+                       "requestIdHex": "00000000000000000000000000000000", "payloadB64": "", "surprise": true},
+        },
+        {
+            "def": "SubmitRequestDto",
+            "reason": "missing required fields",
+            "schemaExpressible": true,
+            "value": {"protocolVersion": 1, "world": "w.x"},
+        },
+        {
+            "def": "SignedSubmitDto",
+            "reason": "space id fails its grammar (Rust parser; schema patterns live under `identifiers`)",
+            "schemaExpressible": false,
+            "value": {"protocolVersion": 1, "spaceId": "ws_short", "world": "com.example.notes",
+                       "actorId": format!("act_{}", "a".repeat(64)), "deviceHex": "b".repeat(64),
+                       "requestIdHex": "0a".repeat(16), "signedActionB64": ""},
+        },
+        {
+            "def": "SubmitRequestDto",
+            "reason": "request id decodes to 17 bytes, not 16 (decoded length is Rust-side)",
+            "schemaExpressible": false,
+            "value": {"protocolVersion": 1, "world": "w.x", "schema": "s", "schemaVersion": 1,
+                       "requestIdHex": "0a".repeat(17), "payloadB64": ""},
+        },
+    ]);
+    serde_json::json!({ "positive": positives, "negative": negatives })
+}
+
+#[test]
+fn the_committed_examples_match_the_rust_corpus() {
+    let generated = serde_json::to_string_pretty(&canonical_examples()).unwrap();
+    let path = schema_path().with_file_name("dto.examples.json");
+    if std::env::var("LAIT_BLESS_SCHEMA").is_ok() {
+        std::fs::write(&path, &generated).unwrap();
+    }
+    let committed = std::fs::read_to_string(&path)
+        .expect("schema/dto.examples.json is committed; run with LAIT_BLESS_SCHEMA=1 to create");
+    let committed: serde_json::Value = serde_json::from_str(&committed).unwrap();
+    let generated: serde_json::Value = serde_json::from_str(&generated).unwrap();
+    assert_eq!(
+        committed, generated,
+        "the committed example corpus drifted from the Rust contract"
     );
 }
 
