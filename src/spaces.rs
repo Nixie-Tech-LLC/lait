@@ -348,3 +348,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&live);
     }
 }
+
+/// Derive a short project KEY from a display name: initials of up to four
+/// words, or the first four letters of a single word, uppercased.
+pub fn derive_project_key(name: &str) -> String {
+    let words: Vec<&str> = name
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let key: String = match words.len() {
+        0 => "PRJ".to_string(),
+        1 => words[0].chars().take(4).collect(),
+        _ => words
+            .iter()
+            .take(4)
+            .filter_map(|w| w.chars().next())
+            .collect(),
+    };
+    key.to_ascii_uppercase()
+}

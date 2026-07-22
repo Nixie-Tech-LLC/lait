@@ -19,7 +19,6 @@ use crate::{
     control::{self, request, ErrorKind, Event, EventKind, Request, Response},
     diagnose::{DiagnosisView, GateState},
     dto::{BoardView, IssueView, Priority, Row},
-    proto::SpaceTicket,
     spaces::{self, SpaceEntry, StorePresence},
 };
 
@@ -733,15 +732,16 @@ fn print_diagnosis(v: &DiagnosisView, out: Out) {
 /// and named immediately instead of surfacing later as a blank board. Under
 /// `--json` we emit only the join DTO (no verifier chrome), mirroring `run_invite`.
 pub async fn run_join(home: &Path, ticket: String, out: Out) -> Result<()> {
-    // Parse client-side to recover the intended space before the ticket is
-    // moved into the request. A malformed ticket simply yields no expectation; the
-    // daemon returns the real parse error.
-    let parsed = ticket.parse::<SpaceTicket>().ok();
-    // A pass-carrying ticket (Pattern A) admits automatically within seconds, so
-    // a pending membership is worth polling out; a pass-less ticket waits on a
-    // human admin and would only stall the readout.
-    let has_pass = parsed.as_ref().is_some_and(|t| t.invite.is_some());
-    let expected = parsed.map(|t| t.space);
+    // Parse client-side to recover the intended space before the link is
+    // moved into the request. A malformed link simply yields no expectation;
+    // the daemon returns the real parse error.
+    let parsed = runtime::SignedCoordinatesV1::parse_link(ticket.trim())
+        .ok()
+        .and_then(|c| c.verify().ok());
+    // An admission-carrying link admits automatically within seconds, so a
+    // pending membership is worth polling out.
+    let has_pass = parsed.as_ref().is_some_and(|v| v.admission.is_some());
+    let expected = parsed.map(|v| v.space.as_str().to_string());
     let resp = client(home, Request::Join { ticket }).await?;
     match &resp {
         Response::Ok { message } => {
@@ -1466,10 +1466,10 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
             // when break-glass is attempted: by then it is too late to fix.
             for h in &s.degraded_recovery {
                 let why = match &h.reason {
-                    crate::replica::RecoveryArtifactFailure::Undecryptable(_) => {
+                    mechanics::ceremony::RecoveryArtifactFailure::Undecryptable(_) => {
                         "it was protected under another Windows account or machine"
                     }
-                    crate::replica::RecoveryArtifactFailure::Io(_) => {
+                    mechanics::ceremony::RecoveryArtifactFailure::Io(_) => {
                         "it is present but could not be read"
                     }
                 };
@@ -1690,10 +1690,7 @@ pub async fn run_invite(
         emit_text(&token, out);
         return Ok(());
     }
-    let link = token
-        .parse::<SpaceTicket>()
-        .map(|t| t.link())
-        .unwrap_or_else(|_| format!("lait://join/{token}"));
+    let link = format!("lait://join/{token}");
     println!("{token}");
     println!("{link}");
     let copied = copy_to_clipboard(&token);

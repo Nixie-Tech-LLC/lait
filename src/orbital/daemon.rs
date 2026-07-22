@@ -413,9 +413,9 @@ impl OrbitalDaemon {
         match req {
             Request::Status => self.status(),
             Request::Inbox { clear } => {
-                let (entries, unread) = crate::inbox::list(&self.home);
+                let (entries, unread) = self.inbox_projection();
                 if clear {
-                    crate::inbox::mark_read(&self.home, now_secs());
+                    self.write_inbox_watermark(now_secs());
                 }
                 Response::Inbox { entries, unread }
             }
@@ -671,7 +671,7 @@ impl OrbitalDaemon {
     // ---- membership ceremonies (formatting mirrors the product adapters) -----
 
     fn space_recover(&self) -> Response {
-        use crate::replica::{SpaceRecovered, SpaceRecovery};
+        use mechanics::ceremony::{SpaceRecovered, SpaceRecovery};
         match self.mechanics.space_recover() {
             Ok(SpaceRecovery::Installed(SpaceRecovered { root, rekey_failed })) => {
                 let head = format!("recovered the space — root reset to {}", root.short());
@@ -864,6 +864,93 @@ impl OrbitalDaemon {
             }
             Err(e) => Response::err(format!("{e}")),
         }
+    }
+
+    /// The addressed-to-you inbox, derived as a PROJECTION over the committed
+    /// snapshot (plan 04: activity/inbox rebuild from query and are never a
+    /// second source of truth): recent events on issues assigned to this
+    /// actor, excluding this device's own edits, newest first. The read
+    /// watermark is a small local file; deleting it merely resets "unread".
+    fn inbox_projection(&self) -> (Vec<crate::dto::InboxEntry>, u64) {
+        use crate::world::contract::IssueQuery;
+        let me_actor = self.facts().actor;
+        let me_device = crate::crypto::device_from_seed(&self.device_seed)
+            .as_str()
+            .to_string();
+        let Some(rows) = self.session_query_json(IssueQuery::List {
+            project: None,
+            label: None,
+            status: None,
+            mine: Some(me_actor),
+            all: true,
+            me: None,
+        }) else {
+            return (Vec::new(), 0);
+        };
+        let watermark = self.read_inbox_watermark();
+        let mut entries: Vec<crate::dto::InboxEntry> = Vec::new();
+        for row in rows.as_array().map(|a| a.as_slice()).unwrap_or_default() {
+            let Some(doc) = row["doc_id"].as_str() else {
+                continue;
+            };
+            let title = row["title"].as_str().unwrap_or_default().to_string();
+            let reff = row["reff"].as_str().unwrap_or(doc).to_string();
+            let Some(events) = self.session_query_json(IssueQuery::History {
+                doc: doc.to_string(),
+            }) else {
+                continue;
+            };
+            for e in events.as_array().map(|a| a.as_slice()).unwrap_or_default() {
+                let kind = e["kind"].as_str().unwrap_or_default();
+                let mapped = match kind {
+                    "assigned" => "assigned",
+                    "comment" => "comment",
+                    "edited"
+                        if e["changes"].as_array().is_some_and(|c| {
+                            c.iter().any(|f| f["field"].as_str() == Some("status"))
+                        }) =>
+                    {
+                        "status"
+                    }
+                    "started" | "finished" | "stopped" => "status",
+                    _ => continue,
+                };
+                // Skip this device's own edits: an inbox is about what OTHERS
+                // did to your work.
+                if e["actor"].as_str() == Some(me_device.as_str()) {
+                    continue;
+                }
+                entries.push(crate::dto::InboxEntry {
+                    ts: e["ts"].as_u64().unwrap_or(0),
+                    kind: mapped.to_string(),
+                    reff: reff.clone(),
+                    doc_id: doc.to_string(),
+                    title: title.clone(),
+                    detail: e["text"].as_str().unwrap_or_default().to_string(),
+                    actor: e["actor"].as_str().map(String::from),
+                    actor_nick: None,
+                });
+            }
+        }
+        entries.sort_by(|a, b| b.ts.cmp(&a.ts));
+        entries.truncate(200);
+        let unread = entries.iter().filter(|e| e.ts > watermark).count() as u64;
+        (entries, unread)
+    }
+
+    fn inbox_watermark_path(&self) -> PathBuf {
+        self.home.join("inbox-read.json")
+    }
+
+    fn read_inbox_watermark(&self) -> u64 {
+        std::fs::read_to_string(self.inbox_watermark_path())
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    fn write_inbox_watermark(&self, ts: u64) {
+        let _ = std::fs::write(self.inbox_watermark_path(), ts.to_string());
     }
 
     /// Query the docked Session for a JSON projection (role/workflow views).

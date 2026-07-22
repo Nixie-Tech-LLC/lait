@@ -320,7 +320,7 @@ pub fn form_space_with_fault(
                 } else {
                     display_name.trim().to_string()
                 };
-                let key = crate::replica::derive_project_key(&name);
+                let key = crate::spaces::derive_project_key(&name);
                 (name, key)
             });
             let project_id = crate::ids::ProjectId::mint(&crate::ids::SystemUlidSource)
@@ -408,7 +408,7 @@ pub fn found_space_cli(
     } else {
         display_name.trim().to_string()
     };
-    let project_key = crate::replica::derive_project_key(&project_name);
+    let project_key = crate::spaces::derive_project_key(&project_name);
     let (mechanics, _coords) = form_space_with_fault(
         home,
         device_seed,
