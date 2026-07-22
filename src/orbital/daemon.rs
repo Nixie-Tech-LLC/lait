@@ -10,10 +10,12 @@
 //! v1; `Subscribe` streams the Station's `ObservationStream` as `Doorbell`
 //! frames.
 //!
-//! Ceremony requests (recovery, elevation, custody, device enrollment, reshare)
-//! are not yet driven on the orbital plane; the daemon answers them with a
-//! typed "not available on the orbital daemon yet" rather than silently
-//! mis-serving them — the honest cutover boundary until that surface is ported.
+//! Every control request has an explicit terminal owner (see
+//! `tests/control_classification.rs`): product intents/queries route to the
+//! World Session; membership, admission, device, key and the FROST
+//! recovery/elevation/custody ceremonies are served by [`OrbitalMechanics`]
+//! over the mechanics primitives; seeds, diagnose, inbox and log are node-local
+//! lifecycle concerns. There is no catch-all refusal.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -279,13 +281,123 @@ impl OrbitalDaemon {
             // truthful answer is an empty pending set (not a mis-served refusal).
             Request::MemberRequests => Response::JoinRequests { requests: vec![] },
 
-            // ---- not yet on the orbital plane (honest boundary) ----
-            other => Response::err(format!(
-                "'{}' is not yet available on the orbital daemon (membership \
-                 ceremonies, recovery, custody, and device enrollment are pending \
-                 their orbital port)",
-                request_name(&other)
-            )),
+            // ---- multi-device (lait/actor/1 device management) ----
+            Request::DeviceInvite => match self.mechanics.device_invite() {
+                Ok((actor, space)) => Response::Text {
+                    text: format!("{actor} {space}"),
+                },
+                Err(e) => Response::err(format!("{e}")),
+            },
+            Request::DeviceAdd { consent } => self.device_add(&consent),
+            Request::DeviceRevoke { device } => match self.mechanics.device_revoke(&device) {
+                Ok(true) => Response::Ok {
+                    message: Some(format!("revoked device {device} and rotated the key")),
+                },
+                Ok(false) => Response::Ok {
+                    message: Some(format!(
+                        "revoked device {device} from your identity — ask an admin to \
+                         rotate the space key to fence its access to existing content"
+                    )),
+                },
+                Err(e) => Response::err(format!("{e}")),
+            },
+            Request::DeviceList => Response::Text {
+                text: self.device_list_text(),
+            },
+            Request::Recover => match self.mechanics.recover() {
+                Ok(actor) => Response::Ok {
+                    message: Some(format!(
+                        "recovered actor {} — device set reset to this device; content \
+                         access re-seals once a peer syncs",
+                        actor.short()
+                    )),
+                },
+                Err(e) => Response::err(format!("{e}")),
+            },
+
+            // ---- admin control plane ----
+            Request::KeyRotate => match self.mechanics.key_rotate() {
+                Ok(gen) => Response::Ok {
+                    message: Some(format!("rotated the space key to generation {gen}")),
+                },
+                Err(e) => Response::err(format!("{e}")),
+            },
+            Request::InviteRevoke { invite } => match self.mechanics.invite_revoke(&invite) {
+                Ok(already_spent) => Response::Ok {
+                    message: Some(if already_spent {
+                        "revoked the invite — note it had already admitted at least one member; \
+                         revocation stops further admissions but does not remove them"
+                            .to_string()
+                    } else {
+                        "revoked the invite — it can no longer admit anyone".to_string()
+                    }),
+                },
+                Err(e) => Response::err(format!("{e}")),
+            },
+            Request::AgentAdd { key } => match self.mechanics.agent_add(&key) {
+                Ok(actor) => Response::Ok {
+                    message: Some(format!("sponsored agent {}", actor.short())),
+                },
+                Err(e) => Response::err(format!("{e}")),
+            },
+            // Removed by the M2 admission cutover: acceptance of an invite is
+            // the approval, redeemed automatically over Contact, so there is no
+            // pending-approval queue to act on. Kept answerable (not a
+            // catch-all refusal) until the surface is deleted in M5.
+            Request::MemberApprove { .. } => Response::err(
+                "there is no pending-approval queue — admission is automatic when a joiner \
+                 accepts an invite; use `invite` to admit someone and `members` to see who \
+                 is in",
+            ),
+            Request::MemberAlias { who, name } => self.set_alias(&who, &name),
+
+            // ---- daemon lifecycle (node-local reads/config) ----
+            // The orbital daemon has no legacy in-memory event ring — live
+            // clients observe the Station's doorbell stream (`Subscribe`)
+            // instead — so the polling log is empty by construction.
+            Request::Log { since } => Response::Events {
+                events: vec![],
+                last: since,
+            },
+            Request::Inbox { clear } => {
+                let (entries, unread) = crate::inbox::list(&self.home);
+                if clear {
+                    crate::inbox::mark_read(&self.home, now_secs());
+                }
+                Response::Inbox { entries, unread }
+            }
+            Request::Diagnose { expected_space } => self.diagnose(expected_space),
+            Request::SeedAdd { arg } => self.seed_add(arg.trim()),
+            Request::SeedList => self.seed_list(),
+            Request::SeedRemove { who } => self.seed_remove(who.trim()),
+
+            // ---- product activity feed (Session) ----
+            Request::Activity { .. } => self.route_issue(req),
+
+            // ---- membership ceremonies (over mechanics FROST primitives) ----
+            Request::SpaceRecover => self.space_recover(),
+            Request::SpaceRecoverApprove { session, expect } => {
+                self.space_recover_approve(session, expect)
+            }
+            Request::SpaceElevate { cofounders, k } => self.space_elevate(cofounders, k),
+            Request::SpaceElevateApprove { session, proposal } => {
+                self.space_elevate_approve(session, proposal)
+            }
+            Request::SpaceCustodyExport { path, passphrase } => {
+                self.space_custody_export(path, passphrase)
+            }
+            Request::SpaceCustodyImport {
+                path,
+                passphrase,
+                force,
+            } => self.space_custody_import(path, passphrase, force),
+
+            // Every control request has an explicit terminal owner above; the
+            // only variants that reach here are the product issue-family that
+            // `IssueRouter::handles` claims at the top of `dispatch`, so route
+            // them to the World Session (which returns its own typed error if
+            // it does not recognize one) — never a catch-all refusal.
+            other => self.route_issue(other),
         }
     }
 
@@ -348,14 +460,324 @@ impl OrbitalDaemon {
                 "pending".into()
             },
             pending_requests: 0,
-            degraded_recovery: vec![],
-            recovery: None,
+            degraded_recovery: self.mechanics.degraded_recovery(),
+            recovery: Some(self.mechanics.recovery_status()),
         }))
     }
 
     fn members(&self) -> Response {
         Response::Members {
             members: self.mechanics.members(),
+        }
+    }
+
+    /// Add a device to this actor from its hex-encoded consent blob (produced
+    /// by the joining machine's `device accept`).
+    fn device_add(&self, consent_hex: &str) -> Response {
+        let binding: crate::actor::DeviceBinding = match data_encoding::HEXLOWER_PERMISSIVE
+            .decode(consent_hex.trim().as_bytes())
+            .ok()
+            .and_then(|b| postcard::from_bytes(&b).ok())
+        {
+            Some(b) => b,
+            None => return Response::err("device consent blob did not decode"),
+        };
+        match self.mechanics.device_add(binding) {
+            Ok(device) => Response::Ok {
+                message: Some(format!("added device {}", device.short())),
+            },
+            Err(e) => Response::err(format!("{e}")),
+        }
+    }
+
+    /// This actor's device set, one per line, marking the active local device.
+    fn device_list_text(&self) -> String {
+        let me = crate::crypto::device_from_seed(&self.device_seed);
+        let devices = self.mechanics.device_list();
+        if devices.is_empty() {
+            return "no devices".to_string();
+        }
+        devices
+            .into_iter()
+            .map(|d| {
+                let tag = if d == me { " (this device)" } else { "" };
+                format!("{}{}", d.as_str(), tag)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Set (or clear, with an empty name) a local petname for a key. Local to
+    /// this node, never broadcast, never part of the signed authority.
+    fn set_alias(&self, who: &str, name: &str) -> Response {
+        match write_alias(&self.home, who, name) {
+            Ok(()) if name.trim().is_empty() => Response::Ok {
+                message: Some(format!("cleared the local name for {who}")),
+            },
+            Ok(()) => Response::Ok {
+                message: Some(format!("{who} is now locally known as {name}")),
+            },
+            Err(e) => Response::err(format!("set alias: {e}")),
+        }
+    }
+
+    /// The guided-join verifier: project live daemon state into the ordered
+    /// onboarding gate list (`docs/UI.md`). Pure over the snapshot the daemon
+    /// already computes — the same core the legacy node used.
+    fn diagnose(&self, expected_space: Option<String>) -> Response {
+        let (issues, projects) = self.counts();
+        let space = self.station.space_id().as_str().to_string();
+        let membership = if self.mechanics.am_i_member() {
+            "member"
+        } else {
+            "pending"
+        };
+        let degraded = self.mechanics.degraded_recovery();
+        let recovery = self.mechanics.recovery_status();
+        let view = crate::diagnose::diagnose(crate::diagnose::DiagnoseInput {
+            space: Some(space.as_str()),
+            name: "",
+            membership,
+            online_peers: self.station.neighbors().len(),
+            projects,
+            issues,
+            expected_space: expected_space.as_deref(),
+            degraded_recovery: &degraded,
+            rekey_pending: None,
+            local_custody: Some(&recovery.local_custody),
+        });
+        Response::Diagnosis(Box::new(view))
+    }
+
+    /// Pin a bootstrap seed by device id (or an orbital Coordinates link's
+    /// approach Station) into the node-local registry.
+    fn seed_add(&self, arg: &str) -> Response {
+        let (id, space) = match crate::ids::DeviceId::parse(arg.trim()) {
+            Some(id) => (id, String::new()),
+            None => match runtime::SignedCoordinatesV1::parse_link(arg.trim())
+                .ok()
+                .and_then(|c| c.verify().ok())
+            {
+                Some(v) => (v.approach_station.clone(), v.space.as_str().to_string()),
+                None => return Response::err("expected a device id or a Coordinates link to pin"),
+            },
+        };
+        let newly = upsert_seed(
+            &self.home,
+            SeedRecord {
+                id: id.clone(),
+                nick: String::new(),
+                space,
+            },
+        );
+        Response::Ok {
+            message: Some(if newly {
+                format!("pinned seed {}", id.as_str())
+            } else {
+                format!("seed {} was already pinned (refreshed)", id.as_str())
+            }),
+        }
+    }
+
+    /// The pinned seed registry with live reachability from the Station's
+    /// current neighbor set.
+    fn seed_list(&self) -> Response {
+        let online: std::collections::BTreeSet<[u8; 32]> = self
+            .station
+            .neighbors()
+            .iter()
+            .map(|n| n.station.key_bytes())
+            .collect();
+        let seeds = load_seeds(&self.home)
+            .into_iter()
+            .map(|s| {
+                // A seed is pinned by device id; a Neighbor is a Station id —
+                // both are the same 32-byte key, so reachability compares those.
+                let is_online =
+                    s.id.key_bytes()
+                        .map(|k| online.contains(&k))
+                        .unwrap_or(false);
+                crate::dto::SeedDto {
+                    id: s.id.as_str().to_string(),
+                    nick: s.nick,
+                    space: s.space,
+                    state: if is_online { "online" } else { "offline" }.to_string(),
+                    online: is_online,
+                }
+            })
+            .collect();
+        Response::Seeds { seeds }
+    }
+
+    /// Unpin seeds matching a full id, id-prefix, or nick.
+    fn seed_remove(&self, needle: &str) -> Response {
+        match remove_seed(&self.home, needle) {
+            0 => Response::err("no pinned seed matched that id/nick"),
+            n => Response::Ok {
+                message: Some(format!("unpinned {n} seed(s)")),
+            },
+        }
+    }
+
+    // ---- membership ceremonies (formatting mirrors the product adapters) -----
+
+    fn space_recover(&self) -> Response {
+        use crate::replica::{SpaceRecovered, SpaceRecovery};
+        match self.mechanics.space_recover() {
+            Ok(SpaceRecovery::Installed(SpaceRecovered { root, rekey_failed })) => {
+                let head = format!("recovered the space — root reset to {}", root.short());
+                Response::Ok {
+                    message: Some(match rekey_failed {
+                        None => format!("{head} and re-keyed"),
+                        Some(e) => format!(
+                            "{head}, but re-keying failed ({e:#}) — the space is still readable \
+                             under the old key until an admin rotates it"
+                        ),
+                    }),
+                }
+            }
+            Ok(SpaceRecovery::Pending {
+                session,
+                incomplete,
+            }) => {
+                let hex = session.to_hex();
+                let head = format!(
+                    "group recovery under way (session {hex}) — each other holder must approve \
+                     it with `space recover-approve {hex}` until the threshold co-signs"
+                );
+                Response::Ok {
+                    message: Some(match incomplete {
+                        None => head,
+                        Some(e) => format!(
+                            "{head}. This device could not add its own share ({e:#}); the request \
+                             stands and the other holders can still complete it"
+                        ),
+                    }),
+                }
+            }
+            Err(e) => Response::err(format!("{e}")),
+        }
+    }
+
+    fn space_recover_approve(&self, session: String, expect: Vec<String>) -> Response {
+        match self.mechanics.space_recover_approve(session, expect) {
+            Ok(a) => {
+                let roots = a
+                    .roots
+                    .iter()
+                    .map(|r| r.short())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Response::Ok {
+                    message: Some(match a.incomplete {
+                        None => format!(
+                            "co-signed the recovery re-rooting the space to {roots} — it installs \
+                             once the threshold has co-signed"
+                        ),
+                        Some(e) => format!(
+                            "co-signed the recovery re-rooting the space to {roots}, and that \
+                             completed the threshold — but re-keying failed ({e:#}), so the space \
+                             is still readable under the old key until an admin rotates it"
+                        ),
+                    }),
+                }
+            }
+            Err(e) => Response::err(format!("{e}")),
+        }
+    }
+
+    fn space_elevate(&self, cofounders: Vec<String>, k: u16) -> Response {
+        match self.mechanics.space_elevate(cofounders, k) {
+            Ok(e) => {
+                let message = match (e.grant_request, e.incomplete) {
+                    (_, Some(why)) => format!(
+                        "proposed a {}-of-{} recovery arrangement (proposal {}) — but this device \
+                         could not carry it further ({why:#}); the proposal stands and can still \
+                         be authorized",
+                        e.k,
+                        e.n,
+                        e.proposal.to_hex()
+                    ),
+                    (None, None) => format!(
+                        "started {}-of-{} recovery elevation — the DKG completes automatically as \
+                         the co-founders' nodes sync; the group key installs once every share is in",
+                        e.k, e.n
+                    ),
+                    (Some(signing), None) => format!(
+                        "proposed a {}-of-{} recovery arrangement (proposal {}) — the current \
+                         group must authorize it: each holder runs `space elevate-approve {} \
+                         --proposal {}`",
+                        e.k,
+                        e.n,
+                        e.proposal.to_hex(),
+                        signing.to_hex(),
+                        e.proposal.to_hex(),
+                    ),
+                };
+                Response::Ok {
+                    message: Some(message),
+                }
+            }
+            Err(e) => Response::err(format!("{e}")),
+        }
+    }
+
+    fn space_elevate_approve(&self, session: String, proposal: String) -> Response {
+        match self.mechanics.space_elevate_approve(session, proposal) {
+            Ok(a) => Response::Ok {
+                message: Some(format!(
+                    "co-signed the authorization for a {}-of-{} arrangement — it takes effect \
+                     once the threshold has signed",
+                    a.k, a.n
+                )),
+            },
+            Err(e) => Response::err(format!("{e}")),
+        }
+    }
+
+    fn space_custody_export(&self, path: String, passphrase: String) -> Response {
+        match self.mechanics.space_custody_export(path, passphrase) {
+            Ok(e) => {
+                let note = if !e.indispensable {
+                    "this arrangement tolerates a lost holder, so no attestation is required to \
+                     install it"
+                        .to_string()
+                } else if e.outstanding == 0 {
+                    "every custodian has attested — the arrangement can now install".to_string()
+                } else {
+                    format!("still waiting on {} custodian(s)", e.outstanding)
+                };
+                Response::Ok {
+                    message: Some(format!(
+                        "exported and verified your share package to {} — {note}. Keep it \
+                         somewhere the passphrase alone cannot be found.",
+                        e.path
+                    )),
+                }
+            }
+            Err(e) => Response::err(format!("{e}")),
+        }
+    }
+
+    fn space_custody_import(&self, path: String, passphrase: String, force: bool) -> Response {
+        match self.mechanics.space_custody_import(path, passphrase, force) {
+            Ok(i) => {
+                let head = format!(
+                    "restored and verified your share for ceremony {} — this device can take part \
+                     in recovery again",
+                    i.ceremony.to_hex()
+                );
+                Response::Ok {
+                    message: Some(match i.incomplete {
+                        None => head,
+                        Some(e) => format!(
+                            "{head}. The ceremony did not advance here ({e:#}); it will retry on \
+                             the next sync"
+                        ),
+                    }),
+                }
+            }
+            Err(e) => Response::err(format!("{e}")),
         }
     }
 
@@ -630,11 +1052,87 @@ async fn write_line_half<T: serde::Serialize>(
     write_half.flush().await
 }
 
-fn request_name(req: &Request) -> String {
-    serde_json::to_value(req)
+/// One pinned bootstrap seed — a deliberately-placed anchor a cold client
+/// converges through. The id is the identity; nick/space are advisory.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SeedRecord {
+    id: crate::ids::DeviceId,
+    #[serde(default)]
+    nick: String,
+    #[serde(default)]
+    space: String,
+}
+
+fn seeds_path(home: &Path) -> PathBuf {
+    home.join("seeds.json")
+}
+
+/// Load the pinned seed registry, dropping (at warn) any record whose id is not
+/// a device key so one bad row never unpins the rest.
+fn load_seeds(home: &Path) -> Vec<SeedRecord> {
+    let Ok(data) = std::fs::read_to_string(seeds_path(home)) else {
+        return Vec::new();
+    };
+    let rows: Vec<SeedRecord> = serde_json::from_str(&data).unwrap_or_default();
+    rows.into_iter()
+        .filter(|r| crate::ids::DeviceId::parse(r.id.as_str()).is_some())
+        .collect()
+}
+
+fn save_seeds(home: &Path, seeds: &[SeedRecord]) {
+    if let Ok(data) = serde_json::to_string_pretty(seeds) {
+        let _ = std::fs::write(seeds_path(home), data);
+    }
+}
+
+/// Upsert a seed keyed by id (nick/space refresh in place). Returns whether it
+/// was newly pinned.
+fn upsert_seed(home: &Path, rec: SeedRecord) -> bool {
+    let mut seeds = load_seeds(home);
+    if let Some(existing) = seeds.iter_mut().find(|s| s.id == rec.id) {
+        existing.nick = rec.nick;
+        existing.space = rec.space;
+        save_seeds(home, &seeds);
+        false
+    } else {
+        seeds.push(rec);
+        save_seeds(home, &seeds);
+        true
+    }
+}
+
+/// Unpin seeds matching a full id, a ≥6-char id prefix, or a nick. Returns the
+/// count removed.
+fn remove_seed(home: &Path, needle: &str) -> usize {
+    let mut seeds = load_seeds(home);
+    let before = seeds.len();
+    seeds.retain(|s| {
+        let id = s.id.as_str();
+        !(id == needle || (needle.len() >= 6 && id.starts_with(needle)) || s.nick == needle)
+    });
+    let removed = before - seeds.len();
+    if removed > 0 {
+        save_seeds(home, &seeds);
+    }
+    removed
+}
+
+/// Set or clear a **local** petname for a key in `aliases.json` beside the
+/// home. Local to this node, never synced; an empty `name` clears the entry.
+fn write_alias(home: &Path, who: &str, name: &str) -> Result<()> {
+    let path = home.join("aliases.json");
+    let mut map: std::collections::BTreeMap<String, String> = std::fs::read(&path)
         .ok()
-        .and_then(|v| v.get("cmd").and_then(|c| c.as_str()).map(String::from))
-        .unwrap_or_else(|| "request".into())
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let who = who.trim().to_string();
+    if name.trim().is_empty() {
+        map.remove(&who);
+    } else {
+        map.insert(who, name.trim().to_string());
+    }
+    std::fs::write(&path, serde_json::to_vec_pretty(&map)?)?;
+    Ok(())
 }
 
 /// Run the orbital daemon on `home` with the default transport, holding the

@@ -127,8 +127,17 @@ impl LedgerEffect {
         match self {
             LedgerEffect::Actor(n) => n.verify_sig(actor::ACTOR_DOMAIN, space.as_str()),
             LedgerEffect::Acl(n) => n.verify_sig(acl::ACL_DOMAIN, space.as_str()),
+            // A ceremony effect is either a terminal space event (Recover /
+            // Rotate, `SPACE_EVENT_DOMAIN`) or a FROST ceremony-board node
+            // (propose / authorize / round / sign, `CEREMONY_DOMAIN`). Both
+            // ride this variant so the whole ceremony transcript replicates and
+            // replays from the one effect history; `parse_board` re-verifies
+            // each node under `CEREMONY_DOMAIN` and `space::replay` under
+            // `SPACE_EVENT_DOMAIN`, so a node lands where its own domain admits
+            // it and nowhere else.
             LedgerEffect::Ceremony(n) => {
                 n.verify_sig(crate::space::SPACE_EVENT_DOMAIN, space.as_str())
+                    || n.verify_sig(crate::dkg::CEREMONY_DOMAIN, space.as_str())
             }
         }
     }

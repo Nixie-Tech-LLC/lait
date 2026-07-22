@@ -50,6 +50,50 @@ const PENDING_PROOF_FILE: &str = "mech-pending-proof.bin";
 const COORDINATES_FILE: &str = "mech-coordinates.bin";
 /// The authority ledger's journal root, under the Space's mechanics dir.
 const LEDGER_DIR: &str = "authority";
+/// The founder's offline **actor** recovery seed (hex), escrowed at formation
+/// so a fresh device can reset this actor's device set.
+const RECOVERY_KEY_FILE: &str = "recovery.key";
+/// The founder's offline **space** break-glass recovery secret (hex), the solo
+/// authority material an elevation converts into a threshold group key.
+const SPACE_RECOVERY_KEY_FILE: &str = "space-recovery.key";
+
+/// Extract an invite nonce from either an orbital Coordinates link (its
+/// embedded admission capability) or a raw 32-hex string.
+fn parse_invite_nonce(input: &str) -> Option<[u8; 16]> {
+    let s = input.trim();
+    if let Ok(coords) = runtime::SignedCoordinatesV1::parse_link(s) {
+        if let runtime::coordinates::CoordinatesAdmission::Some(cap) = &coords.payload.admission {
+            return Some(cap.nonce);
+        }
+    }
+    let raw = data_encoding::HEXLOWER_PERMISSIVE
+        .decode(s.as_bytes())
+        .ok()?;
+    raw.as_slice().try_into().ok()
+}
+
+/// Read a hex-encoded 32-byte secret written by [`persist_hex_key`].
+fn read_hex_key(path: &Path) -> Option<[u8; 32]> {
+    let bytes = crate::secretfs::read_private(path).ok().flatten()?;
+    let hex = String::from_utf8(bytes).ok()?;
+    let raw = data_encoding::HEXLOWER_PERMISSIVE
+        .decode(hex.trim().as_bytes())
+        .ok()?;
+    raw.as_slice().try_into().ok()
+}
+
+/// Escrow a 32-byte secret as owner-only, portable hex — never world-readable
+/// even briefly (create-new; a pre-existing file is left untouched).
+fn persist_hex_key(dir: &Path, file: &str, secret: &[u8; 32]) -> Result<()> {
+    crate::secretfs::create_private_dir(dir)?;
+    let hex = data_encoding::HEXLOWER.encode(secret);
+    crate::secretfs::write_private(
+        &dir.join(file),
+        hex.as_bytes(),
+        crate::secretfs::Create::New,
+        crate::secretfs::Wrap::Portable,
+    )
+}
 
 /// One authority-record unit riding Contact's authority section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,13 +128,13 @@ impl AuthorityRecord {
     }
 }
 
-struct Inner {
-    space: SpaceId,
-    ledger: AuthorityLedger,
-    seed: [u8; 32],
-    me: DeviceId,
-    keyring: BTreeMap<[u8; 16], SpaceKey>,
-    dir: PathBuf,
+pub(super) struct Inner {
+    pub(super) space: SpaceId,
+    pub(super) ledger: AuthorityLedger,
+    pub(super) seed: [u8; 32],
+    pub(super) me: DeviceId,
+    pub(super) keyring: BTreeMap<[u8; 16], SpaceKey>,
+    pub(super) dir: PathBuf,
     /// A joiner's own admission, served until standing is established.
     pending_admission: Option<AdmissionCapabilityV1>,
     /// A joiner's self-inception, held out of the replicated set until an
@@ -102,15 +146,15 @@ struct Inner {
 }
 
 impl Inner {
-    fn acl(&mut self) -> AclState {
+    pub(super) fn acl(&mut self) -> AclState {
         self.ledger.acl_state().unwrap_or_default()
     }
 
-    fn actor_plane(&self) -> actor::ActorPlane {
+    pub(super) fn actor_plane(&self) -> actor::ActorPlane {
         self.ledger.actor_plane()
     }
 
-    fn my_actor(&self) -> Option<ActorId> {
+    pub(super) fn my_actor(&self) -> Option<ActorId> {
         self.actor_plane().actor_of_device(&self.me).cloned()
     }
 
@@ -120,7 +164,7 @@ impl Inner {
 
     /// Unseal every authorized epoch key addressed to this device, bound to
     /// the signed mint's commitment.
-    fn refresh_keyring(&mut self) {
+    pub(super) fn refresh_keyring(&mut self) {
         for e in self.acl().epochs() {
             if self.keyring.contains_key(&e.id) {
                 continue;
@@ -137,8 +181,16 @@ impl Inner {
         }
     }
 
+    /// Whether this device's actor currently holds admin standing.
+    pub(super) fn am_i_admin(&mut self) -> bool {
+        match self.my_actor() {
+            Some(me) => self.acl().is_admin(&me),
+            None => false,
+        }
+    }
+
     /// The deterministic active epoch: highest authorized `(gen, id)`.
-    fn active_epoch(&mut self) -> Option<acl::EpochAuth> {
+    pub(super) fn active_epoch(&mut self) -> Option<acl::EpochAuth> {
         self.acl()
             .epochs()
             .into_iter()
@@ -147,7 +199,7 @@ impl Inner {
 
     /// The sealed records distributing every held epoch key to every device of
     /// `actor` (for batching with the authority effect that admits them).
-    fn seal_records_for_actor(&mut self, target: &ActorId) -> Vec<Vec<u8>> {
+    pub(super) fn seal_records_for_actor(&mut self, target: &ActorId) -> Vec<Vec<u8>> {
         let devices = self.actor_plane().devices_of(target);
         let mut out = Vec::new();
         for (epoch, key) in self.keyring.iter() {
@@ -172,7 +224,7 @@ impl Inner {
 
     /// Author one signed ACL op as this device's actor and commit it — with
     /// any accompanying effects and sealed records — as one atomic batch.
-    fn author(
+    pub(super) fn author(
         &mut self,
         action: AclAction,
         nonce: Option<[u8; 16]>,
@@ -199,6 +251,98 @@ impl Inner {
             .commit_batch(&effects, &sealed_records)
             .map_err(|e| anyhow!("authority commit: {e}"))?;
         Ok(())
+    }
+
+    /// Append one signed ceremony/space event to the authority history as a
+    /// [`LedgerEffect::Ceremony`] — the orbital replacement for the legacy
+    /// `membership.add_ceremony_event` + `persist_membership`. Idempotent (the
+    /// ledger dedups by node hash), so replaying the same board node is a
+    /// no-op, and the node replicates to peers as an ordinary authority record.
+    pub(super) fn commit_ceremony(&mut self, ev: crate::space::SignedSpaceEvent) -> Result<()> {
+        self.ledger
+            .commit_batch(&[LedgerEffect::Ceremony(ev).encode()], &[])
+            .map_err(|e| anyhow!("ceremony commit: {e}"))?;
+        Ok(())
+    }
+
+    /// Resolve an actor by its actor id or by one of its device keys — the
+    /// orbital form of the legacy `resolve_actor`, used to interpret the
+    /// `--to` roots a recovery approver names.
+    pub(super) fn resolve_actor(&self, who: &str) -> Option<ActorId> {
+        let who = who.trim();
+        if let Some(actor) = ActorId::parse(who) {
+            if self.actor_plane().exists(&actor) {
+                return Some(actor);
+            }
+        }
+        if let Some(device) = DeviceId::parse(who) {
+            if let Some(actor) = self.actor_plane().actor_of_device(&device) {
+                return Some(actor.clone());
+            }
+        }
+        None
+    }
+
+    /// Mint a fresh key epoch (gen = active + 1) for the current member set,
+    /// sealed to every current member's devices, and adopt it locally. The
+    /// content-key fence: a departed device holds no envelope for the new
+    /// epoch, so it cannot read anything sealed under it. Requires this device
+    /// to hold the active key (so it can carry the plaintext into the new
+    /// envelopes) and admin standing (mint authorization).
+    pub(super) fn rotate_key(&mut self) -> Result<()> {
+        self.refresh_keyring();
+        let me = self
+            .my_actor()
+            .ok_or_else(|| anyhow!("no actor identity"))?;
+        let next_gen = self.active_epoch().map(|e| e.gen + 1).unwrap_or(0);
+        let id = super::rand16();
+        let key = crypto::random_key();
+        let key_commit = *blake3::hash(&key).as_bytes();
+        let members: Vec<ActorId> = self.acl().members().into_iter().map(|(a, _)| a).collect();
+        // Seal the fresh key to every current member device before the mint
+        // lands, so the batch that authorizes the epoch also distributes it.
+        let mut sealed_records = Vec::new();
+        for actor in &members {
+            for d in self.actor_plane().devices_of(actor) {
+                if let Some(sealed) = crypto::seal_to(&d, &key) {
+                    sealed_records.push(
+                        SealedKeyRecord {
+                            epoch: id,
+                            device: d,
+                            sealed,
+                        }
+                        .encode(),
+                    );
+                }
+            }
+        }
+        self.author(
+            AclAction::MintEpoch {
+                id,
+                gen: next_gen,
+                key_commit,
+                members,
+            },
+            None,
+            vec![],
+            sealed_records,
+        )?;
+        let _ = me;
+        self.keyring.insert(id, key);
+        Ok(())
+    }
+
+    /// This device's offline **actor** recovery seed, if it was escrowed here
+    /// at formation (`recovery.key`). Resets the actor's device set on recover.
+    pub(super) fn read_recovery_key(&self) -> Option<[u8; 32]> {
+        read_hex_key(&self.dir.join(RECOVERY_KEY_FILE))
+    }
+
+    /// This device's offline **space** break-glass recovery secret, if it holds
+    /// the solo authority (`space-recovery.key`). `None` once the space has been
+    /// elevated to a threshold group key.
+    pub(super) fn read_space_recovery_key(&self) -> Option<[u8; 32]> {
+        read_hex_key(&self.dir.join(SPACE_RECOVERY_KEY_FILE))
     }
 
     /// The admin-side admission redemption: validate the capability, the
@@ -398,7 +542,7 @@ pub struct OrbitalMechanics {
 }
 
 impl OrbitalMechanics {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+    pub(super) fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
 
@@ -419,14 +563,14 @@ impl OrbitalMechanics {
     ) -> Result<(Self, runtime::SignedCoordinatesV1)> {
         let me = crypto::device_from_seed(device_seed);
         let salt = super::rand16();
-        let (recovery_pub, _recovery_secret) = crate::space::mint_recovery_key();
+        let (recovery_pub, space_recovery_secret) = crate::space::mint_recovery_key();
         let recovery_root =
             crate::space::recovery_commit(&recovery_pub).ok_or_else(|| anyhow!("recovery key"))?;
         let space = crate::space::derive_space_id(&me, &salt, &recovery_root);
         let dir = Self::dir_for(root, &space);
         std::fs::create_dir_all(&dir)?;
 
-        let (recovery_commit, _recovery_seed) = {
+        let (recovery_commit, actor_recovery_seed) = {
             let mut seed = [0u8; 32];
             getrandom::fill(&mut seed).expect("getrandom");
             let public = crypto::device_from_seed(&seed);
@@ -435,6 +579,13 @@ impl OrbitalMechanics {
                 seed,
             )
         };
+        // Escrow both offline recovery secrets on the founder before anything
+        // else: the space break-glass authority (solo, elevatable to a
+        // threshold group) and the actor's device-reset key. Discarding either
+        // would strand `space elevate`/`space recover` and `recover` with no
+        // authority material to run from.
+        persist_hex_key(&dir, SPACE_RECOVERY_KEY_FILE, &space_recovery_secret)?;
+        persist_hex_key(&dir, RECOVERY_KEY_FILE, &actor_recovery_seed)?;
         let (inception, actor_id) = actor::incept_single(
             device_seed,
             &space,
@@ -868,6 +1019,246 @@ impl OrbitalMechanics {
         }
         inner.author(AclAction::RemoveMember { actor }, None, vec![], vec![])?;
         Ok(())
+    }
+
+    // ---- device management (M3): signed actor-plane authority actions -------
+
+    /// The device keys currently bound to this device's actor.
+    pub fn device_list(&self) -> Vec<DeviceId> {
+        let inner = self.lock();
+        match inner.my_actor() {
+            Some(actor) => inner.actor_plane().devices_of(&actor),
+            None => Vec::new(),
+        }
+    }
+
+    /// Produce this device's consent to join `actor` — the material a new
+    /// device hands to an existing device's `device_add` (the accept side).
+    pub fn device_accept_consent(&self, actor_str: &str) -> Result<actor::DeviceBinding> {
+        let inner = self.lock();
+        let actor = ActorId::parse(actor_str).ok_or_else(|| anyhow!("invalid actor id"))?;
+        let nonce = super::rand16();
+        Ok(actor::consent_sign(
+            &inner.seed,
+            inner.space.as_str(),
+            nonce,
+            &actor::ConsentCtx::Member { actor: &actor },
+        ))
+    }
+
+    /// Add a device to this device's actor from its consent binding, and seal
+    /// it every held epoch key — a signed `AddDevice` actor event plus the
+    /// sealed-key records in one atomic authority batch.
+    pub fn device_add(&self, binding: actor::DeviceBinding) -> Result<DeviceId> {
+        let mut inner = self.lock();
+        let me = inner
+            .my_actor()
+            .ok_or_else(|| anyhow!("no actor identity"))?;
+        // Verify the consent binds to joining OUR actor before authoring.
+        if !actor::consent_verify(
+            inner.space.as_str(),
+            &binding,
+            &actor::ConsentCtx::Member { actor: &me },
+        ) {
+            return Err(anyhow!("device consent does not bind to this actor"));
+        }
+        let device = binding.device.clone();
+        let event = actor::sign_event(
+            &inner.seed,
+            &actor::ActorOp::AddDevice {
+                actor: me.clone(),
+                binding,
+            },
+            inner.ledger.actor_heads(&me),
+            &inner.space,
+        );
+        // Seal every held epoch key to the new device in the same batch.
+        let mut sealed_records = Vec::new();
+        for (epoch, key) in inner.keyring.iter() {
+            if let Some(sealed) = crypto::seal_to(&device, key) {
+                sealed_records.push(
+                    SealedKeyRecord {
+                        epoch: *epoch,
+                        device: device.clone(),
+                        sealed,
+                    }
+                    .encode(),
+                );
+            }
+        }
+        inner
+            .ledger
+            .commit_batch(&[LedgerEffect::Actor(event).encode()], &sealed_records)
+            .map_err(|e| anyhow!("device add: {e}"))?;
+        Ok(device)
+    }
+
+    /// Revoke a device from this device's actor — a signed `RevokeDevice`
+    /// actor event. Revocation immediately prevents that device from
+    /// authoring new commits (historical transactions remain valid at their
+    /// historical frontiers).
+    ///
+    /// De-listing the device is self-authored and always applies; **fencing**
+    /// it from existing content needs a key rotation only an admin may mint. An
+    /// admin rotates in the same call (re-sealing the fresh epoch to remaining
+    /// devices only); a non-admin de-lists and the returned `rotated == false`
+    /// tells the caller re-keying is still pending an admin. Returns whether
+    /// the key was rotated.
+    pub fn device_revoke(&self, device_str: &str) -> Result<bool> {
+        let mut inner = self.lock();
+        let me = inner
+            .my_actor()
+            .ok_or_else(|| anyhow!("no actor identity"))?;
+        let device = DeviceId::parse(device_str).ok_or_else(|| anyhow!("invalid device id"))?;
+        let devices = inner.actor_plane().devices_of(&me);
+        if !devices.contains(&device) {
+            return Err(anyhow!("that device is not bound to this actor"));
+        }
+        if devices.len() <= 1 {
+            return Err(anyhow!("refusing to revoke your only device"));
+        }
+        let event = actor::sign_event(
+            &inner.seed,
+            &actor::ActorOp::RevokeDevice {
+                actor: me.clone(),
+                device,
+            },
+            inner.ledger.actor_heads(&me),
+            &inner.space,
+        );
+        inner
+            .ledger
+            .commit_batch(&[LedgerEffect::Actor(event).encode()], &[])
+            .map_err(|e| anyhow!("device revoke: {e}"))?;
+        let rotated = inner.acl().is_admin(&me);
+        if rotated {
+            inner.rotate_key()?;
+        }
+        Ok(rotated)
+    }
+
+    /// A device-enrollment token for adding another device to *this* actor:
+    /// the actor id and Space id the new machine needs to produce its consent
+    /// blob (via [`Self::device_accept_consent`]). Refuses when this device
+    /// holds no actor identity in the Space.
+    pub fn device_invite(&self) -> Result<(ActorId, SpaceId)> {
+        let inner = self.lock();
+        match inner.my_actor() {
+            Some(actor) => Ok((actor, inner.space.clone())),
+            None => Err(anyhow!("no actor identity in this space")),
+        }
+    }
+
+    /// Recover this device's actor with the offline actor recovery key
+    /// (`recovery.key`): reset the actor's device set to *this* device. Lazy by
+    /// design — identity/standing is restored immediately; this device holds no
+    /// content key until an admin or surviving peer re-seals it. Returns the
+    /// recovered actor id.
+    pub fn recover(&self) -> Result<ActorId> {
+        let mut inner = self.lock();
+        let seed = inner
+            .read_recovery_key()
+            .ok_or_else(|| anyhow!("no actor recovery key on this device"))?;
+        let recovery_pub = crypto::device_from_seed(&seed);
+        let commit = actor::recovery_commitment(&recovery_pub);
+        let plane = inner.actor_plane();
+        let actor = plane
+            .actors()
+            .find(|(_, st)| commit.is_some() && st.recovery_commit == commit)
+            .map(|(id, _)| id.clone())
+            .ok_or_else(|| anyhow!("no actor on this space matches the recovery key"))?;
+        let binding = actor::consent_sign(
+            &inner.seed,
+            inner.space.as_str(),
+            super::rand16(),
+            &actor::ConsentCtx::Member { actor: &actor },
+        );
+        let ev = actor::sign_event(
+            &seed,
+            &actor::ActorOp::Recover {
+                actor: actor.clone(),
+                devices: vec![binding],
+                next_commit: None,
+            },
+            inner.ledger.actor_heads(&actor),
+            &inner.space,
+        );
+        // Validate the recovery took (commitment match) before persisting.
+        let mut candidate = inner.ledger.actor_events();
+        candidate.push(ev.clone());
+        let recovered = actor::replay(&inner.space, &candidate)
+            .state(&actor)
+            .map(|s| s.recovered)
+            .unwrap_or(false);
+        if !recovered {
+            return Err(anyhow!(
+                "recovery key does not match the actor's commitment"
+            ));
+        }
+        inner
+            .ledger
+            .commit_batch(&[LedgerEffect::Actor(ev).encode()], &[])
+            .map_err(|e| anyhow!("actor recover: {e}"))?;
+        Ok(actor)
+    }
+
+    // ---- admin control plane (key rotation, invites, agents) ----------------
+
+    /// Rotate the space content key (admin-only), fencing any de-listed device
+    /// from future content. Returns the new active epoch generation.
+    pub fn key_rotate(&self) -> Result<u64> {
+        let mut inner = self.lock();
+        if !inner.am_i_admin() {
+            return Err(anyhow!("only an admin may rotate the space key"));
+        }
+        inner.rotate_key()?;
+        Ok(inner.active_epoch().map(|e| u64::from(e.gen)).unwrap_or(0))
+    }
+
+    /// Revoke an outstanding invite (admin-only) by its raw 32-hex nonce or an
+    /// orbital Coordinates link carrying the admission. Authors a signed
+    /// [`AclAction::RevokeInvite`]; once it syncs no admin admits via that
+    /// nonce. Returns whether the invite had already admitted someone.
+    pub fn invite_revoke(&self, invite: &str) -> Result<bool> {
+        let mut inner = self.lock();
+        if !inner.am_i_admin() {
+            return Err(anyhow!("only an admin may revoke an invite"));
+        }
+        let nonce = parse_invite_nonce(invite)
+            .ok_or_else(|| anyhow!("not an invite nonce or Coordinates link"))?;
+        let already_spent = inner.acl().is_nonce_spent(&nonce);
+        inner.author(AclAction::RevokeInvite { nonce }, None, vec![], vec![])?;
+        Ok(already_spent)
+    }
+
+    /// Sponsor an agent by its device key (any human member may sponsor). The
+    /// agent's inception must already be known locally (it self-incepts on
+    /// join); this authors a signed `AddAgent` and seals it every held epoch.
+    /// Returns the sponsored agent's actor id.
+    pub fn agent_add(&self, key: &str) -> Result<ActorId> {
+        let mut inner = self.lock();
+        let me = inner
+            .my_actor()
+            .ok_or_else(|| anyhow!("no actor identity"))?;
+        if !inner.acl().is_human_member(&me) {
+            return Err(anyhow!("only a human member may sponsor an agent"));
+        }
+        let agent = inner
+            .resolve_actor(key)
+            .ok_or_else(|| anyhow!("that agent's identity is not known locally yet"))?;
+        if inner.acl().is_member(&agent) {
+            return Err(anyhow!("{} is already a principal", agent.short()));
+        }
+        let sealed = inner.seal_records_for_actor(&agent);
+        inner.author(
+            AclAction::AddAgent {
+                actor: agent.clone(),
+            },
+            None,
+            vec![],
+            sealed,
+        )?;
+        Ok(agent)
     }
 
     /// The authority records this Station serves in a Contact (the export

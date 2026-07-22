@@ -116,6 +116,7 @@ pub fn open_orbital_runtime(
     ))
 }
 
+pub mod ceremony;
 pub mod daemon;
 pub mod mechanics;
 

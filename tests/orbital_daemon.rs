@@ -273,10 +273,12 @@ fn the_orbital_daemon_serves_the_issue_surface_over_the_control_socket() {
     // It parses back as Coordinates v1.
     assert!(runtime::SignedCoordinatesV1::parse_link(&link).is_ok());
 
-    // A ceremony request is honestly refused (typed), not mis-served.
+    // A ceremony request is served by mechanics, not refused: the founder
+    // holds the solo space-recovery key, so break-glass recovery re-roots the
+    // space to it and re-keys (M3 — no catch-all "not yet available").
     let resp = req(&client_rt, &home, Request::SpaceRecover);
     assert!(
-        matches!(resp, Response::Error { ref message, .. } if message.contains("orbital daemon")),
+        matches!(resp, Response::Ok { ref message } if message.as_deref().unwrap_or_default().contains("recovered the space")),
         "{resp:?}"
     );
 
