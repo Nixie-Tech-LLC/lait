@@ -1366,9 +1366,7 @@ pub fn reshare_finalize(
     if my_index == 0 || my_index > new_n {
         return Err(anyhow!("new participant index out of range"));
     }
-    if qualified.is_empty()
-        || qualified.windows(2).any(|w| w[0] >= w[1])
-        || qualified.iter().any(|&i| i == 0)
+    if qualified.is_empty() || qualified.windows(2).any(|w| w[0] >= w[1]) || qualified.contains(&0)
     {
         return Err(anyhow!("qualified set must be sorted, unique and 1-based"));
     }
