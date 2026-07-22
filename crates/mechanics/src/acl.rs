@@ -591,6 +591,22 @@ impl AclState {
             })
     }
 
+    /// Whether `a` may grant `(capability, resource)` to another actor: Space
+    /// policy administration, or an effective exact-resource delegation. The
+    /// policy-admin meta-capability itself is NEVER delegable — only a policy
+    /// admin may install it (administrator escalation stops here).
+    pub fn may_delegate(
+        &self,
+        a: &ActorId,
+        capability: &crate::demand::PolicyCapability,
+        resource: &crate::demand::PolicyResource,
+    ) -> bool {
+        if capability == &policy_admin_capability() && resource == &policy_admin_resource() {
+            return self.is_policy_admin(a);
+        }
+        self.is_policy_admin(a) || self.has_delegation(a, capability, resource)
+    }
+
     /// The active implementation id for a World, if one was activated.
     pub fn active_implementation(&self, world: &str) -> Option<[u8; 32]> {
         self.policy.implementations.get(world).copied()

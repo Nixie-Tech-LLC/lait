@@ -21,8 +21,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::diagnose::DiagnosisView;
 use crate::dto::{
-    ActivityEvent, BoardView, Candidate, GraphView, InboxEntry, IssueView, JoinRequestDto,
-    LabelDto, MemberDto, MemberLogEntry, ProjectDto, Row, SeedDto,
+    ActivityEvent, BoardView, Candidate, GraphView, InboxEntry, IssueView, LabelDto, MemberDto,
+    MemberLogEntry, ProjectDto, Row, SeedDto,
 };
 
 /// The control-plane protocol version this build **speaks** — CLI, web, and MCP
@@ -370,17 +370,6 @@ pub enum Request {
     /// The membership audit log: the signed ACL DAG replayed in causal order
     /// with each op's authorization verdict (cryptographic provenance).
     MemberLog,
-    /// List announced joiners that are not yet members.
-    MemberRequests,
-    /// Approve a pending join request **by id-prefix / key** — sugar over
-    /// `MemberAdd` scoped to the pending set. The joiner's self-asserted nick is
-    /// deliberately not a resolution input (it is unauthenticated); `as_name`
-    /// lets the approver attach a trusted local petname at the same time.
-    MemberApprove {
-        who: String,
-        #[serde(default)]
-        as_name: Option<String>,
-    },
     /// Set (or clear, with an empty name) a **local petname** for a key. Local to
     /// this node, never broadcast, never part of the signed ACL.
     MemberAlias {
@@ -406,18 +395,20 @@ pub enum Request {
         expected_space: Option<String>,
     },
     Id,
-    /// Mint an invite ticket. By default it carries a signed, single-use
-    /// pre-authorization (Pattern A) so the joiner is auto-admitted on `join`.
+    /// Mint an invite link. It always carries a signed admission capability:
+    /// the joiner's explicit acceptance IS the approval, and redemption is
+    /// automatic over Contact — there is no approval queue.
     Invite {
-        /// Mint a grant-less ticket: the joiner lands as a pending request that a
-        /// human admin must `members approve` (the classic flow).
+        /// The role the invite admits as (`viewer` | `contributor` |
+        /// `administrator`); defaults to `contributor`. The capability carries
+        /// the role's exact expanded assignments in its signed evidence.
         #[serde(default)]
-        require_approval: bool,
-        /// Let the grant admit a whole team (valid until expiry) instead of one
-        /// person (single-use).
+        role: Option<String>,
+        /// Let the capability admit a whole team (valid until expiry) instead
+        /// of one person (single-use).
         #[serde(default)]
         reusable: bool,
-        /// Lifetime in hours before the grant expires (default 168 = 7 days).
+        /// Lifetime in hours before the capability expires (default 168 = 7 days).
         #[serde(default)]
         ttl_hours: Option<u64>,
     },
@@ -519,10 +510,6 @@ pub enum Response {
     /// The membership audit log (reply to [`Request::MemberLog`]).
     MemberLog {
         entries: Vec<MemberLogEntry>,
-    },
-    /// Pending join requests: announced joiners that are not yet members.
-    JoinRequests {
-        requests: Vec<JoinRequestDto>,
     },
     /// Pinned seeds ("remotes") and their reachability.
     Seeds {
@@ -685,10 +672,6 @@ pub struct StatusInfo {
     /// the truth instead of implying the join already succeeded.
     #[serde(default)]
     pub membership: String,
-    /// Joiners who have announced a join request but aren't members yet — the
-    /// host-side nudge to run `members approve`. Only meaningful for an admin.
-    #[serde(default)]
-    pub pending_requests: usize,
     /// Recovery shares this device holds that exist but cannot be used.
     ///
     /// Structured, not preformatted: the CLI and web layers render it

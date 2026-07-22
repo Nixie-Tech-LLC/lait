@@ -76,7 +76,7 @@ fn accepting_an_invite_automatically_admits_over_contact() {
     let (_rf, mech_f) = founder("auto");
     let now = now_secs();
     let admission = mech_f
-        .mint_admission(&FOUNDER_SEED, 3600, false, now)
+        .mint_admission(&FOUNDER_SEED, 3600, false, now, "contributor", [0u8; 32])
         .unwrap();
     let invite = mech_f
         .mint_coordinates(&FOUNDER_SEED, "Adm", vec![], Some(admission))
@@ -97,7 +97,14 @@ fn accepting_an_invite_automatically_admits_over_contact() {
 fn exact_replay_of_a_redemption_is_idempotent() {
     let (_rf, mech_f) = founder("replay");
     let admission = mech_f
-        .mint_admission(&FOUNDER_SEED, 3600, false, now_secs())
+        .mint_admission(
+            &FOUNDER_SEED,
+            3600,
+            false,
+            now_secs(),
+            "contributor",
+            [0u8; 32],
+        )
         .unwrap();
     let invite = mech_f
         .mint_coordinates(&FOUNDER_SEED, "Adm", vec![], Some(admission))
@@ -114,7 +121,14 @@ fn exact_replay_of_a_redemption_is_idempotent() {
 fn a_substituted_acceptance_proof_is_refused() {
     let (_rf, mech_f) = founder("sub");
     let admission = mech_f
-        .mint_admission(&FOUNDER_SEED, 3600, false, now_secs())
+        .mint_admission(
+            &FOUNDER_SEED,
+            3600,
+            false,
+            now_secs(),
+            "contributor",
+            [0u8; 32],
+        )
         .unwrap();
     let invite = mech_f
         .mint_coordinates(&FOUNDER_SEED, "Adm", vec![], Some(admission))
@@ -167,7 +181,9 @@ fn a_substituted_acceptance_proof_is_refused() {
 fn an_expired_capability_is_refused_at_redemption() {
     let (_rf, mech_f) = founder("expiry");
     // A capability whose window is already in the past (issued far earlier).
-    let admission = mech_f.mint_admission(&FOUNDER_SEED, 1, false, 1).unwrap();
+    let admission = mech_f
+        .mint_admission(&FOUNDER_SEED, 1, false, 1, "contributor", [0u8; 32])
+        .unwrap();
     let invite = mech_f
         .mint_coordinates(&FOUNDER_SEED, "Adm", vec![], Some(admission))
         .unwrap();
@@ -184,7 +200,7 @@ fn a_single_use_capability_admits_at_most_one_of_two_candidates() {
     let (_rf, mech_f) = founder("single");
     let now = now_secs();
     let admission = mech_f
-        .mint_admission(&FOUNDER_SEED, 3600, false, now)
+        .mint_admission(&FOUNDER_SEED, 3600, false, now, "contributor", [0u8; 32])
         .unwrap();
     let invite = mech_f
         .mint_coordinates(&FOUNDER_SEED, "Adm", vec![], Some(admission))
@@ -209,7 +225,7 @@ fn a_reusable_capability_admits_multiple_candidates() {
     let (_rf, mech_f) = founder("reuse");
     let now = now_secs();
     let admission = mech_f
-        .mint_admission(&FOUNDER_SEED, 3600, true, now)
+        .mint_admission(&FOUNDER_SEED, 3600, true, now, "contributor", [0u8; 32])
         .unwrap();
     let invite = mech_f
         .mint_coordinates(&FOUNDER_SEED, "Adm", vec![], Some(admission))
@@ -232,7 +248,14 @@ fn a_reusable_capability_admits_multiple_candidates() {
 fn persistence_before_dial_survives_a_restart() {
     let (_rf, mech_f) = founder("persist");
     let admission = mech_f
-        .mint_admission(&FOUNDER_SEED, 3600, false, now_secs())
+        .mint_admission(
+            &FOUNDER_SEED,
+            3600,
+            false,
+            now_secs(),
+            "contributor",
+            [0u8; 32],
+        )
         .unwrap();
     let invite = mech_f
         .mint_coordinates(&FOUNDER_SEED, "Adm", vec![], Some(admission))
@@ -273,4 +296,202 @@ fn now_secs() -> u64 {
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+// ---- version-2 role evidence (M2) ------------------------------------------
+
+/// A viewer invite admits with read-only assignments: `space.issue.read` is
+/// installed (the mandatory baseline), no contributor/admin capability lands,
+/// and membership + assignments commit in ONE authority batch (both visible
+/// atomically at the first observation).
+#[test]
+fn a_viewer_invite_installs_exactly_the_read_baseline() {
+    let (_rf, mech_f) = founder("viewer");
+    let admission = mech_f
+        .mint_admission(&FOUNDER_SEED, 3600, false, now_secs(), "viewer", [7u8; 32])
+        .unwrap();
+    let invite = mech_f
+        .mint_coordinates(&FOUNDER_SEED, "Adm", vec![], Some(admission))
+        .unwrap();
+    let (_rj, mech_j, _rec) = joiner_admission(&invite, &JOINER_SEED, "viewer-j");
+    redeem_at_founder(&mech_f, &mech_j);
+    let joiner = joiner_actor(&mech_f, &JOINER_SEED).expect("admitted");
+    let (caps, policy_admin) = mech_f.effective_capabilities(&joiner);
+    assert_eq!(caps, vec!["space.issue.read".to_string()]);
+    assert!(!policy_admin);
+    // Viewer standing carries no write authority.
+    let m = mech_f
+        .members()
+        .into_iter()
+        .find(|m| m.key == joiner.as_str())
+        .unwrap();
+    assert_eq!(m.role, "viewer", "read-only membership standing");
+}
+
+/// A contributor invite (the default) installs the contributor expansion plus
+/// the baseline, atomically with membership.
+#[test]
+fn a_contributor_invite_installs_the_expansion_atomically() {
+    let (_rf, mech_f) = founder("contrib");
+    let admission = mech_f
+        .mint_admission(
+            &FOUNDER_SEED,
+            3600,
+            false,
+            now_secs(),
+            "contributor",
+            [0u8; 32],
+        )
+        .unwrap();
+    let invite = mech_f
+        .mint_coordinates(&FOUNDER_SEED, "Adm", vec![], Some(admission))
+        .unwrap();
+    let (_rj, mech_j, _rec) = joiner_admission(&invite, &JOINER_SEED, "contrib-j");
+    redeem_at_founder(&mech_f, &mech_j);
+    let joiner = joiner_actor(&mech_f, &JOINER_SEED).expect("admitted");
+    let (caps, _) = mech_f.effective_capabilities(&joiner);
+    assert_eq!(
+        caps,
+        vec![
+            "space.contributor".to_string(),
+            "space.issue.read".to_string()
+        ]
+    );
+}
+
+/// An administrator invite requires — and installs — Space policy
+/// administration; the meta-grant travels inside the signed evidence digest.
+#[test]
+fn an_administrator_invite_installs_policy_administration() {
+    let (_rf, mech_f) = founder("adm-role");
+    let admission = mech_f
+        .mint_admission(
+            &FOUNDER_SEED,
+            3600,
+            false,
+            now_secs(),
+            "administrator",
+            [0u8; 32],
+        )
+        .unwrap();
+    let invite = mech_f
+        .mint_coordinates(&FOUNDER_SEED, "Adm", vec![], Some(admission))
+        .unwrap();
+    let (_rj, mech_j, _rec) = joiner_admission(&invite, &JOINER_SEED, "adm-role-j");
+    redeem_at_founder(&mech_f, &mech_j);
+    let joiner = joiner_actor(&mech_f, &JOINER_SEED).expect("admitted");
+    let (caps, policy_admin) = mech_f.effective_capabilities(&joiner);
+    assert!(caps.contains(&"space.admin".to_string()));
+    assert!(policy_admin, "the meta-grant landed with the admission");
+    let m = mech_f
+        .members()
+        .into_iter()
+        .find(|m| m.key == joiner.as_str())
+        .unwrap();
+    assert_eq!(m.role, "admin");
+}
+
+/// Unknown and tombstoned roles reject at issuance.
+#[test]
+fn an_unknown_role_is_refused_at_issuance() {
+    let (_rf, mech_f) = founder("unknown-role");
+    let err = mech_f
+        .mint_admission(&FOUNDER_SEED, 3600, false, now_secs(), "warlord", [0u8; 32])
+        .unwrap_err();
+    assert!(err.to_string().contains("unknown role"), "{err}");
+}
+
+/// Administrator escalation stops at issuance AND redemption: a member
+/// without delegation authority may not mint an invite, and a capability such
+/// an issuer signs anyway (bypassing the local gate) is refused by every
+/// honest redeemer — the delegation proof runs over every assignment.
+#[test]
+fn a_non_delegating_issuer_cannot_escalate() {
+    let (_rf, mech_f) = founder("escalate");
+    // Admit a plain contributor: it holds capabilities but no delegation
+    // authority and no policy administration.
+    let admission = mech_f
+        .mint_admission(
+            &FOUNDER_SEED,
+            3600,
+            false,
+            now_secs(),
+            "contributor",
+            [0u8; 32],
+        )
+        .unwrap();
+    let invite = mech_f
+        .mint_coordinates(&FOUNDER_SEED, "Adm", vec![], Some(admission))
+        .unwrap();
+    let (_rj, mech_j, _rec) = joiner_admission(&invite, &JOINER_SEED, "escalate-j");
+    redeem_at_founder(&mech_f, &mech_j);
+    let mut j = mech_j.clone();
+    j.incorporate_authority(&mech_f.export_records()).unwrap();
+    let joiner = joiner_actor(&mech_f, &JOINER_SEED).expect("admitted");
+    let (_, policy_admin) = mech_f.effective_capabilities(&joiner);
+    assert!(!policy_admin, "a contributor is not a policy admin");
+
+    // Issuance refuses at the local gate.
+    let err = mech_j
+        .mint_admission(
+            &JOINER_SEED,
+            3600,
+            false,
+            now_secs(),
+            "administrator",
+            [0u8; 32],
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("only an admin") || err.to_string().contains("may not delegate"),
+        "{err}"
+    );
+
+    // Bypass the gate: the contributor hand-signs an administrator capability
+    // directly. It is structurally valid, but redemption re-proves issuer
+    // authority over every assignment and refuses the whole expansion.
+    let revision = lait::world::roles::built_in("lait.administrator").unwrap();
+    let evidence = lait::world::roles::role_admission_evidence(&revision, [0u8; 32]);
+    let now = now_secs();
+    let forged = runtime::coordinates::AdmissionCapabilityV1::sign(
+        &mech_f.space(),
+        [9u8; 16],
+        now,
+        now,
+        now + 3600,
+        runtime::coordinates::AdmissionUsePolicy::SingleUse,
+        evidence,
+        &JOINER_SEED,
+    )
+    .unwrap();
+    let forged_invite = mech_f
+        .mint_coordinates(&FOUNDER_SEED, "Adm", vec![], Some(forged))
+        .unwrap();
+    let (_r2, mech_j2, _rec2) = joiner_admission(&forged_invite, &JOINER2_SEED, "escalate-j2");
+    redeem_at_founder(&mech_f, &mech_j2);
+    assert!(
+        joiner_actor(&mech_f, &JOINER2_SEED).is_none(),
+        "a forged administrator capability admits nobody"
+    );
+}
+
+/// A capability whose evidence was tampered with after signing fails
+/// structural verification: the expanded assignment set (including the
+/// mandatory baseline) lives inside the signed evidence digest.
+#[test]
+fn tampered_role_evidence_breaks_the_capability_signature() {
+    let (_rf, mech_f) = founder("tamper-ev");
+    let mut admission = mech_f
+        .mint_admission(&FOUNDER_SEED, 3600, false, now_secs(), "viewer", [0u8; 32])
+        .unwrap();
+    // Escalate the evidence post-hoc: append the admin capability.
+    admission.evidence.assignments.push((
+        mechanics::demand::PolicyCapability::new("com.lait.issues", "space.admin"),
+        mechanics::demand::PolicyResource::space("com.lait.issues"),
+    ));
+    let space = mech_f.space();
+    assert!(
+        admission.verify_structure(&space).is_err(),
+        "a tampered expansion no longer matches the signed evidence digest"
+    );
 }

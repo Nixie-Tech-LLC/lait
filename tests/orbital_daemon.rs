@@ -249,19 +249,12 @@ fn the_orbital_daemon_serves_the_issue_surface_over_the_control_socket() {
         "adding an unknown actor is refused, got {resp:?}"
     );
 
-    // No pending join announcements are tracked on the orbital plane yet.
-    let resp = req(&client_rt, &home, Request::MemberRequests);
-    assert!(
-        matches!(resp, Response::JoinRequests { ref requests } if requests.is_empty()),
-        "{resp:?}"
-    );
-
     // Invite mints a Coordinates link (not a SpaceTicket).
     let resp = req(
         &client_rt,
         &home,
         Request::Invite {
-            require_approval: false,
+            role: None,
             reusable: false,
             ttl_hours: Some(24),
         },

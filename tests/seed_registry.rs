@@ -125,7 +125,7 @@ fn seed_pin_lists_structured_and_survives_restart() {
         &rt,
         &home,
         Request::Invite {
-            require_approval: false,
+            role: None,
             reusable: false,
             ttl_hours: Some(24),
         },

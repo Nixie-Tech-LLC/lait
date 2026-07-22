@@ -43,7 +43,7 @@ use crate::{
         control_name, Doorbell, Event as LogEvent, EventKind, PresenceEntry, Request, Response,
         StatusInfo,
     },
-    dto::{Candidate, JoinRequestDto, SeedDto},
+    dto::{Candidate, SeedDto},
     ids::{DeviceId, SystemUlidSource},
     index::{resolve_device_dir, DeviceResolution, KnownDevice},
     presence::{PeerState, PRESENCE_ALPN},
@@ -757,7 +757,7 @@ impl Node {
                 // Pattern A: if the joiner presented a valid pre-authorization and
                 // we're an admin who can seal, admit them now — no manual approve.
                 // On any failure we simply leave the request pending (the event
-                // above already surfaces it to `members requests`).
+                // above already surfaces it to the event log).
                 if let Some(invite) = invite {
                     self.clone().try_auto_approve(&from, invite, incept);
                 }
@@ -1360,39 +1360,6 @@ impl Node {
             .collect()
     }
 
-    /// Pending join requests: announced joiners (`EventKind::Join`) who are not
-    /// yet ACL members. Newest-first, deduped by key. Ephemeral — bounded by the
-    /// event ring and is never persisted.
-    fn pending_join_requests(&self) -> Vec<JoinRequestDto> {
-        // A joiner's announced id is a *device* key; it is "already a member" if
-        // that device speaks for a member actor.
-        let members: HashSet<String> = self
-            .replica
-            .lock()
-            .unwrap()
-            .member_device_keys()
-            .into_iter()
-            .map(|k| k.as_str().to_string())
-            .collect();
-        let (events, _) = self.shared.events.lock().unwrap().since(0);
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut out = Vec::new();
-        for e in events.iter().rev() {
-            if e.kind != EventKind::Join {
-                continue;
-            }
-            if members.contains(&e.id) || !seen.insert(e.id.clone()) {
-                continue;
-            }
-            out.push(JoinRequestDto {
-                key: e.id.clone(),
-                nick: e.nick.clone(),
-                ts: e.ts,
-            });
-        }
-        out
-    }
-
     /// Resolve the who-refs carried by a request (local-alias / id-prefix → full
     /// key) against the directory, before the replica sees them. Returns
     /// the rewritten request, or an early `Response` (not-found / ambiguous) to
@@ -1668,64 +1635,6 @@ impl Node {
                 }
             }
 
-            // ---- join-request approval (built on the ACL member ops) ----
-            Request::MemberRequests => Ok(Response::JoinRequests {
-                requests: self.pending_join_requests(),
-            }),
-            Request::MemberApprove { who, as_name } => {
-                let pending = self.pending_join_requests();
-                if pending.is_empty() {
-                    return Ok(Response::err("no pending join requests to approve"));
-                }
-                // Key-first: resolve strictly by id-prefix / full key against the
-                // pending set. Empty nicks here mean the joiner's self-asserted name
-                // is NOT a resolution input — an unauthenticated nick must never
-                // select who gets sealed the space key. The approver attaches a
-                // *trusted* local petname via `as_name`.
-                let dir: Vec<KnownDevice> = pending
-                    .iter()
-                    .map(|r| KnownDevice {
-                        key: DeviceId::from_key_string(r.key.clone()),
-                        nick: String::new(),
-                    })
-                    .collect();
-                match resolve_device_dir(who.trim(), &self.shared.my_id.clone(), &dir) {
-                    DeviceResolution::One(u) => {
-                        let key = u.as_str().to_string();
-                        // Import the joiner's stashed inception (from its join
-                        // request) so the replica can resolve its actor — admin-
-                        // gated persistence, only on this explicit approve.
-                        if let Some(incept) = self.pending_incepts.lock().unwrap().get(&u).cloned()
-                        {
-                            let _ = self.replica.lock().unwrap().import_inception(&incept);
-                        }
-                        let (resp, changed) = self.dispatch_replica(Request::MemberAdd {
-                            who: key.clone(),
-                            admin: false,
-                            as_name: None,
-                        });
-                        if changed {
-                            if let Some(name) = as_name.as_deref() {
-                                upsert_alias(&self.home, &key, name.trim());
-                            }
-                            let me = self.clone();
-                            self.spawn(async move {
-                                me.broadcast_announce().await.ok();
-                            });
-                        }
-                        Ok(resp)
-                    }
-                    DeviceResolution::Zero => Ok(Response::not_found(format!(
-                        "no pending join request matches '{who}' — approve by key or \
-                         id-prefix (see `lait members requests`)"
-                    ))),
-                    DeviceResolution::Many(c) => Ok(Response::Candidates {
-                        candidates: device_candidates(&c),
-                        near_miss_for: None,
-                    }),
-                }
-            }
-
             // Subscribe is handled by the streaming path, not here.
             Request::Subscribe { .. } => Ok(Response::err("subscribe is a streaming request")),
 
@@ -1756,7 +1665,6 @@ impl Node {
                         membership.to_string(),
                     )
                 };
-                let pending_requests = self.pending_join_requests().len();
                 let (degraded_recovery, recovery) = {
                     let t = self.replica.lock().unwrap();
                     (t.degraded_recovery_holders(), Some(t.recovery_status()))
@@ -1770,7 +1678,6 @@ impl Node {
                     issues,
                     projects,
                     membership,
-                    pending_requests,
                     degraded_recovery,
                     recovery,
                 })))
@@ -1829,7 +1736,7 @@ impl Node {
                 text: self.shared.my_id.to_string(),
             }),
             Request::Invite {
-                require_approval,
+                role: _,
                 reusable,
                 ttl_hours,
             } => {
@@ -1846,12 +1753,9 @@ impl Node {
                     }
                     (t.space_str(), t.space_name())
                 };
-                // Default: embed a signed, single-use pre-authorization so the
-                // joiner is auto-admitted (Pattern A). `--require-approval` mints a
-                // grant-less ticket that falls back to the manual approve flow.
-                let invite = if require_approval {
-                    None
-                } else {
+                // Always embed a signed pre-authorization: accepting the
+                // invite IS the approval.
+                let invite = {
                     const DEFAULT_TTL_HOURS: u64 = 24 * 7;
                     let ttl_secs = ttl_hours.unwrap_or(DEFAULT_TTL_HOURS).saturating_mul(3600);
                     let grant = InviteGrant::mint(space.clone(), now_secs(), ttl_secs, !reusable);

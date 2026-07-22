@@ -235,7 +235,7 @@ fn coordinates_only_two_endpoint_bootstrap_over_real_iroh() {
         .unwrap()
         .as_secs();
     let admission = mech_f
-        .mint_admission(&FOUNDER_SEED, 3600, true, now)
+        .mint_admission(&FOUNDER_SEED, 3600, true, now, "contributor", [0u8; 32])
         .unwrap();
     let invite = mech_f
         .mint_coordinates(

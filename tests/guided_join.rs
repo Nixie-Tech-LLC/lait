@@ -132,7 +132,7 @@ fn gate_state(v: &DiagnosisView, id: &str) -> GateState {
 /// The full onboarding lifecycle through the verifier: a fresh joiner is blocked
 /// on `membership` until it is admitted, then every gate passes once the board
 /// converges. Orbital admission is automatic on Contact (accepting the invite is
-/// the approval) — no manual `members approve`. This is the "empty board →
+/// the approval) — no manual approval step. This is the "empty board →
 /// legible blocker → get to work" arc the whole change exists to make honest.
 #[test]
 fn diagnose_tracks_join_lifecycle_from_pending_to_all_pass() {
@@ -152,7 +152,7 @@ fn diagnose_tracks_join_lifecycle_from_pending_to_all_pass() {
         &rt,
         &founder_home,
         Request::Invite {
-            require_approval: false,
+            role: None,
             reusable: false,
             ttl_hours: Some(24),
         },

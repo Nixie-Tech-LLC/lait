@@ -244,7 +244,7 @@ fn form_invite_join_autoapprove_and_e2ee_convergence() {
         .unwrap()
         .as_secs();
     let admission = mech_f
-        .mint_admission(&FOUNDER_SEED, 3600, true, now)
+        .mint_admission(&FOUNDER_SEED, 3600, true, now, "contributor", [0u8; 32])
         .unwrap();
     let invite = mech_f
         .mint_coordinates(&FOUNDER_SEED, "Joined Space", vec![], Some(admission))

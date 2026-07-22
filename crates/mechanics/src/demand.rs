@@ -556,7 +556,14 @@ impl WorldAssignmentEvidence {
         for (cap, res) in &self.assignments {
             cap.validate()?;
             res.validate()?;
-            if cap.world != self.world || res.world != self.world {
+            // Every assignment must live in the declared World's namespace —
+            // with ONE Mechanics-owned exception: the policy-admin
+            // meta-capability, which an administrator-level admission installs
+            // (plan 04). It is never delegable, so carrying it does not widen
+            // what a non-policy-admin issuer can grant.
+            let is_meta = *cap == crate::acl::policy_admin_capability()
+                && *res == crate::acl::policy_admin_resource();
+            if !is_meta && (cap.world != self.world || res.world != self.world) {
                 return Err(DemandError::BadStructure(
                     "assignment outside the declared World".into(),
                 ));

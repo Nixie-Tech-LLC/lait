@@ -283,16 +283,6 @@ pub struct MemberRemoveArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct MemberApproveArgs {
-    /// A pending requester: a key id-prefix or a full 64-hex key. The joiner's
-    /// self-asserted nick is not accepted — it is unauthenticated.
-    pub who: String,
-    /// Optional local petname to attach to the approved key (never synced).
-    #[serde(default)]
-    pub alias: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MemberAliasArgs {
     /// A who-ref: a key id-prefix, a full key, or an existing alias.
     pub who: String,
@@ -704,25 +694,6 @@ impl LaitMcp {
         self.run(Request::MemberLog).await
     }
 
-    #[tool(description = "List pending join requests (announced joiners not yet added).")]
-    async fn member_requests(&self) -> Result<CallToolResult, McpError> {
-        self.run(Request::MemberRequests).await
-    }
-
-    #[tool(
-        description = "Approve a pending join request by id-prefix / key (admin-only); seals them the space key. The joiner's nick is not a valid ref (unauthenticated) — pass `alias` to name them locally."
-    )]
-    async fn member_approve(
-        &self,
-        Parameters(a): Parameters<MemberApproveArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        self.run(Request::MemberApprove {
-            who: a.who,
-            as_name: a.alias,
-        })
-        .await
-    }
-
     #[tool(
         description = "Set (or clear, with an empty name) a local petname for a key. Local to this device, never synced or part of the signed ACL."
     )]
@@ -767,7 +738,7 @@ impl LaitMcp {
     )]
     async fn invite_ticket(&self) -> Result<CallToolResult, McpError> {
         self.run(Request::Invite {
-            require_approval: false,
+            role: None,
             reusable: false,
             ttl_hours: None,
         })

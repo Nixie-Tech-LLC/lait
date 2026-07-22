@@ -262,7 +262,11 @@ impl OrbitalDaemon {
                 message: Some(crate::crypto::device_from_seed(&self.device_seed).to_string()),
             },
             Request::Who => Response::Who { peers: vec![] },
-            Request::Invite { reusable, .. } => self.invite(reusable),
+            Request::Invite {
+                role,
+                reusable,
+                ttl_hours,
+            } => self.invite(role.as_deref(), reusable, ttl_hours),
             Request::Connect { ticket } | Request::Join { ticket } => self.connect(&ticket),
             Request::ConfigReload => Response::Ok { message: None },
             Request::Stop => Response::Ok {
@@ -286,10 +290,6 @@ impl OrbitalDaemon {
             Request::MemberLog => Response::MemberLog {
                 entries: self.mechanics.member_log(),
             },
-            // No pending-join announcements are tracked on the orbital plane yet:
-            // admission is redeemed inline during Contact incorporation, so the
-            // truthful answer is an empty pending set (not a mis-served refusal).
-            Request::MemberRequests => Response::JoinRequests { requests: vec![] },
 
             // ---- multi-device (lait/actor/1 device management) ----
             Request::DeviceInvite => match self.mechanics.device_invite() {
@@ -350,15 +350,6 @@ impl OrbitalDaemon {
                 },
                 Err(e) => Response::err(format!("{e}")),
             },
-            // Removed by the M2 admission cutover: acceptance of an invite is
-            // the approval, redeemed automatically over Contact, so there is no
-            // pending-approval queue to act on. Kept answerable (not a
-            // catch-all refusal) until the surface is deleted in M5.
-            Request::MemberApprove { .. } => Response::err(
-                "there is no pending-approval queue — admission is automatic when a joiner \
-                 accepts an invite; use `invite` to admit someone and `members` to see who \
-                 is in",
-            ),
             Request::MemberAlias { who, name } => self.set_alias(&who, &name),
 
             // ---- daemon lifecycle (node-local reads/config) ----
@@ -470,7 +461,6 @@ impl OrbitalDaemon {
             } else {
                 "pending".into()
             },
-            pending_requests: 0,
             degraded_recovery: self.mechanics.degraded_recovery(),
             recovery: Some(self.mechanics.recovery_status()),
         }))
@@ -828,19 +818,25 @@ impl OrbitalDaemon {
         }
     }
 
-    fn invite(&self, reusable: bool) -> Response {
+    fn invite(&self, role: Option<&str>, reusable: bool, ttl_hours: Option<u64>) -> Response {
         // Mint an admission-bearing Coordinates link. Accepting the invite is
-        // the approval: the capability carries the default-contributor role
-        // expansion, and redemption is automatic on Contact. `reusable` admits
-        // a team (up to the redemption cap) instead of one person.
-        let admission =
-            match self
-                .mechanics
-                .mint_admission(&self.device_seed, 24 * 3600, reusable, now_secs())
-            {
-                Ok(a) => a,
-                Err(e) => return Response::err(format!("mint admission: {e}")),
-            };
+        // the approval: the capability carries the selected role's exact
+        // expanded assignments (default contributor), and redemption is
+        // automatic on Contact. `reusable` admits a team (up to the redemption
+        // cap) instead of one person.
+        let ttl_secs = ttl_hours.unwrap_or(168).max(1).saturating_mul(3600);
+        let parent_root = self.station.frontier().root;
+        let admission = match self.mechanics.mint_admission(
+            &self.device_seed,
+            ttl_secs,
+            reusable,
+            now_secs(),
+            role.unwrap_or("contributor"),
+            parent_root,
+        ) {
+            Ok(a) => a,
+            Err(e) => return Response::err(format!("mint admission: {e}")),
+        };
         match self.mechanics.mint_coordinates(
             &self.device_seed,
             "",

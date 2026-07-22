@@ -161,7 +161,7 @@ fn restarted_joiner_daemon_reconverges_from_its_persisted_store() {
         &rt,
         &founder_home,
         Request::Invite {
-            require_approval: false,
+            role: None,
             reusable: false,
             ttl_hours: Some(24),
         },

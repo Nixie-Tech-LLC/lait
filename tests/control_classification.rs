@@ -13,10 +13,7 @@
 //! - **Station** — connect/neighbor/Contact operations;
 //! - **Observation** — status/subscription projections;
 //! - **Lifecycle** — Runtime/Orbit/Station/daemon process concerns and
-//!   node-local configuration adapters;
-//! - **RemovedByM2** — the pending-member approval surface, deleted by the M2
-//!   acceptance-triggered-admission cutover. No other terminal state may use
-//!   this owner.
+//!   node-local configuration adapters.
 
 use lait::control::Request;
 
@@ -27,10 +24,6 @@ enum Owner {
     Station,
     Observation,
     Lifecycle,
-    /// Slated for deletion in M2 (pending-approval surface). Terminal state is
-    /// nonexistence; while the variant exists it must refuse with a typed
-    /// error, never be served.
-    RemovedByM2,
 }
 
 /// The exhaustive terminal-owner table. Compile-enforced: a new `Request`
@@ -105,9 +98,6 @@ fn terminal_owner(r: &Request) -> Owner {
         | Request::Stop
         | Request::Hello { .. }
         | Request::MemberAlias { .. } => Lifecycle,
-
-        // ---- deleted by the M2 admission cutover ----
-        Request::MemberRequests | Request::MemberApprove { .. } => RemovedByM2,
     }
 }
 
@@ -135,20 +125,4 @@ fn every_request_variant_has_a_terminal_owner() {
     );
     assert_eq!(terminal_owner(&Request::Status), Owner::Observation);
     assert_eq!(terminal_owner(&Request::Stop), Owner::Lifecycle);
-    assert_eq!(terminal_owner(&Request::MemberRequests), Owner::RemovedByM2);
-}
-
-#[test]
-fn removed_by_m2_is_reserved_for_the_approval_surface() {
-    // Only the two pending-approval requests may carry the deletion owner; if
-    // M2 has landed (the variants are gone) this test still compiles because
-    // the arms above are deleted with them.
-    let removed = [
-        terminal_owner(&Request::MemberRequests),
-        terminal_owner(&Request::MemberApprove {
-            who: String::new(),
-            as_name: None,
-        }),
-    ];
-    assert!(removed.iter().all(|o| *o == Owner::RemovedByM2));
 }

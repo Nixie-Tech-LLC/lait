@@ -77,11 +77,11 @@ const INVITE_NONCE_LEN: usize = 16;
 /// A capability that **pre-authorizes** admission to a space (Pattern A). An
 /// admin signs it into a [`SignedInvite`]; whoever redeems it on `join` is sealed
 /// the space key automatically — collapsing the classic
-/// request→`members approve` round-trip into a single `join`.
+/// request/approve round-trip into a single `join`.
 ///
 /// It is a **bearer** token: authority rides the channel the invite travels over,
 /// bounded by an expiry and (by default) a single use. A space that wants a
-/// human in the loop mints a grant-less ticket instead (`invite --require-approval`).
+/// human in the loop was the pre-M2 gated flow; it no longer exists.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InviteGrant {
     /// The space this grant admits into (binds the capability to one room).

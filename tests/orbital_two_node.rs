@@ -143,7 +143,7 @@ fn two_orbital_daemons_join_admit_and_converge_over_the_socket() {
         &client,
         &founder_home,
         Request::Invite {
-            require_approval: false,
+            role: None,
             reusable: false,
             ttl_hours: Some(24),
         },
@@ -299,7 +299,7 @@ fn the_inviter_reciprocates_so_a_joiner_side_only_connect_admits() {
         &client,
         &founder_home,
         Request::Invite {
-            require_approval: false,
+            role: None,
             reusable: false,
             ttl_hours: Some(24),
         },

@@ -352,16 +352,28 @@ impl Inner {
             joiner_actor.as_str(),
             &proof.public_key,
         );
-        let _ = acceptance_id;
         let acl_state = self.acl();
         // The capability's issuer must currently speak for an admin.
         let issuer_device = DeviceId::from_key_bytes(&admission.issuer);
-        let issuer_ok = self
+        let issuer_actor = self
             .actor_plane()
             .actor_of_device(&issuer_device)
-            .is_some_and(|a| acl_state.is_admin(a));
-        if !issuer_ok {
+            .cloned()
+            .ok_or_else(|| anyhow!("admission issuer has no actor identity"))?;
+        if !acl_state.is_admin(&issuer_actor) {
             return Err(anyhow!("admission issuer is not an admin"));
+        }
+        // Delegation proof over EVERY assignment: the issuer must hold Space
+        // policy administration or an effective exact-resource delegation for
+        // each capability the evidence installs. A mixed expansion is atomic —
+        // one non-delegable assignment refuses the whole admission.
+        for (capability, resource) in &admission.evidence.assignments {
+            if !acl_state.may_delegate(&issuer_actor, capability, resource) {
+                return Err(anyhow!(
+                    "admission issuer may not delegate `{}` — refusing the whole expansion",
+                    capability.name
+                ));
+            }
         }
         // We can only admit + seal if we ourselves are an admin with the key.
         match self.my_actor() {
@@ -389,7 +401,27 @@ impl Inner {
         if acl_state.is_member(&joiner_actor) {
             return Ok(()); // idempotent
         }
-        // Stage the joiner's inception + AddMember + sealed keys as ONE batch.
+        // The redeeming node itself must be able to author every assignment:
+        // committing an unauthorized grant effect would admit a member whose
+        // capabilities silently fail authorization. Another admin holding the
+        // authority can redeem instead.
+        let me_actor = self
+            .my_actor()
+            .ok_or_else(|| anyhow!("no actor identity"))?;
+        for (capability, resource) in &admission.evidence.assignments {
+            if !acl_state.may_delegate(&me_actor, capability, resource) {
+                return Err(anyhow!(
+                    "this node may not install `{}` — another admin must redeem this admission",
+                    capability.name
+                ));
+            }
+        }
+
+        // Stage the joiner's inception + AddMember + the EXACT expanded
+        // assignments + sealed keys as ONE atomic authority batch: membership
+        // and its capabilities land together or not at all. The grant ops
+        // chain causally off the AddMember so the expansion applies after the
+        // admission in every replay.
         let inception_effect = LedgerEffect::Actor(inception.clone()).encode();
         // Devices of the joiner: from the candidate plane (the inception is
         // not yet committed, so resolve against the candidate set).
@@ -409,42 +441,76 @@ impl Inner {
                 }
             }
         }
+        // Membership standing derives from the installed expansion: the
+        // product's role provenance stays opaque; the generic capability names
+        // decide coarse standing (admin > contributor > viewer).
+        let caps: Vec<&str> = admission
+            .evidence
+            .assignments
+            .iter()
+            .map(|(c, _)| c.name.as_str())
+            .collect();
+        let grants = if caps.contains(&"space.admin") {
+            vec![Grant::Admin, Grant::Write]
+        } else if caps.contains(&"space.contributor") {
+            vec![Grant::Write]
+        } else {
+            vec![]
+        };
+        let actor_asof = self.ledger.actor_heads(&me_actor);
         // Always record the nonce so redemptions are counted for the cap and
         // single-use convergence (the ACL replay resolves concurrent races by
         // canonical acceptance order).
-        self.author(
-            AclAction::AddMember {
-                actor: joiner_actor.clone(),
-                grants: vec![Grant::Write],
+        let add = acl::sign_op(
+            &self.seed,
+            &AclOp {
+                action: AclAction::AddMember {
+                    actor: joiner_actor.clone(),
+                    grants,
+                },
+                by: me_actor.clone(),
+                actor_asof: actor_asof.clone(),
+                nonce: Some(admission.nonce),
             },
-            Some(admission.nonce),
-            vec![inception_effect],
-            sealed_records,
-        )?;
-        // Redemption installs exactly the capability's WorldAssignmentEvidence
-        // expansion (plan M2) — the selected role's expanded assignments,
-        // which for the default contributor invite include the mandatory
-        // `space.issue.read` baseline.
+            self.ledger.acl_heads(),
+            &self.space,
+        );
+        let mut prev = add.hash();
+        let mut effects: Vec<Vec<u8>> = vec![inception_effect, LedgerEffect::Acl(add).encode()];
         for (i, (capability, resource)) in admission.evidence.assignments.iter().enumerate() {
-            let salt = {
-                let mut s = super::rand16();
-                s[0] = i as u8;
-                s
-            };
-            if inner_grant(
-                self,
-                &joiner_actor,
-                capability.clone(),
-                resource.clone(),
-                salt,
-            )
-            .is_err()
-            {
-                // A grant failure inside redemption is a durable-store fault;
-                // surface it rather than admitting without authority.
-                return Err(anyhow!("seal joiner capability"));
-            }
+            // Deterministic salt from the acceptance id: an exact replay of
+            // this redemption derives the identical grant ids.
+            let mut salt_input = acceptance_id.to_vec();
+            salt_input.extend_from_slice(&(i as u32).to_be_bytes());
+            let salt: [u8; 16] = blake3::derive_key("lait.admission-grant-salt.v1", &salt_input)
+                [..16]
+                .try_into()
+                .expect("16 bytes");
+            let grant_id = acl::capability_grant_id(&joiner_actor, capability, resource, &salt)
+                .ok_or_else(|| anyhow!("grant id"))?;
+            let op = acl::sign_op(
+                &self.seed,
+                &AclOp {
+                    action: AclAction::GrantCapability {
+                        grant_id,
+                        actor: joiner_actor.clone(),
+                        capability: capability.clone(),
+                        resource: resource.clone(),
+                        salt,
+                    },
+                    by: me_actor.clone(),
+                    actor_asof: actor_asof.clone(),
+                    nonce: None,
+                },
+                vec![prev.clone()],
+                &self.space,
+            );
+            prev = op.hash();
+            effects.push(LedgerEffect::Acl(op).encode());
         }
+        self.ledger
+            .commit_batch(&effects, &sealed_records)
+            .map_err(|e| anyhow!("admission redemption commit: {e}"))?;
         Ok(())
     }
 }
@@ -913,45 +979,62 @@ impl OrbitalMechanics {
         Ok(runtime::SignedCoordinatesV1::sign(payload, station_seed))
     }
 
-    /// Mint an admission capability (admin-only, checked by the redeemer). It
-    /// carries the default-contributor role expansion as generic
-    /// [`WorldAssignmentEvidence`] — `space.contributor` + the mandatory
-    /// `space.issue.read` baseline — which redemption installs atomically.
+    /// Mint an admission capability carrying a **role's** exact expanded
+    /// assignments as generic [`WorldAssignmentEvidence`] (version-2 evidence:
+    /// role id/revision provenance in the bounded opaque field, the definition
+    /// digest, the parent Manifest root, and the expansion — always including
+    /// the mandatory `space.issue.read` baseline — inside the signed digest).
+    ///
+    /// Issuance proves the issuer may delegate EVERY assignment: Space policy
+    /// administration or an effective exact-resource delegation per
+    /// capability. An administrator invite additionally requires policy
+    /// administration (the meta-grant is never delegable), so escalation
+    /// stops at issuance. Unknown roles reject.
     pub fn mint_admission(
         &self,
         issuer_seed: &[u8; 32],
         ttl_secs: u64,
         reusable: bool,
         now: u64,
+        role_selector: &str,
+        parent_manifest_root: [u8; 32],
     ) -> Result<AdmissionCapabilityV1> {
-        let inner = self.lock();
+        let mut inner = self.lock();
+        let role_id = crate::world::roles::resolve_role_selector(role_selector)
+            .ok_or_else(|| anyhow!("unknown role `{role_selector}`"))?;
+        let revision = crate::world::roles::built_in(role_id)
+            .ok_or_else(|| anyhow!("unknown role `{role_selector}`"))?;
+        if revision.body.tombstone {
+            return Err(anyhow!("role `{role_id}` is tombstoned"));
+        }
+        let evidence =
+            crate::world::roles::role_admission_evidence(&revision, parent_manifest_root);
+        // Prove the issuer may delegate every assignment BEFORE anything is
+        // signed. The issuing device must resolve to a member actor.
+        let issuer_device = crypto::device_from_seed(issuer_seed);
+        let issuer_actor = inner
+            .actor_plane()
+            .actor_of_device(&issuer_device)
+            .cloned()
+            .ok_or_else(|| anyhow!("the issuing device has no actor identity in this space"))?;
+        let acl_state = inner.acl();
+        if !acl_state.is_admin(&issuer_actor) {
+            return Err(anyhow!("only an admin may mint an invite"));
+        }
+        for (capability, resource) in &evidence.assignments {
+            if !acl_state.may_delegate(&issuer_actor, capability, resource) {
+                return Err(anyhow!(
+                    "the issuer may not delegate `{}` — an invite cannot grant what its issuer cannot",
+                    capability.name
+                ));
+            }
+        }
         let use_policy = if reusable {
             runtime::coordinates::AdmissionUsePolicy::Reusable {
                 max_redemptions: 1024,
             }
         } else {
             runtime::coordinates::AdmissionUsePolicy::SingleUse
-        };
-        // The default-contributor expansion, always including the mandatory
-        // baseline read access, sorted/deduped inside the evidence digest.
-        let world = crate::world::contract::PRODUCT_WORLD;
-        let res = mechanics::demand::PolicyResource::space(world);
-        let assignments = vec![
-            (
-                mechanics::demand::PolicyCapability::new(world, "space.contributor"),
-                res.clone(),
-            ),
-            (
-                mechanics::demand::PolicyCapability::new(world, "space.issue.read"),
-                res,
-            ),
-        ];
-        let evidence = mechanics::demand::WorldAssignmentEvidence {
-            world: world.to_string(),
-            opaque_definition_ref: b"lait.contributor".to_vec(),
-            definition_digest: *blake3::hash(b"lait.contributor.v1").as_bytes(),
-            parent_manifest_root: [0u8; 32],
-            assignments,
         };
         AdmissionCapabilityV1::sign(
             &inner.space,
@@ -999,6 +1082,22 @@ impl OrbitalMechanics {
     /// This device's actor id, if established.
     pub fn my_actor(&self) -> Option<ActorId> {
         self.lock().my_actor()
+    }
+
+    /// The effective scoped capability names granted to `actor` (sorted,
+    /// deduped) plus whether it holds Space policy administration — the
+    /// admission gates' assignment oracle.
+    pub fn effective_capabilities(&self, actor: &ActorId) -> (Vec<String>, bool) {
+        let mut inner = self.lock();
+        let acl_state = inner.acl();
+        let mut names: Vec<String> = acl_state
+            .effective_assignments(actor)
+            .into_iter()
+            .map(|(_, g)| g.capability.name.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        (names, acl_state.is_policy_admin(actor))
     }
 
     /// The membership roster as `control::MemberDto` rows.

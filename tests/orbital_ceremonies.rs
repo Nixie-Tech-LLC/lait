@@ -58,7 +58,14 @@ fn founder(tag: &str) -> (PathBuf, OrbitalMechanics) {
 /// path, returning the member's own mechanics handle.
 fn admit(founder: &OrbitalMechanics, seed: &[u8; 32], tag: &str) -> (PathBuf, OrbitalMechanics) {
     let admission = founder
-        .mint_admission(&FOUNDER_SEED, 3600, true, now_secs())
+        .mint_admission(
+            &FOUNDER_SEED,
+            3600,
+            true,
+            now_secs(),
+            "contributor",
+            [0u8; 32],
+        )
         .unwrap();
     let invite = founder
         .mint_coordinates(&FOUNDER_SEED, "Cer", vec![], Some(admission))

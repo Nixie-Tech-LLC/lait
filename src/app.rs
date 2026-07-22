@@ -447,7 +447,7 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
             }
             Special::Invite => {
                 let email = m.get_one::<String>("email").cloned();
-                let require_approval = m.get_flag("require_approval");
+                let role = m.get_one::<String>("role").cloned();
                 let reusable = m.get_flag("reusable");
                 // The clap layer keeps everything a String; the ≥1 range that the
                 // derive enforced with `value_parser!(u64).range(1..)` is validated
@@ -464,8 +464,7 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
                     }
                     None => None,
                 };
-                crate::cli::run_invite(&home, email, require_approval, reusable, ttl_hours, out)
-                    .await?
+                crate::cli::run_invite(&home, email, role, reusable, ttl_hours, out).await?
             }
             Special::Watch => {
                 let since = match m.get_one::<String>("since") {

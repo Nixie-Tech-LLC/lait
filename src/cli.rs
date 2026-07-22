@@ -1373,25 +1373,6 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
             }
             0
         }
-        Response::JoinRequests { requests } => {
-            if requests.is_empty() {
-                println!("(no pending join requests)");
-            } else {
-                // The key is authenticated; the nick is a self-asserted claim.
-                // Approve BY KEY after confirming the short id out-of-band.
-                eprintln!("approve by key/prefix — nick is an unverified claim:");
-            }
-            for r in requests {
-                let short: String = r.key.chars().take(12).collect();
-                let claim = if r.nick.is_empty() {
-                    String::new()
-                } else {
-                    format!("  (claims \"{}\")", r.nick)
-                };
-                println!("{}{}", short, claim);
-            }
-            0
-        }
         Response::Seeds { seeds } => {
             if seeds.is_empty() {
                 println!("(no pinned remotes — add one: `lait remote add <ticket>`)");
@@ -1450,25 +1431,10 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
                     paint(
                         out.color,
                         ansi::CYAN,
-                        "⌛ you've requested to join — waiting for an admin to approve you."
+                        "⌛ admission in progress — it completes automatically on the next contact with a member."
                     )
                 );
                 println!("   the board stays encrypted until then; it syncs automatically once you're in.");
-            } else if s.pending_requests > 0 {
-                let n = s.pending_requests;
-                let plural = if n == 1 { "" } else { "s" };
-                println!();
-                println!(
-                    "{}",
-                    paint(
-                        out.color,
-                        ansi::YELLOW,
-                        &format!(
-                            "⚠ {n} pending join request{plural} — someone is waiting to be let in."
-                        )
-                    )
-                );
-                println!("   review: `lait members requests`   approve: `lait members approve <id> --as <name>`");
             }
             // A degraded recovery holder is reported on every status, not only
             // when break-glass is attempted: by then it is too late to fix.
@@ -1671,7 +1637,7 @@ fn print_issue(v: &IssueView, out: Out) {
 pub async fn run_invite(
     home: &Path,
     email: Option<String>,
-    require_approval: bool,
+    role: Option<String>,
     reusable: bool,
     ttl_hours: Option<u64>,
     out: Out,
@@ -1679,7 +1645,7 @@ pub async fn run_invite(
     let resp = client(
         home,
         Request::Invite {
-            require_approval,
+            role,
             reusable,
             ttl_hours,
         },
@@ -1727,11 +1693,9 @@ pub async fn run_invite(
     if copied {
         println!("(copied to clipboard)");
     }
-    // Tell the host what this ticket actually does, so the mental model matches
-    // the flow (Pattern A: default tickets self-approve).
-    let hint = if require_approval {
-        "your teammate runs `lait join <link>`, then you `lait members approve` them"
-    } else if reusable {
+    // Tell the host what this link actually does, so the mental model matches
+    // the flow: accepting the invite IS the approval.
+    let hint = if reusable {
         "anyone who runs `lait join <link>` is admitted automatically until it expires"
     } else {
         "your teammate runs `lait join <link>` and is admitted automatically — no approve step"
@@ -1880,8 +1844,8 @@ fn kind_str(k: &EventKind) -> &'static str {
 
 fn print_event(e: &Event) {
     match e.kind {
-        // Surface the joiner's short key so an admin can approve them straight from
-        // the log (`lait members approve <that-prefix>`), not just `--json`.
+        // Surface the joiner's short key so an admin can recognize them straight
+        // from the log, not just `--json`.
         EventKind::Join => {
             let short: String = e.id.chars().take(8).collect();
             println!("[join] {} ({}): {}", e.nick, short, e.text);

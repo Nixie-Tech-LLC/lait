@@ -13,20 +13,14 @@ import {
 } from "lucide-react";
 
 import { ConfirmRequired, rpc } from "../api";
-import type { JoinRequestDto, MemberDto, MemberLogEntry } from "../types";
+import type { MemberDto, MemberLogEntry } from "../types";
 import { memberName } from "./Avatar";
-import { when } from "./time";
 import * as ask from "./dialogs";
 import { Button, IconButton } from "./primitives";
 
 /**
- * Members, join requests, and the invite link.
- *
- * The rule this screen exists to enforce, straight from the CLI: **the key is
- * authenticated; the nick is a self-asserted claim.** You approve by key, having
- * confirmed it out-of-band — so the key is what this shows first, in mono, at full
- * scannable width, and the nick is labelled as the claim it is. A UI that led with
- * the nick would be inviting exactly the mistake the ACL cannot catch.
+ * Members and the invite link. Admission needs no controls here: accepting an
+ * invite IS the approval, and redemption is automatic on the next contact.
  *
  * Roles come from the signed ACL graph — the only cryptographically-verified
  * identity in the system. Admin-only actions are hidden for non-admins rather than
@@ -44,10 +38,9 @@ export function Members({
   onError: (m: string) => void;
 }) {
   const [members, setMembers] = useState<MemberDto[]>([]);
-  const [requests, setRequests] = useState<JoinRequestDto[]>([]);
   const [log, setLog] = useState<MemberLogEntry[]>([]);
   const [ticket, setTicket] = useState<string | null>(null);
-  const [busy, setBusy] = useState<string | null>(null);
+  const [, setBusy] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -56,14 +49,6 @@ export function Members({
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e));
       return;
-    }
-    try {
-      const r = await rpc(spaceId, { cmd: "member_requests" });
-      if (r.kind === "join_requests") setRequests(r.requests);
-    } catch {
-      // A non-admin can't list requests, and that's not an error worth shouting
-      // about — they simply don't get the section.
-      setRequests([]);
     }
     try {
       const l = await rpc(spaceId, { cmd: "member_log" });
@@ -100,62 +85,7 @@ export function Members({
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto flex max-w-2xl flex-col gap-6 p-6">
-        {requests.length > 0 && isAdmin && !readOnly && (
-          <section>
-            <h2 className="text-mute mb-1 text-2xs font-semibold tracking-wider uppercase">
-              Pending · {requests.length}
-            </h2>
-            {/* The one sentence that keeps this screen honest. */}
-            <p className="text-warn mb-2 text-sm">
-              Approve by key — confirm it out-of-band. The nick is an unverified claim.
-            </p>
-            <ul className="border-line divide-line divide-y rounded border">
-              {requests.map((r) => (
-                <li key={r.key} className="flex items-center gap-3 p-3">
-                  <span className="min-w-0 flex-1">
-                    {/* Key first, full width, mono: it is the thing you verify. */}
-                    <code className="block truncate text-xs">{r.key}</code>
-                    <span className="text-mute text-xs">
-                      claims to be “{r.nick || "—"}” · {when(r.ts)}
-                    </span>
-                  </span>
-                  <Button
-                    disabled={busy === r.key}
-                    onClick={() =>
-                      void act(r.key, async () => {
-                        const as = await ask.prompt({
-                          title: "Approve this key",
-                          // The key, not the nick: it is the thing you verified.
-                          body: `${r.key.slice(0, 24)}… — this seals them the space key.`,
-                          label: "Local name (private to you)",
-                          placeholder: "optional",
-                          defaultValue: r.nick,
-                          confirmText: "Approve",
-                          // Approving without naming them is a real choice.
-                          allowEmpty: true,
-                        });
-                        // Cancel means cancel — an empty string is a deliberate
-                        // "no petname", null is "I changed my mind".
-                        if (as === null) return;
-                        await rpc(spaceId, {
-                          cmd: "member_approve",
-                          who: r.key,
-                          as_name: as.trim() || null,
-                        });
-                      })
-                    }
-                    variant="outline"
-                  >
-                    <Check className="size-3.5" />
-                    Approve
-                  </Button>
-                </li>
-              ))}
-            </ul>
-          </section>
-        )}
-
-        <section>
+                <section>
           <h2 className="text-mute mb-2 text-2xs font-semibold tracking-wider uppercase">
             Members · {members.length}
           </h2>
@@ -308,11 +238,9 @@ function MemberLog({ entries, members }: { entries: MemberLogEntry[]; members: M
 /**
  * The invite surface.
  *
- * `invite --json` returns the bare **ticket**; the `lait://join/…` link is derived
- * from it. The default pass auto-admits — the joiner runs `lait join <link>` and is
- * in, no approve step — so the copy says that rather than describing the old
- * approval-gated flow. `--require-approval` is the opt-in that makes the Pending
- * section above mean something.
+ * `invite --json` returns the bare **link body**; the `lait://join/…` link is
+ * derived from it. The capability always auto-admits — the joiner runs
+ * `lait join <link>` and is in; accepting the invite is the approval.
  */
 function Invite({
   spaceId,
@@ -327,7 +255,6 @@ function Invite({
 }) {
   const [qr, setQr] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
-  const [approval, setApproval] = useState(false);
 
   const link = ticket ? `lait://join/${ticket}` : null;
 
@@ -342,7 +269,7 @@ function Invite({
 
   const mint = async () => {
     try {
-      const r = await rpc(spaceId, { cmd: "invite", require_approval: approval });
+      const r = await rpc(spaceId, { cmd: "invite" });
       if (r.kind === "text") setTicket(r.text.trim());
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e));
@@ -354,23 +281,10 @@ function Invite({
       <h2 className="text-mute mb-2 text-2xs font-semibold tracking-wider uppercase">Invite</h2>
       <div className="border-line flex flex-col gap-3 rounded border p-3">
         {!link ? (
-          <>
-            <label className="flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={approval}
-                onChange={(e) => setApproval(e.target.checked)}
-              />
-              Require my approval
-              <span className="text-mute">
-                — otherwise the link admits them automatically
-              </span>
-            </label>
-            <Button variant="outline" size="md" onClick={() => void mint()} className="w-fit">
-              <UserPlus className="size-3.5" />
-              Create invite link
-            </Button>
-          </>
+          <Button variant="outline" size="md" onClick={() => void mint()} className="w-fit">
+            <UserPlus className="size-3.5" />
+            Create invite link
+          </Button>
         ) : (
           <>
             <div className="flex gap-4">
@@ -383,9 +297,7 @@ function Invite({
               )}
               <div className="flex min-w-0 flex-1 flex-col gap-2">
                 <p className="text-dim text-sm">
-                  {approval
-                    ? "They’ll appear above as a pending request to approve."
-                    : "They run this and they’re in — no approve step."}
+                  They run this and they’re in — accepting the invite is the approval.
                 </p>
                 <code className="bg-bg border-line block truncate rounded border p-2 text-xs">
                   lait join {link}

@@ -249,7 +249,7 @@ fn two_daemons_converge_over_an_in_memory_peer_transport() {
         &rt,
         &a_home,
         Request::Invite {
-            require_approval: true,
+            role: None,
             reusable: false,
             ttl_hours: None,
         },
@@ -379,7 +379,7 @@ fn an_invite_pass_admits_a_joiner_over_an_in_memory_peer_transport() {
         &rt,
         &a_home,
         Request::Invite {
-            require_approval: false,
+            role: None,
             reusable: false,
             ttl_hours: None,
         },

@@ -887,6 +887,11 @@ impl Replica {
                 "that proposal has not synced here yet — sync and retry",
             ));
         };
+        if proposal.is_reshare() {
+            return Err(ReplicaError::ceremony(
+                "that proposal is malformed or uses an unsupported transition",
+            ));
+        }
         let Some(cfg) = proposal.frost_config() else {
             return Err(ReplicaError::ceremony(
                 "that proposal is malformed or uses an unsupported transition",
@@ -1668,8 +1673,11 @@ impl Replica {
         };
         // Well-formedness and scheme support are the configuration's own rules,
         // re-checked at every acceptor rather than trusted from the proposer.
-        // `frost_config` also refuses a transition this phase does not implement
-        // (Reshare), so an unimplemented promise cannot enter a ceremony.
+        // This legacy plane never implements same-key resharing (the orbital
+        // mechanics engine does); refuse to act on one here.
+        if p.is_reshare() {
+            return None;
+        }
         let cfg = p.frost_config()?;
         let participants = p.frost_devices()?;
         let (n, k) = (participants.len() as u16, cfg.k);

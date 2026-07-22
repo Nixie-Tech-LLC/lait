@@ -252,15 +252,21 @@ fn cli_tree_builds_and_validates() {
 }
 
 #[test]
-fn invite_require_approval_conflicts_with_pass_tuning() {
-    // A parse-level conflict the derive enforced with conflicts_with_all — must
-    // still be rejected before dispatch.
+fn invite_accepts_a_role_and_pass_tuning() {
+    // The invite flags parse together: a role selection composes with the
+    // reuse/expiry tuning (there is no approval flag — acceptance IS the
+    // approval).
     let cli = build_cli(&specs());
-    let res = cli.try_get_matches_from(["lait", "invite", "--require-approval", "--reusable"]);
-    assert!(
-        res.is_err(),
-        "--require-approval with --reusable should be a usage error",
-    );
+    let res = cli.try_get_matches_from([
+        "lait",
+        "invite",
+        "--role",
+        "viewer",
+        "--reusable",
+        "--ttl-hours",
+        "24",
+    ]);
+    assert!(res.is_ok(), "{res:?}");
 }
 
 #[test]

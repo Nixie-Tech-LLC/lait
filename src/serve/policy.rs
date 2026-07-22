@@ -31,7 +31,6 @@ pub fn is_read(req: &Request) -> bool {
         | Request::IssueGraph { .. }
         | Request::Members
         | Request::MemberLog
-        | Request::MemberRequests
         | Request::DeviceInvite
         | Request::DeviceList
         | Request::Status
@@ -67,7 +66,6 @@ pub fn is_read(req: &Request) -> bool {
         // …the ACL, every op of which is signed by whoever's daemon runs it…
         | Request::MemberAdd { .. }
         | Request::MemberRemove { .. }
-        | Request::MemberApprove { .. }
         | Request::MemberAlias { .. }
         | Request::KeyRotate
         | Request::InviteRevoke { .. }
@@ -126,7 +124,7 @@ mod tests {
         }));
         assert!(!is_read(&Request::KeyRotate));
         assert!(!is_read(&Request::Invite {
-            require_approval: false,
+            role: None,
             reusable: false,
             ttl_hours: None,
         }));

@@ -429,7 +429,7 @@ pub fn parse_to_dispatch(argv: &[&str]) -> Result<ParsedCommand> {
 }
 
 /// The palette's completion source: every invocable leaf as `(full name, about)`
-/// — top-level verbs plus one level of group subcommands ("members approve").
+/// — top-level verbs plus one level of group subcommands ("members name").
 pub fn command_index() -> Vec<(String, &'static str)> {
     let mut out = Vec::new();
     for s in specs() {
@@ -1023,25 +1023,6 @@ pub fn specs() -> Vec<Spec> {
                         })
                     },
                 ),
-                Spec::req("requests", "List pending join requests.", vec![], |_| {
-                    Ok(Request::MemberRequests)
-                }),
-                Spec::req(
-                    "approve",
-                    "Approve a pending join request by id-prefix / key (admin-only).",
-                    vec![
-                        A::pos("who", "A key id-prefix or a 64-hex key."),
-                        A::val("as_name", "Attach a local name as you approve them.")
-                            .long("as")
-                            .value_name("NAME"),
-                    ],
-                    |m| {
-                        Ok(Request::MemberApprove {
-                            who: req_str(m, "who"),
-                            as_name: opt_str(m, "as_name"),
-                        })
-                    },
-                ),
                 Spec::req(
                     "name",
                     "Set (or clear) a local name for a member/key.",
@@ -1466,12 +1447,12 @@ pub fn specs() -> Vec<Spec> {
                         "email",
                         "Open your mail client with a prefilled invite to this address.",
                     ),
-                    A::flag(
-                        "require_approval",
-                        "Mint a pass-less ticket: the joiner lands as a pending request.",
+                    A::val(
+                        "role",
+                        "The role the invite admits as: viewer | contributor | administrator.",
                     )
-                    .long("require-approval")
-                    .conflicts(&["reusable", "ttl_hours"]),
+                    .long("role")
+                    .value_name("ROLE"),
                     A::flag(
                         "reusable",
                         "Let one ticket admit your whole team until it expires.",
