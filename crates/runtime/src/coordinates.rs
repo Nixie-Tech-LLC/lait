@@ -111,24 +111,62 @@ pub fn canonical_routes(addrs: &[SocketAddr]) -> Vec<ApproachRoute> {
 }
 
 /// The admission slot. Tag 0 = None, tag 1 = Some (postcard variant order).
+/// The capability is boxed so the enum stays small (the capability carries the
+/// role-expansion evidence).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CoordinatesAdmission {
     None,
-    Some(AdmissionCapabilityV1),
+    Some(Box<AdmissionCapabilityV1>),
 }
 
-/// The signed, single-use-or-reusable pre-authorization to request admission.
-/// Its authority, expiry, and nonce use are validated by mechanics **at
-/// redemption**; here only its structure and self-signature are checked.
+/// How many times an admission capability may be redeemed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AdmissionUsePolicy {
+    /// Exactly one binding admits.
+    SingleUse,
+    /// Up to `max_redemptions` (2..=1024) distinct candidate bindings admit.
+    Reusable { max_redemptions: u16 },
+}
+
+impl AdmissionUsePolicy {
+    /// The redemption cap this policy allows.
+    pub fn cap(&self) -> u32 {
+        match self {
+            AdmissionUsePolicy::SingleUse => 1,
+            AdmissionUsePolicy::Reusable { max_redemptions } => *max_redemptions as u32,
+        }
+    }
+    fn is_valid(&self) -> bool {
+        match self {
+            AdmissionUsePolicy::SingleUse => true,
+            AdmissionUsePolicy::Reusable { max_redemptions } => {
+                (2..=1024).contains(max_redemptions)
+            }
+        }
+    }
+}
+
+/// The signed pre-authorization to request admission (wire version 2).
+/// Accepting valid Coordinates **is** the approval — there is no approval
+/// policy field. It carries the use policy, its validity window, and the
+/// generic [`WorldAssignmentEvidence`] role expansion redemption installs. Its
+/// issuer authority, time window, reuse cap, and evidence delegability are
+/// validated by mechanics **at redemption**; here only structure, time-bound
+/// shape, and the self-signature are checked.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdmissionCapabilityV1 {
     pub version: u8,
     pub space: [u8; SPACE_ID_LEN],
     pub issuer: [u8; 32],
+    /// The capability id / revocation key.
     pub nonce: [u8; 16],
-    pub issued: u64,
-    pub expires: u64,
-    pub single_use: bool,
+    pub issued_at: u64,
+    pub not_before: u64,
+    pub expires_at: u64,
+    pub use_policy: AdmissionUsePolicy,
+    /// The generic role expansion redemption installs (opaque to Mechanics
+    /// beyond its generic assignments).
+    pub evidence: mechanics::demand::WorldAssignmentEvidence,
     pub signature_algorithm: u8,
     #[serde(with = "serde_byte_array")]
     pub signature: [u8; 64],
@@ -246,32 +284,39 @@ impl AdmissionCapabilityV1 {
             self.space,
             self.issuer,
             self.nonce,
-            self.issued,
-            self.expires,
-            self.single_use,
+            self.issued_at,
+            self.not_before,
+            self.expires_at,
+            self.use_policy,
+            self.evidence.digest(),
         ))
         .expect("postcard admission body");
         length_framed(ADMISSION_DOMAIN, &body)
     }
 
     /// Mint and sign an admission capability from the issuing device's seed.
+    #[allow(clippy::too_many_arguments)]
     pub fn sign(
         space: &SpaceId,
         nonce: [u8; 16],
-        issued: u64,
-        expires: u64,
-        single_use: bool,
+        issued_at: u64,
+        not_before: u64,
+        expires_at: u64,
+        use_policy: AdmissionUsePolicy,
+        evidence: mechanics::demand::WorldAssignmentEvidence,
         issuer_seed: &[u8; 32],
     ) -> Option<Self> {
         let issuer = mechanics::crypto::device_from_seed(issuer_seed).key_bytes()?;
         let mut cap = Self {
-            version: 1,
+            version: 2,
             space: space_id_bytes(space)?,
             issuer,
             nonce,
-            issued,
-            expires,
-            single_use,
+            issued_at,
+            not_before,
+            expires_at,
+            use_policy,
+            evidence,
             signature_algorithm: SIG_ALG_ED25519,
             signature: [0u8; 64],
         };
@@ -279,10 +324,20 @@ impl AdmissionCapabilityV1 {
         Some(cap)
     }
 
-    /// Verify structure + self-signature, and that it is bound to `space`.
-    /// Authority, expiry, and nonce use are the redeemer's (mechanics) checks.
+    /// The capability id: BLAKE3 over its full signed bytes (a stable handle
+    /// the acceptance proof binds to).
+    pub fn capability_id(&self) -> [u8; 32] {
+        blake3::derive_key(
+            "lait.admission-capability.v1",
+            &postcard::to_stdvec(self).expect("postcard admission capability"),
+        )
+    }
+
+    /// Verify structure + self-signature + evidence shape + time-bound shape,
+    /// and that it is bound to `space`. Authority, the exact time window, reuse
+    /// cap, and evidence delegability are the redeemer's (mechanics) checks.
     pub fn verify_structure(&self, space: &SpaceId) -> Result<(), CoordinatesError> {
-        if self.version != 1 {
+        if self.version != 2 {
             return Err(CoordinatesError::UnsupportedVersion(self.version));
         }
         if self.signature_algorithm != SIG_ALG_ED25519 {
@@ -293,15 +348,154 @@ impl AdmissionCapabilityV1 {
         if space_id_bytes(space).as_ref() != Some(&self.space) {
             return Err(CoordinatesError::BadAdmission);
         }
+        if !self.use_policy.is_valid() || self.not_before > self.expires_at {
+            return Err(CoordinatesError::BadAdmission);
+        }
+        if self.evidence.validate().is_err() {
+            return Err(CoordinatesError::BadAdmission);
+        }
         if !mechanics::crypto::verify_detached(&self.issuer, &self.preimage(), &self.signature) {
             return Err(CoordinatesError::BadSignature);
         }
         Ok(())
     }
 
+    /// Whether the capability's validity window contains `now` (unix seconds).
+    pub fn is_within_window(&self, now: u64) -> bool {
+        now >= self.not_before && now < self.expires_at
+    }
+
     /// Whether the capability has expired relative to `now` (unix seconds).
     pub fn is_expired(&self, now: u64) -> bool {
-        now >= self.expires
+        now >= self.expires_at
+    }
+}
+
+/// The signature domain for an invitation-acceptance proof.
+pub const ACCEPT_DOMAIN: &[u8] = b"lait.invitation.accept.v1";
+
+/// A candidate's signed proof that it accepted an exact admission capability
+/// under exact Coordinates (plan M2). It authorizes **no** operation except
+/// redemption of that exact capability and candidate binding; the candidate
+/// persists it and reuses it byte-for-byte on every retry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvitationAcceptanceProof {
+    pub version: u16,
+    pub public_key: [u8; 32],
+    pub accepted_at: u64,
+    pub nonce: [u8; 16],
+    #[serde(with = "serde_byte_array")]
+    pub signature: [u8; 64],
+}
+
+impl InvitationAcceptanceProof {
+    /// The signature preimage: the accept domain followed by the canonical
+    /// Coordinates digest, Space, approach Station, capability id, candidate
+    /// actor/device, accepted-at, and nonce, fixed/length-prefixed.
+    fn signing_preimage(
+        &self,
+        coordinates_digest: &[u8; 32],
+        space: &[u8; SPACE_ID_LEN],
+        approach_station: &[u8; 32],
+        capability_id: &[u8; 32],
+        candidate_actor: &str,
+        candidate_device: &[u8; 32],
+    ) -> Vec<u8> {
+        let body = postcard::to_stdvec(&(
+            self.version,
+            coordinates_digest,
+            space,
+            approach_station,
+            capability_id,
+            candidate_actor,
+            candidate_device,
+            self.accepted_at,
+            self.nonce,
+        ))
+        .expect("postcard acceptance preimage");
+        length_framed(ACCEPT_DOMAIN, &body)
+    }
+
+    /// The acceptance id: BLAKE3 over the unsigned preimage (including time and
+    /// nonce, excluding the signature).
+    pub fn acceptance_id(
+        &self,
+        coordinates_digest: &[u8; 32],
+        space: &[u8; SPACE_ID_LEN],
+        approach_station: &[u8; 32],
+        capability_id: &[u8; 32],
+        candidate_actor: &str,
+        candidate_device: &[u8; 32],
+    ) -> [u8; 32] {
+        blake3::derive_key(
+            "lait.invitation-acceptance.v1",
+            &self.signing_preimage(
+                coordinates_digest,
+                space,
+                approach_station,
+                capability_id,
+                candidate_actor,
+                candidate_device,
+            ),
+        )
+    }
+
+    /// Sign an acceptance proof from the candidate's device seed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign(
+        candidate_seed: &[u8; 32],
+        accepted_at: u64,
+        nonce: [u8; 16],
+        coordinates_digest: &[u8; 32],
+        space: &[u8; SPACE_ID_LEN],
+        approach_station: &[u8; 32],
+        capability_id: &[u8; 32],
+        candidate_actor: &str,
+    ) -> Option<Self> {
+        let public_key = mechanics::crypto::device_from_seed(candidate_seed).key_bytes()?;
+        let mut proof = Self {
+            version: 1,
+            public_key,
+            accepted_at,
+            nonce,
+            signature: [0u8; 64],
+        };
+        let preimage = proof.signing_preimage(
+            coordinates_digest,
+            space,
+            approach_station,
+            capability_id,
+            candidate_actor,
+            &public_key,
+        );
+        proof.signature = mechanics::crypto::sign_detached(candidate_seed, &preimage);
+        Some(proof)
+    }
+
+    /// Verify the proof binds this exact candidate/capability/Coordinates. The
+    /// candidate device id must derive from `public_key`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify(
+        &self,
+        coordinates_digest: &[u8; 32],
+        space: &[u8; SPACE_ID_LEN],
+        approach_station: &[u8; 32],
+        capability_id: &[u8; 32],
+        candidate_actor: &str,
+        candidate_device: &[u8; 32],
+    ) -> bool {
+        if self.version != 1 || &self.public_key != candidate_device {
+            return false;
+        }
+        let preimage = self.signing_preimage(
+            coordinates_digest,
+            space,
+            approach_station,
+            capability_id,
+            candidate_actor,
+            candidate_device,
+        );
+        mechanics::crypto::verify_detached(&self.public_key, &preimage, &self.signature)
     }
 }
 
@@ -347,6 +541,11 @@ impl SignedCoordinatesV1 {
     /// Canonical postcard bytes.
     pub fn encode(&self) -> Vec<u8> {
         postcard::to_stdvec(self).expect("postcard coordinates")
+    }
+
+    /// The canonical Coordinates digest an acceptance proof binds to.
+    pub fn digest(&self) -> [u8; 32] {
+        blake3::derive_key("lait.coordinates.v2", &self.encode())
     }
 
     /// Decode canonical bytes: size-bounded, exact decode/re-encode equality.
@@ -426,7 +625,7 @@ impl SignedCoordinatesV1 {
             CoordinatesAdmission::None => None,
             CoordinatesAdmission::Some(cap) => {
                 cap.verify_structure(&space)?;
-                Some(cap.clone())
+                Some((**cap).clone())
             }
         };
 

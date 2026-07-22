@@ -250,9 +250,7 @@ impl OrbitalDaemon {
                 message: Some(crate::crypto::device_from_seed(&self.device_seed).to_string()),
             },
             Request::Who => Response::Who { peers: vec![] },
-            Request::Invite {
-                require_approval, ..
-            } => self.invite(require_approval),
+            Request::Invite { reusable, .. } => self.invite(reusable),
             Request::Connect { ticket } | Request::Join { ticket } => self.connect(&ticket),
             Request::ConfigReload => Response::Ok { message: None },
             Request::Stop => Response::Ok {
@@ -361,19 +359,19 @@ impl OrbitalDaemon {
         }
     }
 
-    fn invite(&self, require_approval: bool) -> Response {
-        // Mint a single-use admission-bearing Coordinates link. `require_approval`
-        // inverts the capability's auto-admit bit: an approval-gated invite carries
-        // the joiner's material but does not self-admit on redemption.
-        let admission = match self.mechanics.mint_admission(
-            &self.device_seed,
-            24 * 3600,
-            !require_approval,
-            now_secs(),
-        ) {
-            Ok(a) => a,
-            Err(e) => return Response::err(format!("mint admission: {e}")),
-        };
+    fn invite(&self, reusable: bool) -> Response {
+        // Mint an admission-bearing Coordinates link. Accepting the invite is
+        // the approval: the capability carries the default-contributor role
+        // expansion, and redemption is automatic on Contact. `reusable` admits
+        // a team (up to the redemption cap) instead of one person.
+        let admission =
+            match self
+                .mechanics
+                .mint_admission(&self.device_seed, 24 * 3600, reusable, now_secs())
+            {
+                Ok(a) => a,
+                Err(e) => return Response::err(format!("mint admission: {e}")),
+            };
         match self.mechanics.mint_coordinates(
             &self.device_seed,
             "",

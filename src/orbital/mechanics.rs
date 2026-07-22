@@ -44,6 +44,7 @@ use runtime::coordinates::AdmissionCapabilityV1;
 const GENESIS_FILE: &str = "mech-genesis.json";
 const PENDING_INCEPTION_FILE: &str = "mech-pending-inception.bin";
 const PENDING_ADMISSION_FILE: &str = "mech-pending-admission.bin";
+const PENDING_PROOF_FILE: &str = "mech-pending-proof.bin";
 /// The verified bootstrap Coordinates a joiner entered with (routes + approach
 /// Station), persisted so the daemon can teach its transport and dial.
 const COORDINATES_FILE: &str = "mech-coordinates.bin";
@@ -60,13 +61,17 @@ pub enum AuthorityRecord {
     /// [`SealedKeyRecord`] bytes). Authorization is the signed mint;
     /// a forged envelope is inert.
     SealedKey(Vec<u8>),
-    /// A joiner's admission redemption: the admin-signed capability plus the
-    /// joiner's canonical inception bytes. An admin incorporator validates
-    /// and redeems it (AddMember + epoch sealing); everyone else retains the
-    /// effect material it rides beside.
+    /// A joiner's admission redemption: the admin-signed capability, the
+    /// joiner's canonical inception bytes, the joiner's signed acceptance
+    /// proof, and the canonical digest of the Coordinates it accepted. An
+    /// admin incorporator validates the proof + capability and redeems it
+    /// (AddMember + the evidence role expansion + epoch sealing); everyone
+    /// else retains the effect material it rides beside.
     Admission {
         admission: Vec<u8>,
         inception: Vec<u8>,
+        proof: Vec<u8>,
+        coordinates_digest: [u8; 32],
     },
 }
 
@@ -91,6 +96,9 @@ struct Inner {
     /// A joiner's self-inception, held out of the replicated set until an
     /// admin admits it (it rides the Admission record).
     pending_inception: Option<actor::SignedEvent>,
+    /// A joiner's signed acceptance proof (persisted, reused byte-for-byte on
+    /// every retry) plus the digest of the Coordinates it accepted.
+    pending_proof: Option<(runtime::coordinates::InvitationAcceptanceProof, [u8; 32])>,
 }
 
 impl Inner {
@@ -193,9 +201,16 @@ impl Inner {
         Ok(())
     }
 
-    /// The admin-side admission redemption: validate the capability and the
-    /// joiner's inception, then admit + seal in one atomic authority batch.
-    fn redeem_admission(&mut self, admission_bytes: &[u8], inception_bytes: &[u8]) -> Result<()> {
+    /// The admin-side admission redemption: validate the capability, the
+    /// acceptance proof, and the joiner's inception, then admit + install the
+    /// evidence role expansion + seal in one atomic authority batch.
+    fn redeem_admission(
+        &mut self,
+        admission_bytes: &[u8],
+        inception_bytes: &[u8],
+        proof_bytes: &[u8],
+        coords_digest: &[u8; 32],
+    ) -> Result<()> {
         let admission: AdmissionCapabilityV1 =
             postcard::from_bytes(admission_bytes).context("admission decode")?;
         admission
@@ -203,13 +218,48 @@ impl Inner {
             .map_err(|e| anyhow!("admission: {e}"))?;
         let inception: actor::SignedEvent =
             postcard::from_bytes(inception_bytes).context("inception decode")?;
+        let proof: runtime::coordinates::InvitationAcceptanceProof =
+            postcard::from_bytes(proof_bytes).context("proof decode")?;
         let joiner_actor = ActorId::from_incept_hash(&inception.hash());
         // The inception must cleanly incept for THIS space.
         let mut candidate = self.ledger.actor_events();
         candidate.push(inception.clone());
-        if !actor::replay(&self.space, &candidate).exists(&joiner_actor) {
+        let candidate_plane = actor::replay(&self.space, &candidate);
+        if !candidate_plane.exists(&joiner_actor) {
             return Err(anyhow!("invalid joiner inception"));
         }
+        // The candidate device: the proof's public key must be one of the
+        // inception's devices, and derive the device id.
+        let candidate_device = DeviceId::from_key_bytes(&proof.public_key);
+        if !candidate_plane.is_device_of(&joiner_actor, &candidate_device) {
+            return Err(anyhow!(
+                "acceptance proof key is not the candidate's device"
+            ));
+        }
+        // Verify the acceptance proof binds this exact candidate + capability +
+        // Coordinates. Substitution of any of these fails here.
+        let space_bytes = <[u8; 29]>::try_from(self.space.as_str().as_bytes())
+            .map_err(|_| anyhow!("space id shape"))?;
+        if !proof.verify(
+            coords_digest,
+            &space_bytes,
+            &admission.issuer,
+            &admission.capability_id(),
+            joiner_actor.as_str(),
+            &proof.public_key,
+        ) {
+            return Err(anyhow!("invalid acceptance proof"));
+        }
+        // The acceptance id, for single-use/reuse convergence + audit.
+        let acceptance_id = proof.acceptance_id(
+            coords_digest,
+            &space_bytes,
+            &admission.issuer,
+            &admission.capability_id(),
+            joiner_actor.as_str(),
+            &proof.public_key,
+        );
+        let _ = acceptance_id;
         let acl_state = self.acl();
         // The capability's issuer must currently speak for an admin.
         let issuer_device = DeviceId::from_key_bytes(&admission.issuer);
@@ -228,8 +278,20 @@ impl Inner {
         if acl_state.is_invite_revoked(&admission.nonce) {
             return Err(anyhow!("admission revoked"));
         }
-        if admission.single_use && acl_state.is_nonce_spent(&admission.nonce) {
-            return Err(anyhow!("admission already redeemed"));
+        // Time window: the capability must be within its validity window and
+        // the acceptance not older than it (skew-tolerant at the redeemer).
+        let now = now_secs();
+        if !admission.is_within_window(now) {
+            return Err(anyhow!("admission outside its validity window"));
+        }
+        // Redemption cap: refuse once the nonce's redemptions reach the cap
+        // (single-use = 1). Idempotent re-admit of the SAME actor is allowed.
+        let already = acl_state.nonce_redeemers(&admission.nonce);
+        if already.contains(&joiner_actor) {
+            return Ok(()); // idempotent replay
+        }
+        if already.len() as u32 >= admission.use_policy.cap() {
+            return Err(anyhow!("admission redemption cap reached"));
         }
         if acl_state.is_member(&joiner_actor) {
             return Ok(()); // idempotent
@@ -254,37 +316,37 @@ impl Inner {
                 }
             }
         }
-        let nonce = admission.single_use.then_some(admission.nonce);
+        // Always record the nonce so redemptions are counted for the cap and
+        // single-use convergence (the ACL replay resolves concurrent races by
+        // canonical acceptance order).
         self.author(
             AclAction::AddMember {
                 actor: joiner_actor.clone(),
                 grants: vec![Grant::Write],
             },
-            nonce,
+            Some(admission.nonce),
             vec![inception_effect],
             sealed_records,
         )?;
-        // Admission installs the mandatory baseline read access plus the
-        // selected role expansion (plan 04). The default invite role is
-        // `contributor` — [space.contributor, space.issue.read] — so its
-        // Session queries and ordinary mutations authorize. The exact
-        // expansion will ride the admission-v2 evidence in M2; until then the
-        // default-contributor expansion is granted here.
-        let res = mechanics::demand::PolicyResource::space(crate::world::contract::PRODUCT_WORLD);
-        for (i, name) in ["space.contributor", "space.issue.read"]
-            .into_iter()
-            .enumerate()
-        {
-            let capability = mechanics::demand::PolicyCapability::new(
-                crate::world::contract::PRODUCT_WORLD,
-                name,
-            );
+        // Redemption installs exactly the capability's WorldAssignmentEvidence
+        // expansion (plan M2) — the selected role's expanded assignments,
+        // which for the default contributor invite include the mandatory
+        // `space.issue.read` baseline.
+        for (i, (capability, resource)) in admission.evidence.assignments.iter().enumerate() {
             let salt = {
                 let mut s = super::rand16();
                 s[0] = i as u8;
                 s
             };
-            if inner_grant(self, &joiner_actor, capability, res.clone(), salt).is_err() {
+            if inner_grant(
+                self,
+                &joiner_actor,
+                capability.clone(),
+                resource.clone(),
+                salt,
+            )
+            .is_err()
+            {
                 // A grant failure inside redemption is a durable-store fault;
                 // surface it rather than admitting without authority.
                 return Err(anyhow!("seal joiner capability"));
@@ -292,6 +354,14 @@ impl Inner {
         }
         Ok(())
     }
+}
+
+/// Unix seconds now.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Author a GrantCapability for an arbitrary actor (used by redemption to
@@ -428,6 +498,7 @@ impl OrbitalMechanics {
             dir,
             pending_admission: None,
             pending_inception: None,
+            pending_proof: None,
         };
         inner.keyring.insert(epoch0, key);
         let mech = Self {
@@ -484,6 +555,7 @@ impl OrbitalMechanics {
             dir,
             pending_admission: verified.admission.clone(),
             pending_inception: None,
+            pending_proof: None,
         };
         // Self-incept so our identity can be admitted — held PENDING, carried
         // by the Admission record until an admin admits it.
@@ -515,6 +587,32 @@ impl OrbitalMechanics {
                 inner.dir.join(PENDING_ADMISSION_FILE),
                 postcard::to_stdvec(admission)?,
             )?;
+            // Accepting valid Coordinates IS the approval: sign the acceptance
+            // proof binding this candidate to the exact capability + Coordinates
+            // now, persist it, and reuse it byte-for-byte on every retry.
+            if let Some(inception) = &inner.pending_inception {
+                let candidate_actor = ActorId::from_incept_hash(&inception.hash());
+                let now = now_secs();
+                let coords_digest = coordinates.digest();
+                let space_bytes = <[u8; 29]>::try_from(inner.space.as_str().as_bytes())
+                    .map_err(|_| anyhow!("space id shape"))?;
+                let proof = runtime::coordinates::InvitationAcceptanceProof::sign(
+                    device_seed,
+                    now,
+                    super::rand16(),
+                    &coords_digest,
+                    &space_bytes,
+                    &admission.issuer,
+                    &admission.capability_id(),
+                    candidate_actor.as_str(),
+                )
+                .ok_or_else(|| anyhow!("sign acceptance proof"))?;
+                std::fs::write(
+                    inner.dir.join(PENDING_PROOF_FILE),
+                    postcard::to_stdvec(&(proof.clone(), coords_digest))?,
+                )?;
+                inner.pending_proof = Some((proof, coords_digest));
+            }
         }
         // Persist the verified Coordinates so the daemon can teach its
         // transport the approach Station's signed routes and bootstrap the
@@ -546,6 +644,9 @@ impl OrbitalMechanics {
                 .ok()
                 .and_then(|b| postcard::from_bytes(&b).ok()),
             pending_inception: std::fs::read(dir.join(PENDING_INCEPTION_FILE))
+                .ok()
+                .and_then(|b| postcard::from_bytes(&b).ok()),
+            pending_proof: std::fs::read(dir.join(PENDING_PROOF_FILE))
                 .ok()
                 .and_then(|b| postcard::from_bytes(&b).ok()),
         };
@@ -589,28 +690,61 @@ impl OrbitalMechanics {
             approach_nick_hint: String::new(),
             approach_routes,
             admission: match admission {
-                Some(a) => runtime::coordinates::CoordinatesAdmission::Some(a),
+                Some(a) => runtime::coordinates::CoordinatesAdmission::Some(Box::new(a)),
                 None => runtime::coordinates::CoordinatesAdmission::None,
             },
         };
         Ok(runtime::SignedCoordinatesV1::sign(payload, station_seed))
     }
 
-    /// Mint an admission capability (admin-only, checked by the redeemer).
+    /// Mint an admission capability (admin-only, checked by the redeemer). It
+    /// carries the default-contributor role expansion as generic
+    /// [`WorldAssignmentEvidence`] — `space.contributor` + the mandatory
+    /// `space.issue.read` baseline — which redemption installs atomically.
     pub fn mint_admission(
         &self,
         issuer_seed: &[u8; 32],
         ttl_secs: u64,
-        single_use: bool,
+        reusable: bool,
         now: u64,
     ) -> Result<AdmissionCapabilityV1> {
         let inner = self.lock();
+        let use_policy = if reusable {
+            runtime::coordinates::AdmissionUsePolicy::Reusable {
+                max_redemptions: 1024,
+            }
+        } else {
+            runtime::coordinates::AdmissionUsePolicy::SingleUse
+        };
+        // The default-contributor expansion, always including the mandatory
+        // baseline read access, sorted/deduped inside the evidence digest.
+        let world = crate::world::contract::PRODUCT_WORLD;
+        let res = mechanics::demand::PolicyResource::space(world);
+        let assignments = vec![
+            (
+                mechanics::demand::PolicyCapability::new(world, "space.contributor"),
+                res.clone(),
+            ),
+            (
+                mechanics::demand::PolicyCapability::new(world, "space.issue.read"),
+                res,
+            ),
+        ];
+        let evidence = mechanics::demand::WorldAssignmentEvidence {
+            world: world.to_string(),
+            opaque_definition_ref: b"lait.contributor".to_vec(),
+            definition_digest: *blake3::hash(b"lait.contributor.v1").as_bytes(),
+            parent_manifest_root: [0u8; 32],
+            assignments,
+        };
         AdmissionCapabilityV1::sign(
             &inner.space,
             super::rand16(),
             now,
+            now,
             now + ttl_secs,
-            single_use,
+            use_policy,
+            evidence,
             issuer_seed,
         )
         .ok_or_else(|| anyhow!("sign admission"))
@@ -759,13 +893,17 @@ impl OrbitalMechanics {
                 me.map(|a| inner.acl().is_member(&a)).unwrap_or(false)
             };
             if !admitted {
-                if let (Some(admission), Some(inception)) =
-                    (&inner.pending_admission, &inner.pending_inception)
-                {
+                if let (Some(admission), Some(inception), Some((proof, coords_digest))) = (
+                    &inner.pending_admission,
+                    &inner.pending_inception,
+                    &inner.pending_proof,
+                ) {
                     records.push(
                         AuthorityRecord::Admission {
                             admission: postcard::to_stdvec(admission).expect("admission bytes"),
                             inception: postcard::to_stdvec(inception).expect("inception bytes"),
+                            proof: postcard::to_stdvec(proof).expect("proof bytes"),
+                            coordinates_digest: *coords_digest,
                         }
                         .encode(),
                     );
@@ -1019,7 +1157,8 @@ impl replica::AuthorityIncorporator for OrbitalMechanics {
         // admissions are redeemed after, each producing its own batch.
         let mut effects: Vec<Vec<u8>> = Vec::new();
         let mut sealed: Vec<Vec<u8>> = Vec::new();
-        let mut admissions: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        type Redemption = (Vec<u8>, Vec<u8>, Vec<u8>, [u8; 32]);
+        let mut admissions: Vec<Redemption> = Vec::new();
         for raw in records {
             match AuthorityRecord::decode(raw) {
                 Some(AuthorityRecord::Effect(bytes)) => effects.push(bytes),
@@ -1027,7 +1166,9 @@ impl replica::AuthorityIncorporator for OrbitalMechanics {
                 Some(AuthorityRecord::Admission {
                     admission,
                     inception,
-                }) => admissions.push((admission, inception)),
+                    proof,
+                    coordinates_digest,
+                }) => admissions.push((admission, inception, proof, coordinates_digest)),
                 None => return Err("unrecognized authority record".into()),
             }
         }
@@ -1036,10 +1177,10 @@ impl replica::AuthorityIncorporator for OrbitalMechanics {
             .ledger
             .commit_batch(&effects, &sealed)
             .map_err(|e| e.to_string())?;
-        for (admission, inception) in &admissions {
+        for (admission, inception, proof, coords_digest) in &admissions {
             // Best-effort: only an admin holding the key can redeem;
             // everyone else carries the material onward.
-            if let Err(e) = inner.redeem_admission(admission, inception) {
+            if let Err(e) = inner.redeem_admission(admission, inception, proof, coords_digest) {
                 tracing::debug!("admission not redeemed here: {e}");
             }
         }
@@ -1057,6 +1198,8 @@ impl replica::AuthorityIncorporator for OrbitalMechanics {
             if inner.pending_inception.take().is_some() {
                 let _ = std::fs::remove_file(inner.dir.join(PENDING_INCEPTION_FILE));
             }
+            inner.pending_proof = None;
+            let _ = std::fs::remove_file(inner.dir.join(PENDING_PROOF_FILE));
             let _ = std::fs::remove_file(inner.dir.join(COORDINATES_FILE));
         }
         Ok(replica::AuthorityBatchReceipt {

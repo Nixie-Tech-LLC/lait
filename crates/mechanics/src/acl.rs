@@ -418,6 +418,10 @@ pub struct AclState {
     /// Policy administrators after every eviction: founders still holding
     /// membership plus effective meta-grant holders still holding membership.
     policy_admins: BTreeSet<ActorId>,
+    /// Invite nonce → the actors currently admitted via it (the redemption
+    /// count for an admission capability's reuse cap). A single-use nonce
+    /// resolves to at most one after convergence.
+    nonce_admits: BTreeMap<[u8; 16], BTreeSet<ActorId>>,
 }
 
 impl AclState {
@@ -434,6 +438,14 @@ impl AclState {
     /// admission — the signed single-use guard.
     pub fn is_nonce_spent(&self, nonce: &[u8; 16]) -> bool {
         self.spent_nonces.contains(nonce)
+    }
+    /// The actors currently admitted via `nonce` — the redemption count for a
+    /// capability's reuse cap (single-use = at most one). Sorted, unique.
+    pub fn nonce_redeemers(&self, nonce: &[u8; 16]) -> Vec<ActorId> {
+        self.nonce_admits
+            .get(nonce)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
     }
     /// The authorized epoch with a given id, if any (its `key_commit` binds the
     /// sealed envelopes).
@@ -1463,11 +1475,18 @@ fn materialize_authorized(
                 .push((h.clone(), actor.clone()));
         }
     }
-    // Pass 1: pick each nonce's winner and collect *every* losing op globally.
-    // A loser of one race must not count as an "independent seat" while
-    // resolving another — both are spent-nonce admissions, not standing grants,
-    // so an actor that double-spends two invites and loses both must not slip
-    // through by having each race point at the other's losing op.
+    // Pass 1: resolve **concurrent** same-nonce admissions only. Sequential
+    // redemptions of a reusable capability are causally ordered (each descends
+    // the previous), so they coexist up to the capability's redemption cap —
+    // which the redeemer's gate enforces before authoring. The convergent
+    // eviction here fires only for a true partition race: two admins that each
+    // admitted a *different* actor under the same nonce **without seeing** the
+    // other. Among a maximal set of pairwise-concurrent distinct-actor admits,
+    // the lowest-op-hash wins and the rest are losers.
+    let concurrent = |a: &str, b: &str| -> bool {
+        !ancestors.get(a).is_some_and(|anc| anc.contains(b))
+            && !ancestors.get(b).is_some_and(|anc| anc.contains(a))
+    };
     let mut all_losing: BTreeSet<String> = BTreeSet::new();
     let mut races: Vec<(ActorId, Vec<(String, ActorId)>)> = Vec::new();
     for group in by_nonce.values() {
@@ -1477,13 +1496,22 @@ fn materialize_authorized(
         }
         let mut group = group.clone();
         group.sort_by(|a, b| a.0.cmp(&b.0));
-        let winner = group[0].1.clone();
+        // An admit loses iff a lower-hash admit for a DIFFERENT actor is
+        // concurrent with it (a partition race it did not descend).
+        let mut race_group: Vec<(String, ActorId)> = Vec::new();
         for (h, actor) in &group {
-            if *actor != winner {
+            let loser = group.iter().any(|(other_h, other_actor)| {
+                other_actor != actor && other_h < h && concurrent(other_h, h)
+            });
+            if loser {
                 all_losing.insert(h.clone());
+                race_group.push((h.clone(), actor.clone()));
             }
         }
-        races.push((winner, group));
+        if !race_group.is_empty() {
+            // The winner is the lowest-hash admit in the whole group.
+            races.push((group[0].1.clone(), group));
+        }
     }
 
     // ---- revoke-wins over concurrent redemption. An admin-signed RevokeInvite
@@ -1640,6 +1668,23 @@ fn materialize_authorized(
         }
     }
 
+    // Redemption tracking: for every authorized AddMember carrying a nonce
+    // whose actor survived to the final member set, record it under that nonce
+    // — the reuse-cap count (single-use converges to at most one).
+    let mut nonce_admits: BTreeMap<[u8; 16], BTreeSet<ActorId>> = BTreeMap::new();
+    for h in authorized {
+        if let Some(AclOp {
+            action: AclAction::AddMember { actor, .. },
+            nonce: Some(n),
+            ..
+        }) = decoded[h].as_ref()
+        {
+            if members.contains_key(actor) {
+                nonce_admits.entry(*n).or_default().insert(actor.clone());
+            }
+        }
+    }
+
     AclState {
         members,
         agents,
@@ -1649,6 +1694,7 @@ fn materialize_authorized(
         rekey_fences,
         policy,
         policy_admins,
+        nonce_admits,
     }
 }
 

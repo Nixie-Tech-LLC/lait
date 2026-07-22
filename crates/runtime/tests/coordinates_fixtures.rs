@@ -57,6 +57,32 @@ fn valid_coordinates() -> SignedCoordinatesV1 {
     SignedCoordinatesV1::sign(payload, &STATION_SEED)
 }
 
+fn test_admission(
+    space: &SpaceId,
+    nonce: [u8; 16],
+    not_before: u64,
+    expires: u64,
+) -> AdmissionCapabilityV1 {
+    let evidence = mechanics::demand::WorldAssignmentEvidence {
+        world: "com.example.issues".into(),
+        opaque_definition_ref: vec![],
+        definition_digest: [0u8; 32],
+        parent_manifest_root: [0u8; 32],
+        assignments: vec![],
+    };
+    AdmissionCapabilityV1::sign(
+        space,
+        nonce,
+        not_before,
+        not_before,
+        expires,
+        runtime::coordinates::AdmissionUsePolicy::SingleUse,
+        evidence,
+        &STATION_SEED,
+    )
+    .unwrap()
+}
+
 #[test]
 fn valid_coordinates_verify() {
     let (ws, _) = valid_payload();
@@ -237,11 +263,10 @@ fn cross_space_admission_is_rejected() {
     // An admission bound to a *different* Space cannot ride these Coordinates.
     let (other_ws, _rc, _incept) = founding([77u8; 32], [3u8; 16]);
     assert_ne!(ws, other_ws);
-    let cap =
-        AdmissionCapabilityV1::sign(&other_ws, [5u8; 16], 100, 200, true, &STATION_SEED).unwrap();
+    let cap = test_admission(&other_ws, [5u8; 16], 100, 200);
 
     let (_ws2, mut payload) = valid_payload();
-    payload.admission = CoordinatesAdmission::Some(cap);
+    payload.admission = CoordinatesAdmission::Some(Box::new(cap));
     let coords = SignedCoordinatesV1::sign(payload, &STATION_SEED);
     assert_eq!(coords.verify(), Err(CoordinatesError::BadAdmission));
 }
@@ -249,10 +274,10 @@ fn cross_space_admission_is_rejected() {
 #[test]
 fn valid_admission_verifies_and_reports_expiry() {
     let (ws, _) = valid_payload();
-    let cap = AdmissionCapabilityV1::sign(&ws, [5u8; 16], 100, 200, true, &STATION_SEED).unwrap();
+    let cap = test_admission(&ws, [5u8; 16], 100, 200);
 
     let (_ws, mut payload) = valid_payload();
-    payload.admission = CoordinatesAdmission::Some(cap.clone());
+    payload.admission = CoordinatesAdmission::Some(Box::new(cap.clone()));
     let coords = SignedCoordinatesV1::sign(payload, &STATION_SEED);
     let verified = coords.verify().unwrap();
     let redeemed = verified.admission.expect("admission present");
@@ -263,8 +288,7 @@ fn valid_admission_verifies_and_reports_expiry() {
 #[test]
 fn admission_with_a_tampered_signature_is_rejected() {
     let (ws, _) = valid_payload();
-    let mut cap =
-        AdmissionCapabilityV1::sign(&ws, [5u8; 16], 100, 200, true, &STATION_SEED).unwrap();
+    let mut cap = test_admission(&ws, [5u8; 16], 100, 200);
     cap.signature[0] ^= 0xff;
     assert_eq!(
         cap.verify_structure(&ws),

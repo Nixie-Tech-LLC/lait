@@ -508,6 +508,64 @@ impl AuthorizationReceipt {
     }
 }
 
+/// The bounded generic evidence that crosses from a product World into
+/// Mechanics as an invite's role expansion (plan 01). Mechanics treats the
+/// reference/digest as opaque audit binding and interprets only the generic
+/// `assignments`, the issuer's delegation authority, and the Space/World
+/// coordinates — no RoleId, workflow type, or product DTO enters Mechanics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldAssignmentEvidence {
+    /// The World whose namespace the assignments live in (canonical WorldId).
+    pub world: String,
+    /// An opaque reference to the product role definition (audit only).
+    pub opaque_definition_ref: Vec<u8>,
+    /// The digest of the exact role definition the assignments expand.
+    pub definition_digest: [u8; 32],
+    /// The Manifest root the role definition was read from.
+    pub parent_manifest_root: [u8; 32],
+    /// The exact expanded effective assignments to install on redemption.
+    pub assignments: Vec<(PolicyCapability, PolicyResource)>,
+}
+
+impl WorldAssignmentEvidence {
+    /// The canonical bytes (postcard with sorted, deduplicated assignments).
+    pub fn canonical(&self) -> Vec<u8> {
+        let mut e = self.clone();
+        e.assignments.sort();
+        e.assignments.dedup();
+        postcard::to_stdvec(&e).expect("postcard world-assignment evidence")
+    }
+
+    /// The evidence digest — bound into the admission capability's signature.
+    pub fn digest(&self) -> [u8; 32] {
+        blake3::derive_key("lait.world-assignment-evidence.v1", &self.canonical())
+    }
+
+    /// Structural validation: bounded assignment count, valid identifiers, and
+    /// every assignment scoped to the declared World.
+    pub fn validate(&self) -> Result<(), DemandError> {
+        if !valid_name(&self.world) {
+            return Err(DemandError::BadIdentifier(format!(
+                "world `{}`",
+                self.world
+            )));
+        }
+        if self.assignments.len() > MAX_REQUIRE_LEAVES {
+            return Err(DemandError::BadStructure("too many assignments".into()));
+        }
+        for (cap, res) in &self.assignments {
+            cap.validate()?;
+            res.validate()?;
+            if cap.world != self.world || res.world != self.world {
+                return Err(DemandError::BadStructure(
+                    "assignment outside the declared World".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 fn push_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(&(s.len() as u16).to_be_bytes());
     out.extend_from_slice(s.as_bytes());
