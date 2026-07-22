@@ -215,7 +215,7 @@ fn a_dead_daemon_is_reported_dead_and_a_live_one_is_not() {
     // leaves only an exit code.
     let said = std::fs::read_to_string(&log_path).unwrap_or_default();
     assert!(
-        said.contains("store not initialized"),
+        said.contains("no orbital store") && said.contains("lait init"),
         "the daemon's stderr must reach its log — that text is the whole \
          diagnosis when a spawn dies; got: {said:?}",
     );

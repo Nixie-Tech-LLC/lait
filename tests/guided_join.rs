@@ -1,89 +1,78 @@
-//! Guided-join verifier + directory-trap fix, end-to-end (see
-//! `docs/UI.md`, joining). Two real nodes exercise the `Diagnose` control verb
-//! across the onboarding lifecycle, and a CLI-level test proves the read-command
-//! decoy-store guard. Drives daemons over the Layer-B control channel like
-//! `invite_ergonomics.rs`; the CLI guard test shells the binary because it is
+//! Guided-join verifier + directory-trap fix, end to end (see `docs/UI.md`,
+//! joining) — over the **orbital daemon**.
+//!
+//! The `Diagnose` verb is a keystone onboarding feature: it projects live daemon
+//! state into the ordered gate list so a stalled joiner gets one legible blocker
+//! instead of a blank board. Here two in-process orbital daemons (in-memory
+//! transport) walk the join lifecycle: a fresh joiner blocks on `membership`
+//! while un-admitted, then — driven only by accepting the invite and Contact
+//! (orbital's automatic admission, no manual approve) — flips to all-pass. A
+//! single-node daemon proves the expected-space directory trap, and the Stop
+//! path is proven to reap the daemon even with a parked subscriber. The CLI
+//! decoy-store / wrong-directory guards shell the real binary because they are
 //! specifically about the pre-daemon store-resolution path.
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::Result;
+use async_trait::async_trait;
 use lait::control::{request, Request, Response};
-use lait::diagnose::GateState;
+use lait::diagnose::{DiagnosisView, GateState};
+use lait::net::Network;
+use lait::orbital::run_orbital_daemon_with;
 use lait::spaces::{Origin, SpaceEntry};
+use lait::transport::mem::MemNet;
+use lait::transport::{Alpn, Transport, TransportFactory};
+
+const FOUNDER_SEED: [u8; 32] = [161u8; 32];
+const JOINER_SEED: [u8; 32] = [162u8; 32];
+
+static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_lait")
 }
 
-fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
+struct MemFactory(MemNet);
+
+#[async_trait]
+impl TransportFactory for MemFactory {
+    async fn build(
+        &self,
+        identity_seed: &[u8; 32],
+        _network: &Network,
+        _alpns: &[Alpn],
+    ) -> Result<Arc<dyn Transport>> {
+        Ok(Arc::new(
+            self.0.peer(lait::crypto::device_from_seed(identity_seed)),
+        ))
+    }
 }
 
 fn unique(tag: &str) -> PathBuf {
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let d = std::env::temp_dir().join(format!(
-        "gc-gj-{}-{}-{}",
+        "gc-gj-{}-{}-{}-{}",
         tag,
         std::process::id(),
+        n,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
+    let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
 }
 
-struct Daemon {
-    child: Child,
-    home: PathBuf,
-    /// The isolated config root for this node (holds its spaces.json).
-    config_root: PathBuf,
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.home);
-        let _ = std::fs::remove_dir_all(&self.config_root);
-    }
-}
-
-#[allow(clippy::zombie_processes)] // Daemon kills+waits on drop
-fn spawn_daemon(home: &Path, config_root: &Path) -> Daemon {
-    let mut child = Command::new(bin())
-        .arg("daemon")
-        .env("LAIT_HOME", home)
-        // Isolate the joined-space registry per node so one test's registry
-        // never bleeds into another's (it lives under config_root).
-        .env("LAIT_CONFIG_ROOT", config_root)
-        .env("LAIT_IDLE_SECS", "0")
-        .env("LAIT_HEARTBEAT_SECS", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn daemon");
-    let rt = rt();
-    let online = poll_until(Duration::from_secs(30), || {
-        rt.block_on(async { request(home, &Request::Status).await })
-            .ok()
-    });
-    if online.is_some() {
-        return Daemon {
-            child,
-            home: home.to_path_buf(),
-            config_root: config_root.to_path_buf(),
-        };
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    panic!("daemon for {} never came online", home.display());
+fn req(rt: &tokio::runtime::Runtime, home: &Path, r: Request) -> Response {
+    rt.block_on(async { request(home, &r).await })
+        .unwrap_or_else(|e| Response::err(format!("{e:#}")))
 }
 
 fn poll_until<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> Option<T> {
@@ -95,23 +84,44 @@ fn poll_until<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> Opt
         if start.elapsed() >= timeout {
             return None;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
-fn req(home: &Path, r: Request) -> Response {
-    rt().block_on(async { request(home, &r).await })
-        .unwrap_or_else(|e| Response::err(format!("{e:#}")))
+fn spawn_daemon(home: PathBuf, seed: [u8; 32], net: MemNet) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            if let Err(e) = run_orbital_daemon_with(home, seed, &MemFactory(net)).await {
+                eprintln!("DAEMON ERR: {e:#}");
+            }
+        });
+    })
 }
 
-fn diagnose(home: &Path, expected_space: Option<String>) -> lait::diagnose::DiagnosisView {
-    match req(home, Request::Diagnose { expected_space }) {
+fn wait_online(rt: &tokio::runtime::Runtime, home: &Path) {
+    let online = poll_until(Duration::from_secs(20), || {
+        matches!(req(rt, home, Request::Status), Response::Status(_)).then_some(())
+    });
+    assert!(
+        online.is_some(),
+        "orbital daemon at {} never came online",
+        home.display()
+    );
+}
+
+fn diagnose(
+    rt: &tokio::runtime::Runtime,
+    home: &Path,
+    expected_space: Option<String>,
+) -> DiagnosisView {
+    match req(rt, home, Request::Diagnose { expected_space }) {
         Response::Diagnosis(v) => *v,
         other => panic!("expected Diagnosis, got {other:?}"),
     }
 }
 
-fn gate_state(v: &lait::diagnose::DiagnosisView, id: &str) -> GateState {
+fn gate_state(v: &DiagnosisView, id: &str) -> GateState {
     v.gates
         .iter()
         .find(|g| g.id == id)
@@ -119,91 +129,50 @@ fn gate_state(v: &lait::diagnose::DiagnosisView, id: &str) -> GateState {
         .state
 }
 
-/// Found a space in `home` in-process, using the SAME identity the daemon
-/// will load (`<home>/secret.key`, since the daemon runs with `LAIT_HOME=home`).
-/// Spaces are never minted lazily anymore — a daemon errors on an
-/// uninitialized store — so every founder home goes through this first.
-fn found_home(home: &Path) {
-    let key = lait::config::load_or_create_identity(home).expect("identity");
-    let me = lait::crypto::device_from_seed(&key);
-    let store = lait::store::Store::open(home).expect("store");
-    lait::replica::found_space(&store, &me, &key, "test", &lait::ids::SystemUlidSource)
-        .expect("found space");
-}
-
-/// Bootstrap a joiner store from a ticket (the client half of `lait join`), so
-/// its daemon boots already bound to the host's space — the daemon-side
-/// Connect/Join no longer adopts a foreign space.
-fn join_home(home: &Path, ticket: &str) {
-    let t: lait::proto::SpaceTicket = ticket.parse().expect("parse ticket");
-    let store = lait::store::Store::open(home).expect("store");
-    lait::replica::join_space_store(
-        &store,
-        &t.space,
-        &t.salt,
-        &t.recovery_root,
-        t.founder_inception
-            .as_ref()
-            .expect("ticket carries a founding proof"),
-    )
-    .expect("bootstrap joiner store");
-}
-
-fn ticket_for(home: &Path, require_approval: bool) -> String {
-    match req(
-        home,
-        Request::Invite {
-            require_approval,
-            reusable: false,
-            ttl_hours: None,
-        },
-    ) {
-        Response::Text { text } => text.trim().to_string(),
-        other => panic!("invite returned {other:?}"),
-    }
-}
-
-/// The full onboarding lifecycle through the verifier: a `require-approval` joiner
-/// is blocked on `membership` until an admin approves them, then every gate passes
-/// once the board converges. This is the "empty board → legible blocker → get to
-/// work" arc the whole change exists to make honest.
+/// The full onboarding lifecycle through the verifier: a fresh joiner is blocked
+/// on `membership` until it is admitted, then every gate passes once the board
+/// converges. Orbital admission is automatic on Contact (accepting the invite is
+/// the approval) — no manual `members approve`. This is the "empty board →
+/// legible blocker → get to work" arc the whole change exists to make honest.
 #[test]
 fn diagnose_tracks_join_lifecycle_from_pending_to_all_pass() {
-    // A founds a space (in-process, same identity as its daemon), then its
-    // daemon adds a project (so the synced gate has something to converge once
-    // B is in).
-    let a_home = unique("life-a");
-    found_home(&a_home);
-    let a = spawn_daemon(&a_home, &unique("life-cfg-a"));
-    assert!(matches!(
-        req(
-            &a.home,
-            Request::ProjectNew {
-                name: "Engineering".into(),
-                key: "ENG".into(),
-            }
-        ),
-        Response::Ref { .. }
-    ));
+    let net = MemNet::new();
 
-    // B bootstraps its store from a require-approval ticket BEFORE its daemon
-    // first starts, then connects → lands pending.
-    let ticket = ticket_for(&a.home, true);
-    let b_home = unique("life-b");
-    join_home(&b_home, &ticket);
-    let b = spawn_daemon(&b_home, &unique("life-cfg-b"));
-    assert!(matches!(
-        req(&b.home, Request::Connect { ticket }),
-        Response::Ok { .. }
-    ));
+    // Founder forms a space (found_space_cli seeds a default project, so the
+    // synced gate has something to converge once the joiner is in).
+    let founder_home = unique("life-a");
+    lait::orbital::found_space_cli(&founder_home, &FOUNDER_SEED, "Engineering").unwrap();
+    let founder_handle = spawn_daemon(founder_home.clone(), FOUNDER_SEED, net.clone());
 
-    // B's diagnosis: the membership gate is the actionable blocker (not a blank
-    // board), and sync is Skip because the board is still encrypted.
-    let waited = poll_until(Duration::from_secs(30), || {
-        let v = diagnose(&b.home, None);
-        (v.blocked_on.as_deref() == Some("membership")).then_some(v)
-    });
-    let v = waited.expect("B should block on membership while pending");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    wait_online(&rt, &founder_home);
+
+    // Founder mints an auto-approving invite; joiner bootstraps from it and serves.
+    let Response::Ref { reff: invite } = req(
+        &rt,
+        &founder_home,
+        Request::Invite {
+            require_approval: false,
+            reusable: false,
+            ttl_hours: Some(24),
+        },
+    ) else {
+        panic!("expected an invite link");
+    };
+    let joiner_home = unique("life-b");
+    lait::orbital::enter_space(&joiner_home, &JOINER_SEED, &invite).unwrap();
+    let joiner_handle = spawn_daemon(joiner_home.clone(), JOINER_SEED, net.clone());
+    wait_online(&rt, &joiner_home);
+
+    // Before Contact the joiner is un-admitted: the membership gate is the
+    // actionable blocker (not a blank board), and sync is Skip because the board
+    // is still encrypted.
+    let v = diagnose(&rt, &joiner_home, None);
+    assert_eq!(
+        v.blocked_on.as_deref(),
+        Some("membership"),
+        "an un-admitted joiner blocks on membership: {v:?}"
+    );
     assert_eq!(gate_state(&v, "membership"), GateState::Wait);
     assert_eq!(
         gate_state(&v, "synced"),
@@ -211,61 +180,69 @@ fn diagnose_tracks_join_lifecycle_from_pending_to_all_pass() {
         "sync is not a second blocker while pending — the board is encrypted"
     );
 
-    // A approves B by authenticated id.
-    let b_id = match req(&b.home, Request::Id) {
-        Response::Text { text } => text.trim().to_string(),
-        other => panic!("B id returned {other:?}"),
-    };
-    let approved = poll_until(Duration::from_secs(30), || {
-        // The pending request has to reach A before it can approve.
-        match req(&a.home, Request::MemberRequests) {
-            Response::JoinRequests { requests } if requests.iter().any(|r| r.key == b_id) => {
-                Some(())
-            }
-            _ => None,
-        }
-    });
-    assert!(approved.is_some(), "A never saw B's join request");
-    assert!(matches!(
-        req(
-            &a.home,
-            Request::MemberApprove {
-                who: b_id,
-                as_name: None,
-            }
-        ),
-        Response::Ok { .. }
-    ));
+    // Drive Contact (the orbital admission handshake). Accepting the invite is
+    // the approval — no manual admin step.
+    let founder_device = lait::crypto::device_from_seed(&FOUNDER_SEED).to_string();
+    let joiner_device = lait::crypto::device_from_seed(&JOINER_SEED).to_string();
 
-    // After approval + convergence, B's diagnosis flips to all-pass: member,
-    // peer online, board synced. blocked_on clears.
+    // After admission + convergence, the joiner's diagnosis flips to all-pass:
+    // member, peer online, board synced. blocked_on clears.
     let cleared = poll_until(Duration::from_secs(30), || {
-        let v = diagnose(&b.home, None);
+        req(
+            &rt,
+            &joiner_home,
+            Request::Connect {
+                ticket: founder_device.clone(),
+            },
+        );
+        req(
+            &rt,
+            &founder_home,
+            Request::Connect {
+                ticket: joiner_device.clone(),
+            },
+        );
+        req(
+            &rt,
+            &joiner_home,
+            Request::Connect {
+                ticket: founder_device.clone(),
+            },
+        );
+        let v = diagnose(&rt, &joiner_home, None);
         v.blocked_on.is_none().then_some(v)
     });
-    let v = cleared.expect("B should reach all-pass after approval + sync");
+    let v = cleared.expect("the joiner should reach all-pass after admission + sync");
     assert_eq!(gate_state(&v, "membership"), GateState::Pass);
     assert_eq!(gate_state(&v, "peer"), GateState::Pass);
     assert_eq!(gate_state(&v, "synced"), GateState::Pass);
-    assert!(v.summary.contains("get to work"));
+    assert!(v.summary.contains("get to work"), "summary: {}", v.summary);
 
-    drop(a);
-    drop(b);
+    let _ = req(&rt, &joiner_home, Request::Stop);
+    let _ = req(&rt, &founder_home, Request::Stop);
+    let _ = joiner_handle.join();
+    let _ = founder_handle.join();
+    let _ = std::fs::remove_dir_all(&founder_home);
+    let _ = std::fs::remove_dir_all(&joiner_home);
 }
 
-/// The directory trap, made legible: `Diagnose { expected_space }` with a
-/// space that isn't the one this store is bound to fails the `space` gate,
-/// and that mismatch wins over every downstream gate — exactly the "you ran the
-/// command in the wrong folder" case the `join` tail catches.
+/// The directory trap, made legible: `Diagnose { expected_space }` with a space
+/// that isn't the one this store is bound to fails the `space` gate, and that
+/// mismatch wins over every downstream gate — exactly the "you ran the command
+/// in the wrong folder" case the `join` tail catches.
 #[test]
 fn diagnose_flags_expected_space_mismatch() {
-    let a_home = unique("mm-a");
-    found_home(&a_home);
-    let a = spawn_daemon(&a_home, &unique("mm-cfg-a"));
+    let net = MemNet::new();
+    let home = unique("mm-a");
+    lait::orbital::found_space_cli(&home, &FOUNDER_SEED, "Mismatch Space").unwrap();
+    let handle = spawn_daemon(home.clone(), FOUNDER_SEED, net.clone());
 
-    // A real space exists (A is admin), but we assert we expected a different
-    // one — as the join tail would if the cwd bound the wrong store.
-    let v = diagnose(&a.home, Some("ws_not_the_one_you_joined".into()));
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    wait_online(&rt, &home);
+
+    // A real space exists (this device is admin), but we assert we expected a
+    // different one — as the join tail would if the cwd bound the wrong store.
+    let v = diagnose(&rt, &home, Some("ws_not_the_one_you_joined".into()));
     assert_eq!(
         gate_state(&v, "space"),
         GateState::Fail,
@@ -276,65 +253,68 @@ fn diagnose_flags_expected_space_mismatch() {
         Some("space"),
         "the store mismatch must be the first/actionable blocker"
     );
-    assert!(v.summary.contains("wrong directory"));
-
-    // Sanity: with the *correct* space the gate passes.
-    let ws = match req(&a.home, Request::Status) {
-        Response::Status(s) => s.space.expect("A has a space"),
-        other => panic!("status returned {other:?}"),
-    };
-    let ok = diagnose(&a.home, Some(ws));
-    assert_eq!(gate_state(&ok, "space"), GateState::Pass);
-
-    drop(a);
-}
-
-/// A successful join records the space in the registry (store path → space)
-/// so the CLI can later route a lost joiner back to the right directory.
-#[test]
-fn join_records_the_space_registry_entry() {
-    let a_home = unique("reg-a");
-    found_home(&a_home);
-    let a = spawn_daemon(&a_home, &unique("reg-cfg-a"));
-
-    let ticket = ticket_for(&a.home, false); // default Pattern A (auto-approve)
-    let b_home = unique("reg-b");
-    join_home(&b_home, &ticket);
-    let b_cfg = unique("reg-cfg-b");
-    let b = spawn_daemon(&b_home, &b_cfg);
-    assert!(matches!(
-        req(&b.home, Request::Connect { ticket }),
-        Response::Ok { .. }
-    ));
-
-    // Every daemon boot upserts its store into spaces.json under its config
-    // root — so B's row exists as soon as its daemon is up (origin defaults to
-    // joined; the CLI-side `lait join` would have stamped host_nick too).
-    let reg_file = b_cfg.join("spaces.json");
-    let found = poll_until(Duration::from_secs(10), || {
-        let txt = std::fs::read_to_string(&reg_file).ok()?;
-        let entries: Vec<SpaceEntry> = serde_json::from_str(&txt).ok()?;
-        entries
-            .into_iter()
-            .find(|e| e.path == b_home.display().to_string())
-    });
-    let entry = found.expect("join must record a registry entry pointing at B's store");
-    assert!(entry.space.starts_with("ws_"), "entry carries the space id");
-    assert_eq!(
-        entry.origin,
-        Origin::Joined,
-        "a bootstrapped joiner registers as joined, not founded"
+    assert!(
+        v.summary.contains("wrong directory"),
+        "summary: {}",
+        v.summary
     );
 
-    drop(a);
-    drop(b);
+    // Sanity: with the *correct* space the gate passes.
+    let ws = match req(&rt, &home, Request::Status) {
+        Response::Status(s) => s.space.expect("this device has a space"),
+        other => panic!("status returned {other:?}"),
+    };
+    let ok = diagnose(&rt, &home, Some(ws));
+    assert_eq!(gate_state(&ok, "space"), GateState::Pass);
+
+    let _ = req(&rt, &home, Request::Stop);
+    let _ = handle.join();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// `stop` must terminate the daemon even while a Subscribe stream is parked on
+/// the shutdown Notify. The zombie regression: `notify_one` could hand its
+/// single permit to the parked subscriber instead of the accept loop, leaving a
+/// daemon that answered "shutting down" running forever with a half-dead control
+/// channel that hangs every later client.
+#[test]
+fn stop_kills_the_daemon_even_with_a_live_subscriber() {
+    let net = MemNet::new();
+    let home = unique("stop-a");
+    lait::orbital::found_space_cli(&home, &FOUNDER_SEED, "Stop Space").unwrap();
+    let handle = spawn_daemon(home.clone(), FOUNDER_SEED, net.clone());
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    wait_online(&rt, &home);
+
+    // Park a real subscriber server-side: read the first (Reset) frame so the
+    // daemon's stream task is provably inside its shutdown/doorbell select.
+    let _sub = rt.block_on(async {
+        let mut sub = lait::control::subscribe(&home, 0).await.expect("subscribe");
+        sub.next().await.expect("first frame").expect("reset frame");
+        sub
+    });
+
+    assert!(matches!(
+        req(&rt, &home, Request::Stop),
+        Response::Ok { .. }
+    ));
+    let exited = poll_until(Duration::from_secs(10), || {
+        handle.is_finished().then_some(())
+    });
+    assert!(
+        exited.is_some(),
+        "the daemon must exit after stop even with a live subscriber"
+    );
+    let _ = handle.join();
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 /// The decoy-store guard: a read-only command run in a directory with no `.lait/`,
-/// when the registry knows of joined spaces, must refuse to create an empty
-/// store and instead point the user at the real one — exit non-zero, no `.lait/`
-/// left behind. This is the direct fix for "joined, but `lait projects` shows
-/// nothing" caused by running from the wrong folder.
+/// when the registry knows of joined spaces, must refuse to create an empty store
+/// and instead point the user at the real one — exit non-zero, no `.lait/` left
+/// behind. This is the direct fix for "joined, but `lait projects` shows nothing"
+/// caused by running from the wrong folder.
 #[test]
 fn read_command_in_empty_dir_refuses_to_create_a_decoy_store() {
     let cfg = unique("guard-cfg");
@@ -436,24 +416,30 @@ fn read_command_with_empty_registry_still_refuses_and_suggests_creation_verbs() 
     let _ = std::fs::remove_dir_all(&cwd);
 }
 
-/// `lait join` in a directory already bound to a DIFFERENT space is a hard
-/// error (exit 2) — never adopt, never wipe. This shells the real binary because
-/// it is the pre-daemon store-resolution path.
+/// `lait join` in a directory already bound to a DIFFERENT space is a hard error
+/// (exit 2) — never adopt, never wipe. This shells the real (orbital) binary
+/// because it is the pre-daemon store-resolution path. The invite is a real
+/// orbital Coordinates link for another space.
 #[test]
 fn join_binary_refuses_a_directory_bound_to_another_space() {
-    // A real host to mint a ticket for space A…
+    // A real orbital space A, whose founder-signed Coordinates link we mint
+    // in-process (no daemon needed — the guard fires before any Contact).
     let a_home = unique("bind-a");
-    found_home(&a_home);
-    let a = spawn_daemon(&a_home, &unique("bind-cfg-a"));
-    let ticket = ticket_for(&a.home, false);
+    let (_mech_a, coords_a) = lait::orbital::form_space(&a_home, &FOUNDER_SEED, "Space A").unwrap();
+    let link = coords_a.render();
 
-    // …and a directory already bound to a different space C.
+    // …and a directory already bound to a different orbital space C.
     let c_home = unique("bind-c");
-    found_home(&c_home);
+    std::fs::write(
+        c_home.join("secret.key"),
+        data_encoding::HEXLOWER.encode(&JOINER_SEED),
+    )
+    .unwrap();
+    lait::orbital::found_space_cli(&c_home, &JOINER_SEED, "Space C").unwrap();
 
     let join_cfg = unique("bind-cfg-join");
     let out = Command::new(bin())
-        .args(["join", &ticket])
+        .args(["join", &link])
         .env("LAIT_HOME", &c_home)
         .env("LAIT_CONFIG_ROOT", &join_cfg)
         .output()
@@ -471,39 +457,7 @@ fn join_binary_refuses_a_directory_bound_to_another_space() {
         "the refusal must name the mismatch, got stderr: {stderr}"
     );
 
+    let _ = std::fs::remove_dir_all(&a_home);
     let _ = std::fs::remove_dir_all(&c_home);
     let _ = std::fs::remove_dir_all(&join_cfg);
-    drop(a);
-}
-
-/// `stop` must terminate the daemon even while a Subscribe stream is parked on
-/// the shutdown Notify. The zombie regression: `notify_one` could hand its
-/// single permit to the parked subscriber instead of the accept loop, leaving a
-/// daemon that answered "shutting down" running forever with a half-dead
-/// control channel that hangs every later client.
-#[test]
-fn stop_kills_the_daemon_even_with_a_live_subscriber() {
-    let d_home = unique("stop-a");
-    found_home(&d_home);
-    let mut d = spawn_daemon(&d_home, &unique("stop-cfg-a"));
-
-    // Park a real subscriber server-side: read the first (Reset) frame so the
-    // daemon's stream task is provably inside its shutdown/doorbell select.
-    let rt = rt();
-    let _sub = rt.block_on(async {
-        let mut sub = lait::control::subscribe(&d.home, 0)
-            .await
-            .expect("subscribe");
-        sub.next().await.expect("first frame").expect("reset frame");
-        sub
-    });
-
-    assert!(matches!(req(&d.home, Request::Stop), Response::Ok { .. }));
-    let exited = poll_until(Duration::from_secs(10), || {
-        d.child.try_wait().ok().flatten()
-    });
-    assert!(
-        exited.is_some(),
-        "daemon must exit after stop even with a live subscriber"
-    );
 }

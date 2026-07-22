@@ -1,43 +1,63 @@
-//! Restart durability: a daemon that is killed and restarted must actively rejoin
-//! the gossip mesh from its persisted peer set (`peers.json`) instead of sitting
-//! idle waiting to be re-announced to, and reconverge with a peer that kept
-//! running the whole time.
+//! Restart durability over the **orbital daemon** (in-process, in-memory
+//! transport): a joiner that is admitted and converged, then has its daemon
+//! killed and restarted on the SAME home, must come back holding its persisted
+//! membership and reconverge with a peer that files new content while it was
+//! down.
 //!
-//! Previously, `run_daemon` re-subscribed to the room topic with an empty
-//! bootstrap list and presence was in-memory only, so a restarted node could
-//! only rejoin if a still-live peer happened to redial it. This test kills B,
-//! files a new issue on A while B is down, restarts B on the SAME home, and
-//! asserts B — using only the peers it persisted before the crash — reconnects
-//! and converges to the post-restart issue.
-//!
-//! Like `two_node_sync.rs` this drives the real iroh stack over the Layer-B
-//! control channel; convergence timing over discovery/relay is variable, so the
-//! polls are generous. If the sandbox blocks iroh the daemons never come online
-//! and the test fails at setup with a clear message rather than passing silently.
+//! `orbital_two_node.rs` proves the cold form → invite → enter → admit →
+//! converge arc. This adds the restart in the middle: after admission, the
+//! joiner daemon is dropped, the founder files a new issue, and the joiner
+//! daemon is respawned on its persisted store. It must re-dock from persisted
+//! membership and, once Contact is re-driven, converge to the post-restart
+//! issue — proving the orbital store survives a crash and rejoins.
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::Result;
+use async_trait::async_trait;
 use lait::control::{request, Filter, Request, Response};
+use lait::net::Network;
+use lait::orbital::run_orbital_daemon_with;
+use lait::transport::mem::MemNet;
+use lait::transport::{Alpn, Transport, TransportFactory};
 
-fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_lait")
+const FOUNDER_SEED: [u8; 32] = [151u8; 32];
+const JOINER_SEED: [u8; 32] = [152u8; 32];
+
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct MemFactory(MemNet);
+
+#[async_trait]
+impl TransportFactory for MemFactory {
+    async fn build(
+        &self,
+        identity_seed: &[u8; 32],
+        _network: &Network,
+        _alpns: &[Alpn],
+    ) -> Result<Arc<dyn Transport>> {
+        Ok(Arc::new(
+            self.0.peer(lait::crypto::device_from_seed(identity_seed)),
+        ))
+    }
 }
 
-/// A current-thread runtime: each `req` is a single control-channel round trip, so
-/// building the default multi-thread runtime (worker-thread pool) per call — often
-/// hundreds of times over a tight poll — is pure churn. Far cheaper to build.
-fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
+fn temp_home(tag: &str) -> PathBuf {
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("lait-restart-{tag}-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
-/// Poll `check` immediately, then every 50 ms, until it yields `Some` or `timeout`
-/// elapses (returns `None`). Returning the instant the condition holds keeps a
-/// fast-converging case in the millisecond range instead of burning whole ticks.
+fn req(rt: &tokio::runtime::Runtime, home: &Path, r: Request) -> Response {
+    rt.block_on(async { request(home, &r).await })
+        .unwrap_or_else(|e| Response::err(format!("{e:#}")))
+}
+
 fn poll_until<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> Option<T> {
     let start = Instant::now();
     loop {
@@ -47,92 +67,35 @@ fn poll_until<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> Opt
         if start.elapsed() >= timeout {
             return None;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
-fn tmp_home(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "gc-restart-{}-{}-{}",
-        tag,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn spawn_daemon(home: PathBuf, seed: [u8; 32], net: MemNet) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            if let Err(e) = run_orbital_daemon_with(home, seed, &MemFactory(net)).await {
+                eprintln!("DAEMON ERR: {e:#}");
+            }
+        });
+    })
 }
 
-/// A running daemon whose process is killed on drop, so a failed assert (panic)
-/// still reaps the child instead of leaking it — a leaked daemon keeps the test
-/// harness's stdout pipe open and looks like a hang. `stop()` kills it early
-/// without wiping the home, so the same store can be respawned (the restart).
-struct Proc(Option<Child>);
-
-impl Proc {
-    fn stop(&mut self) {
-        if let Some(mut c) = self.0.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-    }
-}
-
-impl Drop for Proc {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-/// Spawn a daemon on `home` and wait until its control channel answers.
-#[allow(clippy::zombie_processes)] // Proc kills+waits on drop
-fn spawn(home: &Path) -> Proc {
-    let child = Command::new(bin())
-        .arg("daemon")
-        .env("LAIT_HOME", home)
-        // Isolate the space registry per node: the daemon-boot upsert must land
-        // in a scratch config root, never the developer's real spaces.json.
-        .env("LAIT_CONFIG_ROOT", home.join("cfgroot"))
-        // Disable idle shutdown so the restart, not a timer, is what we test.
-        .env("LAIT_IDLE_SECS", "0")
-        // Run the protocol on a fast heartbeat so catch-up/absence windows are
-        // seconds, not the 10s production default — the pipeline's biggest lever.
-        .env("LAIT_HEARTBEAT_SECS", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn daemon");
-    let rt = rt();
-    let online = poll_until(Duration::from_secs(30), || {
-        rt.block_on(async { request(home, &Request::Status).await })
-            .ok()
+fn wait_online(rt: &tokio::runtime::Runtime, home: &Path) {
+    let online = poll_until(Duration::from_secs(20), || {
+        matches!(req(rt, home, Request::Status), Response::Status(_)).then_some(())
     });
-    if online.is_some() {
-        return Proc(Some(child));
-    }
-    let mut c = child;
-    let _ = c.kill();
-    let _ = c.wait();
-    panic!("daemon for {} never came online", home.display());
+    assert!(
+        online.is_some(),
+        "orbital daemon at {} never came online",
+        home.display()
+    );
 }
 
-fn req(home: &Path, r: Request) -> Response {
-    rt().block_on(async { request(home, &r).await })
-        .unwrap_or_else(|e| Response::err(format!("{e:#}")))
-}
-
-fn id_of(home: &Path) -> String {
-    match req(home, Request::Id) {
-        Response::Text { text } => text.trim().to_string(),
-        other => panic!("id returned {other:?}"),
-    }
-}
-
-fn list_titles(home: &Path) -> Vec<String> {
+fn list_titles(rt: &tokio::runtime::Runtime, home: &Path) -> Vec<String> {
     match req(
+        rt,
         home,
         Request::List {
             project: None,
@@ -144,58 +107,9 @@ fn list_titles(home: &Path) -> Vec<String> {
     }
 }
 
-fn poll_title(home: &Path, needle: &str, timeout: Duration) -> bool {
-    poll_until(timeout, || {
-        list_titles(home).iter().any(|t| t == needle).then_some(())
-    })
-    .is_some()
-}
-
-/// Poll until `peers.json` under `home` records `id` (written when the mesh forms
-/// or on the first successful pull).
-fn poll_peer_persisted(home: &Path, id: &str, timeout: Duration) -> bool {
-    poll_until(timeout, || {
-        std::fs::read_to_string(home.join("peers.json"))
-            .unwrap_or_default()
-            .contains(id)
-            .then_some(())
-    })
-    .is_some()
-}
-
-/// Found a space in `home` in-process, using the SAME identity the daemon
-/// will load (`<home>/secret.key`, since the daemon runs with `LAIT_HOME=home`).
-/// Spaces are never minted lazily anymore — a daemon errors on an
-/// uninitialized store — so every founder home goes through this first.
-fn found_home(home: &Path) {
-    let key = lait::config::load_or_create_identity(home).expect("identity");
-    let me = lait::crypto::device_from_seed(&key);
-    let store = lait::store::Store::open(home).expect("store");
-    lait::replica::found_space(&store, &me, &key, "test", &lait::ids::SystemUlidSource)
-        .expect("found space");
-}
-
-/// Bootstrap a joiner store from a ticket (the client half of `lait join`), so
-/// its daemon boots already bound to the host's space — the daemon-side
-/// Connect/Join no longer adopts a foreign space. Restarts are unaffected:
-/// the store stays initialized.
-fn join_home(home: &Path, ticket: &str) {
-    let t: lait::proto::SpaceTicket = ticket.parse().expect("parse ticket");
-    let store = lait::store::Store::open(home).expect("store");
-    lait::replica::join_space_store(
-        &store,
-        &t.space,
-        &t.salt,
-        &t.recovery_root,
-        t.founder_inception
-            .as_ref()
-            .expect("ticket carries a founding proof"),
-    )
-    .expect("bootstrap joiner store");
-}
-
-fn new_issue(home: &Path, title: &str) -> Response {
+fn new_issue(rt: &tokio::runtime::Runtime, home: &Path, title: &str) -> Response {
     req(
+        rt,
         home,
         Request::IssueNew {
             title: title.into(),
@@ -210,17 +124,22 @@ fn new_issue(home: &Path, title: &str) -> Response {
 }
 
 #[test]
-fn restarted_daemon_rejoins_from_persisted_peers() {
-    let a_home = tmp_home("a");
-    let b_home = tmp_home("b");
-    found_home(&a_home);
-    let a = spawn(&a_home);
+fn restarted_joiner_daemon_reconverges_from_its_persisted_store() {
+    let net = MemNet::new();
 
-    // A (the founder) adds a project and files the first issue.
+    // Founder: form, seed a project + first issue, mint an auto-approving invite.
+    let founder_home = temp_home("founder");
+    lait::orbital::found_space_cli(&founder_home, &FOUNDER_SEED, "Restart Space").unwrap();
+    let founder_handle = spawn_daemon(founder_home.clone(), FOUNDER_SEED, net.clone());
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    wait_online(&rt, &founder_home);
+
     assert!(
         matches!(
             req(
-                &a_home,
+                &rt,
+                &founder_home,
                 Request::ProjectNew {
                     name: "Engineering".into(),
                     key: "ENG".into(),
@@ -228,85 +147,126 @@ fn restarted_daemon_rejoins_from_persisted_peers() {
             ),
             Response::Ref { .. }
         ),
-        "A: projects new"
+        "founder: projects new"
     );
     assert!(
-        matches!(new_issue(&a_home, "before restart"), Response::Ref { .. }),
-        "A: first issue"
+        matches!(
+            new_issue(&rt, &founder_home, "before restart"),
+            Response::Ref { .. }
+        ),
+        "founder: first issue"
     );
 
-    // B bootstraps its store from A's ticket BEFORE its daemon first starts,
-    // then connects, and A grants B membership so B can decrypt.
-    let ticket = match req(
-        &a_home,
+    let Response::Ref { reff: invite } = req(
+        &rt,
+        &founder_home,
         Request::Invite {
-            require_approval: true,
+            require_approval: false,
             reusable: false,
-            ttl_hours: None,
+            ttl_hours: Some(24),
         },
-    ) {
-        Response::Text { text } => text.trim().to_string(),
-        other => panic!("A: invite returned {other:?}"),
+    ) else {
+        panic!("expected an invite link");
     };
-    join_home(&b_home, &ticket);
-    let mut b = spawn(&b_home);
+
+    // Joiner: bootstrap the store from the invite, serve, drive admission.
+    let joiner_home = temp_home("joiner");
+    lait::orbital::enter_space(&joiner_home, &JOINER_SEED, &invite).unwrap();
+    let mut joiner_handle = Some(spawn_daemon(joiner_home.clone(), JOINER_SEED, net.clone()));
+    wait_online(&rt, &joiner_home);
+
+    let founder_device = lait::crypto::device_from_seed(&FOUNDER_SEED).to_string();
+    let joiner_device = lait::crypto::device_from_seed(&JOINER_SEED).to_string();
+
+    let drive_contact = |rt: &tokio::runtime::Runtime| {
+        req(
+            rt,
+            &joiner_home,
+            Request::Connect {
+                ticket: founder_device.clone(),
+            },
+        );
+        req(
+            rt,
+            &founder_home,
+            Request::Connect {
+                ticket: joiner_device.clone(),
+            },
+        );
+        req(
+            rt,
+            &joiner_home,
+            Request::Connect {
+                ticket: founder_device.clone(),
+            },
+        );
+    };
+
+    let admitted = poll_until(Duration::from_secs(20), || {
+        drive_contact(&rt);
+        match req(&rt, &joiner_home, Request::Status) {
+            Response::Status(info) if info.membership == "member" => Some(()),
+            _ => None,
+        }
+    });
+    assert!(admitted.is_some(), "the joiner was never admitted");
+
+    // The joiner converges the founder's pre-restart issue.
+    assert!(
+        poll_until(Duration::from_secs(20), || {
+            drive_contact(&rt);
+            list_titles(&rt, &joiner_home)
+                .iter()
+                .any(|t| t == "before restart")
+                .then_some(())
+        })
+        .is_some(),
+        "pre-restart: the joiner did not converge to the founder's first issue"
+    );
+
+    // Crash the joiner (kill its daemon thread) — its home/store survive.
+    let _ = req(&rt, &joiner_home, Request::Stop);
+    let _ = joiner_handle.take().unwrap().join();
+
+    // While the joiner is down, the founder files a new issue under the same key.
     assert!(
         matches!(
-            req(&b_home, Request::Connect { ticket }),
-            Response::Ok { .. }
+            new_issue(&rt, &founder_home, "after restart"),
+            Response::Ref { .. }
         ),
-        "B: connect"
+        "founder: post-restart issue"
     );
-    let b_id = id_of(&b_home);
-    assert!(
-        matches!(
-            req(
-                &a_home,
-                Request::MemberAdd {
-                    who: b_id,
-                    admin: false,
-                    as_name: None
-                }
-            ),
-            Response::Ok { .. }
+
+    // Restart the joiner on the SAME home. It re-docks from its persisted
+    // membership (no re-admission) and, once Contact is re-driven, reconverges.
+    let joiner_handle = spawn_daemon(joiner_home.clone(), JOINER_SEED, net.clone());
+    wait_online(&rt, &joiner_home);
+
+    // It comes back already a member — membership is persisted, not re-earned.
+    match req(&rt, &joiner_home, Request::Status) {
+        Response::Status(info) => assert_eq!(
+            info.membership, "member",
+            "the restarted joiner must reload its membership from the persisted store"
         ),
-        "A: member add B"
-    );
+        other => panic!("status returned {other:?}"),
+    }
 
-    // Prove the mesh formed and B synced A's first issue.
     assert!(
-        poll_title(&b_home, "before restart", Duration::from_secs(80)),
-        "pre-restart: B did not converge to A's first issue"
+        poll_until(Duration::from_secs(25), || {
+            drive_contact(&rt);
+            list_titles(&rt, &joiner_home)
+                .iter()
+                .any(|t| t == "after restart")
+                .then_some(())
+        })
+        .is_some(),
+        "post-restart: the joiner did not rejoin and converge to the founder's new issue"
     );
 
-    // Restart precondition: B persisted A's endpoint as a bootstrap peer.
-    let a_id = id_of(&a_home);
-    assert!(
-        poll_peer_persisted(&b_home, &a_id, Duration::from_secs(20)),
-        "B should persist A ({a_id}) in peers.json for restart bootstrap"
-    );
-
-    // Crash B (kill, not a graceful stop) — its home/store survive.
-    b.stop();
-
-    // While B is down, A files a new issue under the same epoch key.
-    assert!(
-        matches!(new_issue(&a_home, "after B restart"), Response::Ref { .. }),
-        "A: post-restart issue"
-    );
-
-    // Restart B on the same home. It bootstraps gossip from peers.json
-    // (A's id) and actively redials A; without it, B would wait to be re-announced
-    // to and never converge here.
-    b = spawn(&b_home);
-    assert!(
-        poll_title(&b_home, "after B restart", Duration::from_secs(90)),
-        "post-restart: B did not rejoin the mesh from persisted peers and converge"
-    );
-
-    // Explicit teardown (Drop would also handle it on panic).
-    b.stop();
-    drop(a);
-    let _ = std::fs::remove_dir_all(&a_home);
-    let _ = std::fs::remove_dir_all(&b_home);
+    let _ = req(&rt, &joiner_home, Request::Stop);
+    let _ = req(&rt, &founder_home, Request::Stop);
+    let _ = joiner_handle.join();
+    let _ = founder_handle.join();
+    let _ = std::fs::remove_dir_all(&founder_home);
+    let _ = std::fs::remove_dir_all(&joiner_home);
 }

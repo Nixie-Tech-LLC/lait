@@ -23,8 +23,7 @@ use crate::{
     config::{self, load_or_create_identity},
     control::{Request, Response},
     install::{self, Client, Scope},
-    mcp, node, spaces,
-    store::Store,
+    mcp, spaces,
 };
 
 fn now_secs() -> u64 {
@@ -424,17 +423,13 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
                             .unwrap_or_else(|_| "lait=info,warn".into()),
                     )
                     .init();
-                // Dual-mode during the orbital cutover: an orbital home is served
-                // by the orbital daemon; a legacy home keeps the legacy node. A
-                // fresh `lait init` now forms an orbital Space, so new homes take
-                // the orbital path; existing v0.x homes are untouched.
-                if crate::orbital::is_orbital_home(&home) {
-                    crate::orbital::run_orbital_daemon(home, &crate::transport::DefaultFactory)
-                        .await?;
-                    std::process::exit(0);
-                } else {
-                    node::run_daemon(home, m.get_flag("seed")).await?;
-                }
+                // The orbital daemon is the only daemon. `open` runs the preflight
+                // legacy detector: a pre-orbital (v0.x) store is refused with
+                // recreation guidance before anything binds, and an uninitialized
+                // home is told to run `lait init` — never a silent fallback to a
+                // legacy node.
+                crate::orbital::run_orbital_daemon(home, &crate::transport::DefaultFactory).await?;
+                std::process::exit(0);
             }
             Special::Mcp => {
                 mcp::run_mcp(&home).await?;
@@ -755,96 +750,22 @@ async fn run_join_orbital(m: &ArgMatches, link: &str, out: Out) -> Result<()> {
 async fn run_join_cli(m: &ArgMatches, out: Out) -> Result<()> {
     let ticket_str = m.get_one::<String>("ticket").cloned().unwrap_or_default();
 
-    // Dual-mode during the orbital cutover: a Coordinates v1 link takes the
-    // orbital join path; a legacy SpaceTicket takes the legacy node path.
-    if runtime::SignedCoordinatesV1::parse_link(ticket_str.trim()).is_ok() {
-        return run_join_orbital(m, &ticket_str, out).await;
+    // Orbital is the only join path: a Coordinates v1 link joins. Anything else
+    // — a legacy `SpaceTicket`, an older/newer link, malformed bytes — is
+    // refused with the typed [`CoordinatesError`] (a pre-carve ticket surfaces
+    // as `UnsupportedVersion`), never a fallback to the legacy node.
+    match runtime::SignedCoordinatesV1::parse_link(ticket_str.trim()) {
+        Ok(_) => run_join_orbital(m, &ticket_str, out).await,
+        Err(runtime::coordinates::CoordinatesError::UnsupportedVersion(v)) => Err(anyhow!(
+            "this invite is not a lait Coordinates link (version {v} — it looks like a \
+             legacy space ticket from an older lait). Ask the inviter for a fresh \
+             `lait invite` link."
+        )),
+        Err(e) => Err(anyhow!(
+            "this invite could not be read as a lait Coordinates link ({e:?}). Ask the \
+             inviter for a fresh `lait invite` link."
+        )),
     }
-    let ticket: crate::proto::SpaceTicket = ticket_str.parse()?;
-
-    // Resolve the target store: --dir, else the discoverable store, else a
-    // fresh `cwd/.lait` (with a guard against homedir/root litter).
-    let target = if let Some(d) = m.get_one::<String>("dir") {
-        config::store_dir_under(std::path::Path::new(d))?
-    } else if let Some(existing) = config::existing_home() {
-        existing
-    } else {
-        let cwd = std::env::current_dir()?;
-        let is_home = std::env::var_os("USERPROFILE")
-            .or_else(|| std::env::var_os("HOME"))
-            .is_some_and(|h| std::path::Path::new(&h) == cwd);
-        if is_home || cwd.parent().is_none() {
-            eprintln!("refusing to create a space store in {} — pass --dir <path> (or cd into the project directory first).", cwd.display());
-            std::process::exit(1);
-        }
-        config::store_dir_for_init(&cwd)?
-    };
-
-    if crate::store::initialized_at(&target) {
-        // Bound already: a re-join of the same space is fine; a different
-        // one is a hard error (never adopt, never wipe).
-        let store = Store::open(&target)?;
-        match store.genesis()? {
-            Some(g) if g.space_id.to_string() == ticket.space => {}
-            Some(g) => {
-                eprintln!(
-                    "this directory holds space {} — the invite is for {}.",
-                    g.space_id, ticket.space
-                );
-                eprintln!("run `lait join` from another directory, or pass --dir <path>.");
-                std::process::exit(2);
-            }
-            None => {
-                return Err(anyhow!(
-                    "corrupt store at {} (catalog without genesis)",
-                    target.display()
-                ))
-            }
-        }
-    } else {
-        let store = Store::open(&target)?;
-        let founder_inception = ticket.founder_inception.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "this invite carries no founding proof — it may be from an older lait; ask for a fresh one"
-            )
-        })?;
-        crate::replica::join_space_store(
-            &store,
-            &ticket.space,
-            &ticket.salt,
-            &ticket.recovery_root,
-            founder_inception,
-        )?;
-    }
-
-    // Set the display name before the daemon is auto-spawned so a cold joiner
-    // announces the right name on its join request. It stays a self-asserted
-    // claim — the admin approves by key, never by this nickname.
-    if let Some(n) = m.get_one::<String>("nick") {
-        let p = config::store_config_path(&target);
-        let mut cfg = config::ConfigMap::load(&p);
-        cfg.set("user.nick", n);
-        cfg.save(&p)?;
-    }
-
-    // Register the joiner store (pre-daemon, so `lait spaces` sees it even
-    // if the transport leg fails below).
-    if let Err(e) = spaces::upsert(spaces::SpaceEntry {
-        space: ticket.space.clone(),
-        name: ticket.name.clone(),
-        path: target.display().to_string(),
-        origin: spaces::Origin::Joined,
-        host_nick: ticket.host_nick.clone(),
-        last_opened: now_secs(),
-        projects: vec![],
-    }) {
-        eprintln!("(space registry update failed: {e:#})");
-    }
-
-    // Daemon leg: spawn against the exact bootstrapped store, then the guided
-    // verifier tail (gate readout instead of a bare "ok").
-    std::env::set_var("LAIT_STORE", &target);
-    crate::cli::run_join(&target, ticket_str, out).await
 }
 
 /// `lait config get|set|unset|ls`: layered local settings. Daemon-free by

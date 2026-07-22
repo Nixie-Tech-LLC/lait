@@ -83,6 +83,11 @@ pub struct OrbitalDaemon {
     /// Signalled by a `Stop` request so `serve` returns (the injectable
     /// contract: return, don't `exit`).
     shutdown: Arc<tokio::sync::Notify>,
+    /// Latched when teardown begins (Stop or idle-shutdown). A live
+    /// `Subscribe` stream polls this between its bounded waits so it lets go
+    /// promptly instead of pinning a worker thread inside a long blocking
+    /// `next_timeout`, which would otherwise keep the daemon alive after Stop.
+    stopping: std::sync::atomic::AtomicBool,
     /// Control connections currently being served (idle-shutdown suppressor).
     active_conns: std::sync::atomic::AtomicU64,
     /// When the last control connection was accepted or completed — the idle
@@ -178,6 +183,7 @@ impl OrbitalDaemon {
             device_seed,
             home: home.to_path_buf(),
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            stopping: std::sync::atomic::AtomicBool::new(false),
             active_conns: std::sync::atomic::AtomicU64::new(0),
             last_activity: Mutex::new(std::time::Instant::now()),
         })
@@ -845,6 +851,7 @@ impl OrbitalDaemon {
                 _ = idle_tick.tick() => {
                     if self.should_idle_shutdown(idle_window) {
                         tracing::info!("orbital daemon idle-shutdown after {idle_window:?}");
+                        self.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
                         break;
                     }
                 }
@@ -925,6 +932,8 @@ impl OrbitalDaemon {
         let resp = self.dispatch(req);
         let _ = write_line(write_half, &resp).await;
         if stop {
+            self.stopping
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             self.shutdown.notify_one();
         }
     }
@@ -958,7 +967,15 @@ impl OrbitalDaemon {
         // Drain the initial reset record so subsequent records are live.
         let _ = stream.try_next();
         loop {
-            match stream.next_timeout(Duration::from_secs(30)) {
+            // Poll on a short window rather than one long blocking wait: the
+            // wait is synchronous, so a 30s window would pin this worker thread
+            // and keep the daemon alive ~30s past a Stop. A quarter-second
+            // window bounds teardown while still delivering a doorbell within
+            // one tick of its publication.
+            if self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            match stream.next_timeout(Duration::from_millis(250)) {
                 Ok(Some(record)) => {
                     let frame = Doorbell {
                         epoch: record.epoch.as_u64(),
