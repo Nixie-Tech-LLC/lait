@@ -3,7 +3,7 @@
 //! One tracked driver thread runs a current-thread tokio runtime hosting:
 //!
 //! - the **accept loop**: inbound `lait/contact/1` connections are answered by
-//!   serving a snapshot of the Replica's retained material (signed Hello/Ack
+//!   serving a snapshot of the Replica's retained material (signed Hello/PresenceAck
 //!   handshake binding Space, Stations, transport identity, and nonces; then
 //!   the canonical frame sequence; then the `TransferAck`, `finish`,
 //!   `wait_closed` discipline). Inbound `lait/neighbor-presence/1` probes are
@@ -39,7 +39,7 @@ use crate::contact::{
 use crate::error::ContactError;
 use crate::lifecycle::CancelToken;
 use crate::lifecycle::ContactOutcome;
-use crate::neighbor_presence::{Ack, Probe, PRESENCE_ALPN};
+use crate::neighbor_presence::{PresenceAck, PresenceProbe, PRESENCE_ALPN};
 use crate::neighbors::NeighborRegistry;
 use crate::session::StationCore;
 
@@ -82,7 +82,7 @@ pub struct GossipOptions {
 /// The comms configuration a Station activates with.
 pub struct CommsOptions {
     pub transport: Arc<dyn comms::Transport>,
-    /// The Station's own device seed: signs Hello/Ack, Beacons, manifests,
+    /// The Station's own device seed: signs Hello/PresenceAck, Beacons, manifests,
     /// and attributes incorporations.
     pub station_seed: [u8; 32],
     pub mechanics: ContactMechanics,
@@ -432,7 +432,7 @@ async fn step<F: std::future::Future>(
     tokio::time::timeout(budget, fut).await.map_err(|_| ())
 }
 
-/// The initiator side over an open stream: Hello/Ack handshake, receive every
+/// The initiator side over an open stream: Hello/PresenceAck handshake, receive every
 /// frame through the pure machine, send the ack.
 async fn initiate(
     ctx: &DriverContext,
@@ -645,7 +645,8 @@ async fn serve_presence(
         .map_err(|_| ContactError::Unreachable)?
         .map_err(|e| ContactError::Transfer(e.to_string()))?
         .ok_or(ContactError::Unreachable)?;
-    let probe = Probe::decode(&probe_bytes).map_err(|e| ContactError::Transfer(e.to_string()))?;
+    let probe =
+        PresenceProbe::decode(&probe_bytes).map_err(|e| ContactError::Transfer(e.to_string()))?;
     let prober = StationId::from_device(&from).ok_or(ContactError::UnknownNeighbor)?;
     probe
         .verify(&ctx.space_bytes, &prober)
@@ -655,7 +656,7 @@ async fn serve_presence(
     }
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|e| ContactError::Transfer(e.to_string()))?;
-    let ack = Ack::sign(&probe, nonce, &ctx.options.station_seed)
+    let ack = PresenceAck::sign(&probe, nonce, &ctx.options.station_seed)
         .ok_or_else(|| ContactError::Transfer("sign presence ack".into()))?;
     let _ = step(
         deadline,
