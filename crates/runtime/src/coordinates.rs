@@ -1,5 +1,5 @@
 //! Coordinates v1 — the canonical, verifiable material to identify and approach
-//! a Space. This is S2's replacement for the pre-carve `SpaceTicket`: a signed,
+//! a Space. This is S2's replacement for the pre-carve join ticket: a signed,
 //! self-describing envelope with a fixed postcard tuple layout, a length-framed
 //! signature preimage, strict bounds, and an exhaustive malformed/substitution
 //! rejection matrix.
@@ -13,7 +13,7 @@
 //! authorizes a *request* — standing exists only after mechanics validates
 //! incorporated authority material at redemption.
 //!
-//! The old `SpaceTicket` tag/domain is rejected with
+//! The old ticket tag/domain is rejected with
 //! [`CoordinatesError::UnsupportedVersion`]; there is no migration.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -202,7 +202,7 @@ pub struct SignedCoordinates {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoordinatesError {
     /// The version tag was not 2 (covers Coordinates v1 and a pre-carve
-    /// `SpaceTicket`) — rejected, never negotiated.
+    /// join ticket) — rejected, never negotiated.
     UnsupportedVersion(u8),
     /// The signature algorithm was not Ed25519.
     UnsupportedSignatureAlgorithm(u8),

@@ -4,7 +4,7 @@
 //! semantic transaction DAG. It is an **equality/cursor token**, not a scalar
 //! ordering claim: ancestry and concurrency are proven by Manifest transaction
 //! references during Convergence, which is what avoids an unbounded public
-//! vector clock. Fabric's own Loro frontier stays an opaque token *inside*
+//! vector clock. Fabric's own document frontier stays an opaque token *inside*
 //! Fabric commit receipts and never appears in World/runtime wire types.
 
 use serde::{Deserialize, Serialize};

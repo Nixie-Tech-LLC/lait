@@ -4,7 +4,7 @@
 //! Replica translates a validated set of staged [`BodyOp`]s into semantic
 //! [`FabricOp`]s, submits them to a Fabric engine for an atomic apply, and
 //! advances its semantic frontier **only** from the returned Fabric receipt.
-//! It never authors a Loro delta and never fabricates a receipt.
+//! It never authors a raw document delta and never fabricates a receipt.
 //!
 //! **The canonical store.** A durable Replica persists — through the Fabric
 //! journal's six-step commit protocol, at one linearization point per
@@ -34,8 +34,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use fabric::{
-    journal::ObjectRef, BodyExport, Fabric, FabricError, FabricKey, FabricOp,
-    FabricTransactionRequest, JournaledStore, LoroFabric,
+    journal::ObjectRef, BodyExport, CrdtFabric, Fabric, FabricError, FabricKey, FabricOp,
+    FabricTransactionRequest, JournaledStore,
 };
 use mechanics::crypto::BODY_EPOCH_ID_LEN;
 use mechanics::ids::SpaceId;
@@ -504,9 +504,9 @@ impl Replica {
         }
     }
 
-    /// Build a Loro-backed Replica with **no** durable store (tests/scratch).
+    /// Build a fabric-backed Replica with **no** durable store (tests/scratch).
     pub fn loro() -> Self {
-        Self::new(Box::new(LoroFabric::new()))
+        Self::new(Box::new(CrdtFabric::new()))
     }
 
     /// Attach a mechanics-owned key source (required to seal local commits and
@@ -581,7 +581,7 @@ impl Replica {
             }
             Err(e) => return Err(ReplicaCommitError::Durability(e.to_string())),
         };
-        let mut replica = Self::new(Box::new(LoroFabric::new())).with_keys(keys.clone());
+        let mut replica = Self::new(Box::new(CrdtFabric::new())).with_keys(keys.clone());
         let Some(manifest) = store.manifest() else {
             replica.durable = Some(store);
             return Ok(replica);

@@ -622,11 +622,11 @@ pub fn default_workflow_states() -> Vec<WorkflowState> {
 /// Revision-head computation over a grow-only log: the heads are entries no
 /// other entry names as a predecessor. One head is usable; several are an
 /// explicit conflict the caller must surface.
-fn heads_of<'a, T, I: Fn(&T) -> &str, P: Fn(&T) -> &[String]>(
-    log: &'a [T],
+fn heads_of<T, I: Fn(&T) -> &str, P: Fn(&T) -> &[String]>(
+    log: &[T],
     id_of: I,
     preds_of: P,
-) -> Vec<&'a T> {
+) -> Vec<&T> {
     use std::collections::BTreeSet;
     let referenced: BTreeSet<&str> = log
         .iter()

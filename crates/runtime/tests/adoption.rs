@@ -11,7 +11,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use mechanics::acl::Grant;
 use mechanics::ids::{ActorId, DeviceId};
 use replica::body::{BodyOp, BodySchema, MutationModel};
 use replica::frontier::{AuthorityFrontier, ReplicaFrontier};
@@ -28,8 +27,8 @@ fn any_demand() -> Vec<u8> {
 }
 use runtime::{
     ActivationOptions, AuthorityView, DeorbitConfirmation, LifecycleError, LocalIdentity,
-    PrincipalResolution, Runtime, RuntimeBuilder, SpaceFormationOptions, Standing, World,
-    WorldContext, WorldEffect, WorldError, WorldIntent, WorldLimits, WorldProjection, WorldQuery,
+    PrincipalResolution, Runtime, RuntimeBuilder, SpaceFormationOptions, World, WorldContext,
+    WorldEffect, WorldError, WorldIntent, WorldLimits, WorldProjection, WorldQuery,
     WorldRegistration, WorldVersion,
 };
 
@@ -37,22 +36,62 @@ use runtime::{
 const WRITER_SEED: [u8; 32] = [51u8; 32];
 const READER_SEED: [u8; 32] = [52u8; 32];
 
-/// The consumer-supplied mechanics view: grants Write to the writer device only.
+/// A view whose default `authorize_mutation` builds a structurally-valid
+/// receipt — the permissive delegate for the writer-only view's allow path.
+struct PermissiveAuthority;
+
+impl AuthorityView for PermissiveAuthority {
+    fn resolve(&self, _device: &DeviceId) -> Option<PrincipalResolution> {
+        None
+    }
+}
+
+/// The consumer-supplied mechanics view: authorizes mutations for the writer
+/// device only (every known device resolves and may dock).
 struct ConsumerAuthority;
 
 impl AuthorityView for ConsumerAuthority {
-    fn resolve(&self, device: &DeviceId) -> Option<PrincipalResolution> {
-        let writer = mechanics::crypto::device_from_seed(&WRITER_SEED);
-        let grants = if device == &writer {
-            vec![Grant::Write]
-        } else {
-            vec![]
-        };
+    fn resolve(&self, _device: &DeviceId) -> Option<PrincipalResolution> {
         Some(PrincipalResolution {
             actor: ActorId::from_incept_hash(&"b".repeat(64)),
-            standing: Standing::new(grants),
             authority_frontier: AuthorityFrontier::from_canonical_bytes(vec![2]),
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_mutation(
+        &self,
+        space: &mechanics::ids::SpaceId,
+        world: &WorldId,
+        actor: &ActorId,
+        device: &DeviceId,
+        authority_frontier: &AuthorityFrontier,
+        parent_manifest_root: [u8; 32],
+        implementation_id: [u8; 32],
+        intent_digest: [u8; 32],
+        demand: &[u8],
+        operations_digest: [u8; 32],
+        core_digest: [u8; 32],
+    ) -> Result<Vec<u8>, String> {
+        // The coarse per-device write gate lives in the view, as the orbital
+        // composition's demand evaluation does — never in the World callback.
+        let writer = mechanics::crypto::device_from_seed(&WRITER_SEED);
+        if device != &writer {
+            return Err("device holds no write authority".into());
+        }
+        PermissiveAuthority.authorize_mutation(
+            space,
+            world,
+            actor,
+            device,
+            authority_frontier,
+            parent_manifest_root,
+            implementation_id,
+            intent_digest,
+            demand,
+            operations_digest,
+            core_digest,
+        )
     }
 }
 
@@ -128,12 +167,9 @@ impl World for KvWorld {
     }
     fn submit(
         &self,
-        ctx: &mut WorldContext<'_>,
+        _ctx: &mut WorldContext<'_>,
         intent: WorldIntent,
     ) -> Result<WorldEffect, WorldError> {
-        if !ctx.principal().standing.has(&Grant::Write) {
-            return Err(WorldError::Denied);
-        }
         let text = String::from_utf8(intent.payload).map_err(|_| WorldError::InvalidRequest)?;
         let (key, value) = text.split_once('=').ok_or(WorldError::InvalidRequest)?;
         let body = self.body(key);

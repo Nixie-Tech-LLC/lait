@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use mechanics::acl::Grant;
 use mechanics::crypto::AuthorizedBodyKey;
 use mechanics::ids::{ActorId, DeviceId};
 use replica::body::{BodyOp, BodySchema, MutationModel};
@@ -83,12 +82,9 @@ impl World for KvWorld {
     }
     fn submit(
         &self,
-        ctx: &mut WorldContext<'_>,
+        _ctx: &mut WorldContext<'_>,
         intent: WorldIntent,
     ) -> Result<WorldEffect, WorldError> {
-        if !ctx.principal().standing.has(&Grant::Write) {
-            return Err(WorldError::Denied);
-        }
         let text = String::from_utf8(intent.payload).map_err(|_| WorldError::InvalidRequest)?;
         let (key, value) = text.split_once('=').ok_or(WorldError::InvalidRequest)?;
         let body = self.body(key);
@@ -122,19 +118,59 @@ impl World for KvWorld {
 }
 
 struct WriterOnly;
+
+/// A view whose default `authorize_mutation` builds a structurally-valid
+/// receipt — the permissive delegate for the writer-only view's allow path.
+struct PermissiveAuthority;
+
+impl runtime::AuthorityView for PermissiveAuthority {
+    fn resolve(&self, _device: &DeviceId) -> Option<runtime::PrincipalResolution> {
+        None
+    }
+}
+
 impl runtime::AuthorityView for WriterOnly {
-    fn resolve(&self, device: &DeviceId) -> Option<runtime::PrincipalResolution> {
-        let writer = mechanics::crypto::device_from_seed(&WRITER_SEED);
-        let grants = if device == &writer {
-            vec![Grant::Write]
-        } else {
-            vec![]
-        };
+    fn resolve(&self, _device: &DeviceId) -> Option<runtime::PrincipalResolution> {
         Some(runtime::PrincipalResolution {
             actor: ActorId::from_incept_hash(&"e".repeat(64)),
-            standing: runtime::Standing::new(grants),
             authority_frontier: AuthorityFrontier::from_canonical_bytes(vec![5]),
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_mutation(
+        &self,
+        space: &mechanics::ids::SpaceId,
+        world: &WorldId,
+        actor: &ActorId,
+        device: &DeviceId,
+        authority_frontier: &AuthorityFrontier,
+        parent_manifest_root: [u8; 32],
+        implementation_id: [u8; 32],
+        intent_digest: [u8; 32],
+        demand: &[u8],
+        operations_digest: [u8; 32],
+        core_digest: [u8; 32],
+    ) -> Result<Vec<u8>, String> {
+        // The coarse per-device write gate lives in the view, as the orbital
+        // composition's demand evaluation does — never in the World callback.
+        let writer = mechanics::crypto::device_from_seed(&WRITER_SEED);
+        if device != &writer {
+            return Err("device holds no write authority".into());
+        }
+        PermissiveAuthority.authorize_mutation(
+            space,
+            world,
+            actor,
+            device,
+            authority_frontier,
+            parent_manifest_root,
+            implementation_id,
+            intent_digest,
+            demand,
+            operations_digest,
+            core_digest,
+        )
     }
 }
 

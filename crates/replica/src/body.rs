@@ -3,7 +3,7 @@
 //! A Body is a durable addressable World entity. A World declares its
 //! [`BodySchema`]s and stages [`BodyOp`]s; Replica validates them, mechanics
 //! adjudicates authority, and Fabric makes them durable. The operation algebra
-//! is LAIT semantics — **not** a copy of Loro's API — and is frozen as an S1
+//! is LAIT semantics — **not** a copy of the CRDT engine's API — and is frozen as an S1
 //! fixture and implemented through Fabric in S5. This module defines the sealed
 //! contract shapes; S0 introduces no production routing.
 
@@ -72,7 +72,7 @@ pub struct BodySchema {
 }
 
 /// The LAIT-owned Body operation algebra. A World stages these; it cannot submit
-/// raw Loro updates or container ids. Stable element ids, paths, concurrency,
+/// raw CRDT updates or container ids. Stable element ids, paths, concurrency,
 /// idempotency, limits, and errors are LAIT semantics. This enum is the sealed
 /// S0 shape; the exact path grammar and element-identity rules are frozen as an
 /// S1 fixture and implemented through Fabric in S5.

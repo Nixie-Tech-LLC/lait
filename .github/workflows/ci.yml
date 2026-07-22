@@ -130,13 +130,6 @@ jobs:
         shell: bash
         run: bash ci/portability-guard.sh
 
-      # Boundary guard: the replica domain must not speak the client protocol.
-      # `dispatch.rs` is the one adapter; a domain module naming Request or
-      # Response compiles fine, so only this catches the regression.
-      - name: Replica boundary guard (no control protocol in the domain)
-        shell: bash
-        run: bash ci/replica-boundary-guard.sh
-
       # End-to-end smoke against the REAL binary (no network): drive the P0
       # tracker flow — create a project + issues, render the board, edit an
       # issue, and read the activity feed — asserting on observed output. Proves
@@ -208,6 +201,74 @@ jobs:
             fi
           done
           exit "$bad"
+
+  # ---------------------------------------------------------------------------
+  # Orbital release gates (plan 50): each named job proves one mandatory
+  # artifact family from the verification matrix, on a clean checkout of the
+  # identical commit. The full workspace suite in `check` subsumes these tests;
+  # naming them as separate required jobs is the point — a deleted or renamed
+  # gate turns a green aggregate red instead of silently narrowing coverage.
+  # nextest `binary()` filters match test binaries across the whole workspace,
+  # and an expression that matches nothing fails the run rather than skipping.
+  orbital-gates:
+    name: ${{ matrix.job }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - job: orbital-boundaries
+            filter: "binary(orbital_boundaries)"
+          - job: orbital-clean-break
+            filter: "binary(orbital_clean_break) + binary(semantic_type_names)"
+          - job: orbital-authority
+            filter: "binary(authority_history) + binary(authority_checkpoint) + binary(world_policy) + binary(ceremony_frontier_isolation)"
+          - job: orbital-formats
+            filter: "binary(dto_schema) + binary(coordinates_fixtures) + binary(contact_fixtures) + binary(beacon_presence_fixtures) + binary(manifest_fixtures) + binary(transaction_marker_fixtures) + binary(canonical_ids) + binary(canonical_store) + binary(algebra_fixtures)"
+          - job: orbital-faults
+            filter: "binary(journal_faults) + binary(journal_child_crash) + binary(manifest_atomicity) + binary(orbital_catalog)"
+          - job: orbital-contact-real
+            filter: "binary(contact_iroh) + binary(contact_mem)"
+          - job: orbital-bootstrap-real
+            filter: "binary(orbital_join_iroh) + binary(orbital_admission)"
+          - job: orbital-ceremonies
+            filter: "binary(orbital_ceremonies) + binary(mechanics_sparse_ceremony)"
+          - job: orbital-independent-world
+            filter: "binary(independent_world) + binary(orbital_adoption)"
+          - job: orbital-product-parity
+            filter: "binary(orbital_product_parity) + binary(issues_policy_designer) + binary(orbital_daemon_lifecycle) + binary(control_classification) + binary(mcp_parity) + binary(viewer_parity)"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install nextest
+        uses: taiki-e/install-action@e658debeddbabf20b2b866d9235eb08a2375b1ad
+        with:
+          tool: nextest
+      - name: Run gate
+        run: cargo nextest run --locked --all-features -E '${{ matrix.filter }}'
+
+  # Aggregate required check: green only when every orbital gate (and the
+  # cross-platform workspace matrix) is green. Branch protection points here so
+  # a skipped or cancelled gate can never satisfy the release bar.
+  orbital-complete:
+    name: orbital-complete
+    runs-on: ubuntu-latest
+    needs: [check, orbital-gates, viewer]
+    if: always()
+    steps:
+      - name: Assert every dependency succeeded
+        run: |
+          results='${{ toJSON(needs) }}'
+          echo "$results"
+          echo "$results" | grep -q '"result": *"failure"' && exit 1
+          echo "$results" | grep -q '"result": *"cancelled"' && exit 1
+          echo "$results" | grep -q '"result": *"skipped"' && exit 1
+          exit 0
 
   # Verify the MSRV floor holds. The floor is driven by iroh 1.0.0-rc.1 (rustc
   # 1.91). If this breaks, either the floor moved or a dep raised its MSRV.

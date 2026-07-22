@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::acl::{self, AclAction, AclOp, AclState, Grant};
+use crate::acl::{self, AclAction, AclOp, AclState};
 use crate::actor;
 use crate::crypto::{self, SpaceKey};
 use crate::genesis::Genesis;
@@ -450,13 +450,7 @@ impl Inner {
             .iter()
             .map(|(c, _)| c.name.as_str())
             .collect();
-        let grants = if caps.contains(&"space.admin") {
-            vec![Grant::Admin, Grant::Write]
-        } else if caps.contains(&"space.contributor") {
-            vec![Grant::Write]
-        } else {
-            vec![]
-        };
+        let grants = acl::grants_for_capability_names(&caps);
         let actor_asof = self.ledger.actor_heads(&me_actor);
         // Always record the nonce so redemptions are counted for the cap and
         // single-use convergence (the ACL replay resolves concurrent races by
@@ -1110,7 +1104,7 @@ impl OrbitalMechanics {
             .into_iter()
             .map(|(actor, grants)| crate::dto::MemberDto {
                 key: actor.as_str().to_string(),
-                role: role_of(&grants),
+                role: acl::role_label(&grants).to_string(),
                 me: me.as_ref() == Some(&actor),
                 sponsor: None,
                 alias: String::new(),
@@ -1142,7 +1136,10 @@ impl OrbitalMechanics {
                 actor: entry.by.map(|a| a.as_str().to_string()).unwrap_or_default(),
                 kind: entry.kind.to_string(),
                 subject: entry.subject.map(|a| a.as_str().to_string()),
-                role: entry.grants.as_deref().map(role_of),
+                role: entry
+                    .grants
+                    .as_deref()
+                    .map(|g| acl::role_label(g).to_string()),
                 authorized: entry.authorized,
             })
             .collect()
@@ -1163,11 +1160,7 @@ impl OrbitalMechanics {
         if inner.acl().is_member(&actor) {
             return Ok(());
         }
-        let grants = if admin {
-            vec![Grant::Admin, Grant::Write]
-        } else {
-            vec![Grant::Write]
-        };
+        let grants = acl::membership_grants(admin);
         let sealed = inner.seal_records_for_actor(&actor);
         inner.author(
             AclAction::AddMember {
@@ -1715,10 +1708,8 @@ impl runtime::AuthorityView for OrbitalMechanics {
         if !acl_state.is_member(&actor) {
             return None;
         }
-        let standing = runtime::Standing::new(acl_state.grants(&actor));
         Some(runtime::PrincipalResolution {
             actor,
-            standing,
             authority_frontier: inner.frontier(),
         })
     }
@@ -1925,16 +1916,5 @@ impl replica::AuthorityIncorporator for OrbitalMechanics {
             resulting_frontier: inner.frontier(),
             batch_digest: receipt.batch_digest,
         })
-    }
-}
-
-/// Render an ACL grant set as the product's coarse role label.
-fn role_of(grants: &[Grant]) -> String {
-    if grants.contains(&Grant::Admin) {
-        "admin".into()
-    } else if grants.contains(&Grant::Write) {
-        "member".into()
-    } else {
-        "viewer".into()
     }
 }

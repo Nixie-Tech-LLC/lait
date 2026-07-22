@@ -79,17 +79,17 @@ pub struct SpaceEntry {
 /// a live control-channel probe, done by the CLI layer (it needs async).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorePresence {
-    /// The path holds an initialized store (genesis + catalog on disk).
+    /// The path holds a formed/entered Space store.
     Present,
-    /// The path is gone or no longer holds an initialized store.
+    /// The path is gone or no longer holds a Space store.
     Missing,
 }
 
-/// Check whether an entry's path still holds an initialized store. Mirrors
-/// `Store::is_initialized` without opening (or creating) anything.
+/// Check whether an entry's path still holds a Space store, without opening
+/// (or creating) anything.
 pub fn presence(entry: &SpaceEntry) -> StorePresence {
     let path = Path::new(&entry.path);
-    if crate::store::initialized_at(path) || crate::orbital::is_orbital_home(path) {
+    if crate::orbital::space_store_present(path) {
         StorePresence::Present
     } else {
         StorePresence::Missing
@@ -192,6 +192,25 @@ pub fn prune() -> Result<Vec<SpaceEntry>> {
         save(&kept)?;
     }
     Ok(removed)
+}
+
+/// Derive a short project KEY from a display name: initials of up to four
+/// words, or the first four letters of a single word, uppercased.
+pub fn derive_project_key(name: &str) -> String {
+    let words: Vec<&str> = name
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let key: String = match words.len() {
+        0 => "PRJ".to_string(),
+        1 => words[0].chars().take(4).collect(),
+        _ => words
+            .iter()
+            .take(4)
+            .filter_map(|w| w.chars().next())
+            .collect(),
+    };
+    key.to_ascii_uppercase()
 }
 
 #[cfg(test)]
@@ -333,9 +352,10 @@ mod tests {
         // A real initialized store on disk…
         let live = std::env::temp_dir().join(format!("lait-wsreg-live-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&live);
-        std::fs::create_dir_all(live.join("repo")).unwrap();
-        std::fs::write(live.join("repo").join("genesis.json"), "{}").unwrap();
-        std::fs::write(live.join("repo").join("catalog.loro"), "x").unwrap();
+        // The store probe wants a `ws_*` directory under the orbital store
+        // root — shape only, no contents.
+        std::fs::create_dir_all(live.join("orbital").join("ws_00000000000000000000000000"))
+            .unwrap();
         upsert(entry("ws_LIVE", live.to_str().unwrap(), 10)).unwrap();
         // …and a registered path that holds nothing.
         upsert(entry("ws_GONE", "/tmp/definitely-gone-xyz", 20)).unwrap();
@@ -347,23 +367,4 @@ mod tests {
         assert_eq!(kept[0].space, "ws_LIVE");
         let _ = std::fs::remove_dir_all(&live);
     }
-}
-
-/// Derive a short project KEY from a display name: initials of up to four
-/// words, or the first four letters of a single word, uppercased.
-pub fn derive_project_key(name: &str) -> String {
-    let words: Vec<&str> = name
-        .split(|c: char| !c.is_ascii_alphabetic())
-        .filter(|w| !w.is_empty())
-        .collect();
-    let key: String = match words.len() {
-        0 => "PRJ".to_string(),
-        1 => words[0].chars().take(4).collect(),
-        _ => words
-            .iter()
-            .take(4)
-            .filter_map(|w| w.chars().next())
-            .collect(),
-    };
-    key.to_ascii_uppercase()
 }

@@ -42,8 +42,7 @@ fn resolve_space_selector(sel: &str) -> Result<std::path::PathBuf> {
     // the `.lait` dir itself or its parent.
     if sel.contains('/') || sel.contains('\\') || Path::new(sel).is_dir() {
         let p = Path::new(sel);
-        let has_space =
-            |h: &Path| crate::store::initialized_at(h) || crate::orbital::is_orbital_home(h);
+        let has_space = |h: &Path| crate::orbital::space_store_present(h);
         let store = if has_space(p) {
             p.to_path_buf()
         } else if has_space(&p.join(".lait")) {
@@ -276,7 +275,7 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
             }
             // A fresh identity home holds no space yet — say so instead of
             // spawning a daemon that can only fail to open the store.
-            if !crate::store::initialized_at(&home) && !crate::orbital::is_orbital_home(&home) {
+            if !crate::orbital::space_store_present(&home) {
                 crate::cli::emit_ok(
                     &format!(
                         "identity '{name}' has no space yet — `lait init` to found one, or `lait join <link>`"
@@ -509,7 +508,9 @@ async fn run_init(m: &ArgMatches, out: Out) -> Result<()> {
     // Refuse when discovery already binds an initialized store: one directory
     // (tree) holds one space — legacy or orbital.
     if let Some(existing) = config::existing_home() {
-        if crate::store::initialized_at(&existing) || crate::orbital::is_orbital_home(&existing) {
+        if crate::orbital::space_store_present(&existing)
+            || crate::orbital::unsupported_store_at(&existing).is_some()
+        {
             eprintln!(
                 "already inside a space — its store is at {}",
                 existing.display()
@@ -653,7 +654,7 @@ async fn run_join_orbital(m: &ArgMatches, link: &str, out: Out) -> Result<()> {
     };
 
     // Refuse to re-bind a directory that already holds a different space.
-    if crate::orbital::is_orbital_home(&target) {
+    if crate::orbital::space_store_present(&target) {
         match crate::orbital::discover_space_id(&target) {
             Some(existing) if existing.as_str() == space => {}
             Some(existing) => {
@@ -675,7 +676,7 @@ async fn run_join_orbital(m: &ArgMatches, link: &str, out: Out) -> Result<()> {
     }
 
     // Bootstrap the orbital store from the invite (idempotent for a re-join).
-    if !crate::orbital::is_orbital_home(&target) {
+    if !crate::orbital::space_store_present(&target) {
         crate::orbital::enter_space(&target, &seed, link)?;
     }
 
@@ -692,7 +693,7 @@ async fn run_join_orbital(m: &ArgMatches, link: &str, out: Out) -> Result<()> {
         eprintln!("(space registry update failed: {e:#})");
     }
 
-    // Spawn the orbital daemon (dual-mode `daemon` picks orbital for this home).
+    // Spawn the daemon (the orbital Station is the only daemon).
     crate::cli::ensure_daemon(&target).await?;
 
     // Drive Contact to the approach Station until admitted (or a deadline). The
@@ -750,9 +751,9 @@ async fn run_join_cli(m: &ArgMatches, out: Out) -> Result<()> {
     let ticket_str = m.get_one::<String>("ticket").cloned().unwrap_or_default();
 
     // Orbital is the only join path: a Coordinates v1 link joins. Anything else
-    // — a legacy `SpaceTicket`, an older/newer link, malformed bytes — is
+    // — a pre-carve join ticket, an older/newer link, malformed bytes — is
     // refused with the typed [`CoordinatesError`] (a pre-carve ticket surfaces
-    // as `UnsupportedVersion`), never a fallback to the legacy node.
+    // as `UnsupportedVersion`), never a fallback to a legacy code path.
     match runtime::SignedCoordinates::parse_link(ticket_str.trim()) {
         Ok(_) => run_join_orbital(m, &ticket_str, out).await,
         Err(runtime::coordinates::CoordinatesError::UnsupportedVersion(v)) => Err(anyhow!(
@@ -773,8 +774,7 @@ async fn run_join_cli(m: &ArgMatches, out: Out) -> Result<()> {
 /// `ConfigReload`, else it applies on next start (and says so).
 async fn run_config(dispatch: &Dispatch, m: &ArgMatches, out: Out) -> Result<()> {
     use crate::config::{key_spec, ConfigMap, KeyLayers, Settings, KEYS};
-    let home = config::existing_home()
-        .filter(|h| crate::store::initialized_at(h) || crate::orbital::is_orbital_home(h));
+    let home = config::existing_home().filter(|h| crate::orbital::space_store_present(h));
     let which = match dispatch {
         Dispatch::Special(s) => *s,
         _ => unreachable!(),

@@ -411,7 +411,7 @@ pub async fn ensure_daemon_as(home: &Path, identity: Option<&Path>) -> Result<()
     // A daemon can only open an initialized store — fail fast with guidance
     // instead of spawning a doomed process and timing out 20s later. This is a
     // missing store, not an unreachable daemon: `1`, not `3`.
-    if !crate::store::initialized_at(home) && !crate::orbital::is_orbital_home(home) {
+    if !crate::orbital::space_store_present(home) {
         return Err(anyhow!(
             "no space at {} — found one with `lait init`, or join one with `lait join <link>`",
             home.display()

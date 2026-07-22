@@ -2,7 +2,7 @@
 //!
 //! This lives in the kernel, not the store: it is the seed that seeds every
 //! trust-plane replay ([`crate::acl`], [`crate::actor`], [`crate::space`],
-//! [`crate::authz`]), depends on nothing but identity types, and is durable-
+//! the content plane), depends on nothing but identity types, and is durable-
 //! format-agnostic. The store merely *persists* it (as `genesis.json`); it does
 //! not define it.
 

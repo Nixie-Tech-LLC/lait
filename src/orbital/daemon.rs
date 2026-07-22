@@ -38,7 +38,7 @@ use runtime::{
 use crate::config::{acquire_daemon_lock, load_or_create_identity};
 use crate::control::{control_name, Doorbell, Request, Response, StatusInfo};
 use crate::ids::SystemUlidSource;
-use crate::orbital::{detect_legacy_home, orbital_store_root, OrbitalMechanics};
+use crate::orbital::{orbital_store_root, unsupported_store_at, OrbitalMechanics};
 use crate::transport::{Transport, TransportFactory};
 use crate::world::{IssueRouter, IssuesWorld, RouterFacts};
 
@@ -106,7 +106,7 @@ impl OrbitalDaemon {
         device_seed: [u8; 32],
         factory: &dyn TransportFactory,
     ) -> Result<Self> {
-        if let Some(err) = detect_legacy_home(home) {
+        if let Some(err) = unsupported_store_at(home) {
             return Err(anyhow!("{err}"));
         }
         let space = discover_space(home)?;
@@ -932,7 +932,7 @@ impl OrbitalDaemon {
                 });
             }
         }
-        entries.sort_by(|a, b| b.ts.cmp(&a.ts));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.ts));
         entries.truncate(200);
         let unread = entries.iter().filter(|e| e.ts > watermark).count() as u64;
         (entries, unread)

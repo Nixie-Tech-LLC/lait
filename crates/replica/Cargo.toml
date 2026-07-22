@@ -3,17 +3,17 @@ name = "replica"
 version = "0.6.0"
 edition = "2021"
 rust-version = "1.91"
-description = "LAIT Replica semantics: Body identity, schemas, descriptors, semantic frontiers, transaction plans, incorporation, and Convergence — above mechanics and Fabric, naming neither Loro nor any product/consumer type."
+description = "LAIT Replica semantics: Body identity, schemas, descriptors, semantic frontiers, transaction plans, incorporation, and Convergence — above mechanics and Fabric, naming neither the CRDT engine nor any product/consumer type."
 license = "MIT OR Apache-2.0"
 
 [dependencies]
 # mechanics — identity, authority, custody, key legitimacy. Replica combines
 # these facts with Fabric durability into orbital Replica semantics.
 mechanics = { path = "../mechanics" }
-# fabric — the sealed Loro component. Replica translates validated semantic
+# fabric — the sealed convergence component. Replica translates validated semantic
 # plans into Fabric requests and advances its frontier only from a Fabric commit
 # receipt. `loro` is intentionally ABSENT from this manifest: the seal is the
-# dependency edge, so `loro::*` cannot be named here.
+# dependency edge, so the CRDT engine cannot be named here.
 fabric = { path = "../fabric" }
 
 serde = { version = "1", features = ["derive"] }

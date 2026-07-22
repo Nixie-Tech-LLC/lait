@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use mechanics::acl::Grant;
 use mechanics::ids::{ActorId, DeviceId};
 
 use crate::error::WorldError;
@@ -14,7 +13,7 @@ use crate::lifecycle::{ActivationOptions, Runtime, SpaceFormationOptions};
 use crate::registry::RuntimeBuilder;
 use crate::session::ObservationCursor;
 use crate::world::{
-    AuthorityView, LocalIdentity, PrincipalResolution, Standing, World, WorldContext, WorldEffect,
+    AuthorityView, LocalIdentity, PrincipalResolution, World, WorldContext, WorldEffect,
     WorldIntent, WorldLimits, WorldProjection, WorldQuery, WorldRegistration, WorldVersion,
 };
 use replica::body::{BodyOp, BodySchema, MutationModel};
@@ -30,28 +29,67 @@ fn any_demand() -> Vec<u8> {
     .expect("canonical demand")
 }
 
-/// The writing test device (granted Write by [`SeedAuthority`]).
+/// The writing test device (authorized to mutate by [`SeedAuthority`]).
 const WRITER_SEED: [u8; 32] = [41u8; 32];
-/// A second device with no grants (resolves, but has empty standing).
+/// A second device that resolves (docks fine) but is refused every mutation.
 const READER_SEED: [u8; 32] = [42u8; 32];
 
-/// A test mechanics view: the writer device gets Write standing, any other
-/// known-shaped device resolves with empty standing.
+/// A view whose default `authorize_mutation` builds a structurally-valid
+/// receipt — the permissive delegate for [`SeedAuthority`]'s allow path.
+struct PermissiveAuthority;
+
+impl AuthorityView for PermissiveAuthority {
+    fn resolve(&self, _device: &DeviceId) -> Option<PrincipalResolution> {
+        None
+    }
+}
+
+/// A test mechanics view: every known-shaped device resolves, but only the
+/// writer device passes mutation authorization — the coarse per-device gate
+/// lives in the view (as the orbital composition's demand evaluation does),
+/// never in the World callback.
 struct SeedAuthority;
 
 impl AuthorityView for SeedAuthority {
-    fn resolve(&self, device: &DeviceId) -> Option<PrincipalResolution> {
-        let writer = mechanics::crypto::device_from_seed(&WRITER_SEED);
-        let grants = if device == &writer {
-            vec![Grant::Write]
-        } else {
-            vec![]
-        };
+    fn resolve(&self, _device: &DeviceId) -> Option<PrincipalResolution> {
         Some(PrincipalResolution {
             actor: ActorId::from_incept_hash(&"a".repeat(64)),
-            standing: Standing::new(grants),
             authority_frontier: AuthorityFrontier::from_canonical_bytes(vec![1]),
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_mutation(
+        &self,
+        space: &mechanics::ids::SpaceId,
+        world: &WorldId,
+        actor: &ActorId,
+        device: &DeviceId,
+        authority_frontier: &AuthorityFrontier,
+        parent_manifest_root: [u8; 32],
+        implementation_id: [u8; 32],
+        intent_digest: [u8; 32],
+        demand: &[u8],
+        operations_digest: [u8; 32],
+        core_digest: [u8; 32],
+    ) -> Result<Vec<u8>, String> {
+        let writer = mechanics::crypto::device_from_seed(&WRITER_SEED);
+        if device != &writer {
+            return Err("device holds no write authority".into());
+        }
+        PermissiveAuthority.authorize_mutation(
+            space,
+            world,
+            actor,
+            device,
+            authority_frontier,
+            parent_manifest_root,
+            implementation_id,
+            intent_digest,
+            demand,
+            operations_digest,
+            core_digest,
+        )
     }
 }
 
@@ -110,13 +148,9 @@ impl World for NoteWorld {
     }
     fn submit(
         &self,
-        ctx: &mut WorldContext<'_>,
+        _ctx: &mut WorldContext<'_>,
         intent: WorldIntent,
     ) -> Result<WorldEffect, WorldError> {
-        // Authorization is per request: the note World needs Write standing.
-        if !ctx.principal().standing.has(&Grant::Write) {
-            return Err(WorldError::Denied);
-        }
         if intent.schema.as_str() != "note" {
             return Err(WorldError::UnsupportedSchema);
         }
@@ -240,7 +274,8 @@ fn test_world_submits_and_queries_through_dispatch() {
 fn authorization_is_checked_per_request() {
     let station = station();
     let world_id = WorldId::parse("com.example.notes").unwrap();
-    // A principal with no Write standing is denied at submit, not at dock.
+    // A principal the view refuses to authorize is denied at submit (the
+    // mechanics authorizer returns a typed denial), not at dock.
     let session = station.dock(&world_id, &reader()).unwrap();
     let denied = submit_as(
         &session,
@@ -659,7 +694,6 @@ impl AuthorityView for FlippingAuthority {
     fn resolve(&self, _device: &DeviceId) -> Option<PrincipalResolution> {
         Some(PrincipalResolution {
             actor: ActorId::from_incept_hash(&"a".repeat(64)),
-            standing: Standing::new(vec![Grant::Write]),
             authority_frontier: AuthorityFrontier::from_canonical_bytes(
                 self.frontier.lock().unwrap().clone(),
             ),
@@ -804,9 +838,6 @@ impl World for BoardWorld {
         ctx: &mut WorldContext<'_>,
         intent: WorldIntent,
     ) -> Result<WorldEffect, WorldError> {
-        if !ctx.principal().standing.has(&Grant::Write) {
-            return Err(WorldError::Denied);
-        }
         let key = self.body();
         Ok(WorldEffect {
             demand: any_demand(),

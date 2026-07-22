@@ -2,7 +2,7 @@
 //! projection** of Layer A. These are the shapes the CLI
 //! `--json` contract emits and the MCP tools return; they are checked against
 //! the MCP tool schemas (see `tests/mcp_parity.rs`) so agent and human surfaces
-//! never drift. They are **not** an automatic dump of the Loro layout — a
+//! never drift. They are **not** an automatic dump of the storage layout — a
 //! storage refactor must not break these.
 //!
 //! Also home to the shared plain-domain enums ([`Priority`], [`StatusCategory`],
@@ -42,7 +42,7 @@ pub const MIN_SUPPORTED_SCHEMA: u32 = 3;
 /// string leaf and projected here.
 ///
 /// ```
-/// use mechanics::dto::Priority;
+/// use lait::dto::Priority;
 /// assert_eq!(Priority::parse("urgent"), Some(Priority::Urgent));
 /// assert_eq!(Priority::parse("h"), Some(Priority::High)); // one-letter alias
 /// assert!(Priority::Urgent > Priority::Low);              // orders low→high

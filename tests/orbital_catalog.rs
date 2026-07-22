@@ -169,7 +169,6 @@ fn principal(space: &mechanics::ids::SpaceId) -> runtime::PrincipalFacts {
         station: mechanics::ids::StationId::from_device(&device).unwrap(),
         device,
         space: space.clone(),
-        standing: runtime::Standing::new(vec![]),
         authority_frontier: replica::frontier::AuthorityFrontier::from_canonical_bytes(vec![]),
     }
 }
@@ -202,8 +201,10 @@ fn misplaced_and_duplicate_catalogs_are_typed_corrupt_never_repaired() {
     );
 
     // A catalog-schema Body at the WRONG key only: corrupt (never selected).
-    let mut reader = StubReader::default();
-    reader.catalog_bodies = vec![wrong.clone()];
+    let mut reader = StubReader {
+        catalog_bodies: vec![wrong.clone()],
+        ..Default::default()
+    };
     reader
         .views
         .insert(wrong.clone(), replica::CollaborativeView::default());
@@ -217,8 +218,10 @@ fn misplaced_and_duplicate_catalogs_are_typed_corrupt_never_repaired() {
     );
 
     // The right key AND a second semantic catalog: corrupt (never merged).
-    let mut reader = StubReader::default();
-    reader.catalog_bodies = vec![right.clone(), wrong.clone()];
+    let mut reader = StubReader {
+        catalog_bodies: vec![right.clone(), wrong.clone()],
+        ..Default::default()
+    };
     reader
         .views
         .insert(right.clone(), replica::CollaborativeView::default());
@@ -236,8 +239,10 @@ fn misplaced_and_duplicate_catalogs_are_typed_corrupt_never_repaired() {
 
     // The right key bound as a catalog but unreadable under the collaborative
     // model (wrong model/encoding): corrupt, not "missing".
-    let mut reader = StubReader::default();
-    reader.catalog_bodies = vec![right.clone()];
+    let reader = StubReader {
+        catalog_bodies: vec![right.clone()],
+        ..Default::default()
+    };
     let ctx = WorldContext::with_reads(&facts, &reader, [0u8; 32]);
     assert!(
         matches!(

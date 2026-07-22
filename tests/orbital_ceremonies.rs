@@ -232,7 +232,7 @@ fn break_glass_solo_recovery_re_roots_and_re_keys() {
     // break-glass recovery re-roots the space to it and re-keys to fence the
     // old root — a completed, installed recovery.
     match f.space_recover().unwrap() {
-        lait::replica::SpaceRecovery::Installed(done) => {
+        mechanics::ceremony::SpaceRecovery::Installed(done) => {
             assert!(
                 done.rekey_failed.is_none(),
                 "the follow-on content re-key succeeded"
@@ -268,7 +268,7 @@ fn threshold_recovery_installs_the_exact_root_and_fences_the_old_epoch() {
     // group signature installs on convergence.
     let opened = c1.1.space_recover().unwrap();
     let session = match &opened {
-        lait::replica::SpaceRecovery::Pending { session, .. } => *session,
+        mechanics::ceremony::SpaceRecovery::Pending { session, .. } => *session,
         other => panic!("one holder alone cannot complete a threshold recovery: {other:?}"),
     };
     converge(&[&f, &c1.1, &c2.1]);
@@ -447,7 +447,7 @@ fn resharing_replaces_a_participant_without_changing_the_key() {
     // co-signs a threshold recovery that installs.
     let opened = c1.1.space_recover().unwrap();
     let session = match &opened {
-        lait::replica::SpaceRecovery::Pending { session, .. } => *session,
+        mechanics::ceremony::SpaceRecovery::Pending { session, .. } => *session,
         other => panic!("threshold recovery still needs a co-signature: {other:?}"),
     };
     converge(&[&f, &c1.1, &c2.1, &c3.1]);

@@ -2,7 +2,7 @@
 //!
 //! This module fixes the LAIT Body operation algebra's **declared semantics** and
 //! **bounds** so an implementation (S5, through Fabric) and an independent World
-//! author agree on behavior. It is LAIT semantics, not a copy of Loro's API.
+//! author agree on behavior. It is LAIT semantics, not a copy of the CRDT engine's API.
 //!
 //! # Paths
 //!

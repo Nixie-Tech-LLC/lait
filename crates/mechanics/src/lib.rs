@@ -2,7 +2,7 @@
 //! the minimal set of commitments everything else is derived from, and against
 //! which every scaffold is replaceable.
 //!
-//! This crate lists **no scaffold** in its manifest — not Loro, not iroh — so a
+//! This crate lists **no scaffold** in its manifest — no CRDT engine, no transport — so a
 //! scaffold reference here does not compile. That absence *is* the boundary:
 //! "where lait starts and ends" is the dependency edge, enforced by rustc.
 //!
@@ -28,7 +28,6 @@
 pub mod acl;
 pub mod actor;
 pub mod authority;
-pub mod authz;
 pub mod ceremony;
 pub mod compile;
 pub mod crypto;
@@ -36,7 +35,6 @@ pub mod custody;
 pub mod demand;
 
 pub mod dkg;
-pub mod dto;
 pub mod expand;
 pub mod gaccess;
 pub mod gdkg;

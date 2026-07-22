@@ -1,6 +1,6 @@
 //! The **actor identity plane** — the third signed hash-DAG plane
 //! (`lait/actor/1`), beneath membership. Where the ACL ([`crate::acl`])
-//! answers *which actors are here* and content authority ([`crate::authz`])
+//! answers *which actors are here* and content authority
 //! answers *which high-consequence actions were taken*, this plane answers
 //! *which device keys speak for an actor* — and it is the only plane that is
 //! **self-authorized**: an actor adds, revokes, and recovers its own devices;
@@ -52,7 +52,7 @@
 //! *concurrent with* a valid `Recover` are struck: the compromised branch
 //! cannot race the recovery). Replay is a pure function of the event set —
 //! never a current-state gate — so every replica converges (the
-//! [`crate::authz`] doctrine, one layer down).
+//! content-authority doctrine, one layer down).
 //!
 //! **Recovery supremacy.** Recovery-wins is applied *before* revoke-wins by
 //! striking every device-authored event (adds *and* revokes) concurrent with a
@@ -63,7 +63,7 @@
 //! standing commitment — so a signature-valid-but-commitment-invalid `Recover`
 //! has zero effect and never triggers the strike.
 //!
-//! **The accepted residual** is the same class the authz plane names: a still-
+//! **The accepted residual** is the same class the content plane names: a still-
 //! bound device can author ops embedding a pre-revocation frontier until the
 //! revocation propagates — bounded by concurrency, remediated by an explicit
 //! counter-op. Not a new risk class.
@@ -91,7 +91,7 @@ pub const ACTOR_DOMAIN: &[u8] = b"lait/actor/1";
 pub const CONSENT_DOMAIN: &[u8] = b"lait/devbind/1";
 
 /// Cap on the `actor_asof` frontier other planes embed when resolving a
-/// device→actor binding at position (cf. [`crate::authz::MAX_ASOF`]).
+/// device→actor binding at position (bounded like the content plane's asof).
 pub const MAX_ACTOR_ASOF: usize = 16;
 
 /// A signed actor key-event — the shared envelope under this plane's domain.

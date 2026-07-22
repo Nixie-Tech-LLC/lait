@@ -46,11 +46,10 @@ impl std::fmt::Display for UnsupportedStoreVersion {
 }
 impl std::error::Error for UnsupportedStoreVersion {}
 
-/// Whether `home` holds a formed/entered **orbital** Space store — a `ws_*`
-/// directory under the orbital store root. The product's "is there a space
-/// here?" predicate for the orbital era, alongside the legacy
-/// `store::initialized_at`. Cheap (a single directory scan) and side-effect free.
-pub fn is_orbital_home(home: &Path) -> bool {
+/// Whether `home` holds a formed/entered Space store — a `ws_*` directory
+/// under the store root. The product's one "is there a space here?" predicate.
+/// Cheap (a single directory scan) and side-effect free.
+pub fn space_store_present(home: &Path) -> bool {
     discover_space_id(home).is_some()
 }
 
@@ -79,11 +78,12 @@ pub fn discover_space_id(home: &Path) -> Option<crate::ids::SpaceId> {
 
 /// Detect a pre-orbital (v0.x) space store under `home`. The orbital
 /// composition root must NEVER create a fresh Orbit beside or over one.
-pub fn detect_legacy_home(home: &Path) -> Option<UnsupportedStoreVersion> {
+pub fn unsupported_store_at(home: &Path) -> Option<UnsupportedStoreVersion> {
+    // A pre-orbital (v0.x) store always carried `repo/genesis.json`; the
+    // orbital layout keeps everything under the `orbital/` store root, so this
+    // one probe is a complete and non-overlapping discriminator.
     let repo = home.join("repo");
-    let legacy = repo.join("genesis.json").exists()
-        || repo.join("catalog.loro").exists()
-        || repo.join("membership.loro").exists();
+    let legacy = repo.join("genesis.json").exists();
     legacy.then(|| UnsupportedStoreVersion {
         legacy_repo: repo,
         guidance: "this home holds a pre-orbital space store; the orbital                    formats are a clean break with no migration. Export what                    you need with a v0.x binary, then remove the old store                    (or choose a fresh home) and re-create the space."
@@ -105,7 +105,7 @@ pub fn open_orbital_runtime(
     authority: Arc<dyn AuthorityView>,
     keys: Arc<dyn BodyKeySource>,
 ) -> Result<Runtime, UnsupportedStoreVersion> {
-    if let Some(err) = detect_legacy_home(home) {
+    if let Some(err) = unsupported_store_at(home) {
         return Err(err);
     }
     Ok(Runtime::open(
@@ -258,7 +258,7 @@ pub fn form_space_with_fault(
     project: Option<(String, String)>,
     fault: Option<BootstrapFault>,
 ) -> Result<(OrbitalMechanics, runtime::SignedCoordinates)> {
-    if let Some(err) = detect_legacy_home(home) {
+    if let Some(err) = unsupported_store_at(home) {
         return Err(anyhow::anyhow!("{err}"));
     }
     let root = orbital_store_root(home);
@@ -437,7 +437,7 @@ pub fn enter_space(
     device_seed: &[u8; 32],
     invite_link: &str,
 ) -> Result<(OrbitalMechanics, runtime::SignedCoordinates)> {
-    if let Some(err) = detect_legacy_home(home) {
+    if let Some(err) = unsupported_store_at(home) {
         return Err(anyhow::anyhow!("{err}"));
     }
     let coords = runtime::SignedCoordinates::parse_link(invite_link.trim())

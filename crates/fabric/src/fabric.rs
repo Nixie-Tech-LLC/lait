@@ -15,7 +15,7 @@
 //!   proof of a real Fabric commit — an outside crate cannot forge the token
 //!   Replica advances from.
 //!
-//! [`LoroFabric`] is the sole engine: atomic Bodies plus the frozen
+//! [`CrdtFabric`] is the sole engine: atomic Bodies plus the frozen
 //! collaborative algebra (register/map/list/text/set/counter with stable
 //! element identity) over real Loro containers — one Loro document per Body,
 //! so per-Body export/import carries exactly one Body's causal history — with
@@ -258,7 +258,7 @@ impl From<journal::JournalError> for FabricError {
 /// Replica drives. It accepts semantic operations and returns a receipt whose
 /// construction is Fabric-private, serves committed reads, and exports/imports
 /// **one Body at a time** — the canonical store persists per-Body protected
-/// objects, never a whole-engine snapshot. [`LoroFabric`] is the only engine.
+/// objects, never a whole-engine snapshot. [`CrdtFabric`] is the only engine.
 pub trait Fabric {
     /// Durably apply a transaction and return a commit receipt. Atomic: either
     /// every op is applied and a receipt returned, or nothing changes.
@@ -333,7 +333,7 @@ pub enum BodyExport {
 /// shadowed. Initialize a Body's paths in its creating transaction (before
 /// concurrent editing starts), as the conformance Worlds do; deep container
 /// merge is future work.
-pub struct LoroFabric {
+pub struct CrdtFabric {
     bodies: BTreeMap<FabricKey, BodyState>,
 }
 
@@ -409,7 +409,7 @@ impl BodyState {
     }
 }
 
-impl LoroFabric {
+impl CrdtFabric {
     /// A fresh, empty Loro-backed engine.
     pub fn new() -> Self {
         Self {
@@ -737,13 +737,13 @@ impl LoroFabric {
     }
 }
 
-impl Default for LoroFabric {
+impl Default for CrdtFabric {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Fabric for LoroFabric {
+impl Fabric for CrdtFabric {
     fn commit(
         &mut self,
         request: FabricTransactionRequest,
@@ -950,7 +950,7 @@ mod tests {
     fn a_body_export_carries_exactly_one_body() {
         // Two collaborative Bodies; exporting one and importing it elsewhere
         // must bring that Body only — never a cross-Body snapshot.
-        let mut a = LoroFabric::new();
+        let mut a = CrdtFabric::new();
         let k1 = FabricKey::from_bytes(b"body/1".to_vec());
         let k2 = FabricKey::from_bytes(b"body/2".to_vec());
         a.commit(FabricTransactionRequest::new(
@@ -972,7 +972,7 @@ mod tests {
 
         let export = a.export_body(&k1).unwrap();
         assert!(matches!(export, BodyExport::Collaborative(_)));
-        let mut b = LoroFabric::new();
+        let mut b = CrdtFabric::new();
         b.import_body(&k1, &export).unwrap().unwrap();
         assert_eq!(
             b.read_collaborative(&k1).unwrap().registers["title"],
@@ -986,7 +986,7 @@ mod tests {
 
     #[test]
     fn per_body_import_preserves_stable_element_identity() {
-        let mut a = LoroFabric::new();
+        let mut a = CrdtFabric::new();
         let k = FabricKey::from_bytes(b"body/ids".to_vec());
         a.commit(FabricTransactionRequest::new(
             "created",
@@ -1003,7 +1003,7 @@ mod tests {
             .clone();
 
         // B imports the Body and removes the element BY THE SAME STABLE ID.
-        let mut b = LoroFabric::new();
+        let mut b = CrdtFabric::new();
         b.import_body(&k, &a.export_body(&k).unwrap()).unwrap();
         b.commit(FabricTransactionRequest::new(
             "removed",
@@ -1019,7 +1019,7 @@ mod tests {
 
     #[test]
     fn reimporting_known_material_is_unchanged() {
-        let mut a = LoroFabric::new();
+        let mut a = CrdtFabric::new();
         let k = FabricKey::from_bytes(b"body/known".to_vec());
         a.commit(FabricTransactionRequest::new(
             "created",
@@ -1031,7 +1031,7 @@ mod tests {
         ))
         .unwrap();
         let export = a.export_body(&k).unwrap();
-        let mut b = LoroFabric::new();
+        let mut b = CrdtFabric::new();
         assert!(b.import_body(&k, &export).unwrap().is_some(), "new");
         assert!(
             b.import_body(&k, &export).unwrap().is_none(),
@@ -1046,7 +1046,7 @@ mod tests {
 
     #[test]
     fn a_model_mismatch_at_the_same_key_is_a_type_conflict() {
-        let mut f = LoroFabric::new();
+        let mut f = CrdtFabric::new();
         let k = FabricKey::from_bytes(b"body/mismatch".to_vec());
         f.commit(FabricTransactionRequest::new(
             "created",
@@ -1057,7 +1057,7 @@ mod tests {
         ))
         .unwrap();
         // A collaborative export addressed at an atomic key is refused.
-        let mut other = LoroFabric::new();
+        let mut other = CrdtFabric::new();
         other
             .commit(FabricTransactionRequest::new(
                 "created",
@@ -1097,7 +1097,7 @@ mod tests {
 
     #[test]
     fn atomic_bodies_commit_read_remove_and_advance_the_causal_token() {
-        let mut fabric = LoroFabric::new();
+        let mut fabric = CrdtFabric::new();
         let key = FabricKey::from_bytes(b"body/0".to_vec());
         let r1 = fabric
             .commit(FabricTransactionRequest::new(

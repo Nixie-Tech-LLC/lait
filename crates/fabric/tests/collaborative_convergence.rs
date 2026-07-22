@@ -4,7 +4,7 @@
 //! sets, summed counters, no lost list inserts, preserved concurrent text, and
 //! an agreed LWW register winner.
 
-use fabric::{Fabric, FabricKey, FabricOp, FabricTransactionRequest, LoroFabric};
+use fabric::{CrdtFabric, Fabric, FabricKey, FabricOp, FabricTransactionRequest};
 
 fn key() -> FabricKey {
     FabricKey::from_bytes(b"body/collab".to_vec())
@@ -17,8 +17,8 @@ fn req(ops: Vec<FabricOp>) -> FabricTransactionRequest {
 /// A common ancestor with every path initialized (the documented discipline:
 /// paths are created in the Body's creating transaction, before concurrent
 /// editing), then forked into two engines.
-fn forked_pair() -> (LoroFabric, LoroFabric) {
-    let mut a = LoroFabric::new();
+fn forked_pair() -> (CrdtFabric, CrdtFabric) {
+    let mut a = CrdtFabric::new();
     a.commit(req(vec![
         FabricOp::CreateBody { key: key() },
         FabricOp::RegisterSet {
@@ -65,13 +65,13 @@ fn forked_pair() -> (LoroFabric, LoroFabric) {
     .unwrap();
     // Fork by cloning the single Body's canonical per-Body export into b.
     let export = a.export_body(&key()).unwrap();
-    let mut b = LoroFabric::new();
+    let mut b = CrdtFabric::new();
     b.import_body(&key(), &export).unwrap();
     (a, b)
 }
 
 /// Cross-merge both engines (per-Body) and assert their views are identical.
-fn converge(a: &mut LoroFabric, b: &mut LoroFabric) -> fabric::CollaborativeView {
+fn converge(a: &mut CrdtFabric, b: &mut CrdtFabric) -> fabric::CollaborativeView {
     let ea = a.export_body(&key()).unwrap();
     let eb = b.export_body(&key()).unwrap();
     a.import_body(&key(), &eb).unwrap();

@@ -20,7 +20,6 @@ use runtime::{
     WorldQuery,
 };
 
-use crate::acl::Grant;
 use crate::dto::{ActivityEvent, FieldChange, Priority, StatusCategory};
 use crate::ids::{ActorId, DocId};
 
@@ -534,9 +533,6 @@ impl World for IssuesWorld {
         ctx: &mut WorldContext<'_>,
         intent: WorldIntent,
     ) -> Result<WorldEffect, WorldError> {
-        if !ctx.principal().standing.has(&Grant::Write) {
-            return Err(WorldError::Denied);
-        }
         let intent = IssueIntent::from_json(&intent.payload).ok_or(WorldError::InvalidRequest)?;
         let catalog = catalog_state(ctx)?;
         let mut staging = Staging::for_space(ctx.principal().space.clone());

@@ -3,12 +3,12 @@ name = "mechanics"
 version = "0.6.0"
 edition = "2021"
 rust-version = "1.91"
-description = "The lait kernel: identity, trust regimes, and derivation rules — the roots lait grows from, depending on no scaffold (no Loro, no iroh)."
+description = "The lait kernel: identity, trust regimes, and derivation rules — the roots lait grows from, depending on no scaffold (no CRDT engine, no transport)."
 license = "MIT OR Apache-2.0"
 
 [lints.rust]
 # Nothing from a scaffold may be named here. This crate lists neither loro nor
-# iroh in its manifest, so `use loro::…` / `use iroh::…` cannot compile — the
+# iroh in its manifest, so a CRDT or transport reference cannot compile — the
 # boundary is the dependency edge, enforced by rustc, not by review.
 
 [dependencies]

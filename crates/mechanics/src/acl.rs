@@ -9,7 +9,7 @@
 //! and replay verifies the signing device belonged to that actor *at that
 //! frontier* before weighing the actor's standing. This keeps replay a pure
 //! function of `(genesis, actor events, acl ops)` — never a current-state gate
-//! — so replicas at different sync points converge (the [`crate::authz`]
+//! — so replicas at different sync points converge (the content-authority
 //! doctrine, applied one layer down). Authors MUST land any actor events an
 //! op's frontier references in the same commit as the op (see
 //! `MembershipDoc::add_actor_event`), so no replica ever holds an op whose
@@ -51,8 +51,41 @@ pub type SignedOp = SignedNode;
 pub enum Grant {
     /// Membership authority: add/remove members, set grants, rotate the key.
     Admin,
-    /// Content authority: author high-consequence content ops (authz plane).
+    /// Content authority: author high-consequence content ops.
     Write,
+}
+
+/// The coarse membership grant set an admission's generic capability names
+/// resolve to (space.admin ⇒ full membership authority, space.contributor ⇒
+/// content authorship, anything else ⇒ read-only membership).
+pub fn grants_for_capability_names(caps: &[&str]) -> Vec<Grant> {
+    if caps.contains(&"space.admin") {
+        vec![Grant::Admin, Grant::Write]
+    } else if caps.contains(&"space.contributor") {
+        vec![Grant::Write]
+    } else {
+        vec![]
+    }
+}
+
+/// The coarse membership grant set for a direct member-add (admin or not).
+pub fn membership_grants(admin: bool) -> Vec<Grant> {
+    if admin {
+        vec![Grant::Admin, Grant::Write]
+    } else {
+        vec![Grant::Write]
+    }
+}
+
+/// Render a grant set as the product's coarse role label.
+pub fn role_label(grants: &[Grant]) -> &'static str {
+    if grants.contains(&Grant::Admin) {
+        "admin"
+    } else if grants.contains(&Grant::Write) {
+        "member"
+    } else {
+        "viewer"
+    }
 }
 
 /// What a membership op does. Variants are **append-only**.
@@ -360,7 +393,7 @@ pub struct RekeyFence {
 /// A membership op: the action, the actor its author claims to be, and the
 /// frontier of that actor's key-event log the author observed — the
 /// at-position anchor for device→actor resolution (module docs; cf.
-/// [`crate::authz`]'s membership `asof`).
+/// the content plane's membership `asof`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AclOp {
     pub action: AclAction,

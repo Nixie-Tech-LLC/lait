@@ -461,7 +461,6 @@ impl Session {
             device: self.principal.device.clone(),
             station: self.principal.station.clone(),
             space: self.space.clone(),
-            standing: resolution.standing,
             authority_frontier: resolution.authority_frontier,
         })
     }

@@ -133,7 +133,7 @@ pub const PROJECT_CAPABILITIES: [&str; 14] = [
 ];
 
 /// The canonical exhaustive registry bytes: one line per entry,
-/// `scope	id	delegable`, sorted. The `workflow.transition` row stands for
+/// `scope id delegable`, sorted. The `workflow.transition` row stands for
 /// the qualified `workflow.transition.<TransitionId>` family.
 pub fn capability_registry_bytes() -> Vec<u8> {
     let mut out = String::new();

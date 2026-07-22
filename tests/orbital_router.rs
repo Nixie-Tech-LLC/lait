@@ -5,7 +5,6 @@
 
 use std::sync::Arc;
 
-use lait::acl::Grant;
 use lait::control::{BoardPos, Filter, Request, Response};
 use lait::ids::{ActorId, DeviceId, SystemUlidSource};
 use lait::world::{IssueRouter, IssuesWorld, RouterFacts};
@@ -27,7 +26,6 @@ impl runtime::AuthorityView for WriterAuthority {
     fn resolve(&self, _device: &DeviceId) -> Option<runtime::PrincipalResolution> {
         Some(runtime::PrincipalResolution {
             actor: actor(),
-            standing: runtime::Standing::new(vec![Grant::Write, Grant::Admin]),
             authority_frontier: AuthorityFrontier::from_canonical_bytes(vec![1]),
         })
     }
@@ -221,7 +219,6 @@ fn the_router_maps_the_control_surface_to_the_issues_world() {
         fn resolve(&self, _d: &DeviceId) -> Option<runtime::PrincipalResolution> {
             Some(runtime::PrincipalResolution {
                 actor: actor(),
-                standing: runtime::Standing::new(vec![]),
                 authority_frontier: AuthorityFrontier::from_canonical_bytes(vec![1]),
             })
         }

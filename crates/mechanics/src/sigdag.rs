@@ -2,7 +2,7 @@
 //! (`docs/DATA-CONTRACT.md`) the authority planes ride:
 //!
 //! * membership / ACL ([`crate::acl`], domain `lait/aclop/1`, plaintext-synced),
-//! * content authority ([`crate::authz`], domain `lait/authz/1`, encrypted).
+//! * content authority (domain `lait/authz/1`, encrypted).
 //!
 //! One node = one signed op: ed25519 by `author` over
 //! `blake3(domain ‖ op-bytes ‖ author ‖ sorted(parents) ‖ space-id)`.

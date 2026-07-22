@@ -15,7 +15,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use lait::acl::Grant;
 use lait::dto::{BoardView, GraphView, IssueView, LabelDto, ProjectDto, Row, StatusCategory};
 use lait::ids::{ActorId, DeviceId, DocId, LabelId, ProjectId, SystemUlidSource};
 use lait::world::contract::{self, IssueIntent, IssueQuery, Pos, WorkAction};
@@ -78,7 +77,6 @@ impl runtime::AuthorityView for WriterAuthority {
     fn resolve(&self, _device: &DeviceId) -> Option<runtime::PrincipalResolution> {
         Some(runtime::PrincipalResolution {
             actor: my_actor(),
-            standing: runtime::Standing::new(vec![Grant::Write, Grant::Admin]),
             authority_frontier: AuthorityFrontier::from_canonical_bytes(vec![8]),
         })
     }

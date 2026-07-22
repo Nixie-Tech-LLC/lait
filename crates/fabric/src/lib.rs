@@ -8,25 +8,14 @@
 //! and version together as lait's substrate.
 //!
 //! This crate is the substrate's Loro boundary. It owns container layouts, CRDT
-//! mutations, import/export, and projection; kernel replay adjudicates signed
-//! authority inputs. Everything outside sees typed wrappers
-//! ([`issue::IssueDoc`], [`catalog::CatalogDoc`], [`membership::MembershipDoc`])
-//! whose mutating commit path is [`op::OpCtx`]-carrying `apply()`.
-//!
-//! The wrappers do not expose raw document handles, keeping container details
-//! and commit metadata inside the fabric boundary.
+//! mutations, import/export, and the collaborative-document seam the replica
+//! drives ([`fabric::Fabric`]); kernel replay adjudicates signed authority
+//! inputs. Raw document handles never cross the boundary — everything outside
+//! sees [`fabric::FabricOp`] transactions and typed exports.
 
-// Kernel re-exports give fabric modules one internal namespace for shared types.
-pub(crate) use mechanics::{acl, actor, dto, genesis, ids, sigdag, space};
-
-pub mod catalog;
 pub mod fabric;
-pub mod history;
-pub mod issue;
 mod loro_ext;
-pub mod membership;
-pub mod op;
-pub mod store;
+mod op;
 
 /// The semantics-free durable commit protocol, extracted into the lower
 /// `journal` crate (mechanics commits its authority ledger through the same
@@ -37,7 +26,7 @@ pub mod journal {
 }
 
 pub use fabric::{
-    BodyExport, CausalToken, CollaborativeView, Fabric, FabricCommitReceipt, FabricError,
-    FabricKey, FabricOp, FabricTransactionRequest, ListElement, LoroFabric,
+    BodyExport, CausalToken, CollaborativeView, CrdtFabric, Fabric, FabricCommitReceipt,
+    FabricError, FabricKey, FabricOp, FabricTransactionRequest, ListElement,
 };
 pub use journal::{FaultInjector, JournaledStore, ObjectRef, StoreManifest, FAULT_POINTS};

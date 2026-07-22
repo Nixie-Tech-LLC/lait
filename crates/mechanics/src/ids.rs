@@ -2,9 +2,8 @@
 //! stability guarantee. App-minted ids are `<prefix>_<ULID>`: a ULID is a
 //! 128-bit, lexicographically-sortable, time-ordered identifier rendered in
 //! Crockford base32 (26 chars), so ids sort by creation time and never collide
-//! in practice. These are **content-independent** and **not** Loro `PeerId`s:
-//! a `DocId` is minted once and is permanent, while a Loro `PeerId`
-//! is an internal, per-session `u64`.
+//! in practice. These are **content-independent**: an id is minted once and is
+//! permanent, never derived from document or session internals.
 //!
 //! `DeviceId` is an ed25519 public key — the same bytes as the iroh `EndpointId`.
 //! Since the `lait/actor/1` cutover it identifies a **device**, not a person: a
@@ -50,6 +49,13 @@ impl UlidSource for SystemUlidSource {
 
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHIJKLMNOPQRSTUV";
 
+/// Whether `s` is a well-formed 26-char Crockford-base32 ULID.
+pub fn valid_ulid(s: &str) -> bool {
+    s.len() == 26
+        && s.bytes()
+            .all(|b| CROCKFORD.contains(&b.to_ascii_uppercase()))
+}
+
 /// Render a 128-bit value as a 26-char Crockford base32 ULID string.
 fn encode_ulid(value: u128) -> String {
     // 128 bits → 26 base32 chars (the top char encodes only 2 bits).
@@ -69,11 +75,24 @@ pub fn mint_ulid(src: &dyn UlidSource) -> String {
     encode_ulid((ts << 80) | rand)
 }
 
-/// Declare a newtype id `$name` with textual prefix `$prefix` (e.g. `iss_`).
+/// Declare a newtype id `$name` with textual prefix `$prefix` (e.g. `ws_`).
+/// Exported so the product crate declares its own ids with the identical
+/// grammar, minting, and display semantics.
+#[macro_export]
 macro_rules! prefixed_id {
     ($(#[$m:meta])* $name:ident, $prefix:literal) => {
         $(#[$m])*
-        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[derive(
+            Debug,
+            Clone,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Hash,
+            ::serde::Serialize,
+            ::serde::Deserialize,
+        )]
         pub struct $name(String);
 
         impl $name {
@@ -81,14 +100,14 @@ macro_rules! prefixed_id {
             pub const PREFIX: &'static str = $prefix;
 
             /// Mint a fresh id: `<prefix><ULID>`.
-            pub fn mint(src: &dyn UlidSource) -> Self {
-                Self(format!("{}{}", $prefix, mint_ulid(src)))
+            pub fn mint(src: &dyn $crate::ids::UlidSource) -> Self {
+                Self(format!("{}{}", $prefix, $crate::ids::mint_ulid(src)))
             }
 
             /// Wrap an existing string, validating the prefix + ULID shape.
             pub fn parse(s: &str) -> Option<Self> {
                 let rest = s.strip_prefix($prefix)?;
-                if rest.len() == 26 && rest.bytes().all(|b| CROCKFORD.contains(&b.to_ascii_uppercase())) {
+                if $crate::ids::valid_ulid(rest) {
                     Some(Self(s.to_string()))
                 } else {
                     None
@@ -115,8 +134,8 @@ macro_rules! prefixed_id {
             }
         }
 
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        impl ::std::fmt::Display for $name {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                 f.write_str(&self.0)
             }
         }
@@ -147,30 +166,6 @@ impl SpaceId {
         ))
     }
 }
-prefixed_id!(
-    /// Issue document id — app-minted, content-independent, the key in
-    /// `Catalog.docs`, the filename in git, and the routing key on the wire.
-    ///
-    /// ```
-    /// use mechanics::ids::{DocId, SystemUlidSource};
-    /// let id = DocId::mint(&SystemUlidSource);
-    /// assert!(id.as_str().starts_with("iss_"));
-    /// // a short, git-style handle is a genuine prefix of the full id
-    /// let short = id.short(7);
-    /// assert!(id.as_str().starts_with(&short));
-    /// // round-trips through parse()
-    /// assert_eq!(DocId::parse(id.as_str()), Some(id));
-    /// ```
-    DocId, "iss_"
-);
-prefixed_id!(
-    /// Project id — key in `Catalog.projects`.
-    ProjectId, "prj_"
-);
-prefixed_id!(
-    /// Label id — key in `Catalog.labels`.
-    LabelId, "lbl_"
-);
 
 /// A **device** id — an ed25519 public key, hex-encoded (64 lowercase hex
 /// chars), the same bytes as the iroh `EndpointId`. Kept as a validated string
@@ -421,37 +416,27 @@ mod tests {
     }
 
     #[test]
-    fn docid_roundtrips_and_validates() {
+    fn prefixed_ids_roundtrip_sort_and_shorten() {
+        // The macro-declared grammar, exercised through SpaceId (the one
+        // prefixed id the kernel itself owns): parse round-trip, prefix
+        // enforcement, time-ordering, and the short-handle contract.
         let s = FakeSource::new(1_700_000_000_000);
-        let id = DocId::mint(&s);
-        assert!(id.as_str().starts_with("iss_"));
-        assert_eq!(DocId::parse(id.as_str()), Some(id.clone()));
-        assert_eq!(DocId::parse("iss_short"), None, "bad ULID length rejected");
+        let id = SpaceId::mint(&s);
+        assert!(id.as_str().starts_with("ws_"));
+        assert_eq!(SpaceId::parse(id.as_str()), Some(id.clone()));
+        assert_eq!(SpaceId::parse("ws_short"), None, "bad ULID length rejected");
         assert_eq!(
-            DocId::parse("prj_00000000000000000000000000"),
+            SpaceId::parse("xx_00000000000000000000000000"),
             None,
             "wrong prefix rejected"
         );
-    }
-
-    #[test]
-    fn ulids_sort_by_time() {
-        // Two ids minted at different times sort by time (ULID property), which
-        // is what lets the Done view order by creation without extra state.
         let early = FakeSource::new(1_000);
         let late = FakeSource::new(2_000);
-        let a = DocId::mint(&early);
-        let b = DocId::mint(&late);
+        let a = SpaceId::mint(&early);
+        let b = SpaceId::mint(&late);
         assert!(a < b, "earlier ULID sorts before later: {a} !< {b}");
-    }
-
-    #[test]
-    fn short_handle_is_prefix_plus_n() {
-        let s = FakeSource::new(1_700_000_000_000);
-        let id = DocId::mint(&s);
         let short = id.short(3);
-        assert!(short.starts_with("iss_"));
-        assert_eq!(short.len(), "iss_".len() + 3);
+        assert_eq!(short.len(), "ws_".len() + 3);
         assert!(
             id.as_str().starts_with(&short),
             "short is a genuine prefix of the full id"

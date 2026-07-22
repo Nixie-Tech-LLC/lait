@@ -4,7 +4,7 @@
 //! authority. It defines Body schemas, decodes Intents/Queries, authorizes
 //! within supplied Space standing, stages LAIT-owned Body operations, and
 //! returns Effects/Projections. It **cannot** redefine membership, custody, key
-//! legitimacy, storage, Contact, or Convergence, and receives no Loro, raw
+//! legitimacy, storage, Contact, or Convergence, and receives no CRDT handle, raw
 //! keys/ciphertext, files, network handles, or mutable Replica.
 //!
 //! World callbacks are trusted, cooperative, in-process Rust code — not a
@@ -13,30 +13,12 @@
 //! work. Runtime contains an unwind-safe panic as `WorldImplementationFailed`
 //! without ending the Station.
 
-use mechanics::acl::Grant;
 use mechanics::ids::{ActorId, DeviceId, StationId};
 use replica::body::BodyOp;
 use replica::frontier::AuthorityFrontier;
 use replica::ids::{BodyKey, SchemaId, WorldId};
 use replica::BodySchema;
 use serde::{Deserialize, Serialize};
-
-/// The mechanics-derived standing of a principal within a Space — the grants the
-/// authority plane has replayed for the actor. A World reads it to authorize but
-/// cannot alter it. Frozen against the S1a principal packet.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Standing {
-    pub grants: Vec<Grant>,
-}
-
-impl Standing {
-    pub fn new(grants: Vec<Grant>) -> Self {
-        Self { grants }
-    }
-    pub fn has(&self, grant: &Grant) -> bool {
-        self.grants.contains(grant)
-    }
-}
 
 /// The facts Runtime derives for a docked principal. A World cannot assert or
 /// replace them; authorization and commit compare-and-swap the same
@@ -52,17 +34,16 @@ pub struct PrincipalFacts {
     /// The Space this principal is docked in — with the WorldId, the input to
     /// deterministic per-Space identities (e.g. the Issues Catalog BodyId).
     pub space: mechanics::ids::SpaceId,
-    pub standing: Standing,
     pub authority_frontier: AuthorityFrontier,
 }
 
 /// What the mechanics authority plane resolves for a local device: who it
-/// speaks for, its standing, and the authority frontier that standing was
-/// replayed at.
+/// speaks for and the authority frontier that membership was replayed at.
+/// Fine-grained authorization is never carried here — every mutation is judged
+/// by the capability demand evaluated at the pinned frontier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrincipalResolution {
     pub actor: ActorId,
-    pub standing: Standing,
     pub authority_frontier: AuthorityFrontier,
 }
 
@@ -325,7 +306,7 @@ pub struct WorldProjection {
 }
 
 /// A read view of the committed Body snapshot, handed to a World during a query.
-/// It exposes only authorized canonical reads — no Loro, no mutation, no keys.
+/// It exposes only authorized canonical reads — no CRDT internals, no mutation, no keys.
 /// Runtime backs it with the Station's Replica.
 pub trait BodyReader {
     /// The committed canonical bytes of an atomic Body, if present.
@@ -341,7 +322,7 @@ pub trait BodyReader {
 
 /// The bounded capability handed to World callbacks. It exposes the principal
 /// facts, authorized reads of the stable committed snapshot (during a query),
-/// and **nothing** below the boundary: no Loro, no mutable storage, no keys, no
+/// and **nothing** below the boundary: no CRDT internals, no mutable storage, no keys, no
 /// network. A World stages Body operations by *returning* them in a
 /// [`WorldEffect`]; Runtime — not the World — performs the durable commit.
 pub struct WorldContext<'a> {

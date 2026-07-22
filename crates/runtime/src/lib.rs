@@ -11,7 +11,7 @@
 //!
 //! Runtime owns the domain lifecycle: forming/entering/observing/acquiring
 //! Orbits, activating them into Stations, hosting Worlds, docking Sessions,
-//! Contact policy, and Observation publication. It exposes **no** Loro, iroh,
+//! Contact policy, and Observation publication. It exposes **no** CRDT, iroh,
 //! stream, file, key, ciphertext, mutex, or product request types — those live
 //! below the boundary in [`fabric`], [`comms`], and [`mechanics`].
 //!
@@ -70,6 +70,6 @@ pub use session::{
 };
 pub use world::{
     AuthorityView, BodyDeclaration, BodyReader, LocalIdentity, PrincipalFacts, PrincipalResolution,
-    Standing, World, WorldContext, WorldEffect, WorldIntent, WorldLimits, WorldProjection,
-    WorldQuery, WorldRegistration, WorldVersion,
+    World, WorldContext, WorldEffect, WorldIntent, WorldLimits, WorldProjection, WorldQuery,
+    WorldRegistration, WorldVersion,
 };

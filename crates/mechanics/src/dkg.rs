@@ -690,7 +690,7 @@ fn round_key(op: &CeremonyOp) -> Option<(u8, &str)> {
 /// and participant rules do the real work.
 ///
 /// **This bounds the materialized projection, not storage.** Dropping entries
-/// here stops replay work; it does not reclaim raw Loro oplog history, which
+/// here stops replay work; it does not reclaim raw collaborative-document history, which
 /// still holds every event ever synced. Actual reclamation needs a separately
 /// designed mechanism — ceremony-document rotation, an authenticated checkpoint,
 /// or snapshot compaction with retained terminal proofs — and none of that is

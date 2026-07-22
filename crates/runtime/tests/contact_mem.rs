@@ -13,7 +13,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mechanics::acl::Grant;
 use mechanics::crypto::AuthorizedBodyKey;
 use mechanics::ids::{ActorId, DeviceId, SpaceId, StationId};
 use replica::body::{BodyOp, BodySchema, MutationModel};
@@ -161,7 +160,6 @@ impl runtime::AuthorityView for TestAuthority {
     fn resolve(&self, _device: &DeviceId) -> Option<runtime::PrincipalResolution> {
         Some(runtime::PrincipalResolution {
             actor: ActorId::from_incept_hash(&"c".repeat(64)),
-            standing: runtime::Standing::new(vec![Grant::Write]),
             authority_frontier: AuthorityFrontier::from_canonical_bytes(vec![3]),
         })
     }

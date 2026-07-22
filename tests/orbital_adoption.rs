@@ -11,12 +11,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use lait::orbital::{open_orbital_runtime, orbital_store_root};
-use mechanics::acl::Grant;
 use mechanics::ids::{ActorId, DeviceId};
 use runtime::{
     ActivationOptions, AuthorityView, PrincipalResolution, Runtime, RuntimeBuilder,
-    SpaceFormationOptions, Standing, World, WorldContext, WorldEffect, WorldError, WorldIntent,
-    WorldLimits, WorldProjection, WorldQuery, WorldRegistration, WorldVersion,
+    SpaceFormationOptions, World, WorldContext, WorldEffect, WorldError, WorldIntent, WorldLimits,
+    WorldProjection, WorldQuery, WorldRegistration, WorldVersion,
 };
 
 use ::replica::body::{BodyOp, BodySchema, MutationModel};
@@ -53,7 +52,6 @@ impl AuthorityView for ExampleAuthority {
         let writer = mechanics::crypto::device_from_seed(&WRITER_SEED);
         (device == &writer).then(|| PrincipalResolution {
             actor: ActorId::from_incept_hash(&"c".repeat(64)),
-            standing: Standing::new(vec![Grant::Write]),
             authority_frontier: AuthorityFrontier::from_canonical_bytes(vec![3]),
         })
     }
@@ -102,9 +100,6 @@ impl World for TallyWorld {
         ctx: &mut WorldContext<'_>,
         intent: WorldIntent,
     ) -> Result<WorldEffect, WorldError> {
-        if !ctx.principal().standing.has(&Grant::Write) {
-            return Err(WorldError::Denied);
-        }
         let next = self.current(ctx) + intent.payload.len() as u64;
         let key = self.body();
         Ok(WorldEffect {

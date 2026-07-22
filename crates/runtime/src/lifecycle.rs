@@ -33,7 +33,7 @@ use replica::ids::WorldId;
 use replica::{BodyKeySource, ConvergenceOutcome};
 
 /// The authority view a Runtime without one falls back to: nobody resolves, so
-/// nothing can dock. Standing exists only when the deployment supplies a real
+/// nothing can dock. Membership exists only when the deployment supplies a real
 /// mechanics view.
 struct DenyAllAuthority;
 
@@ -565,7 +565,7 @@ impl Station {
     /// this activation epoch. The caller supplies only a [`LocalIdentity`]
     /// (possession of a device seed) — Runtime **derives** the principal facts by
     /// resolving the device through the mechanics [`AuthorityView`]; a caller
-    /// cannot assert actor, standing, or authority frontier. Standing is
+    /// cannot assert actor, membership, or authority frontier. Membership is
     /// re-resolved at every submit, so dock-time facts never outlive the
     /// authority state. Many Sessions may dock; none can stop the Station.
     /// Refused once the Station is going dormant.
@@ -592,7 +592,6 @@ impl Station {
             device: identity.device().clone(),
             station,
             space: self.space_id().clone(),
-            standing: resolution.standing,
             authority_frontier: resolution.authority_frontier,
         };
         let world = self

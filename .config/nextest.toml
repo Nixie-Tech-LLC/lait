@@ -48,11 +48,9 @@ slow-timeout = { period = "30s", terminate-after = 3 }
 # second attempt; deterministic tests colocated in the same binaries inherit it.
 [[profile.default.overrides]]
 filter = '''
-    binary(two_node_sync)
+    binary(orbital_join_iroh)
     + binary(restart_reconnect)
     + binary(guided_join)
-    + binary(invite_ergonomics)
-    + binary(invite_autoapprove)
     + binary(seed_registry)
     + binary(control_plane)
     + binary(cli_safety)

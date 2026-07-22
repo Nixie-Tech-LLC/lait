@@ -3,7 +3,7 @@
 //! A Replica is an Orbit's durable local materialization of its Space: authority
 //! material, World Bodies, semantic frontiers, locally held keys, and enough
 //! metadata to distinguish unknown, partial, and corrupt material. Replica is a
-//! LAIT semantic type — **not Loro**, and it never exposes Loro. It applies
+//! LAIT semantic type — **not the CRDT engine**, which it never exposes. It applies
 //! transaction, incorporation, and Convergence policy using [`mechanics`]
 //! (mechanics) for legitimacy and [`fabric`] (Fabric) for canonical
 //! collaborative representation and durability.

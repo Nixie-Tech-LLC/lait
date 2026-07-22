@@ -43,7 +43,6 @@ use crate::cli::ensure_daemon;
 use crate::control::{request, Request, Response};
 use crate::dto::MemberDto;
 use crate::list_picker::{row_line, window, Cell};
-use crate::proto::SpaceTicket;
 
 /// One selectable row: an existing member.
 #[derive(Clone)]
@@ -199,10 +198,7 @@ impl App {
         match request(&self.home, &req).await {
             Ok(Response::Text { text }) => {
                 let token = text.trim().to_string();
-                let link = token
-                    .parse::<SpaceTicket>()
-                    .map(|t| t.link())
-                    .unwrap_or_else(|_| token.clone());
+                let link = format!("lait://join/{token}");
                 self.status = Some(if crate::cli::copy_to_clipboard(&link) {
                     "invite link copied — single-use, auto-admit, expires in 7d".into()
                 } else {
