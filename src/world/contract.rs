@@ -534,6 +534,14 @@ pub enum IssueQuery {
     Activity {
         since: u64,
     },
+    /// The addressed-to-you inbox, derived in ONE pass over the committed
+    /// snapshot: recent events on issues assigned to `actor`, excluding
+    /// events authored by `exclude_device` (a device's own edits are not its
+    /// inbox), newest first, bounded.
+    Inbox {
+        actor: String,
+        exclude_device: Option<String>,
+    },
     /// A project's workflow revision head(s).
     Workflow {
         project: String,

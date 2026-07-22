@@ -375,6 +375,9 @@ impl crate::world::BodyReader for ReplicaReader<'_> {
             .filter(|k| &k.world == world && self.0.binding(k).is_some_and(|b| &b.schema == schema))
             .collect()
     }
+    fn body_stamp(&self, key: &BodyKey) -> Option<Vec<u8>> {
+        self.0.body_stamp(key)
+    }
 }
 
 /// A local caller's handle to a hosted World.

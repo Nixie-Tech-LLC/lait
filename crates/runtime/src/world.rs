@@ -318,6 +318,15 @@ pub trait BodyReader {
     /// singleton-integrity seam (a World validating that exactly its one
     /// deterministic instance of a schema exists).
     fn bodies_with_schema(&self, world: &WorldId, schema: &SchemaId) -> Vec<BodyKey>;
+
+    /// An opaque per-Body VERSION STAMP: two reads returning the same stamp
+    /// for a key are guaranteed byte-equivalent Bodies, so a World may reuse
+    /// state it derived from the earlier read. `None` (the default) promises
+    /// nothing — the World must re-derive. Never a content hash contract;
+    /// only equality is meaningful.
+    fn body_stamp(&self, _key: &BodyKey) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// The bounded capability handed to World callbacks. It exposes the principal
@@ -365,6 +374,11 @@ impl<'a> WorldContext<'a> {
 
     /// Every interpreted Body of `world` bound to `schema` in the committed
     /// snapshot (empty without read access).
+    /// The reader's per-Body version stamp (see [`BodyReader::body_stamp`]).
+    pub fn body_stamp(&self, key: &BodyKey) -> Option<Vec<u8>> {
+        self.reads.and_then(|r| r.body_stamp(key))
+    }
+
     pub fn bodies_with_schema(&self, world: &WorldId, schema: &SchemaId) -> Vec<BodyKey> {
         self.reads
             .map(|r| r.bodies_with_schema(world, schema))

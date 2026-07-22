@@ -766,6 +766,22 @@ impl Replica {
         self.bodies.get(key).is_some_and(|r| !r.interpreted)
     }
 
+    /// A Body's version stamp: its chain frontier plus every head's
+    /// transaction commitment. Equal stamps guarantee byte-equivalent Bodies
+    /// (a chain never repeats across distinct states, and the head set pins
+    /// the constituent material exactly).
+    pub fn body_stamp(&self, key: &BodyKey) -> Option<Vec<u8>> {
+        let record = self.bodies.get(key)?;
+        let mut stamp = record.chain.root.to_vec();
+        stamp.extend_from_slice(&record.chain.transaction_count.to_be_bytes());
+        let mut commitments: Vec<[u8; 32]> = record.heads.iter().map(|h| h.tx_commitment).collect();
+        commitments.sort_unstable();
+        for c in commitments {
+            stamp.extend_from_slice(&c);
+        }
+        Some(stamp)
+    }
+
     /// Every Body currently present (interpreted or opaque).
     pub fn body_keys(&self) -> Vec<BodyKey> {
         self.bodies.keys().cloned().collect()

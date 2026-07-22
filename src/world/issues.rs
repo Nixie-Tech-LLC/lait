@@ -12,6 +12,7 @@
 //! `persist_issue_and_row` failure mode does not exist here).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use replica::body::{BodyOp, BodySchema, CollaborativeSchema, MutationModel};
 use replica::ids::BodyKey;
@@ -36,6 +37,90 @@ use super::views::{
 pub struct IssuesWorld {
     id: replica::ids::WorldId,
     schemas: Vec<BodySchema>,
+    /// The derived read-model cache, keyed by the EXACT Manifest root each
+    /// query is pinned to — registered in `tests/mixed_root_guard.rs` with its
+    /// mixed-root rejection proof. A hit is only ever the same root, so output
+    /// mixing two roots is unrepresentable; per-issue entries are additionally
+    /// reused across roots ONLY under a reader-issued version stamp
+    /// ([`runtime::world::BodyReader::body_stamp`]) that guarantees
+    /// byte-equivalence.
+    cache: std::sync::Mutex<RootKeyedCache>,
+}
+
+/// See [`IssuesWorld::cache`].
+#[derive(Default)]
+struct RootKeyedCache {
+    /// `(manifest root, derived snapshot)` — a bounded, most-recent-last list.
+    roots: Vec<([u8; 32], Arc<DerivedSnapshot>)>,
+    /// Per-issue parsed state: `doc -> (stamp, state)`.
+    issues: std::collections::HashMap<String, (Vec<u8>, Arc<IssueState>)>,
+}
+
+/// The immutable read model every query arm consumes: the integrity-checked
+/// catalog, its derived aliases, and every issue's parsed state — all from ONE
+/// committed snapshot (one Manifest root).
+struct DerivedSnapshot {
+    catalog: Arc<CatalogState>,
+    aliases: Arc<DerivedAliases>,
+    issues: BTreeMap<String, Arc<IssueState>>,
+}
+
+/// How many recent roots stay warm: the current root plus the previous one
+/// (a doorbell-raced query may still be pinned to the prior root).
+const CACHED_ROOTS: usize = 2;
+
+impl IssuesWorld {
+    /// The derived read model for THIS context's Manifest root: served from
+    /// the cache when the root is warm, else built from the committed snapshot
+    /// (reusing per-issue parses whose reader stamp is unchanged) and cached
+    /// under the root. A zero root (fixture contexts without a snapshot
+    /// identity) is never cached.
+    fn derived_snapshot(&self, ctx: &WorldContext<'_>) -> Result<Arc<DerivedSnapshot>, WorldError> {
+        let root = ctx.manifest_root();
+        let identified = root != [0u8; 32];
+        if identified {
+            let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some((_, snap)) = cache.roots.iter().find(|(r, _)| r == &root) {
+                return Ok(snap.clone());
+            }
+        }
+        let catalog = Arc::new(catalog_state(ctx)?);
+        let aliases = Arc::new(derive_aliases(&catalog));
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        let mut issues: BTreeMap<String, Arc<IssueState>> = BTreeMap::new();
+        for doc in catalog.doc_ids() {
+            let stamp = ctx.body_stamp(&issue_key(&doc));
+            let state = match (&stamp, cache.issues.get(&doc)) {
+                (Some(stamp), Some((cached_stamp, state))) if stamp == cached_stamp => {
+                    state.clone()
+                }
+                _ => match issue_state(ctx, &doc) {
+                    Some(state) => Arc::new(state),
+                    None => continue,
+                },
+            };
+            if let Some(stamp) = stamp {
+                cache.issues.insert(doc.clone(), (stamp, state.clone()));
+            }
+            issues.insert(doc, state);
+        }
+        // Registered docs are the live set: drop parses for departed docs.
+        cache.issues.retain(|doc, _| issues.contains_key(doc));
+        let snap = Arc::new(DerivedSnapshot {
+            catalog,
+            aliases,
+            issues,
+        });
+        if identified {
+            cache.roots.retain(|(r, _)| r != &root);
+            cache.roots.push((root, snap.clone()));
+            if cache.roots.len() > CACHED_ROOTS {
+                let drop_count = cache.roots.len() - CACHED_ROOTS;
+                cache.roots.drain(..drop_count);
+            }
+        }
+        Ok(snap)
+    }
 }
 
 impl Default for IssuesWorld {
@@ -48,6 +133,7 @@ impl IssuesWorld {
     pub fn new() -> Self {
         Self {
             id: contract::world_id(),
+            cache: std::sync::Mutex::new(RootKeyedCache::default()),
             schemas: vec![
                 BodySchema {
                     id: contract::issue_schema(),
@@ -1439,21 +1525,17 @@ impl World for IssuesWorld {
         query: WorldQuery,
     ) -> Result<WorldProjection, WorldError> {
         let query = IssueQuery::from_json(&query.payload).ok_or(WorldError::InvalidRequest)?;
-        let catalog = catalog_state(ctx)?;
-        let aliases = derive_aliases(&catalog);
+        // ONE derived read model per Manifest root; every arm below reads the
+        // same immutable snapshot (see [`IssuesWorld::derived_snapshot`]).
+        let snap = self.derived_snapshot(ctx)?;
+        let catalog: &CatalogState = &snap.catalog;
+        let aliases: &DerivedAliases = &snap.aliases;
         let projection = |bytes: Vec<u8>| WorldProjection {
             schema: contract::issue_schema(),
             schema_version: contract::ISSUE_SCHEMA_VERSION,
             bytes,
             frontier: replica::ReplicaFrontier::EMPTY, // stamped by Runtime
             demand: contract::demand_read(),
-        };
-        let load_issues = |ctx: &WorldContext<'_>| -> BTreeMap<String, IssueState> {
-            catalog
-                .doc_ids()
-                .into_iter()
-                .filter_map(|doc| issue_state(ctx, &doc).map(|s| (doc, s)))
-                .collect()
         };
         match query {
             IssueQuery::Snapshot => {
@@ -1469,16 +1551,16 @@ impl World for IssuesWorld {
             }
             IssueQuery::View { doc, me } => {
                 let me = me.and_then(|m| ActorId::parse(&m));
-                let issue = issue_state(ctx, &doc);
+                let issue = snap.issues.get(&doc);
                 let view = match issue {
                     Some(issue) => {
                         // The space id rides in the projection consumer; the
                         // World does not know it — stamp a placeholder the
                         // daemon replaces? No: the daemon supplies it in the
                         // query. Provisional views come from the row path.
-                        issue_view(&catalog, &aliases, &space_placeholder(), &doc, &issue)
+                        issue_view(catalog, aliases, &space_placeholder(), &doc, issue)
                     }
-                    None => provisional_view(&catalog, &aliases, &doc),
+                    None => provisional_view(catalog, aliases, &doc),
                 };
                 let _ = me;
                 Ok(projection(serde_json::to_vec(&view).expect("view json")))
@@ -1493,9 +1575,8 @@ impl World for IssuesWorld {
             } => {
                 let me = me.and_then(|m| ActorId::parse(&m));
                 let mine = mine.and_then(|m| ActorId::parse(&m));
-                let issues = load_issues(ctx);
                 let mut rows: Vec<(String, Row2)> = Vec::new();
-                for (doc, issue) in &issues {
+                for (doc, issue) in &snap.issues {
                     if let Some(project) = &project {
                         if &issue.project != project {
                             continue;
@@ -1524,7 +1605,7 @@ impl World for IssuesWorld {
                     rows.push((
                         doc.clone(),
                         Row2 {
-                            row: project_row(&catalog, &aliases, doc, Some(issue), me.as_ref()),
+                            row: project_row(catalog, aliases, doc, Some(issue), me.as_ref()),
                             priority: issue.priority,
                         },
                     ));
@@ -1537,20 +1618,18 @@ impl World for IssuesWorld {
             }
             IssueQuery::Board { project, me } => {
                 let me = me.and_then(|m| ActorId::parse(&m));
-                let issues = load_issues(ctx);
-                let view = board_view(&catalog, &aliases, &project, &issues, me.as_ref())
+                let view = board_view(catalog, aliases, &project, &snap.issues, me.as_ref())
                     .ok_or(WorldError::InvalidRequest)?;
                 Ok(projection(serde_json::to_vec(&view).expect("board json")))
             }
             IssueQuery::Graph { doc, me } => {
                 let me = me.and_then(|m| ActorId::parse(&m));
-                let issues = load_issues(ctx);
-                let view = graph_view(&catalog, &aliases, &doc, &issues, me.as_ref());
+                let view = graph_view(catalog, aliases, &doc, &snap.issues, me.as_ref());
                 Ok(projection(serde_json::to_vec(&view).expect("graph json")))
             }
             IssueQuery::History { doc } => {
-                let issue = issue_state(ctx, &doc).ok_or(WorldError::InvalidRequest)?;
-                let reff = canonical_for(&aliases, &doc);
+                let issue = snap.issues.get(&doc).ok_or(WorldError::InvalidRequest)?;
+                let reff = canonical_for(aliases, &doc);
                 let events: Vec<ActivityEvent> = issue
                     .events
                     .iter()
@@ -1587,9 +1666,8 @@ impl World for IssuesWorld {
                 // every converged replica derives the identical sequence. The
                 // cursor is a position in that total order: `since = last`
                 // resumes exactly after the previously served tail.
-                let issues = load_issues(ctx);
                 let mut feed: Vec<(u64, &String, usize, &IssueEvent)> = Vec::new();
-                for (doc, issue) in &issues {
+                for (doc, issue) in &snap.issues {
                     for (i, e) in issue.events.iter().enumerate() {
                         feed.push((e.t, doc, i, e));
                     }
@@ -1602,7 +1680,7 @@ impl World for IssuesWorld {
                     .map(|(pos, (_, doc, _, e))| ActivityEvent {
                         seq: (pos + 1) as u64,
                         doc_id: DocId::parse(doc),
-                        reff: canonical_for(&aliases, doc),
+                        reff: canonical_for(aliases, doc),
                         kind: e.k.clone(),
                         changes: e
                             .c
@@ -1623,6 +1701,43 @@ impl World for IssuesWorld {
                     .collect();
                 let value = serde_json::json!({ "events": events, "last": last });
                 Ok(projection(serde_json::to_vec(&value).expect("activity")))
+            }
+            IssueQuery::Inbox {
+                actor,
+                exclude_device,
+            } => {
+                let actor = ActorId::parse(&actor).ok_or(WorldError::InvalidRequest)?;
+                let mut entries: Vec<serde_json::Value> = Vec::new();
+                for (doc, issue) in &snap.issues {
+                    if !issue.assignees.contains(&actor) {
+                        continue;
+                    }
+                    let reff = canonical_for(aliases, doc);
+                    for e in &issue.events {
+                        let kind = match e.k.as_str() {
+                            "assigned" => "assigned",
+                            "commented" => "comment",
+                            "started" | "finished" | "stopped" => "status",
+                            "edited" if e.c.iter().any(|c| c.f == "status") => "status",
+                            _ => continue,
+                        };
+                        if exclude_device.as_deref() == Some(e.d.as_str()) {
+                            continue;
+                        }
+                        entries.push(serde_json::json!({
+                            "ts": e.t,
+                            "kind": kind,
+                            "reff": reff,
+                            "doc_id": doc,
+                            "title": issue.title,
+                            "detail": e.x,
+                            "actor": e.d,
+                        }));
+                    }
+                }
+                entries.sort_by(|a, b| b["ts"].as_u64().cmp(&a["ts"].as_u64()));
+                entries.truncate(500);
+                Ok(projection(serde_json::to_vec(&entries).expect("inbox")))
             }
             IssueQuery::Projects => {
                 let projects: Vec<crate::dto::ProjectDto> = catalog
@@ -1760,11 +1875,11 @@ fn graph_view(
     catalog: &CatalogState,
     aliases: &DerivedAliases,
     doc: &str,
-    issues: &BTreeMap<String, IssueState>,
+    issues: &BTreeMap<String, Arc<IssueState>>,
     me: Option<&ActorId>,
 ) -> crate::dto::GraphView {
     let live = |d: &str| issues.contains_key(d) && !catalog.tombstones.contains(d);
-    let row = |d: &str| project_row(catalog, aliases, d, issues.get(d), me);
+    let row = |d: &str| project_row(catalog, aliases, d, issues.get(d).map(|i| i.as_ref()), me);
     let parent = catalog.parents.get(doc).filter(|p| live(p)).map(|p| row(p));
     let mut children: Vec<crate::dto::Row> = catalog
         .parents

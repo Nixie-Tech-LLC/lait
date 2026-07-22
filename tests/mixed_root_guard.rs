@@ -17,9 +17,36 @@
 use std::path::{Path, PathBuf};
 
 /// Registered product-layer caches: `(identifier, keyed-by, mixed-root test)`.
-/// EMPTY today — the daemon derives every response from the live docked
-/// snapshot. An entry added here must name a `#[test]` that exists.
-const REGISTERED_CACHES: &[(&str, &str, &str)] = &[];
+/// An entry added here must name a `#[test]` that exists.
+///
+/// The ONE registered cache is the IssuesWorld derived read model
+/// (`src/world/issues.rs`): its snapshot entries are keyed by the EXACT
+/// Manifest root the query context is pinned to (a hit is only ever the same
+/// root, so mixed-root output is unrepresentable), and its per-issue parse
+/// memo is reusable across roots only under a reader-issued Body version
+/// stamp whose equality guarantees byte-equivalent Bodies.
+const REGISTERED_CACHES: &[(&str, &str, &str)] = &[
+    (
+        "RootKeyedCache",
+        "snapshot: exact [u8; 32] Manifest root; per-issue memo: Body version stamp (chain frontier + sorted head transaction commitments)",
+        "the_issues_world_cache_never_serves_across_roots",
+    ),
+    (
+        "cache",
+        "field of IssuesWorld holding the RootKeyedCache",
+        "the_issues_world_cache_never_serves_across_roots",
+    ),
+    (
+        "CACHED_ROOTS",
+        "the bound on warm roots (current + previous)",
+        "the_issues_world_cache_never_serves_across_roots",
+    ),
+    (
+        "cached_stamp",
+        "the per-issue memo's stamp comparand",
+        "the_issues_world_cache_never_serves_across_roots",
+    ),
+];
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

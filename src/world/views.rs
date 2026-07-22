@@ -542,7 +542,7 @@ pub fn board_view(
     catalog: &CatalogState,
     aliases: &DerivedAliases,
     project_id: &str,
-    issues: &BTreeMap<String, IssueState>,
+    issues: &BTreeMap<String, std::sync::Arc<IssueState>>,
     me: Option<&ActorId>,
 ) -> Option<BoardView> {
     let meta = catalog.projects.get(project_id)?;
@@ -574,7 +574,7 @@ pub fn board_view(
                     catalog,
                     aliases,
                     doc,
-                    issues.get(doc.as_str()),
+                    issues.get(doc.as_str()).map(|i| i.as_ref()),
                     me,
                 ));
             }
@@ -582,7 +582,13 @@ pub fn board_view(
             let mut seen = BTreeSet::new();
             for doc in &board_order {
                 if members.contains(&doc) && in_state(doc) && seen.insert(doc.clone()) {
-                    rows.push(project_row(catalog, aliases, doc, issues.get(doc), me));
+                    rows.push(project_row(
+                        catalog,
+                        aliases,
+                        doc,
+                        issues.get(doc).map(|i| i.as_ref()),
+                        me,
+                    ));
                 }
             }
             let mut unlisted: Vec<&&String> = members
@@ -595,7 +601,7 @@ pub fn board_view(
                     catalog,
                     aliases,
                     doc,
-                    issues.get(doc.as_str()),
+                    issues.get(doc.as_str()).map(|i| i.as_ref()),
                     me,
                 ));
             }
