@@ -6,19 +6,16 @@
 # and gates p95 regressions once baselines are frozen in the spec.
 name: perf
 
+# NOT a PR gate: the full corpus is hours of daemon traffic by design (it
+# measures the real product surface, not a fixture), so it runs as a
+# scheduled benchmark plus on-demand dispatch. PRs pay only the smoke-scale
+# run inside the default test suite. NOTE: both `schedule` and
+# `workflow_dispatch` only take effect once this file exists on the default
+# branch — the first full run (and the baseline freeze) happens after merge.
 on:
   workflow_dispatch:
-  # Perf-affecting changes run the full gate on their own PR: the corpus spec,
-  # the harness, and this workflow. Other PRs pay only the smoke run inside
-  # the default suite.
-  pull_request:
-    paths:
-      - "benchmarks/**"
-      - "tests/issues_reference_perf.rs"
-      - ".github/workflows/perf.yml"
   schedule:
-    # Weekly, off-peak: the full corpus build is hours of daemon traffic by
-    # design (it measures the real product surface, not a fixture).
+    # Weekly, off-peak.
     - cron: "17 3 * * 1"
 
 concurrency:
