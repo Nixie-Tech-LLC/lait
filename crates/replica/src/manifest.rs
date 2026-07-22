@@ -51,7 +51,7 @@ pub const SPACE_ID_LEN: usize = 29;
 /// One Body's manifest entry: its key, the hash of its public descriptor, and
 /// the commitment to its signed BodyTransaction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManifestEntryV1 {
+pub struct ManifestEntry {
     pub key: BodyKey,
     pub descriptor_hash: [u8; 32],
     pub transaction_commitment: [u8; 32],
@@ -59,16 +59,16 @@ pub struct ManifestEntryV1 {
 
 /// One manifest page: BodyKey-sorted entries for a slice of the Body set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManifestPageV1 {
+pub struct ManifestPage {
     pub version: u8,
     pub space: [u8; SPACE_ID_LEN],
     pub page_index: u32,
-    pub entries: Vec<ManifestEntryV1>,
+    pub entries: Vec<ManifestEntry>,
 }
 
 /// The signed manifest root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManifestRootV1 {
+pub struct ManifestRoot {
     pub version: u8,
     pub space: [u8; SPACE_ID_LEN],
     pub replica_frontier: ReplicaFrontier,
@@ -124,8 +124,8 @@ fn length_framed(domain: &[u8], body: &[u8]) -> Vec<u8> {
     out
 }
 
-impl ManifestPageV1 {
-    pub fn new(space: &SpaceId, page_index: u32, entries: Vec<ManifestEntryV1>) -> Option<Self> {
+impl ManifestPage {
+    pub fn new(space: &SpaceId, page_index: u32, entries: Vec<ManifestEntry>) -> Option<Self> {
         Some(Self {
             version: 1,
             space: <[u8; SPACE_ID_LEN]>::try_from(space.as_str().as_bytes()).ok()?,
@@ -189,7 +189,7 @@ pub fn pages_root(ordered_page_hashes: &[[u8; 32]]) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
-impl ManifestRootV1 {
+impl ManifestRoot {
     fn preimage(&self) -> Vec<u8> {
         let body = postcard::to_stdvec(&(
             self.version,
@@ -211,7 +211,7 @@ impl ManifestRootV1 {
     pub fn sign(
         space: &SpaceId,
         replica_frontier: ReplicaFrontier,
-        pages: &[ManifestPageV1],
+        pages: &[ManifestPage],
         authority_frontier: AuthorityFrontier,
         signer_seed: &[u8; 32],
     ) -> Option<Self> {
@@ -228,7 +228,7 @@ impl ManifestRootV1 {
     pub fn sign_with(
         space: &SpaceId,
         replica_frontier: ReplicaFrontier,
-        pages: &[ManifestPageV1],
+        pages: &[ManifestPage],
         authority_frontier: AuthorityFrontier,
         signer: &dyn crate::transaction::TransactionSigner,
     ) -> Option<Self> {
@@ -294,7 +294,7 @@ impl ManifestRootV1 {
     /// Verify a complete page set against this (already-verified) root:
     /// per-page structure and hash membership at the right index, Space
     /// agreement, and **global** strict BodyKey order across page boundaries.
-    pub fn verify_pages(&self, pages: &[ManifestPageV1]) -> Result<(), ManifestError> {
+    pub fn verify_pages(&self, pages: &[ManifestPage]) -> Result<(), ManifestError> {
         if pages.len() != self.ordered_page_hashes.len() {
             return Err(ManifestError::PageNotInRoot);
         }
@@ -353,14 +353,14 @@ impl ManifestRootV1 {
 
 /// A manifest root whose structure, signature, **and signer authority** have
 /// been verified. Constructible only through
-/// [`ManifestRootV1::verify_authorized`].
+/// [`ManifestRoot::verify_authorized`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizedRoot {
-    root: ManifestRootV1,
+    root: ManifestRoot,
 }
 
 impl AuthorizedRoot {
-    pub fn root(&self) -> &ManifestRootV1 {
+    pub fn root(&self) -> &ManifestRoot {
         &self.root
     }
 }

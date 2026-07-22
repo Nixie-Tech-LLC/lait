@@ -266,7 +266,7 @@ fn the_orbital_daemon_serves_the_issue_surface_over_the_control_socket() {
     };
     assert!(!link.is_empty());
     // It parses back as Coordinates v1.
-    assert!(runtime::SignedCoordinatesV1::parse_link(&link).is_ok());
+    assert!(runtime::SignedCoordinates::parse_link(&link).is_ok());
 
     // A ceremony request is served by mechanics, not refused: the founder
     // holds the solo space-recovery key, so break-glass recovery re-roots the

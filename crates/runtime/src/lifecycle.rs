@@ -244,7 +244,7 @@ impl Runtime {
     /// import arrive with the product cutover (completion package C5).
     pub fn enter_orbit(
         &self,
-        coordinates: &crate::coordinates::SignedCoordinatesV1,
+        coordinates: &crate::coordinates::SignedCoordinates,
         _options: EnterOptions,
     ) -> Result<Orbit, LifecycleError> {
         let root = self.root()?;
@@ -647,7 +647,7 @@ impl Station {
         }
         drop(driver);
         // No transport: ingest directly into the registry.
-        let Ok(signed) = crate::beacon::SignedBeaconV1::decode_canonical(bytes) else {
+        let Ok(signed) = crate::beacon::SignedBeacon::decode_canonical(bytes) else {
             return;
         };
         let Ok(verified) = signed.verify() else {

@@ -1,4 +1,4 @@
-//! `SignedWorldActionV1` — the canonical, signed application-action envelope.
+//! `SignedWorldAction` — the canonical, signed application-action envelope.
 //!
 //! A World intent that must be authorized and durably committed rides this
 //! envelope. Runtime derives [`PrincipalFacts`](crate::world::PrincipalFacts)
@@ -12,7 +12,7 @@
 //! equality is required — a non-canonical encoding is rejected, not tolerated.
 //!
 //! The envelope's self-signature, canonical form, payload binding, and version
-//! rejection are validated here ([`SignedWorldActionV1::verify_self`]); the
+//! rejection are validated here ([`SignedWorldAction::verify_self`]); the
 //! mechanics authority proof (the signer is the docked principal, with standing
 //! at the header's authority frontier) and the persistent-idempotency scope are
 //! enforced by [`Session::submit`](crate::session::Session::submit), which is
@@ -84,7 +84,7 @@ pub struct WorldActionHeader {
 /// A signed World action. `version` is exactly 1; `signature_algorithm` is 1
 /// (Ed25519). The payload is at most 1 MiB.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SignedWorldActionV1 {
+pub struct SignedWorldAction {
     pub version: u8,
     pub header: WorldActionHeader,
     pub payload: Vec<u8>,
@@ -146,7 +146,7 @@ fn action_preimage(
     out
 }
 
-impl SignedWorldActionV1 {
+impl SignedWorldAction {
     /// Construct and sign a World action from the acting device's identity seed.
     /// The seed's public key must equal `header.device`.
     pub fn sign(header: WorldActionHeader, payload: Vec<u8>, device_seed: &[u8; 32]) -> Self {
@@ -235,17 +235,17 @@ mod tests {
         }
     }
 
-    fn signed(seed: &[u8; 32]) -> SignedWorldActionV1 {
+    fn signed(seed: &[u8; 32]) -> SignedWorldAction {
         let device = mechanics::crypto::device_from_seed(seed);
         let payload = b"an application intent".to_vec();
-        SignedWorldActionV1::sign(header(&payload, &device), payload, seed)
+        SignedWorldAction::sign(header(&payload, &device), payload, seed)
     }
 
     #[test]
     fn signed_action_roundtrips_and_verifies() {
         let action = signed(&[7u8; 32]);
         let bytes = action.encode();
-        let back = SignedWorldActionV1::decode_canonical(&bytes).unwrap();
+        let back = SignedWorldAction::decode_canonical(&bytes).unwrap();
         assert_eq!(action, back);
         let key = back.verify_self().unwrap();
         assert_eq!(key.request, RequestId::from_bytes([1u8; 16]));
@@ -300,7 +300,7 @@ mod tests {
         let mut bytes = action.encode();
         bytes.push(0x00);
         assert_eq!(
-            SignedWorldActionV1::decode_canonical(&bytes),
+            SignedWorldAction::decode_canonical(&bytes),
             Err(ActionError::NonCanonical)
         );
     }
@@ -310,7 +310,7 @@ mod tests {
         let seed = [3u8; 32];
         let device = mechanics::crypto::device_from_seed(&seed);
         let payload = vec![0u8; MAX_PAYLOAD + 1];
-        let action = SignedWorldActionV1::sign(header(&payload, &device), payload, &seed);
+        let action = SignedWorldAction::sign(header(&payload, &device), payload, &seed);
         assert_eq!(action.verify_self(), Err(ActionError::PayloadTooLarge));
     }
 

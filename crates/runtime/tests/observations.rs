@@ -184,7 +184,7 @@ fn action(
     identity: &LocalIdentity,
     request: RequestId,
     entry: &str,
-) -> runtime::SignedWorldActionV1 {
+) -> runtime::SignedWorldAction {
     identity
         .sign_action(
             session,

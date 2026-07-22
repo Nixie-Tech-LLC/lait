@@ -9,9 +9,9 @@
 //! **The canonical store.** A durable Replica persists — through the Fabric
 //! journal's six-step commit protocol, at one linearization point per
 //! transaction — the canonical signed [`BodyTransaction`] record, one sealed
-//! [`ProtectedBodyPayloadV1`] object per changed Body (`epoch_id[16] ||
+//! [`ProtectedBodyPayload`] object per changed Body (`epoch_id[16] ||
 //! nonce[12] || ciphertext_and_tag`; no plaintext Body payload is ever at
-//! rest), the [`RequestReceiptV1`] idempotency record, and the signed Manifest
+//! rest), the [`RequestReceipt`] idempotency record, and the signed Manifest
 //! root/pages over the full Body set. Recovery reopens exactly that graph: a
 //! Body whose key-epoch material is locally held is opened, validated, and
 //! imported into the engine; a Body whose epoch key is absent is retained
@@ -46,9 +46,9 @@ use crate::body::{BodyOp, ContentCommitment};
 use crate::convergence::ConvergenceOutcome;
 use crate::frontier::{AuthorityFrontier, ReplicaFrontier};
 use crate::ids::{BodyKey, EncodingId, SchemaId, WorldId};
-use crate::manifest::{ManifestEntryV1, ManifestPageV1, ManifestRootV1, MAX_ENTRIES_PER_PAGE};
-use crate::protected::{BodyKeySource, ProtectedBodyPayloadV1, ProtectedError, MAX_BODY_BYTES};
-use crate::receipt::RequestReceiptV1;
+use crate::manifest::{ManifestEntry, ManifestPage, ManifestRoot, MAX_ENTRIES_PER_PAGE};
+use crate::protected::{BodyKeySource, ProtectedBodyPayload, ProtectedError, MAX_BODY_BYTES};
+use crate::receipt::RequestReceipt;
 use crate::transaction::{
     AuthoritySource, BodyDescriptor, BodyTransaction, BodyTransactionCore, TransactionSignRequest,
     TransactionSigner,
@@ -142,15 +142,15 @@ impl std::error::Error for ReplicaCommitError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionOutcome {
     /// The request committed now; the receipt records its result.
-    Committed(RequestReceiptV1),
+    Committed(RequestReceipt),
     /// The identical request had already committed; the original receipt is
     /// returned and **nothing was reapplied**.
-    Replayed(RequestReceiptV1),
+    Replayed(RequestReceipt),
 }
 
 impl ActionOutcome {
     /// The receipt either way.
-    pub fn receipt(&self) -> &RequestReceiptV1 {
+    pub fn receipt(&self) -> &RequestReceipt {
         match self {
             ActionOutcome::Committed(r) | ActionOutcome::Replayed(r) => r,
         }
@@ -366,7 +366,7 @@ struct BodyRecord {
 /// The store's opaque caller metadata: the complete Replica index, persisted
 /// with every commit at the journal's manifest linearization point.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoreMetaV1 {
+struct StoreMeta {
     version: u8,
     space: Option<SpaceId>,
     frontier: ReplicaFrontier,
@@ -388,7 +388,7 @@ pub struct Replica {
     supported: SupportedSchemas,
     quota: QuotaConfig,
     bodies: BTreeMap<BodyKey, BodyRecord>,
-    receipts: BTreeMap<Vec<u8>, (RequestReceiptV1, Option<ObjectRef>)>,
+    receipts: BTreeMap<Vec<u8>, (RequestReceipt, Option<ObjectRef>)>,
     /// Opaque retained material kept in memory for non-durable replicas (a
     /// durable store keeps it as objects; this map indexes the raw envelope
     /// bytes + transaction bytes for byte-identical forwarding either way).
@@ -586,7 +586,7 @@ impl Replica {
             replica.durable = Some(store);
             return Ok(replica);
         };
-        let meta: StoreMetaV1 = postcard::from_bytes(&manifest.meta)
+        let meta: StoreMeta = postcard::from_bytes(&manifest.meta)
             .map_err(|e| ReplicaCommitError::Integrity(format!("store meta: {e}")))?;
         if meta.version != 1 {
             return Err(ReplicaCommitError::Integrity(format!(
@@ -625,7 +625,7 @@ impl Replica {
             // failing the whole store.
             match (record.interpreted, keys.opening_key(&epoch)) {
                 (true, Some(key_cap)) => {
-                    let payload = ProtectedBodyPayloadV1::open(&key_cap, &envelope)
+                    let payload = ProtectedBodyPayload::open(&key_cap, &envelope)
                         .map_err(|e| ReplicaCommitError::Integrity(format!("protected: {e}")))?;
                     replica
                         .fabric
@@ -645,7 +645,7 @@ impl Replica {
             let bytes = store
                 .read_object(&receipt_ref)
                 .map_err(|e| ReplicaCommitError::Integrity(e.to_string()))?;
-            let receipt = RequestReceiptV1::decode_canonical(&bytes)
+            let receipt = RequestReceipt::decode_canonical(&bytes)
                 .map_err(|e| ReplicaCommitError::Integrity(format!("receipt: {e}")))?;
             replica.receipts.insert(scope, (receipt, Some(receipt_ref)));
         }
@@ -678,7 +678,7 @@ impl Replica {
             .and_then(|m| {
                 // The Replica meta records the manifest-root object ref; a
                 // fresh or non-durable store has none.
-                postcard::from_bytes::<StoreMetaV1>(&m.meta)
+                postcard::from_bytes::<StoreMeta>(&m.meta)
                     .ok()
                     .and_then(|meta| meta.manifest_root)
                     .map(|r| r.hash)
@@ -714,7 +714,7 @@ impl Replica {
         device: &mechanics::ids::DeviceId,
         request: &[u8; 16],
         payload_hash: &[u8; 32],
-    ) -> Result<Option<RequestReceiptV1>, ReplicaCommitError> {
+    ) -> Result<Option<RequestReceipt>, ReplicaCommitError> {
         let key = crate::receipt::scope_key(space, world, device, request);
         match self.receipts.get(&key) {
             None => Ok(None),
@@ -784,7 +784,7 @@ impl Replica {
         // does not advance — but the receipt is still recorded durably so an
         // identical retry replays instead of re-running the World.
         if ops.is_empty() {
-            let receipt = RequestReceiptV1 {
+            let receipt = RequestReceipt {
                 version: 1,
                 space: ctx.space.clone(),
                 world: world.clone(),
@@ -853,7 +853,7 @@ impl Replica {
 
         // Build per-Body chain advances and records for every touched Body.
         let mut new_records: BTreeMap<BodyKey, Option<BodyRecord>> = BTreeMap::new();
-        let mut sealed: Vec<(BodyKey, Vec<u8>, ProtectedBodyPayloadV1)> = Vec::new();
+        let mut sealed: Vec<(BodyKey, Vec<u8>, ProtectedBodyPayload)> = Vec::new();
         for key in &touched {
             let export = self.fabric.export_body(&fabric_key(key));
             match export {
@@ -876,7 +876,7 @@ impl Replica {
                             .map(|r| r.binding.clone())
                             .expect("validated above"),
                     };
-                    let payload = ProtectedBodyPayloadV1::new(export, base, chain);
+                    let payload = ProtectedBodyPayload::new(export, base, chain);
                     let envelope = match &sealing {
                         Some(sealing) => payload.seal(sealing).map_err(|e| {
                             self.poisoned = true;
@@ -951,7 +951,7 @@ impl Replica {
                     record.tx = tx_id;
                 }
             }
-            let receipt_record = RequestReceiptV1 {
+            let receipt_record = RequestReceipt {
                 version: 1,
                 space: ctx.space.clone(),
                 world: world.clone(),
@@ -1036,7 +1036,7 @@ impl Replica {
         self.frontier = next_frontier;
         let receipt_record = match durable_result {
             Some(receipt) => receipt,
-            None => RequestReceiptV1 {
+            None => RequestReceipt {
                 version: 1,
                 space: ctx.space.clone(),
                 world: world.clone(),
@@ -1158,7 +1158,7 @@ impl Replica {
             envelope: Vec<u8>,
             /// `Some` when the payload opens and is locally interpreted;
             /// `None` for the opaque branch.
-            payload: Option<ProtectedBodyPayloadV1>,
+            payload: Option<ProtectedBodyPayload>,
             record: BodyRecord,
         }
         let mut planned: Vec<Planned> = Vec::new();
@@ -1198,7 +1198,7 @@ impl Replica {
                         outcome.rejected += 1;
                         continue;
                     }
-                    let payload = match ProtectedBodyPayloadV1::open(&open_key, envelope) {
+                    let payload = match ProtectedBodyPayload::open(&open_key, envelope) {
                         Ok(p) => p,
                         Err(_) => {
                             // InvalidProtectedBody: authenticated rejection.
@@ -1499,22 +1499,22 @@ impl Replica {
 
         // Manifest pages over the full Body set.
         let space = ctx.space;
-        let entries: Vec<ManifestEntryV1> = bodies
+        let entries: Vec<ManifestEntry> = bodies
             .iter()
-            .map(|(key, r)| ManifestEntryV1 {
+            .map(|(key, r)| ManifestEntry {
                 key: key.clone(),
                 descriptor_hash: r.descriptor_hash,
                 transaction_commitment: r.tx_commitment,
             })
             .collect();
-        let mut pages: Vec<ManifestPageV1> = Vec::new();
+        let mut pages: Vec<ManifestPage> = Vec::new();
         for (i, chunk) in entries.chunks(MAX_ENTRIES_PER_PAGE).enumerate() {
             pages.push(
-                ManifestPageV1::new(space, i as u32, chunk.to_vec())
+                ManifestPage::new(space, i as u32, chunk.to_vec())
                     .ok_or_else(|| ReplicaCommitError::Illegitimate("space id shape".into()))?,
             );
         }
-        let root = ManifestRootV1::sign_with(
+        let root = ManifestRoot::sign_with(
             space,
             next_frontier,
             &pages,
@@ -1573,7 +1573,7 @@ impl Replica {
         keep.sort_by_key(|r| r.hash);
         keep.dedup_by_key(|r| r.hash);
 
-        let meta = StoreMetaV1 {
+        let meta = StoreMeta {
             version: 1,
             space: Some(space.clone()),
             frontier: next_frontier,
@@ -1679,7 +1679,7 @@ impl Replica {
             });
         }
         // 3. + 4. Authority-verified manifest root and its complete pages.
-        let root = ManifestRootV1::decode_canonical(&staged.manifest_root_bytes)
+        let root = ManifestRoot::decode_canonical(&staged.manifest_root_bytes)
             .map_err(|e| illegit(format!("manifest root: {e}")))?;
         let root_space = root.space;
         let authorized = root
@@ -1688,7 +1688,7 @@ impl Replica {
         let mut pages = Vec::with_capacity(staged.manifest_pages.len());
         for bytes in &staged.manifest_pages {
             pages.push(
-                ManifestPageV1::decode_canonical(bytes)
+                ManifestPage::decode_canonical(bytes)
                     .map_err(|e| illegit(format!("manifest page: {e}")))?,
             );
         }
@@ -1696,7 +1696,7 @@ impl Replica {
             .root()
             .verify_pages(&pages)
             .map_err(|e| illegit(format!("manifest pages: {e}")))?;
-        let entries: BTreeMap<BodyKey, &ManifestEntryV1> = pages
+        let entries: BTreeMap<BodyKey, &ManifestEntry> = pages
             .iter()
             .flat_map(|p| p.entries.iter())
             .map(|e| (e.key.clone(), e))
@@ -1793,23 +1793,23 @@ impl Replica {
         &self,
         ctx: &CommitContext<'_>,
     ) -> Result<(Vec<u8>, Vec<Vec<u8>>), ReplicaCommitError> {
-        let entries: Vec<ManifestEntryV1> = self
+        let entries: Vec<ManifestEntry> = self
             .bodies
             .iter()
-            .map(|(key, r)| ManifestEntryV1 {
+            .map(|(key, r)| ManifestEntry {
                 key: key.clone(),
                 descriptor_hash: r.descriptor_hash,
                 transaction_commitment: r.tx_commitment,
             })
             .collect();
-        let mut pages: Vec<ManifestPageV1> = Vec::new();
+        let mut pages: Vec<ManifestPage> = Vec::new();
         for (i, chunk) in entries.chunks(MAX_ENTRIES_PER_PAGE).enumerate() {
             pages.push(
-                ManifestPageV1::new(ctx.space, i as u32, chunk.to_vec())
+                ManifestPage::new(ctx.space, i as u32, chunk.to_vec())
                     .ok_or_else(|| ReplicaCommitError::Illegitimate("space id shape".into()))?,
             );
         }
-        let root = ManifestRootV1::sign_with(
+        let root = ManifestRoot::sign_with(
             ctx.space,
             self.frontier,
             &pages,
@@ -1940,11 +1940,11 @@ impl Replica {
         &mut self,
         ctx: &CommitContext<'_>,
         tx: &BodyTransaction,
-        sealed: &[(BodyKey, Vec<u8>, ProtectedBodyPayloadV1)],
+        sealed: &[(BodyKey, Vec<u8>, ProtectedBodyPayload)],
         new_records: &mut BTreeMap<BodyKey, Option<BodyRecord>>,
-        receipt: Option<RequestReceiptV1>,
+        receipt: Option<RequestReceipt>,
         next_frontier: ReplicaFrontier,
-    ) -> Result<RequestReceiptV1, ReplicaCommitError> {
+    ) -> Result<RequestReceipt, ReplicaCommitError> {
         let sealed: Vec<(BodyKey, Vec<u8>, ())> = sealed
             .iter()
             .map(|(k, e, _)| (k.clone(), e.clone(), ()))
@@ -1956,12 +1956,9 @@ impl Replica {
 
     /// Persist ONLY a new idempotency receipt: the body index, manifest, and
     /// frontier are unchanged; every existing object is carried forward.
-    fn persist_receipt_only(
-        &mut self,
-        receipt: &RequestReceiptV1,
-    ) -> Result<(), ReplicaCommitError> {
+    fn persist_receipt_only(&mut self, receipt: &RequestReceipt) -> Result<(), ReplicaCommitError> {
         let store = self.durable.as_ref().expect("durable path");
-        let prior: Option<StoreMetaV1> = store
+        let prior: Option<StoreMeta> = store
             .manifest()
             .map(|m| postcard::from_bytes(&m.meta))
             .transpose()
@@ -1995,7 +1992,7 @@ impl Replica {
         keep.extend(manifest_pages.iter().copied());
         keep.sort_by_key(|r| r.hash);
         keep.dedup_by_key(|r| r.hash);
-        let meta = StoreMetaV1 {
+        let meta = StoreMeta {
             version: 1,
             space: self.space.clone(),
             frontier: self.frontier,
@@ -2036,7 +2033,7 @@ impl Replica {
         tx: &BodyTransaction,
         sealed: &[(BodyKey, Vec<u8>, ())],
         new_records: &mut BTreeMap<BodyKey, Option<BodyRecord>>,
-        receipt: Option<&RequestReceiptV1>,
+        receipt: Option<&RequestReceipt>,
         next_frontier: ReplicaFrontier,
     ) -> Result<(), ReplicaCommitError> {
         let tx_bytes = tx.encode();
@@ -2074,22 +2071,22 @@ impl Replica {
 
         // Manifest pages over the full Body set.
         let space = ctx.space;
-        let entries: Vec<ManifestEntryV1> = bodies
+        let entries: Vec<ManifestEntry> = bodies
             .iter()
-            .map(|(key, r)| ManifestEntryV1 {
+            .map(|(key, r)| ManifestEntry {
                 key: key.clone(),
                 descriptor_hash: r.descriptor_hash,
                 transaction_commitment: r.tx_commitment,
             })
             .collect();
-        let mut pages: Vec<ManifestPageV1> = Vec::new();
+        let mut pages: Vec<ManifestPage> = Vec::new();
         for (i, chunk) in entries.chunks(MAX_ENTRIES_PER_PAGE).enumerate() {
             pages.push(
-                ManifestPageV1::new(space, i as u32, chunk.to_vec())
+                ManifestPage::new(space, i as u32, chunk.to_vec())
                     .ok_or_else(|| ReplicaCommitError::Illegitimate("space id shape".into()))?,
             );
         }
-        let root = ManifestRootV1::sign_with(
+        let root = ManifestRoot::sign_with(
             space,
             next_frontier,
             &pages,
@@ -2153,7 +2150,7 @@ impl Replica {
         keep.sort_by_key(|r| r.hash);
         keep.dedup_by_key(|r| r.hash);
 
-        let meta = StoreMetaV1 {
+        let meta = StoreMeta {
             version: 1,
             space: Some(space.clone()),
             frontier: next_frontier,

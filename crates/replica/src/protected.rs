@@ -1,4 +1,4 @@
-//! `ProtectedBodyPayloadV1` — the canonical plaintext a protected Body object
+//! `ProtectedBodyPayload` — the canonical plaintext a protected Body object
 //! seals, and the key-source seam Replica consults to seal/open it.
 //!
 //! The canonical plaintext is a versioned tuple scoped to **exactly one Body**:
@@ -35,7 +35,7 @@ pub const MUTATION_COLLABORATIVE: u8 = 2;
 /// The canonical protected-Body plaintext. `version` is exactly 1 and
 /// `mutation_model` must agree with the payload variant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProtectedBodyPayloadV1 {
+pub struct ProtectedBodyPayload {
     pub version: u8,
     pub mutation_model: u8,
     pub payload: BodyExport,
@@ -66,7 +66,7 @@ impl std::fmt::Display for ProtectedError {
 }
 impl std::error::Error for ProtectedError {}
 
-impl ProtectedBodyPayloadV1 {
+impl ProtectedBodyPayload {
     /// Build the canonical plaintext for one Body's export.
     pub fn new(
         payload: BodyExport,
@@ -184,8 +184,8 @@ mod tests {
         AuthorizedBodyKey::for_authorized_epoch([7u8; 16], [9u8; 32])
     }
 
-    fn payload() -> ProtectedBodyPayloadV1 {
-        ProtectedBodyPayloadV1::new(
+    fn payload() -> ProtectedBodyPayload {
+        ProtectedBodyPayload::new(
             BodyExport::Atomic(b"the canonical application bytes".to_vec()),
             ReplicaFrontier::EMPTY,
             ReplicaFrontier::new([1u8; 32], 1),
@@ -199,7 +199,7 @@ mod tests {
         // epoch_id[16] || nonce[12] || ciphertext_and_tag
         assert_eq!(&envelope[..16], &[7u8; 16]);
         assert_eq!(envelope.len(), p.encode().len() + BODY_ENVELOPE_OVERHEAD);
-        assert_eq!(ProtectedBodyPayloadV1::open(&key(), &envelope).unwrap(), p);
+        assert_eq!(ProtectedBodyPayload::open(&key(), &envelope).unwrap(), p);
     }
 
     #[test]
@@ -221,13 +221,13 @@ mod tests {
         // Wrong epoch on the capability.
         let other = AuthorizedBodyKey::for_authorized_epoch([8u8; 16], [9u8; 32]);
         assert_eq!(
-            ProtectedBodyPayloadV1::open(&other, &envelope),
+            ProtectedBodyPayload::open(&other, &envelope),
             Err(ProtectedError::InvalidProtectedBody)
         );
         // Wrong key material under the right epoch.
         let wrong_key = AuthorizedBodyKey::for_authorized_epoch([7u8; 16], [1u8; 32]);
         assert_eq!(
-            ProtectedBodyPayloadV1::open(&wrong_key, &envelope),
+            ProtectedBodyPayload::open(&wrong_key, &envelope),
             Err(ProtectedError::InvalidProtectedBody)
         );
         // A flipped ciphertext byte fails authentication with the SAME error.
@@ -235,7 +235,7 @@ mod tests {
         let last = tampered.len() - 1;
         tampered[last] ^= 0xff;
         assert_eq!(
-            ProtectedBodyPayloadV1::open(&key(), &tampered),
+            ProtectedBodyPayload::open(&key(), &tampered),
             Err(ProtectedError::InvalidProtectedBody)
         );
     }
@@ -245,7 +245,7 @@ mod tests {
         let mut p = payload();
         p.mutation_model = MUTATION_COLLABORATIVE; // payload is Atomic
         assert_eq!(
-            ProtectedBodyPayloadV1::decode_canonical(&p.encode()),
+            ProtectedBodyPayload::decode_canonical(&p.encode()),
             Err(ProtectedError::InvalidProtectedBody)
         );
     }
@@ -255,7 +255,7 @@ mod tests {
         let mut p = payload();
         p.version = 2;
         assert_eq!(
-            ProtectedBodyPayloadV1::decode_canonical(&p.encode()),
+            ProtectedBodyPayload::decode_canonical(&p.encode()),
             Err(ProtectedError::UnsupportedVersion(2))
         );
     }
@@ -265,12 +265,12 @@ mod tests {
         // An over-bound input is refused by length alone (no decode attempt).
         let huge = vec![0u8; MAX_PROTECTED_PLAINTEXT + 1];
         assert_eq!(
-            ProtectedBodyPayloadV1::decode_canonical(&huge),
+            ProtectedBodyPayload::decode_canonical(&huge),
             Err(ProtectedError::BodyTooLarge)
         );
         let huge_envelope = vec![0u8; MAX_BODY_BYTES + 1];
         assert_eq!(
-            ProtectedBodyPayloadV1::open(&key(), &huge_envelope),
+            ProtectedBodyPayload::open(&key(), &huge_envelope),
             Err(ProtectedError::BodyTooLarge)
         );
     }

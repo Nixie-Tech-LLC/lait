@@ -1113,7 +1113,7 @@ fn an_action_for_another_space_or_world_is_refused() {
     let mut header = good.header.clone();
     header.space = mechanics::ids::SpaceId::from_digest([0xAB; 16]);
     let foreign =
-        crate::action::SignedWorldActionV1::sign(header, good.payload.clone(), &WRITER_SEED);
+        crate::action::SignedWorldAction::sign(header, good.payload.clone(), &WRITER_SEED);
     assert_eq!(session.submit(foreign), Err(WorldError::InvalidRequest));
     // A tampered (unsigned) mutation of the same header fails signature
     // verification outright.

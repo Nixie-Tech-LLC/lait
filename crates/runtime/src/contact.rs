@@ -144,7 +144,7 @@ impl ContactId {
 
 /// The initiator's signed opening of a Contact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContactHelloV1 {
+pub struct ContactHello {
     pub protocol: u16,
     pub space: [u8; 29],
     pub initiator_station: [u8; 32],
@@ -159,7 +159,7 @@ pub struct ContactHelloV1 {
 
 /// The accepter's signed answer, binding the exact Hello.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContactHelloAckV1 {
+pub struct ContactHelloAck {
     pub hello_hash: [u8; 32],
     pub responder_transport: [u8; 32],
     pub nonce: [u8; 32],
@@ -202,7 +202,7 @@ where
     Ok(value)
 }
 
-impl ContactHelloV1 {
+impl ContactHello {
     #[allow(clippy::too_many_arguments)]
     fn preimage(
         protocol: u16,
@@ -323,7 +323,7 @@ impl ContactHelloV1 {
     }
 }
 
-impl ContactHelloAckV1 {
+impl ContactHelloAck {
     fn preimage(
         hello_hash: &[u8; 32],
         responder_transport: &[u8; 32],
@@ -335,11 +335,7 @@ impl ContactHelloAckV1 {
     }
 
     /// Sign an ack answering `hello` from the responder's device seed.
-    pub fn sign(
-        hello: &ContactHelloV1,
-        nonce: [u8; 32],
-        responder_seed: &[u8; 32],
-    ) -> Option<Self> {
+    pub fn sign(hello: &ContactHello, nonce: [u8; 32], responder_seed: &[u8; 32]) -> Option<Self> {
         let responder = mechanics::crypto::device_from_seed(responder_seed).key_bytes()?;
         let hello_hash = hello.hash();
         let preimage = Self::preimage(&hello_hash, &responder, &nonce);
@@ -364,7 +360,7 @@ impl ContactHelloAckV1 {
     /// Verify against the Hello it answers and the negotiated connection peer.
     pub fn verify(
         &self,
-        hello: &ContactHelloV1,
+        hello: &ContactHello,
         transport_peer: &StationId,
     ) -> Result<(), ContactWireError> {
         if self.signature_algorithm != SIG_ALG_ED25519 {
@@ -415,7 +411,7 @@ pub enum ContactFrame {
         record_count: u32,
         set_hash: [u8; 32],
     },
-    /// The canonical `ManifestRootV1` bytes, opaque at the frame layer; the
+    /// The canonical `ManifestRoot` bytes, opaque at the frame layer; the
     /// manifest layer validates them and `manifest_root_ref` names them.
     ManifestOffer {
         root_bytes: Vec<u8>,

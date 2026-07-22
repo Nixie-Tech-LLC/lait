@@ -1,4 +1,4 @@
-//! `RequestReceiptV1` — the canonical persistent-idempotency receipt.
+//! `RequestReceipt` — the canonical persistent-idempotency receipt.
 //!
 //! Every semantic transaction committed through the public action API records a
 //! receipt under its durable idempotency scope `(Space, World, Device,
@@ -28,7 +28,7 @@ pub const MAX_EFFECT_BYTES: usize = 1024 * 1024;
 
 /// The canonical committed-request receipt. `version` is exactly 1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RequestReceiptV1 {
+pub struct RequestReceipt {
     pub version: u8,
     /// The durable idempotency scope.
     pub space: SpaceId,
@@ -68,7 +68,7 @@ impl std::fmt::Display for ReceiptError {
 }
 impl std::error::Error for ReceiptError {}
 
-impl RequestReceiptV1 {
+impl RequestReceipt {
     /// Encode to canonical bytes.
     pub fn encode(&self) -> Vec<u8> {
         postcard::to_stdvec(self).expect("postcard receipt")
@@ -113,8 +113,8 @@ mod tests {
     use super::*;
     use crate::ids::BodyId;
 
-    fn receipt() -> RequestReceiptV1 {
-        RequestReceiptV1 {
+    fn receipt() -> RequestReceipt {
+        RequestReceipt {
             version: 1,
             space: SpaceId::from_digest([2u8; 16]),
             world: WorldId::parse("com.example.notes").unwrap(),
@@ -135,7 +135,7 @@ mod tests {
     fn receipt_roundtrips_canonically() {
         let r = receipt();
         let bytes = r.encode();
-        assert_eq!(RequestReceiptV1::decode_canonical(&bytes).unwrap(), r);
+        assert_eq!(RequestReceipt::decode_canonical(&bytes).unwrap(), r);
     }
 
     #[test]
@@ -143,7 +143,7 @@ mod tests {
         let mut bytes = receipt().encode();
         bytes.push(0);
         assert_eq!(
-            RequestReceiptV1::decode_canonical(&bytes),
+            RequestReceipt::decode_canonical(&bytes),
             Err(ReceiptError::NonCanonical)
         );
     }
@@ -153,7 +153,7 @@ mod tests {
         let mut r = receipt();
         r.version = 2;
         assert_eq!(
-            RequestReceiptV1::decode_canonical(&r.encode()),
+            RequestReceipt::decode_canonical(&r.encode()),
             Err(ReceiptError::UnsupportedVersion(2))
         );
     }
@@ -162,10 +162,10 @@ mod tests {
     fn oversized_effect_is_rejected_at_exactly_the_bound() {
         let mut r = receipt();
         r.effect = vec![0u8; MAX_EFFECT_BYTES];
-        assert!(RequestReceiptV1::decode_canonical(&r.encode()).is_ok());
+        assert!(RequestReceipt::decode_canonical(&r.encode()).is_ok());
         r.effect = vec![0u8; MAX_EFFECT_BYTES + 1];
         assert_eq!(
-            RequestReceiptV1::decode_canonical(&r.encode()),
+            RequestReceipt::decode_canonical(&r.encode()),
             Err(ReceiptError::EffectTooLarge)
         );
     }

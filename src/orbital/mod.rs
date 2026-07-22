@@ -243,7 +243,7 @@ pub fn form_space(
     home: &Path,
     device_seed: &[u8; 32],
     display_name: &str,
-) -> Result<(OrbitalMechanics, runtime::SignedCoordinatesV1)> {
+) -> Result<(OrbitalMechanics, runtime::SignedCoordinates)> {
     form_space_with_fault(home, device_seed, display_name, None, None)
 }
 
@@ -257,7 +257,7 @@ pub fn form_space_with_fault(
     display_name: &str,
     project: Option<(String, String)>,
     fault: Option<BootstrapFault>,
-) -> Result<(OrbitalMechanics, runtime::SignedCoordinatesV1)> {
+) -> Result<(OrbitalMechanics, runtime::SignedCoordinates)> {
     if let Some(err) = detect_legacy_home(home) {
         return Err(anyhow::anyhow!("{err}"));
     }
@@ -371,7 +371,7 @@ pub fn form_space_with_fault(
     };
 
     // Submit the EXACT persisted signed bytes (fresh build or crash replay).
-    let action: runtime::SignedWorldActionV1 = postcard::from_bytes(&record.signed_action)
+    let action: runtime::SignedWorldAction = postcard::from_bytes(&record.signed_action)
         .map_err(|e| anyhow::anyhow!("bootstrap record corrupt: {e}"))?;
     if fault == Some(BootstrapFault::BeforeSubmit) {
         let _ = station.go_dormant();
@@ -436,11 +436,11 @@ pub fn enter_space(
     home: &Path,
     device_seed: &[u8; 32],
     invite_link: &str,
-) -> Result<(OrbitalMechanics, runtime::SignedCoordinatesV1)> {
+) -> Result<(OrbitalMechanics, runtime::SignedCoordinates)> {
     if let Some(err) = detect_legacy_home(home) {
         return Err(anyhow::anyhow!("{err}"));
     }
-    let coords = runtime::SignedCoordinatesV1::parse_link(invite_link.trim())
+    let coords = runtime::SignedCoordinates::parse_link(invite_link.trim())
         .map_err(|e| anyhow::anyhow!("invalid invite link: {e}"))?;
     let root = orbital_store_root(home);
     let mechanics = OrbitalMechanics::enter(&root, device_seed, &coords)?;

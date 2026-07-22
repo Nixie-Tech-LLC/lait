@@ -41,15 +41,15 @@ pub use fabric::{CollaborativeView, ListElement};
 pub use frontier::{AuthorityFrontier, ReplicaFrontier};
 pub use ids::{BodyId, BodyKey, EncodingId, SchemaId, WorldId};
 pub use manifest::{
-    AuthorizedRoot, ManifestBook, ManifestEntryV1, ManifestError, ManifestPageV1, ManifestRootV1,
+    AuthorizedRoot, ManifestBook, ManifestEntry, ManifestError, ManifestPage, ManifestRoot,
     RootObservation,
 };
-pub use marker::{MarkerError, StoreMarkerV1};
+pub use marker::{MarkerError, StoreMarker};
 pub use protected::{
-    BodyKeySource, ProtectedBodyPayloadV1, ProtectedError, StaticBodyKeys, MAX_BODY_BYTES,
+    BodyKeySource, ProtectedBodyPayload, ProtectedError, StaticBodyKeys, MAX_BODY_BYTES,
     MAX_PROTECTED_PLAINTEXT,
 };
-pub use receipt::{ReceiptError, RequestReceiptV1, MAX_EFFECT_BYTES};
+pub use receipt::{ReceiptError, RequestReceipt, MAX_EFFECT_BYTES};
 pub use replica::{
     operations_digest_of, ActionOutcome, BodyBinding, CommitAuthorization, CommitContext,
     ExportedMaterial, QuotaConfig, Replica, ReplicaCommitError, StaticAuthorizer, SupportedSchemas,

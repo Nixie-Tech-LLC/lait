@@ -81,7 +81,7 @@ fn activate(
     root: &std::path::Path,
     seed: [u8; 32],
     mech: &OrbitalMechanics,
-    coords: &runtime::SignedCoordinatesV1,
+    coords: &runtime::SignedCoordinates,
     transport: Arc<dyn comms::Transport>,
     bootstrap: Vec<comms::PeerId>,
 ) -> (Runtime, Station) {
@@ -157,7 +157,7 @@ fn contact_until<F: Fn() -> bool>(station: &Station, peer: &mechanics::ids::Stat
 
 #[test]
 fn coordinates_only_two_endpoint_bootstrap_over_real_iroh() {
-    let alpns: &[comms::Alpn] = &[runtime::contact::CONTACT_ALPN, runtime::PRESENCE_ALPN_V1];
+    let alpns: &[comms::Alpn] = &[runtime::contact::CONTACT_ALPN, runtime::PRESENCE_ALPN];
     let net = comms::policy::Network::Isolated;
     // A long-lived multi-thread runtime hosts both endpoints' background tasks.
     let rt = tokio::runtime::Runtime::new().unwrap();

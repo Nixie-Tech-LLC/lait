@@ -44,16 +44,16 @@ pub mod store;
 pub(crate) mod wire;
 pub mod world;
 
-pub use action::{ActionError, IdempotencyKey, RequestId, SignedWorldActionV1, WorldActionHeader};
-pub use beacon::{BeaconError, RouteHint, SignedBeaconV1, VerifiedBeacon};
+pub use action::{ActionError, IdempotencyKey, RequestId, SignedWorldAction, WorldActionHeader};
+pub use beacon::{BeaconError, RouteHint, SignedBeacon, VerifiedBeacon};
 pub use contact::{
-    AccepterEvent, AccepterValidator, ContactFrame, ContactHelloAckV1, ContactHelloV1, ContactId,
+    AccepterEvent, AccepterValidator, ContactFrame, ContactHello, ContactHelloAck, ContactId,
     ContactWireError, InitiatorReceiver, InitiatorState, Progress, ReceivedMaterial,
 };
 pub use contact_driver::{CommsOptions, ContactMechanics, GossipOptions, MAX_CONTACTS_IN_FLIGHT};
 pub use coordinates::{
-    canonical_routes, AdmissionCapabilityV1, ApproachRoute, CoordinatesAdmission, CoordinatesError,
-    CoordinatesPayloadV1, SignedCoordinatesV1, VerifiedCoordinates,
+    canonical_routes, AdmissionCapability, ApproachRoute, CoordinatesAdmission, CoordinatesError,
+    CoordinatesPayload, SignedCoordinates, VerifiedCoordinates,
 };
 pub use error::{ContactError, DormancyError, LifecycleError, StationExit, WorldError};
 pub use lifecycle::{
@@ -61,8 +61,8 @@ pub use lifecycle::{
     EnterOptions, Neighbor, Orbit, OrbitObservation, Reachability, Runtime, SpaceFormationOptions,
     Station,
 };
-pub use neighbor_presence::{AckV1, PresenceError, ProbeV1, PRESENCE_ALPN_V1};
-pub use neighbors::{NeighborRecordV1, NeighborRegistry, RegistryError, StoredRoute};
+pub use neighbor_presence::{Ack, PresenceError, Probe, PRESENCE_ALPN};
+pub use neighbors::{NeighborRecord, NeighborRegistry, RegistryError, StoredRoute};
 pub use registry::{RuntimeBuilder, WorldRegistry};
 pub use session::{
     CommittedEffect, Observation, ObservationCursor, ObservationStream, ObservationStreamError,

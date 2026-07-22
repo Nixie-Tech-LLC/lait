@@ -30,16 +30,16 @@ use std::time::{Duration, Instant, SystemTime};
 use mechanics::ids::{SpaceId, StationId};
 use replica::{AuthorityIncorporator, AuthoritySource, StagedContactMaterial};
 
-use crate::beacon::{RouteHint, SignedBeaconV1, BEACON_PROTOCOL};
+use crate::beacon::{RouteHint, SignedBeacon, BEACON_PROTOCOL};
 use crate::contact::{
-    build_transfer_frames, AccepterEvent, AccepterValidator, ContactFrame, ContactHelloAckV1,
-    ContactHelloV1, ContactId, InitiatorReceiver, OutboundTransfer, Progress, ReceivedMaterial,
+    build_transfer_frames, AccepterEvent, AccepterValidator, ContactFrame, ContactHello,
+    ContactHelloAck, ContactId, InitiatorReceiver, OutboundTransfer, Progress, ReceivedMaterial,
     CONTACT_ALPN, CONTACT_PROTOCOL, MAX_FRAME,
 };
 use crate::error::ContactError;
 use crate::lifecycle::CancelToken;
 use crate::lifecycle::ContactOutcome;
-use crate::neighbor_presence::{AckV1, ProbeV1, PRESENCE_ALPN_V1};
+use crate::neighbor_presence::{Ack, Probe, PRESENCE_ALPN};
 use crate::neighbors::NeighborRegistry;
 use crate::session::StationCore;
 
@@ -187,7 +187,7 @@ async fn drive(ctx: DriverContext) {
                     let comms::Incoming { from, alpn, stream } = incoming;
                     if alpn == CONTACT_ALPN {
                         let _ = serve_contact(&ctx3, from, stream).await;
-                    } else if alpn == PRESENCE_ALPN_V1 {
+                    } else if alpn == PRESENCE_ALPN {
                         let _ = serve_presence(&ctx3, from, stream).await;
                     }
                 });
@@ -235,7 +235,7 @@ async fn drive(ctx: DriverContext) {
                 last_beacon = Instant::now();
                 let sequence = beacon_seq.fetch_add(1, Ordering::SeqCst) + 1;
                 let frontier = ctx.core.frontier();
-                if let Some(beacon) = SignedBeaconV1::emit(
+                if let Some(beacon) = SignedBeacon::emit(
                     BEACON_PROTOCOL,
                     &ctx.space,
                     mechanics::ids::StationEpoch::from_u64(ctx.epoch),
@@ -286,7 +286,7 @@ fn beacon_topic(space: &SpaceId) -> comms::Topic {
 }
 
 fn ingest_beacon(ctx: &DriverContext, bytes: &[u8]) {
-    let Ok(signed) = SignedBeaconV1::decode_canonical(bytes) else {
+    let Ok(signed) = SignedBeacon::decode_canonical(bytes) else {
         return;
     };
     let Ok(verified) = signed.verify() else {
@@ -444,7 +444,7 @@ async fn initiate(
     let contact = ContactId::mint();
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|e| ContactError::Transfer(e.to_string()))?;
-    let hello = ContactHelloV1::sign(
+    let hello = ContactHello::sign(
         CONTACT_PROTOCOL,
         ctx.space_bytes,
         responder.key_bytes(),
@@ -464,7 +464,7 @@ async fn initiate(
         .map_err(|e| ContactError::Transfer(e.to_string()))?
         .ok_or(ContactError::Unreachable)?;
     let ack =
-        ContactHelloAckV1::decode(&ack_bytes).map_err(|e| ContactError::Transfer(e.to_string()))?;
+        ContactHelloAck::decode(&ack_bytes).map_err(|e| ContactError::Transfer(e.to_string()))?;
     // Bind the negotiated transport peer to the signed Station identity
     // BEFORE any staging is allocated.
     ack.verify(&hello, responder)
@@ -521,7 +521,7 @@ async fn serve_contact(
         .map_err(|e| ContactError::Transfer(e.to_string()))?
         .ok_or(ContactError::Unreachable)?;
     let hello =
-        ContactHelloV1::decode(&hello_bytes).map_err(|e| ContactError::Transfer(e.to_string()))?;
+        ContactHello::decode(&hello_bytes).map_err(|e| ContactError::Transfer(e.to_string()))?;
     // Bind the transport peer to the signed initiator identity BEFORE
     // allocating anything.
     let transport_peer = StationId::from_device(&from).ok_or(ContactError::UnknownNeighbor)?;
@@ -544,7 +544,7 @@ async fn serve_contact(
     }
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|e| ContactError::Transfer(e.to_string()))?;
-    let ack = ContactHelloAckV1::sign(&hello, nonce, &ctx.options.station_seed)
+    let ack = ContactHelloAck::sign(&hello, nonce, &ctx.options.station_seed)
         .ok_or_else(|| ContactError::Transfer("sign ack".into()))?;
     step(deadline, progress, stream.send(&ack.encode()))
         .await
@@ -645,7 +645,7 @@ async fn serve_presence(
         .map_err(|_| ContactError::Unreachable)?
         .map_err(|e| ContactError::Transfer(e.to_string()))?
         .ok_or(ContactError::Unreachable)?;
-    let probe = ProbeV1::decode(&probe_bytes).map_err(|e| ContactError::Transfer(e.to_string()))?;
+    let probe = Probe::decode(&probe_bytes).map_err(|e| ContactError::Transfer(e.to_string()))?;
     let prober = StationId::from_device(&from).ok_or(ContactError::UnknownNeighbor)?;
     probe
         .verify(&ctx.space_bytes, &prober)
@@ -655,7 +655,7 @@ async fn serve_presence(
     }
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|e| ContactError::Transfer(e.to_string()))?;
-    let ack = AckV1::sign(&probe, nonce, &ctx.options.station_seed)
+    let ack = Ack::sign(&probe, nonce, &ctx.options.station_seed)
         .ok_or_else(|| ContactError::Transfer("sign presence ack".into()))?;
     let _ = step(
         deadline,

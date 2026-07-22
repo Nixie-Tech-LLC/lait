@@ -128,7 +128,7 @@ impl OrbitalDaemon {
             .build(
                 &device_seed,
                 &network,
-                &[runtime::contact::CONTACT_ALPN, runtime::PRESENCE_ALPN_V1],
+                &[runtime::contact::CONTACT_ALPN, runtime::PRESENCE_ALPN],
             )
             .await?;
         // Retain a transport clone for invite route advertisement before the
@@ -603,7 +603,7 @@ impl OrbitalDaemon {
     fn seed_add(&self, arg: &str) -> Response {
         let (id, space) = match crate::ids::DeviceId::parse(arg.trim()) {
             Some(id) => (id, String::new()),
-            None => match runtime::SignedCoordinatesV1::parse_link(arg.trim())
+            None => match runtime::SignedCoordinates::parse_link(arg.trim())
                 .ok()
                 .and_then(|c| c.verify().ok())
             {

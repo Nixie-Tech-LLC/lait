@@ -56,7 +56,7 @@ pub struct StoredRoute {
 
 /// One Neighbor's persistent record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NeighborRecordV1 {
+pub struct NeighborRecord {
     pub station: StationId,
     /// Verified Beacon high-water: forward-only per Station, fails closed on
     /// u64 overflow.
@@ -83,10 +83,10 @@ const REACH_REACHABLE: u8 = 1;
 const REACH_UNREACHABLE: u8 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
-struct RegistryFileV1 {
+struct RegistryFile {
     version: u8,
     space: SpaceId,
-    entries: Vec<NeighborRecordV1>,
+    entries: Vec<NeighborRecord>,
 }
 
 /// The persistent registry. All mutation methods persist atomically before
@@ -95,7 +95,7 @@ struct RegistryFileV1 {
 pub struct NeighborRegistry {
     path: PathBuf,
     space: SpaceId,
-    entries: BTreeMap<StationId, NeighborRecordV1>,
+    entries: BTreeMap<StationId, NeighborRecord>,
 }
 
 impl NeighborRegistry {
@@ -107,7 +107,7 @@ impl NeighborRegistry {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
             Err(e) => return Err(RegistryError::Io(e.to_string())),
             Ok(bytes) => {
-                let file: RegistryFileV1 =
+                let file: RegistryFile =
                     postcard::from_bytes(&bytes).map_err(|_| RegistryError::CorruptRegistry)?;
                 if file.version != REGISTRY_VERSION {
                     return Err(RegistryError::UnsupportedRegistryVersion(file.version));
@@ -129,7 +129,7 @@ impl NeighborRegistry {
     }
 
     fn persist(&self) -> Result<(), RegistryError> {
-        let file = RegistryFileV1 {
+        let file = RegistryFile {
             version: REGISTRY_VERSION,
             space: self.space.clone(),
             entries: self.entries.values().cloned().collect(),
@@ -162,7 +162,7 @@ impl NeighborRegistry {
         let entry = self
             .entries
             .entry(station.clone())
-            .or_insert_with(|| NeighborRecordV1 {
+            .or_insert_with(|| NeighborRecord {
                 station,
                 epoch: 0,
                 sequence: 0,
@@ -229,7 +229,7 @@ impl NeighborRegistry {
         let entry = self
             .entries
             .entry(station.clone())
-            .or_insert_with(|| NeighborRecordV1 {
+            .or_insert_with(|| NeighborRecord {
                 station: station.clone(),
                 epoch: 0,
                 sequence: 0,
@@ -264,7 +264,7 @@ impl NeighborRegistry {
     /// backoff, and holding an unexpired route lease (route expiry suppresses
     /// dialing). Fair order: sorted by `next_attempt_ms` then StationId.
     pub fn eligible(&self, now_ms: u64) -> Vec<StationId> {
-        let mut due: Vec<(&NeighborRecordV1, &StationId)> = self
+        let mut due: Vec<(&NeighborRecord, &StationId)> = self
             .entries
             .iter()
             .filter(|(_, e)| {
@@ -371,7 +371,7 @@ impl NeighborRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::beacon::SignedBeaconV1;
+    use crate::beacon::SignedBeacon;
     use mechanics::ids::StationEpoch;
 
     const SEED: [u8; 32] = [77u8; 32];
@@ -388,7 +388,7 @@ mod tests {
     }
 
     fn beacon(epoch: u64, sequence: u64, root: [u8; 32]) -> VerifiedBeacon {
-        SignedBeaconV1::emit(
+        SignedBeacon::emit(
             crate::beacon::BEACON_PROTOCOL,
             &space(),
             StationEpoch::from_u64(epoch),
@@ -503,7 +503,7 @@ mod tests {
         assert!(dir.join(NEIGHBORS_FILE).exists(), "never deleted");
 
         // An unsupported version is ITS error, not corruption.
-        let file = RegistryFileV1 {
+        let file = RegistryFile {
             version: 9,
             space: space(),
             entries: vec![],
@@ -519,7 +519,7 @@ mod tests {
         );
 
         // A registry for another Space is refused.
-        let file = RegistryFileV1 {
+        let file = RegistryFile {
             version: REGISTRY_VERSION,
             space: SpaceId::from_digest([99u8; 16]),
             entries: vec![],

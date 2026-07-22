@@ -8,8 +8,8 @@ use replica::body::ContentCommitment;
 use replica::ids::{BodyId, BodyKey, WorldId};
 use runtime::contact::{
     abort, authority_record_hash, authority_set_hash, body_chunk_hash, manifest_page_hash,
-    manifest_root_ref, AccepterEvent, AccepterValidator, ContactFrame, ContactHelloAckV1,
-    ContactHelloV1, ContactId, ContactWireError, InitiatorReceiver, InitiatorState, Progress,
+    manifest_root_ref, AccepterEvent, AccepterValidator, ContactFrame, ContactHello,
+    ContactHelloAck, ContactId, ContactWireError, InitiatorReceiver, InitiatorState, Progress,
 };
 
 const INITIATOR_SEED: [u8; 32] = [71u8; 32];
@@ -38,8 +38,8 @@ fn body_key() -> BodyKey {
 // Hello / HelloAck
 // ---------------------------------------------------------------------------
 
-fn hello() -> ContactHelloV1 {
-    ContactHelloV1::sign(
+fn hello() -> ContactHello {
+    ContactHello::sign(
         1,
         space_bytes(),
         station_of(&RESPONDER_SEED).key_bytes(),
@@ -55,13 +55,13 @@ fn a_valid_hello_exchange_completes() {
     let h = hello();
     h.verify(&space_bytes(), &station_of(&INITIATOR_SEED))
         .unwrap();
-    let ack = ContactHelloAckV1::sign(&h, [4u8; 32], &RESPONDER_SEED).unwrap();
+    let ack = ContactHelloAck::sign(&h, [4u8; 32], &RESPONDER_SEED).unwrap();
     ack.verify(&h, &station_of(&RESPONDER_SEED)).unwrap();
 }
 
 #[test]
 fn an_unsupported_contact_protocol_is_refused() {
-    let h = ContactHelloV1::sign(
+    let h = ContactHello::sign(
         99,
         space_bytes(),
         station_of(&RESPONDER_SEED).key_bytes(),
@@ -102,7 +102,7 @@ fn hello_substitution_and_replay_are_rejected() {
 #[test]
 fn ack_binds_the_exact_hello_and_a_fresh_nonce() {
     let h1 = hello();
-    let h2 = ContactHelloV1::sign(
+    let h2 = ContactHello::sign(
         1,
         space_bytes(),
         station_of(&RESPONDER_SEED).key_bytes(),
@@ -111,14 +111,14 @@ fn ack_binds_the_exact_hello_and_a_fresh_nonce() {
         &INITIATOR_SEED,
     )
     .unwrap();
-    let ack = ContactHelloAckV1::sign(&h1, [4u8; 32], &RESPONDER_SEED).unwrap();
+    let ack = ContactHelloAck::sign(&h1, [4u8; 32], &RESPONDER_SEED).unwrap();
     // Presented against a different hello: commitment mismatch.
     assert_eq!(
         ack.verify(&h2, &station_of(&RESPONDER_SEED)),
         Err(ContactWireError::ChallengeMismatch)
     );
     // A reflected nonce is refused.
-    let reflected = ContactHelloAckV1::sign(&h1, h1.nonce, &RESPONDER_SEED).unwrap();
+    let reflected = ContactHelloAck::sign(&h1, h1.nonce, &RESPONDER_SEED).unwrap();
     assert_eq!(
         reflected.verify(&h1, &station_of(&RESPONDER_SEED)),
         Err(ContactWireError::ChallengeMismatch)

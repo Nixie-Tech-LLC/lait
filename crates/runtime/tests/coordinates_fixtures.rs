@@ -3,8 +3,8 @@
 
 use mechanics::ids::SpaceId;
 use runtime::coordinates::{
-    AdmissionCapabilityV1, ApproachRoute, CoordinatesAdmission, CoordinatesError,
-    CoordinatesPayloadV1, SignedCoordinatesV1, MAX_INCEPTION, MAX_NAME,
+    AdmissionCapability, ApproachRoute, CoordinatesAdmission, CoordinatesError, CoordinatesPayload,
+    SignedCoordinates, MAX_INCEPTION, MAX_NAME,
 };
 
 const FOUNDER_SEED: [u8; 32] = [7u8; 32];
@@ -33,9 +33,9 @@ fn space_bytes(ws: &SpaceId) -> [u8; 29] {
     <[u8; 29]>::try_from(ws.as_str().as_bytes()).unwrap()
 }
 
-fn valid_payload() -> (SpaceId, CoordinatesPayloadV1) {
+fn valid_payload() -> (SpaceId, CoordinatesPayload) {
     let (ws, rc, incept) = founding(FOUNDER_SEED, SALT);
-    let payload = CoordinatesPayloadV1 {
+    let payload = CoordinatesPayload {
         space: space_bytes(&ws),
         salt: SALT,
         recovery_root: rc,
@@ -52,9 +52,9 @@ fn valid_payload() -> (SpaceId, CoordinatesPayloadV1) {
     (ws, payload)
 }
 
-fn valid_coordinates() -> SignedCoordinatesV1 {
+fn valid_coordinates() -> SignedCoordinates {
     let (_ws, payload) = valid_payload();
-    SignedCoordinatesV1::sign(payload, &STATION_SEED)
+    SignedCoordinates::sign(payload, &STATION_SEED)
 }
 
 fn test_admission(
@@ -62,7 +62,7 @@ fn test_admission(
     nonce: [u8; 16],
     not_before: u64,
     expires: u64,
-) -> AdmissionCapabilityV1 {
+) -> AdmissionCapability {
     let evidence = mechanics::demand::WorldAssignmentEvidence {
         world: "com.example.issues".into(),
         opaque_definition_ref: vec![],
@@ -70,7 +70,7 @@ fn test_admission(
         parent_manifest_root: [0u8; 32],
         assignments: vec![],
     };
-    AdmissionCapabilityV1::sign(
+    AdmissionCapability::sign(
         space,
         nonce,
         not_before,
@@ -102,7 +102,7 @@ fn link_roundtrips() {
     assert!(link
         .bytes()
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()));
-    let back = SignedCoordinatesV1::parse_link(&link).unwrap();
+    let back = SignedCoordinates::parse_link(&link).unwrap();
     assert_eq!(coords, back);
 }
 
@@ -151,7 +151,7 @@ fn unusable_routes_are_rejected() {
         assert!(!bad.is_usable());
         let (_ws, mut payload) = valid_payload();
         payload.approach_routes = vec![bad];
-        let coords = SignedCoordinatesV1::sign(payload, &STATION_SEED);
+        let coords = SignedCoordinates::sign(payload, &STATION_SEED);
         assert_eq!(coords.verify(), Err(CoordinatesError::BadAddresses));
     }
     // Canonicalization drops the unusable ones and sorts/dedups the rest.
@@ -208,7 +208,7 @@ fn unsorted_or_duplicate_addresses_are_rejected() {
             port: 1,
         },
     ];
-    let coords = SignedCoordinatesV1::sign(payload, &STATION_SEED);
+    let coords = SignedCoordinates::sign(payload, &STATION_SEED);
     assert_eq!(coords.verify(), Err(CoordinatesError::BadAddresses));
 }
 
@@ -216,7 +216,7 @@ fn unsorted_or_duplicate_addresses_are_rejected() {
 fn oversized_name_hint_is_rejected() {
     let (_ws, mut payload) = valid_payload();
     payload.display_name_hint = "a".repeat(MAX_NAME + 1);
-    let coords = SignedCoordinatesV1::sign(payload, &STATION_SEED);
+    let coords = SignedCoordinates::sign(payload, &STATION_SEED);
     assert_eq!(coords.verify(), Err(CoordinatesError::BadNameHint));
 }
 
@@ -225,7 +225,7 @@ fn non_nfc_name_hint_is_rejected() {
     let (_ws, mut payload) = valid_payload();
     // "e" + combining acute is NFD, not NFC (which would be the single "é").
     payload.display_name_hint = "e\u{0301}".into();
-    let coords = SignedCoordinatesV1::sign(payload, &STATION_SEED);
+    let coords = SignedCoordinates::sign(payload, &STATION_SEED);
     assert_eq!(coords.verify(), Err(CoordinatesError::BadNameHint));
 }
 
@@ -233,7 +233,7 @@ fn non_nfc_name_hint_is_rejected() {
 fn oversized_inception_is_rejected() {
     let (_ws, mut payload) = valid_payload();
     payload.founder_inception = vec![0u8; MAX_INCEPTION + 1];
-    let coords = SignedCoordinatesV1::sign(payload, &STATION_SEED);
+    let coords = SignedCoordinates::sign(payload, &STATION_SEED);
     assert_eq!(coords.verify(), Err(CoordinatesError::InceptionTooLarge));
 }
 
@@ -242,7 +242,7 @@ fn founding_that_the_space_id_does_not_commit_to_is_rejected() {
     let (_ws, mut payload) = valid_payload();
     // A different salt breaks the SpaceId ← founder commitment.
     payload.salt = [0xEEu8; 16];
-    let coords = SignedCoordinatesV1::sign(payload, &STATION_SEED);
+    let coords = SignedCoordinates::sign(payload, &STATION_SEED);
     assert_eq!(coords.verify(), Err(CoordinatesError::FoundingInvalid));
 }
 
@@ -252,7 +252,7 @@ fn trailing_bytes_are_non_canonical() {
     let mut bytes = coords.encode();
     bytes.push(0x00);
     assert_eq!(
-        SignedCoordinatesV1::decode_canonical(&bytes),
+        SignedCoordinates::decode_canonical(&bytes),
         Err(CoordinatesError::NonCanonical)
     );
 }
@@ -267,7 +267,7 @@ fn cross_space_admission_is_rejected() {
 
     let (_ws2, mut payload) = valid_payload();
     payload.admission = CoordinatesAdmission::Some(Box::new(cap));
-    let coords = SignedCoordinatesV1::sign(payload, &STATION_SEED);
+    let coords = SignedCoordinates::sign(payload, &STATION_SEED);
     assert_eq!(coords.verify(), Err(CoordinatesError::BadAdmission));
 }
 
@@ -278,7 +278,7 @@ fn valid_admission_verifies_and_reports_expiry() {
 
     let (_ws, mut payload) = valid_payload();
     payload.admission = CoordinatesAdmission::Some(Box::new(cap.clone()));
-    let coords = SignedCoordinatesV1::sign(payload, &STATION_SEED);
+    let coords = SignedCoordinates::sign(payload, &STATION_SEED);
     let verified = coords.verify().unwrap();
     let redeemed = verified.admission.expect("admission present");
     assert!(!redeemed.is_expired(150), "before expiry");

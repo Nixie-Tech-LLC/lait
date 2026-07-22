@@ -1,7 +1,7 @@
 //! The Orbit's durable on-disk footprint and its exclusive lock.
 //!
 //! An Orbit lives under `<root>/<space-id>/`. This module owns three of that
-//! store's files: the [`replica::StoreMarkerV1`] `marker` (what Space this is,
+//! store's files: the [`replica::StoreMarker`] `marker` (what Space this is,
 //! and that it is a Replica store at all), an `epoch` counter durably
 //! incremented before each activation, and a `lock` file carrying the OS
 //! advisory exclusive lock that is the typed double-lock — only one
@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
 use mechanics::ids::SpaceId;
-use replica::marker::{MarkerError, StoreMarkerV1};
+use replica::marker::{MarkerError, StoreMarker};
 
 use crate::error::LifecycleError;
 
@@ -69,7 +69,7 @@ impl OrbitStore {
             return Err(LifecycleError::AlreadyExists(space.clone()));
         }
         std::fs::create_dir_all(&dir).map_err(io_err)?;
-        let marker = StoreMarkerV1::new(space).ok_or(LifecycleError::IntegrityFailure(
+        let marker = StoreMarker::new(space).ok_or(LifecycleError::IntegrityFailure(
             "space id is not renderable".into(),
         ))?;
         write_sync(&dir.join(MARKER_FILE), &marker.encode())?;
@@ -95,7 +95,7 @@ impl OrbitStore {
             }
             Err(e) => return Err(io_err(e)),
         };
-        let marker = StoreMarkerV1::classify(&marker_bytes).map_err(marker_err)?;
+        let marker = StoreMarker::classify(&marker_bytes).map_err(marker_err)?;
         if marker.space().as_ref() != Some(space) {
             return Err(LifecycleError::IntegrityFailure(
                 "store marker names a different Space".into(),
@@ -240,7 +240,7 @@ impl OrbitStore {
                 continue;
             }
             if let Ok(bytes) = std::fs::read(entry.path().join(MARKER_FILE)) {
-                if let Ok(marker) = StoreMarkerV1::classify(&bytes) {
+                if let Ok(marker) = StoreMarker::classify(&bytes) {
                     if let Some(space) = marker.space() {
                         out.push(space);
                     }

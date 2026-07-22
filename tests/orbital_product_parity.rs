@@ -24,7 +24,7 @@ use mechanics::crypto::AuthorizedBodyKey;
 use replica::frontier::AuthorityFrontier;
 use runtime::{
     ActivationOptions, CommsOptions, ContactMechanics, ContactOptions, EnterOptions, LocalIdentity,
-    RequestId, Runtime, RuntimeBuilder, Session, SignedWorldActionV1, Station, WorldError,
+    RequestId, Runtime, RuntimeBuilder, Session, SignedWorldAction, Station, WorldError,
     WorldIntent, WorldQuery,
 };
 
@@ -46,15 +46,15 @@ fn temp_root(tag: &str) -> std::path::PathBuf {
     dir
 }
 
-fn coordinates() -> runtime::SignedCoordinatesV1 {
-    use runtime::coordinates::{ApproachRoute, CoordinatesAdmission, CoordinatesPayloadV1};
+fn coordinates() -> runtime::SignedCoordinates {
+    use runtime::coordinates::{ApproachRoute, CoordinatesAdmission, CoordinatesPayload};
     let rc = mechanics::space::recovery_commit(&mechanics::space::recovery_pub_of(&RECOVERY_SEED))
         .unwrap();
     let device = mechanics::space::recovery_pub_of(&FOUNDER_SEED);
     let ws = mechanics::space::derive_space_id(&device, &[9u8; 16], &rc);
     let (incept, _actor) =
         mechanics::actor::incept_single(&FOUNDER_SEED, &ws, [1u8; 16], [2u8; 16], None);
-    let payload = CoordinatesPayloadV1 {
+    let payload = CoordinatesPayload {
         space: <[u8; 29]>::try_from(ws.as_str().as_bytes()).unwrap(),
         salt: [9u8; 16],
         recovery_root: rc,
@@ -70,7 +70,7 @@ fn coordinates() -> runtime::SignedCoordinatesV1 {
         }],
         admission: CoordinatesAdmission::None,
     };
-    runtime::SignedCoordinatesV1::sign(payload, &STATION_A_SEED)
+    runtime::SignedCoordinates::sign(payload, &STATION_A_SEED)
 }
 
 struct WriterAuthority;
@@ -154,7 +154,7 @@ impl Driver {
         self.now
     }
 
-    fn signed(&self, intent: &IssueIntent) -> SignedWorldActionV1 {
+    fn signed(&self, intent: &IssueIntent) -> SignedWorldAction {
         self.writer
             .sign_action(
                 &self.session,

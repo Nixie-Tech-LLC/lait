@@ -7,7 +7,7 @@ use replica::body::ContentCommitment;
 use replica::frontier::AuthorityFrontier as AF;
 use replica::frontier::{AuthorityFrontier, ReplicaFrontier};
 use replica::ids::{BodyId, EncodingId, SchemaId, WorldId};
-use replica::marker::{MarkerError, StoreMarkerV1, STORE_MAGIC};
+use replica::marker::{MarkerError, StoreMarker, STORE_MAGIC};
 use replica::transaction::{
     AuthoritySource, BodyDescriptor, BodyTransaction, SeedSigner, TransactionError,
     TransactionSignRequest, NO_PARENT_ROOT,
@@ -209,39 +209,39 @@ fn trailing_bytes_are_non_canonical() {
 
 #[test]
 fn a_valid_marker_classifies_to_its_space() {
-    let marker = StoreMarkerV1::new(&space()).unwrap();
+    let marker = StoreMarker::new(&space()).unwrap();
     let bytes = marker.encode();
-    let back = StoreMarkerV1::classify(&bytes).unwrap();
+    let back = StoreMarker::classify(&bytes).unwrap();
     assert_eq!(back.space(), Some(space()));
 }
 
 #[test]
 fn a_foreign_directory_is_not_a_replica_store() {
     assert_eq!(
-        StoreMarkerV1::classify(b"some other file entirely"),
+        StoreMarker::classify(b"some other file entirely"),
         Err(MarkerError::NotAReplicaStore)
     );
 }
 
 #[test]
 fn an_unsupported_version_is_named() {
-    let mut marker = StoreMarkerV1::new(&space()).unwrap();
+    let mut marker = StoreMarker::new(&space()).unwrap();
     marker.version = 2;
     // Recompute checksum so it is the version, not the checksum, that trips.
     let bytes = marker.encode();
     assert_eq!(
-        StoreMarkerV1::classify(&bytes),
+        StoreMarker::classify(&bytes),
         Err(MarkerError::UnsupportedStoreVersion { found: 2 })
     );
 }
 
 #[test]
 fn a_corrupt_marker_is_detected() {
-    let mut marker = StoreMarkerV1::new(&space()).unwrap();
+    let mut marker = StoreMarker::new(&space()).unwrap();
     marker.checksum[0] ^= 0xff;
     let bytes = marker.encode();
     assert_eq!(
-        StoreMarkerV1::classify(&bytes),
+        StoreMarker::classify(&bytes),
         Err(MarkerError::CorruptStoreMarker)
     );
 }
@@ -254,7 +254,7 @@ fn a_corrupt_lait_marker_is_distinct_from_a_foreign_directory() {
     bytes.push(1); // version
     bytes.extend_from_slice(&[0x00, 0x01]); // a stub, not a full body
     assert_eq!(
-        StoreMarkerV1::classify(&bytes),
+        StoreMarker::classify(&bytes),
         Err(MarkerError::CorruptStoreMarker)
     );
 }

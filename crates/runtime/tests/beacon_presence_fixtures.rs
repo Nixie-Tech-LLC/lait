@@ -2,8 +2,8 @@
 //! Neighbor presence v1 challenge transcript matrix.
 
 use mechanics::ids::{SpaceId, StationEpoch, StationId};
-use runtime::beacon::{BeaconError, RouteHint, SignedBeaconV1, MAX_ROUTE_HINTS};
-use runtime::neighbor_presence::{AckV1, PresenceError, ProbeV1};
+use runtime::beacon::{BeaconError, RouteHint, SignedBeacon, MAX_ROUTE_HINTS};
+use runtime::neighbor_presence::{Ack, PresenceError, Probe};
 
 const STATION_SEED: [u8; 32] = [11u8; 32];
 
@@ -15,8 +15,8 @@ fn space_bytes() -> [u8; 29] {
     <[u8; 29]>::try_from(space().as_str().as_bytes()).unwrap()
 }
 
-fn beacon(epoch: u64, sequence: u64, routes: Vec<RouteHint>) -> SignedBeaconV1 {
-    SignedBeaconV1::emit(
+fn beacon(epoch: u64, sequence: u64, routes: Vec<RouteHint>) -> SignedBeacon {
+    SignedBeacon::emit(
         runtime::beacon::BEACON_PROTOCOL,
         &space(),
         StationEpoch::from_u64(epoch),
@@ -105,7 +105,7 @@ fn trailing_bytes_are_non_canonical() {
     let mut bytes = beacon(1, 0, vec![]).encode();
     bytes.push(0);
     assert_eq!(
-        SignedBeaconV1::decode_canonical(&bytes),
+        SignedBeacon::decode_canonical(&bytes),
         Err(BeaconError::NonCanonical)
     );
 }
@@ -119,9 +119,9 @@ fn station_of(seed: &[u8; 32]) -> StationId {
     StationId::from_device(&mechanics::crypto::device_from_seed(seed)).unwrap()
 }
 
-fn probe(nonce: [u8; 32]) -> ProbeV1 {
+fn probe(nonce: [u8; 32]) -> Probe {
     let responder = station_of(&RESPONDER_SEED).key_bytes();
-    ProbeV1::sign(
+    Probe::sign(
         runtime::neighbor_presence::PRESENCE_PROTOCOL,
         space_bytes(),
         responder,
@@ -134,7 +134,7 @@ fn probe(nonce: [u8; 32]) -> ProbeV1 {
 #[test]
 fn an_unsupported_protocol_version_is_refused_not_negotiated() {
     // Beacon: a signed frame naming a future protocol is rejected by name.
-    let b = SignedBeaconV1::emit(
+    let b = SignedBeacon::emit(
         99,
         &space(),
         StationEpoch::from_u64(1),
@@ -149,7 +149,7 @@ fn an_unsupported_protocol_version_is_refused_not_negotiated() {
 
     // Presence probe: same rule.
     let responder = station_of(&RESPONDER_SEED).key_bytes();
-    let p = ProbeV1::sign(99, space_bytes(), responder, [1u8; 32], &INITIATOR_SEED).unwrap();
+    let p = Probe::sign(99, space_bytes(), responder, [1u8; 32], &INITIATOR_SEED).unwrap();
     assert_eq!(
         p.verify(&space_bytes(), &station_of(&INITIATOR_SEED)),
         Err(PresenceError::UnsupportedProtocol(99))
@@ -161,7 +161,7 @@ fn a_valid_challenge_completes() {
     let p = probe([1u8; 32]);
     p.verify(&space_bytes(), &station_of(&INITIATOR_SEED))
         .unwrap();
-    let a = AckV1::sign(&p, [2u8; 32], &RESPONDER_SEED).unwrap();
+    let a = Ack::sign(&p, [2u8; 32], &RESPONDER_SEED).unwrap();
     a.verify(&p, &station_of(&RESPONDER_SEED)).unwrap();
 }
 
@@ -169,7 +169,7 @@ fn a_valid_challenge_completes() {
 fn a_reflected_nonce_is_rejected() {
     let p = probe([1u8; 32]);
     // The responder echoes the initiator's nonce instead of a fresh one.
-    let a = AckV1::sign(&p, [1u8; 32], &RESPONDER_SEED).unwrap();
+    let a = Ack::sign(&p, [1u8; 32], &RESPONDER_SEED).unwrap();
     assert_eq!(
         a.verify(&p, &station_of(&RESPONDER_SEED)),
         Err(PresenceError::ChallengeMismatch)
@@ -180,7 +180,7 @@ fn a_reflected_nonce_is_rejected() {
 fn an_ack_for_another_probe_is_rejected() {
     let p1 = probe([1u8; 32]);
     let p2 = probe([9u8; 32]);
-    let a = AckV1::sign(&p1, [2u8; 32], &RESPONDER_SEED).unwrap();
+    let a = Ack::sign(&p1, [2u8; 32], &RESPONDER_SEED).unwrap();
     // Presented against a different probe: commitment mismatch.
     assert_eq!(
         a.verify(&p2, &station_of(&RESPONDER_SEED)),
@@ -213,7 +213,7 @@ fn station_transport_substitution_is_rejected() {
 fn role_reversal_ack_signed_by_the_initiator_is_rejected() {
     let p = probe([1u8; 32]);
     // An ack "from" the responder but actually signed by the initiator.
-    let mut a = AckV1::sign(&p, [2u8; 32], &INITIATOR_SEED).unwrap();
+    let mut a = Ack::sign(&p, [2u8; 32], &INITIATOR_SEED).unwrap();
     // Claim the responder transport so identity passes, exposing the bad sig.
     a.responder_transport = station_of(&RESPONDER_SEED).key_bytes();
     assert_eq!(
@@ -237,15 +237,15 @@ fn trailing_bytes_and_oversize_are_non_canonical() {
     let p = probe([1u8; 32]);
     let mut bytes = p.encode();
     bytes.push(0);
-    assert_eq!(ProbeV1::decode(&bytes), Err(PresenceError::NonCanonical));
+    assert_eq!(Probe::decode(&bytes), Err(PresenceError::NonCanonical));
 
-    let a = AckV1::sign(&p, [2u8; 32], &RESPONDER_SEED).unwrap();
+    let a = Ack::sign(&p, [2u8; 32], &RESPONDER_SEED).unwrap();
     let mut abytes = a.encode();
     abytes.push(0);
-    assert_eq!(AckV1::decode(&abytes), Err(PresenceError::NonCanonical));
+    assert_eq!(Ack::decode(&abytes), Err(PresenceError::NonCanonical));
 
     assert_eq!(
-        ProbeV1::decode(&vec![0u8; 5000]),
+        Probe::decode(&vec![0u8; 5000]),
         Err(PresenceError::NonCanonical)
     );
 }
@@ -257,6 +257,6 @@ fn presence_carries_no_frontier_or_authority() {
     // construction would stop compiling — the reminder is deliberate.)
     let p = probe([1u8; 32]);
     let _ = (p.protocol, p.space, p.initiator_station, p.nonce);
-    let a = AckV1::sign(&p, [2u8; 32], &RESPONDER_SEED).unwrap();
+    let a = Ack::sign(&p, [2u8; 32], &RESPONDER_SEED).unwrap();
     let _ = (a.probe_hash, a.responder_transport, a.nonce);
 }

@@ -19,7 +19,7 @@ use mechanics::ids::{ActorId, DeviceId, SpaceId, StationId};
 use replica::body::{BodyOp, BodySchema, MutationModel};
 use replica::frontier::{AuthorityFrontier, ReplicaFrontier};
 use replica::ids::{BodyId, BodyKey, EncodingId, SchemaId, WorldId};
-use runtime::coordinates::{ApproachRoute, CoordinatesAdmission, CoordinatesPayloadV1};
+use runtime::coordinates::{ApproachRoute, CoordinatesAdmission, CoordinatesPayload};
 
 #[allow(dead_code)]
 fn any_demand() -> Vec<u8> {
@@ -32,7 +32,7 @@ fn any_demand() -> Vec<u8> {
 }
 use runtime::{
     ActivationOptions, CommsOptions, ContactMechanics, ContactOptions, EnterOptions, GossipOptions,
-    RequestId, Runtime, RuntimeBuilder, SignedCoordinatesV1, Station, World, WorldContext,
+    RequestId, Runtime, RuntimeBuilder, SignedCoordinates, Station, World, WorldContext,
     WorldEffect, WorldError, WorldIntent, WorldLimits, WorldProjection, WorldQuery,
     WorldRegistration, WorldVersion,
 };
@@ -58,14 +58,14 @@ fn temp_root(tag: &str) -> std::path::PathBuf {
 }
 
 /// A valid founding + Coordinates both nodes enter with.
-fn coordinates() -> (SpaceId, SignedCoordinatesV1) {
+fn coordinates() -> (SpaceId, SignedCoordinates) {
     let rc = mechanics::space::recovery_commit(&mechanics::space::recovery_pub_of(&RECOVERY_SEED))
         .unwrap();
     let device = mechanics::space::recovery_pub_of(&FOUNDER_SEED);
     let ws = mechanics::space::derive_space_id(&device, &SALT, &rc);
     let (incept, _actor) =
         mechanics::actor::incept_single(&FOUNDER_SEED, &ws, [1u8; 16], [2u8; 16], None);
-    let payload = CoordinatesPayloadV1 {
+    let payload = CoordinatesPayload {
         space: <[u8; 29]>::try_from(ws.as_str().as_bytes()).unwrap(),
         salt: SALT,
         recovery_root: rc,
@@ -81,7 +81,7 @@ fn coordinates() -> (SpaceId, SignedCoordinatesV1) {
         }],
         admission: CoordinatesAdmission::None,
     };
-    (ws, SignedCoordinatesV1::sign(payload, &STATION_A_SEED))
+    (ws, SignedCoordinates::sign(payload, &STATION_A_SEED))
 }
 
 /// The shared note World: intents `key=value` set atomic Bodies.
@@ -241,7 +241,7 @@ fn comms_options(
 
 fn activate_with(
     rt: &Runtime,
-    coords: &SignedCoordinatesV1,
+    coords: &SignedCoordinates,
     transport: Arc<dyn comms::Transport>,
     seed: [u8; 32],
     gossip: Option<GossipOptions>,

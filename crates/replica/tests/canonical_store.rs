@@ -283,9 +283,9 @@ fn the_store_addresses_canonical_objects_not_an_engine_snapshot() {
     for obj in &manifest.objects {
         let bytes = store.read_object(obj).unwrap();
         let is_tx = replica::BodyTransaction::decode_canonical(&bytes).is_ok();
-        let is_receipt = replica::RequestReceiptV1::decode_canonical(&bytes).is_ok();
-        let is_root = replica::ManifestRootV1::decode_canonical(&bytes).is_ok();
-        let is_page = replica::ManifestPageV1::decode_canonical(&bytes).is_ok();
+        let is_receipt = replica::RequestReceipt::decode_canonical(&bytes).is_ok();
+        let is_root = replica::ManifestRoot::decode_canonical(&bytes).is_ok();
+        let is_page = replica::ManifestPage::decode_canonical(&bytes).is_ok();
         let is_protected = mechanics::crypto::body_epoch_id(&bytes) == Some(EPOCH);
         assert!(
             is_tx || is_receipt || is_root || is_page || is_protected,

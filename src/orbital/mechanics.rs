@@ -39,7 +39,7 @@ use crate::genesis::Genesis;
 use crate::ids::{ActorId, DeviceId, SpaceId};
 use mechanics::ledger::{AuthorityLedger, LedgerEffect, SealedKeyRecord};
 use replica::frontier::AuthorityFrontier;
-use runtime::coordinates::AdmissionCapabilityV1;
+use runtime::coordinates::AdmissionCapability;
 
 const GENESIS_FILE: &str = "mech-genesis.json";
 const PENDING_INCEPTION_FILE: &str = "mech-pending-inception.bin";
@@ -61,7 +61,7 @@ const SPACE_RECOVERY_KEY_FILE: &str = "space-recovery.key";
 /// embedded admission capability) or a raw 32-hex string.
 fn parse_invite_nonce(input: &str) -> Option<[u8; 16]> {
     let s = input.trim();
-    if let Ok(coords) = runtime::SignedCoordinatesV1::parse_link(s) {
+    if let Ok(coords) = runtime::SignedCoordinates::parse_link(s) {
         if let runtime::coordinates::CoordinatesAdmission::Some(cap) = &coords.payload.admission {
             return Some(cap.nonce);
         }
@@ -142,7 +142,7 @@ pub(super) struct Inner {
     pub(super) keyring: BTreeMap<[u8; 16], SpaceKey>,
     pub(super) dir: PathBuf,
     /// A joiner's own admission, served until standing is established.
-    pending_admission: Option<AdmissionCapabilityV1>,
+    pending_admission: Option<AdmissionCapability>,
     /// A joiner's self-inception, held out of the replicated set until an
     /// admin admits it (it rides the Admission record).
     pending_inception: Option<actor::SignedEvent>,
@@ -304,7 +304,7 @@ impl Inner {
         proof_bytes: &[u8],
         coords_digest: &[u8; 32],
     ) -> Result<()> {
-        let admission: AdmissionCapabilityV1 =
+        let admission: AdmissionCapability =
             postcard::from_bytes(admission_bytes).context("admission decode")?;
         admission
             .verify_structure(&self.space)
@@ -691,7 +691,7 @@ impl OrbitalMechanics {
         device_seed: &[u8; 32],
         display_name: &str,
         approach_routes: Vec<runtime::coordinates::ApproachRoute>,
-    ) -> Result<(Self, runtime::SignedCoordinatesV1)> {
+    ) -> Result<(Self, runtime::SignedCoordinates)> {
         let me = crypto::device_from_seed(device_seed);
         let salt = super::rand16();
         let (recovery_pub, space_recovery_secret) = crate::space::mint_recovery_key();
@@ -796,7 +796,7 @@ impl OrbitalMechanics {
     pub fn enter(
         root: &Path,
         device_seed: &[u8; 32],
-        coordinates: &runtime::SignedCoordinatesV1,
+        coordinates: &runtime::SignedCoordinates,
     ) -> Result<Self> {
         let verified = coordinates
             .verify()
@@ -945,8 +945,8 @@ impl OrbitalMechanics {
         station_seed: &[u8; 32],
         display_name: &str,
         approach_routes: Vec<runtime::coordinates::ApproachRoute>,
-        admission: Option<AdmissionCapabilityV1>,
-    ) -> Result<runtime::SignedCoordinatesV1> {
+        admission: Option<AdmissionCapability>,
+    ) -> Result<runtime::SignedCoordinates> {
         let inner = self.lock();
         let genesis = inner.ledger.genesis().clone();
         let founder = genesis
@@ -959,7 +959,7 @@ impl OrbitalMechanics {
             .into_iter()
             .find(|ev| ActorId::from_incept_hash(&ev.hash()) == *founder)
             .ok_or_else(|| anyhow!("founder inception not held"))?;
-        let payload = runtime::coordinates::CoordinatesPayloadV1 {
+        let payload = runtime::coordinates::CoordinatesPayload {
             space: <[u8; 29]>::try_from(inner.space.as_str().as_bytes())
                 .map_err(|_| anyhow!("space id shape"))?,
             salt: genesis.salt,
@@ -976,7 +976,7 @@ impl OrbitalMechanics {
                 None => runtime::coordinates::CoordinatesAdmission::None,
             },
         };
-        Ok(runtime::SignedCoordinatesV1::sign(payload, station_seed))
+        Ok(runtime::SignedCoordinates::sign(payload, station_seed))
     }
 
     /// Mint an admission capability carrying a **role's** exact expanded
@@ -998,7 +998,7 @@ impl OrbitalMechanics {
         now: u64,
         role_selector: &str,
         parent_manifest_root: [u8; 32],
-    ) -> Result<AdmissionCapabilityV1> {
+    ) -> Result<AdmissionCapability> {
         let mut inner = self.lock();
         let role_id = crate::world::roles::resolve_role_selector(role_selector)
             .ok_or_else(|| anyhow!("unknown role `{role_selector}`"))?;
@@ -1036,7 +1036,7 @@ impl OrbitalMechanics {
         } else {
             runtime::coordinates::AdmissionUsePolicy::SingleUse
         };
-        AdmissionCapabilityV1::sign(
+        AdmissionCapability::sign(
             &inner.space,
             super::rand16(),
             now,
@@ -1491,10 +1491,10 @@ impl OrbitalMechanics {
     /// persisted and this device is not yet admitted — the daemon reads it to
     /// teach the transport the approach Station's routes and dial. `None` once
     /// admitted (the pending material is cleaned up).
-    pub fn pending_coordinates(&self) -> Option<runtime::SignedCoordinatesV1> {
+    pub fn pending_coordinates(&self) -> Option<runtime::SignedCoordinates> {
         let inner = self.lock();
         let bytes = std::fs::read(inner.dir.join(COORDINATES_FILE)).ok()?;
-        runtime::SignedCoordinatesV1::decode_canonical(&bytes).ok()
+        runtime::SignedCoordinates::decode_canonical(&bytes).ok()
     }
 
     /// Activate a World implementation id for this Space — an admin-authored

@@ -629,7 +629,7 @@ fn dir_display_name(home: &std::path::Path) -> String {
 /// so repeated joiner-side Connects converge to membership without a manual
 /// admin step (for an auto-approving invite).
 async fn run_join_orbital(m: &ArgMatches, link: &str, out: Out) -> Result<()> {
-    let coords = runtime::SignedCoordinatesV1::parse_link(link.trim())
+    let coords = runtime::SignedCoordinates::parse_link(link.trim())
         .map_err(|e| anyhow!("invalid invite link: {e}"))?;
     let verified = coords.verify().map_err(|e| anyhow!("invite: {e}"))?;
     let space = verified.space.as_str().to_string();
@@ -753,7 +753,7 @@ async fn run_join_cli(m: &ArgMatches, out: Out) -> Result<()> {
     // — a legacy `SpaceTicket`, an older/newer link, malformed bytes — is
     // refused with the typed [`CoordinatesError`] (a pre-carve ticket surfaces
     // as `UnsupportedVersion`), never a fallback to the legacy node.
-    match runtime::SignedCoordinatesV1::parse_link(ticket_str.trim()) {
+    match runtime::SignedCoordinates::parse_link(ticket_str.trim()) {
         Ok(_) => run_join_orbital(m, &ticket_str, out).await,
         Err(runtime::coordinates::CoordinatesError::UnsupportedVersion(v)) => Err(anyhow!(
             "this invite is not a lait Coordinates link (version {v} — it looks like a \

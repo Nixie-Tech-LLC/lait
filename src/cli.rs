@@ -735,7 +735,7 @@ pub async fn run_join(home: &Path, ticket: String, out: Out) -> Result<()> {
     // Parse client-side to recover the intended space before the link is
     // moved into the request. A malformed link simply yields no expectation;
     // the daemon returns the real parse error.
-    let parsed = runtime::SignedCoordinatesV1::parse_link(ticket.trim())
+    let parsed = runtime::SignedCoordinates::parse_link(ticket.trim())
         .ok()
         .and_then(|c| c.verify().ok());
     // An admission-carrying link admits automatically within seconds, so a

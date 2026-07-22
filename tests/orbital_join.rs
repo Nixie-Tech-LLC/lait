@@ -78,7 +78,7 @@ fn activate(
     root: &std::path::Path,
     seed: [u8; 32],
     mech: &OrbitalMechanics,
-    coords: &runtime::SignedCoordinatesV1,
+    coords: &runtime::SignedCoordinates,
     transport: Arc<dyn comms::Transport>,
 ) -> (Runtime, Station) {
     let rt = Runtime::open(

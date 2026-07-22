@@ -18,7 +18,7 @@ use crate::wire::length_framed;
 pub const PRESENCE_PROTOCOL: u16 = 1;
 
 /// The Neighbor-presence v1 ALPN.
-pub const PRESENCE_ALPN_V1: &[u8] = b"lait/neighbor-presence/1";
+pub const PRESENCE_ALPN: &[u8] = b"lait/neighbor-presence/1";
 /// Probe signing domain.
 pub const PROBE_DOMAIN: &[u8] = b"lait/neighbor-presence/1/probe";
 /// Ack signing domain.
@@ -30,7 +30,7 @@ pub const MAX_MESSAGE: usize = 4 * 1024;
 
 /// The probe that opens a presence challenge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProbeV1 {
+pub struct Probe {
     pub protocol: u16,
     pub space: [u8; 29],
     pub initiator_station: [u8; 32],
@@ -44,7 +44,7 @@ pub struct ProbeV1 {
 
 /// The ack that answers a probe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AckV1 {
+pub struct Ack {
     /// Commitment to the exact probe being answered.
     pub probe_hash: [u8; 32],
     pub responder_transport: [u8; 32],
@@ -92,7 +92,7 @@ where
     Ok(value)
 }
 
-impl ProbeV1 {
+impl Probe {
     fn preimage(
         protocol: u16,
         space: &[u8; 29],
@@ -205,7 +205,7 @@ impl ProbeV1 {
     }
 }
 
-impl AckV1 {
+impl Ack {
     fn preimage(
         probe_hash: &[u8; 32],
         responder_transport: &[u8; 32],
@@ -217,7 +217,7 @@ impl AckV1 {
     }
 
     /// Sign an ack answering `probe` from the responder's device seed.
-    pub fn sign(probe: &ProbeV1, nonce: [u8; 32], responder_seed: &[u8; 32]) -> Option<Self> {
+    pub fn sign(probe: &Probe, nonce: [u8; 32], responder_seed: &[u8; 32]) -> Option<Self> {
         let responder = mechanics::crypto::device_from_seed(responder_seed).key_bytes()?;
         let probe_hash = probe.hash();
         let preimage = Self::preimage(&probe_hash, &responder, &nonce);
@@ -242,7 +242,7 @@ impl AckV1 {
     /// Verify the ack against the probe it answers and the responder's
     /// negotiated transport identity. Rejects reflection (echoing the probe's
     /// nonce), commitment mismatch, and identity/signature substitution.
-    pub fn verify(&self, probe: &ProbeV1, transport_peer: &StationId) -> Result<(), PresenceError> {
+    pub fn verify(&self, probe: &Probe, transport_peer: &StationId) -> Result<(), PresenceError> {
         if self.signature_algorithm != SIG_ALG_ED25519 {
             return Err(PresenceError::UnsupportedSignatureAlgorithm(
                 self.signature_algorithm,

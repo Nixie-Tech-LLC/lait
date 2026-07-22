@@ -39,7 +39,7 @@ pub struct RouteHint {
 
 /// The signed body of a Beacon (field order is canonical).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BeaconBodyV1 {
+pub struct BeaconBody {
     pub protocol: u16,
     pub space: [u8; 29],
     pub station: [u8; 32],
@@ -54,9 +54,9 @@ pub struct BeaconBodyV1 {
 
 /// A signed Beacon. `version` is exactly 1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SignedBeaconV1 {
+pub struct SignedBeacon {
     pub version: u8,
-    pub body: BeaconBodyV1,
+    pub body: BeaconBody,
     pub signature_algorithm: u8,
     #[serde(with = "serde_byte_array")]
     pub signature: [u8; 64],
@@ -88,8 +88,8 @@ fn space_bytes(space: &SpaceId) -> Option<[u8; 29]> {
     <[u8; 29]>::try_from(space.as_str().as_bytes()).ok()
 }
 
-impl SignedBeaconV1 {
-    fn preimage(body: &BeaconBodyV1) -> Vec<u8> {
+impl SignedBeacon {
+    fn preimage(body: &BeaconBody) -> Vec<u8> {
         let b = postcard::to_stdvec(body).expect("postcard beacon body");
         length_framed(BEACON_DOMAIN, &b)
     }
@@ -107,7 +107,7 @@ impl SignedBeaconV1 {
         station_seed: &[u8; 32],
     ) -> Option<Self> {
         let station = mechanics::crypto::device_from_seed(station_seed).key_bytes()?;
-        let body = BeaconBodyV1 {
+        let body = BeaconBody {
             protocol,
             space: space_bytes(space)?,
             station,
@@ -193,7 +193,7 @@ impl SignedBeaconV1 {
 }
 
 /// A beacon whose signature and structure have been verified. It cannot be
-/// constructed except by [`SignedBeaconV1::verify`], so a forged signed
+/// constructed except by [`SignedBeacon::verify`], so a forged signed
 /// structure can never reach freshness state (the Neighbor registry only
 /// advances its high-water from a [`VerifiedBeacon`]).
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -16,7 +16,7 @@ use replica::body::{BodyOp, BodySchema, MutationModel};
 use replica::frontier::{AuthorityFrontier, ReplicaFrontier};
 use replica::ids::{BodyId, BodyKey, EncodingId, SchemaId, WorldId};
 use runtime::contact::CONTACT_ALPN;
-use runtime::coordinates::{ApproachRoute, CoordinatesAdmission, CoordinatesPayloadV1};
+use runtime::coordinates::{ApproachRoute, CoordinatesAdmission, CoordinatesPayload};
 
 #[allow(dead_code)]
 fn any_demand() -> Vec<u8> {
@@ -29,9 +29,9 @@ fn any_demand() -> Vec<u8> {
 }
 use runtime::{
     ActivationOptions, CommsOptions, ContactMechanics, ContactOptions, EnterOptions, RequestId,
-    Runtime, RuntimeBuilder, SignedCoordinatesV1, Station, World, WorldContext, WorldEffect,
+    Runtime, RuntimeBuilder, SignedCoordinates, Station, World, WorldContext, WorldEffect,
     WorldError, WorldIntent, WorldLimits, WorldProjection, WorldQuery, WorldRegistration,
-    WorldVersion, PRESENCE_ALPN_V1,
+    WorldVersion, PRESENCE_ALPN,
 };
 
 const FOUNDER_SEED: [u8; 32] = [7u8; 32];
@@ -56,14 +56,14 @@ fn temp_root(tag: &str) -> std::path::PathBuf {
     dir
 }
 
-fn coordinates() -> (SpaceId, SignedCoordinatesV1) {
+fn coordinates() -> (SpaceId, SignedCoordinates) {
     let rc = mechanics::space::recovery_commit(&mechanics::space::recovery_pub_of(&RECOVERY_SEED))
         .unwrap();
     let device = mechanics::space::recovery_pub_of(&FOUNDER_SEED);
     let ws = mechanics::space::derive_space_id(&device, &SALT, &rc);
     let (incept, _actor) =
         mechanics::actor::incept_single(&FOUNDER_SEED, &ws, [1u8; 16], [2u8; 16], None);
-    let payload = CoordinatesPayloadV1 {
+    let payload = CoordinatesPayload {
         space: <[u8; 29]>::try_from(ws.as_str().as_bytes()).unwrap(),
         salt: SALT,
         recovery_root: rc,
@@ -79,7 +79,7 @@ fn coordinates() -> (SpaceId, SignedCoordinatesV1) {
         }],
         admission: CoordinatesAdmission::None,
     };
-    (ws, SignedCoordinatesV1::sign(payload, &STATION_A_SEED))
+    (ws, SignedCoordinates::sign(payload, &STATION_A_SEED))
 }
 
 struct KvWorld {
@@ -263,7 +263,7 @@ fn a_real_iroh_contact_converges_two_stations() {
     // A long-lived multi-thread runtime hosts the endpoints' background tasks
     // for the duration of the test.
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let alpns: &[comms::Alpn] = &[CONTACT_ALPN, PRESENCE_ALPN_V1];
+    let alpns: &[comms::Alpn] = &[CONTACT_ALPN, PRESENCE_ALPN];
     let (ta, tb) = rt.block_on(async {
         let a =
             comms::DefaultTransport::new(&STATION_A_SEED, &comms::policy::Network::Isolated, alpns)

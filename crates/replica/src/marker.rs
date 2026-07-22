@@ -33,7 +33,7 @@ struct MarkerBody {
 
 /// The store marker header.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoreMarkerV1 {
+pub struct StoreMarker {
     pub version: u8,
     pub space: [u8; SPACE_ID_LEN],
     /// BLAKE3 over `MAGIC || [version] || space`.
@@ -73,7 +73,7 @@ fn checksum(version: u8, space: &[u8; SPACE_ID_LEN]) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
-impl StoreMarkerV1 {
+impl StoreMarker {
     /// Build a marker for a Space's store.
     pub fn new(space: &SpaceId) -> Option<Self> {
         let space = <[u8; SPACE_ID_LEN]>::try_from(space.as_str().as_bytes()).ok()?;

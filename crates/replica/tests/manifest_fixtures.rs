@@ -8,7 +8,7 @@ use replica::frontier::AuthorityFrontier as AF;
 use replica::frontier::{AuthorityFrontier, ReplicaFrontier};
 use replica::ids::{BodyId, BodyKey, WorldId};
 use replica::manifest::{
-    ManifestBook, ManifestEntryV1, ManifestError, ManifestPageV1, ManifestRootV1, RootObservation,
+    ManifestBook, ManifestEntry, ManifestError, ManifestPage, ManifestRoot, RootObservation,
 };
 use replica::transaction::AuthoritySource;
 
@@ -43,8 +43,8 @@ fn auth() -> AuthorityFrontier {
     AuthorityFrontier::from_canonical_bytes(vec![1])
 }
 
-fn entry(n: u8) -> ManifestEntryV1 {
-    ManifestEntryV1 {
+fn entry(n: u8) -> ManifestEntry {
+    ManifestEntry {
         key: BodyKey::new(
             WorldId::parse("com.example.notes").unwrap(),
             BodyId::from_bytes([n; 16]),
@@ -54,17 +54,17 @@ fn entry(n: u8) -> ManifestEntryV1 {
     }
 }
 
-fn page(index: u32, entries: Vec<ManifestEntryV1>) -> ManifestPageV1 {
-    ManifestPageV1::new(&space(), index, entries).unwrap()
+fn page(index: u32, entries: Vec<ManifestEntry>) -> ManifestPage {
+    ManifestPage::new(&space(), index, entries).unwrap()
 }
 
 /// A two-page manifest with globally increasing keys: [1,2] then [3,4].
-fn valid_manifest() -> (ManifestRootV1, Vec<ManifestPageV1>) {
+fn valid_manifest() -> (ManifestRoot, Vec<ManifestPage>) {
     let pages = vec![
         page(0, vec![entry(1), entry(2)]),
         page(1, vec![entry(3), entry(4)]),
     ];
-    let root = ManifestRootV1::sign(&space(), frontier(1), &pages, auth(), &SIGNER_SEED).unwrap();
+    let root = ManifestRoot::sign(&space(), frontier(1), &pages, auth(), &SIGNER_SEED).unwrap();
     (root, pages)
 }
 
@@ -74,9 +74,9 @@ fn a_valid_manifest_verifies_root_and_pages() {
     root.verify().unwrap();
     root.verify_pages(&pages).unwrap();
     // Canonical roundtrip.
-    let back = ManifestRootV1::decode_canonical(&root.encode()).unwrap();
+    let back = ManifestRoot::decode_canonical(&root.encode()).unwrap();
     assert_eq!(back, root);
-    let pback = ManifestPageV1::decode_canonical(&pages[0].encode()).unwrap();
+    let pback = ManifestPage::decode_canonical(&pages[0].encode()).unwrap();
     assert_eq!(pback, pages[0]);
 }
 
@@ -133,7 +133,7 @@ fn page_substitution_omission_and_reorder_fail() {
 fn entry_order_is_strict_within_and_across_pages() {
     // Unsorted within a page.
     let bad = vec![page(0, vec![entry(2), entry(1)])];
-    let root = ManifestRootV1::sign(&space(), frontier(1), &bad, auth(), &SIGNER_SEED).unwrap();
+    let root = ManifestRoot::sign(&space(), frontier(1), &bad, auth(), &SIGNER_SEED).unwrap();
     root.verify().unwrap();
     assert_eq!(root.verify_pages(&bad), Err(ManifestError::OrderViolation));
 
@@ -142,7 +142,7 @@ fn entry_order_is_strict_within_and_across_pages() {
         page(0, vec![entry(1), entry(2)]),
         page(1, vec![entry(2), entry(3)]),
     ];
-    let root = ManifestRootV1::sign(&space(), frontier(1), &dup, auth(), &SIGNER_SEED).unwrap();
+    let root = ManifestRoot::sign(&space(), frontier(1), &dup, auth(), &SIGNER_SEED).unwrap();
     assert_eq!(root.verify_pages(&dup), Err(ManifestError::OrderViolation));
 
     // Regression across the boundary.
@@ -150,7 +150,7 @@ fn entry_order_is_strict_within_and_across_pages() {
         page(0, vec![entry(3), entry(4)]),
         page(1, vec![entry(1), entry(2)]),
     ];
-    let root = ManifestRootV1::sign(&space(), frontier(1), &regress, auth(), &SIGNER_SEED).unwrap();
+    let root = ManifestRoot::sign(&space(), frontier(1), &regress, auth(), &SIGNER_SEED).unwrap();
     assert_eq!(
         root.verify_pages(&regress),
         Err(ManifestError::OrderViolation)
@@ -164,8 +164,7 @@ fn concurrent_roots_coexist_and_replays_dedupe() {
 
     // A different signer at its own coordinate coexists.
     let pages_b = vec![page(0, vec![entry(7)])];
-    let root_b =
-        ManifestRootV1::sign(&space(), frontier(2), &pages_b, auth(), &OTHER_SEED).unwrap();
+    let root_b = ManifestRoot::sign(&space(), frontier(2), &pages_b, auth(), &OTHER_SEED).unwrap();
 
     assert_eq!(
         book.observe(&root_a.clone().verify_authorized(&BothSigners).unwrap())
@@ -183,7 +182,7 @@ fn concurrent_roots_coexist_and_replays_dedupe() {
     let (advanced, _) = {
         let pages = vec![page(0, vec![entry(1)])];
         (
-            ManifestRootV1::sign(&space(), frontier(3), &pages, auth(), &SIGNER_SEED).unwrap(),
+            ManifestRoot::sign(&space(), frontier(3), &pages, auth(), &SIGNER_SEED).unwrap(),
             pages,
         )
     };
@@ -213,7 +212,7 @@ fn same_coordinate_equivocation_is_rejected() {
     // coordinate: that is equivocation, rejected and reportable.
     let other_pages = vec![page(0, vec![entry(9)])];
     let equivocating =
-        ManifestRootV1::sign(&space(), frontier(1), &other_pages, auth(), &SIGNER_SEED).unwrap();
+        ManifestRoot::sign(&space(), frontier(1), &other_pages, auth(), &SIGNER_SEED).unwrap();
     assert_eq!(
         book.observe(&equivocating.verify_authorized(&BothSigners).unwrap()),
         Err(ManifestError::Equivocation)
@@ -257,8 +256,8 @@ fn version_and_space_mismatches_are_typed() {
     let (root, _) = valid_manifest();
     let foreign_space = SpaceId::from_digest([99u8; 16]);
     let foreign = vec![
-        ManifestPageV1::new(&foreign_space, 0, vec![entry(1), entry(2)]).unwrap(),
-        ManifestPageV1::new(&foreign_space, 1, vec![entry(3), entry(4)]).unwrap(),
+        ManifestPage::new(&foreign_space, 0, vec![entry(1), entry(2)]).unwrap(),
+        ManifestPage::new(&foreign_space, 1, vec![entry(3), entry(4)]).unwrap(),
     ];
     assert!(matches!(
         root.verify_pages(&foreign),

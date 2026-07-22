@@ -8,7 +8,7 @@
 //! SpaceId** (the founder inception), independent of the approach Station's
 //! outer signature. The outer signature (domain `lait/coordinates/1`) proves the
 //! approach Station vouches for the routing hints; `issuer` must equal
-//! `approach_station`. An optional [`AdmissionCapabilityV1`] (domain
+//! `approach_station`. An optional [`AdmissionCapability`] (domain
 //! `lait/admission/1`) is separately authority-signed; possession only
 //! authorizes a *request* — standing exists only after mechanics validates
 //! incorporated authority material at redemption.
@@ -116,7 +116,7 @@ pub fn canonical_routes(addrs: &[SocketAddr]) -> Vec<ApproachRoute> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CoordinatesAdmission {
     None,
-    Some(Box<AdmissionCapabilityV1>),
+    Some(Box<AdmissionCapability>),
 }
 
 /// How many times an admission capability may be redeemed.
@@ -154,7 +154,7 @@ impl AdmissionUsePolicy {
 /// validated by mechanics **at redemption**; here only structure, time-bound
 /// shape, and the self-signature are checked.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AdmissionCapabilityV1 {
+pub struct AdmissionCapability {
     pub version: u8,
     pub space: [u8; SPACE_ID_LEN],
     pub issuer: [u8; 32],
@@ -174,7 +174,7 @@ pub struct AdmissionCapabilityV1 {
 
 /// The signed payload of Coordinates. Field order is the canonical tuple layout.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CoordinatesPayloadV1 {
+pub struct CoordinatesPayload {
     pub space: [u8; SPACE_ID_LEN],
     pub salt: [u8; 16],
     pub recovery_root: [u8; 32],
@@ -189,9 +189,9 @@ pub struct CoordinatesPayloadV1 {
 
 /// The full signed Coordinates envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SignedCoordinatesV1 {
+pub struct SignedCoordinates {
     pub version: u8,
-    pub payload: CoordinatesPayloadV1,
+    pub payload: CoordinatesPayload,
     pub issuer: [u8; 32],
     pub signature_algorithm: u8,
     #[serde(with = "serde_byte_array")]
@@ -248,7 +248,7 @@ pub struct VerifiedCoordinates {
     pub approach_routes: Vec<SocketAddr>,
     /// A structurally-valid, correctly-signed admission bound to this Space.
     /// Authority/expiry/nonce-use are validated by mechanics at redemption.
-    pub admission: Option<AdmissionCapabilityV1>,
+    pub admission: Option<AdmissionCapability>,
 }
 
 /// Build the length-framed preimage `u16be(domain_len) || domain ||
@@ -277,7 +277,7 @@ fn space_id_from_bytes(bytes: &[u8; SPACE_ID_LEN]) -> Option<SpaceId> {
     SpaceId::parse(s)
 }
 
-impl AdmissionCapabilityV1 {
+impl AdmissionCapability {
     fn preimage(&self) -> Vec<u8> {
         let body = postcard::to_stdvec(&(
             self.version,
@@ -499,7 +499,7 @@ impl InvitationAcceptanceProof {
     }
 }
 
-impl SignedCoordinatesV1 {
+impl SignedCoordinates {
     fn preimage(&self) -> Vec<u8> {
         let body = postcard::to_stdvec(&self.payload).expect("postcard coordinates payload");
         length_framed(COORDINATES_DOMAIN, &body)
@@ -507,7 +507,7 @@ impl SignedCoordinatesV1 {
 
     /// Mint and sign Coordinates from the approach Station's device seed. The
     /// seed's public key must equal `payload.approach_station`.
-    pub fn sign(payload: CoordinatesPayloadV1, station_seed: &[u8; 32]) -> Self {
+    pub fn sign(payload: CoordinatesPayload, station_seed: &[u8; 32]) -> Self {
         let issuer = mechanics::crypto::device_from_seed(station_seed)
             .key_bytes()
             .expect("device key bytes");

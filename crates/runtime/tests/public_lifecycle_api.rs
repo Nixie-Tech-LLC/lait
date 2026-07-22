@@ -14,7 +14,7 @@
 use runtime::{
     ActivationOptions, CommittedEffect, ContactError, ContactOptions, ContactOutcome,
     DeorbitConfirmation, DormancyError, EnterOptions, LifecycleError, LocalIdentity, Neighbor,
-    ObservationCursor, Orbit, OrbitObservation, RequestId, Runtime, Session, SignedWorldActionV1,
+    ObservationCursor, Orbit, OrbitObservation, RequestId, Runtime, Session, SignedWorldAction,
     SpaceFormationOptions, Station, StationExit, WorldError, WorldIntent, WorldProjection,
     WorldQuery,
 };
@@ -31,7 +31,7 @@ fn the_target_lifecycle_methods_have_their_frozen_signatures() {
         Runtime::form_space;
     let _: fn(
         &Runtime,
-        &runtime::SignedCoordinatesV1,
+        &runtime::SignedCoordinates,
         EnterOptions,
     ) -> Result<Orbit, LifecycleError> = Runtime::enter_orbit;
     let _: fn(&Runtime, &SpaceId) -> Result<Orbit, LifecycleError> = Runtime::orbit;
@@ -60,9 +60,8 @@ fn the_target_lifecycle_methods_have_their_frozen_signatures() {
         &Session,
         RequestId,
         WorldIntent,
-    ) -> Result<SignedWorldActionV1, WorldError> = LocalIdentity::sign_action;
-    let _: fn(&Session, SignedWorldActionV1) -> Result<CommittedEffect, WorldError> =
-        Session::submit;
+    ) -> Result<SignedWorldAction, WorldError> = LocalIdentity::sign_action;
+    let _: fn(&Session, SignedWorldAction) -> Result<CommittedEffect, WorldError> = Session::submit;
     let _: fn(&Session, WorldQuery) -> Result<WorldProjection, WorldError> = Session::query;
     let _: fn(&Session, Option<ObservationCursor>) -> runtime::ObservationStream = Session::observe;
     let _: fn(Session) = Session::undock;

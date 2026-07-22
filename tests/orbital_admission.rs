@@ -40,7 +40,7 @@ fn founder(tag: &str) -> (PathBuf, OrbitalMechanics) {
 /// A joiner that entered the invite: returns its mechanics and its exported
 /// Admission record (the acceptance proof rides it).
 fn joiner_admission(
-    invite: &runtime::SignedCoordinatesV1,
+    invite: &runtime::SignedCoordinates,
     seed: &[u8; 32],
     tag: &str,
 ) -> (PathBuf, OrbitalMechanics, Vec<u8>) {
@@ -453,7 +453,7 @@ fn a_non_delegating_issuer_cannot_escalate() {
     let revision = lait::world::roles::built_in("lait.administrator").unwrap();
     let evidence = lait::world::roles::role_admission_evidence(&revision, [0u8; 32]);
     let now = now_secs();
-    let forged = runtime::coordinates::AdmissionCapabilityV1::sign(
+    let forged = runtime::coordinates::AdmissionCapability::sign(
         &mech_f.space(),
         [9u8; 16],
         now,

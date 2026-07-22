@@ -186,7 +186,7 @@ impl LocalIdentity {
         &self.device
     }
 
-    /// Construct and sign the canonical [`SignedWorldActionV1`]
+    /// Construct and sign the canonical [`SignedWorldAction`]
     /// (`crate::action`) for an intent against a docked Session: the header is
     /// built from the Session's Space/World and **fresh mechanics facts**
     /// resolved for this device (the caller cannot assert them), the payload is
@@ -200,7 +200,7 @@ impl LocalIdentity {
         session: &crate::session::Session,
         request: crate::action::RequestId,
         intent: WorldIntent,
-    ) -> Result<crate::action::SignedWorldActionV1, crate::error::WorldError> {
+    ) -> Result<crate::action::SignedWorldAction, crate::error::WorldError> {
         let resolution = session
             .resolve_for_signing(&self.device)
             .ok_or(crate::error::WorldError::Denied)?;
@@ -215,7 +215,7 @@ impl LocalIdentity {
             intent_version: intent.schema_version,
             payload_hash: crate::action::payload_hash(&intent.payload),
         };
-        Ok(crate::action::SignedWorldActionV1::sign(
+        Ok(crate::action::SignedWorldAction::sign(
             header,
             intent.payload,
             &self.seed,

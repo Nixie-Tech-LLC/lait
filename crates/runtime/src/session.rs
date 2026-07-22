@@ -624,7 +624,7 @@ impl Session {
     /// exists only after the journaled store committed the transaction.
     pub fn submit(
         &self,
-        action: crate::action::SignedWorldActionV1,
+        action: crate::action::SignedWorldAction,
     ) -> Result<CommittedEffect, WorldError> {
         self.ensure_live()?;
         // Opaque verification first: version, algorithm, bounds, payload hash,
