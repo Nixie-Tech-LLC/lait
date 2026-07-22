@@ -843,9 +843,11 @@ impl<'a> IssueRouter<'a> {
                     true,
                 ))
             }
-            other => Err(Response::err(format!(
-                "request not routed to the issues world: {other:?}"
-            ))),
+            // Ownership is fixed by the production classifier; the agreement
+            // gate (control_classification) proves every Session-owned request
+            // has an arm above, so a foreign request here is a caller bug,
+            // never a servable state.
+            other => unreachable!("misrouted issues-world request: {other:?}"),
         }
     }
 
