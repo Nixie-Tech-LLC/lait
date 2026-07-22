@@ -1,0 +1,51 @@
+# IssuesWorld reference performance gate (plan 50). The default CI suite runs
+# the same harness at smoke scale on every commit; this workflow runs the FULL
+# frozen corpus (benchmarks/issues-reference.json — 20 projects, 50k issues,
+# per-issue events/labels, incremental tail) through the public daemon surface
+# on the pinned runner image, uploads every sample + peak RSS as an artifact,
+# and gates p95 regressions once baselines are frozen in the spec.
+name: perf
+
+# NOT a PR gate: the full corpus is hours of daemon traffic by design (it
+# measures the real product surface, not a fixture), so it runs as a
+# scheduled benchmark plus on-demand dispatch. PRs pay only the smoke-scale
+# run inside the default test suite. NOTE: both `schedule` and
+# `workflow_dispatch` only take effect once this file exists on the default
+# branch — the first full run (and the baseline freeze) happens after merge.
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, off-peak.
+    - cron: "17 3 * * 1"
+
+concurrency:
+  group: perf-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  orbital-perf:
+    name: orbital-perf (issues-reference, full corpus)
+    runs-on: namespace-profile-nixiesoftware
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Run the full reference corpus
+        env:
+          LAIT_PERF_FULL: "1"
+        run: cargo test --release --locked --test issues_reference_perf -- --nocapture
+      - name: Upload sample artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: issues-reference-report
+          path: target/perf/issues-reference-report.json
+          if-no-files-found: error

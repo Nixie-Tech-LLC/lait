@@ -21,8 +21,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::diagnose::DiagnosisView;
 use crate::dto::{
-    ActivityEvent, BoardView, Candidate, GraphView, InboxEntry, IssueView, JoinRequestDto,
-    LabelDto, MemberDto, MemberLogEntry, ProjectDto, Row, SeedDto,
+    ActivityEvent, BoardView, Candidate, GraphView, InboxEntry, IssueView, LabelDto, MemberDto,
+    MemberLogEntry, ProjectDto, Row, SeedDto,
 };
 
 /// The control-plane protocol version this build **speaks** — CLI, web, and MCP
@@ -338,6 +338,15 @@ pub enum Request {
         session: String,
         proposal: String,
     },
+    /// Reshare the standing group recovery key onto a new K-of-N arrangement
+    /// **without changing the key** (same-key share redistribution) — the
+    /// participant-replacement path. The current holders authorize it exactly
+    /// like an elevation (`SpaceElevateApprove`), the redistribution advances
+    /// on sync, and the current group threshold-signs the installation.
+    SpaceReshare {
+        participants: Vec<String>,
+        k: u16,
+    },
     /// Export this device's recovery share as a portable, passphrase-protected
     /// package, verify it by reopening, and attest that on the board. An
     /// all-holders arrangement will not install until every custodian has done
@@ -361,22 +370,80 @@ pub enum Request {
     /// The membership audit log: the signed ACL DAG replayed in causal order
     /// with each op's authorization verdict (cryptographic provenance).
     MemberLog,
-    /// List announced joiners that are not yet members.
-    MemberRequests,
-    /// Approve a pending join request **by id-prefix / key** — sugar over
-    /// `MemberAdd` scoped to the pending set. The joiner's self-asserted nick is
-    /// deliberately not a resolution input (it is unauthenticated); `as_name`
-    /// lets the approver attach a trusted local petname at the same time.
-    MemberApprove {
-        who: String,
-        #[serde(default)]
-        as_name: Option<String>,
-    },
     /// Set (or clear, with an empty name) a **local petname** for a key. Local to
     /// this node, never broadcast, never part of the signed ACL.
     MemberAlias {
         who: String,
         name: String,
+    },
+
+    // ---- role / access / workflow authoring (plan 04) ----
+    /// Every role definition: built-ins plus custom heads.
+    RoleList,
+    RoleShow {
+        role: String,
+    },
+    /// Create a custom role (Space-scoped, or Project-scoped with `project`).
+    RoleCreate {
+        name: String,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        project: Option<String>,
+        capabilities: Vec<String>,
+    },
+    /// Edit a custom role at an exact expected revision head.
+    RoleEdit {
+        role: String,
+        expect_revision: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        capabilities: Option<Vec<String>>,
+    },
+    /// Tombstone a custom role at an exact expected revision head.
+    RoleDelete {
+        role: String,
+        expect_revision: String,
+    },
+    /// Resolve concurrent role heads with a complete replacement body.
+    RoleResolve {
+        role: String,
+        expect_heads: Vec<String>,
+        body_json: String,
+    },
+    /// Effective scoped assignments (Mechanics history, not Catalog state).
+    AccessList {
+        #[serde(default)]
+        actor: Option<String>,
+    },
+    /// Expand a role's pinned definition and install the exact assignments —
+    /// authority-first, all-or-nothing.
+    AccessGrant {
+        actor: String,
+        role: String,
+        #[serde(default)]
+        project: Option<String>,
+    },
+    /// Revoke one effective assignment by its grant id (64-hex).
+    AccessRevoke {
+        grant_id: String,
+    },
+    /// A project's workflow revision head(s).
+    WorkflowShow {
+        project: String,
+    },
+    /// Validate a canonical workflow body without committing anything.
+    WorkflowValidate {
+        body_json: String,
+    },
+    /// Replace a project's workflow at exactly the current heads.
+    WorkflowSet {
+        project: String,
+        expect_heads: Vec<String>,
+        body_json: String,
     },
     /// Streaming dirty notifications for live clients. Turns the one-shot handler into a
     /// stream of [`Doorbell`] frames until the client disconnects.
@@ -397,18 +464,20 @@ pub enum Request {
         expected_space: Option<String>,
     },
     Id,
-    /// Mint an invite ticket. By default it carries a signed, single-use
-    /// pre-authorization (Pattern A) so the joiner is auto-admitted on `join`.
+    /// Mint an invite link. It always carries a signed admission capability:
+    /// the joiner's explicit acceptance IS the approval, and redemption is
+    /// automatic over Contact — there is no approval queue.
     Invite {
-        /// Mint a grant-less ticket: the joiner lands as a pending request that a
-        /// human admin must `members approve` (the classic flow).
+        /// The role the invite admits as (`viewer` | `contributor` |
+        /// `administrator`); defaults to `contributor`. The capability carries
+        /// the role's exact expanded assignments in its signed evidence.
         #[serde(default)]
-        require_approval: bool,
-        /// Let the grant admit a whole team (valid until expiry) instead of one
-        /// person (single-use).
+        role: Option<String>,
+        /// Let the capability admit a whole team (valid until expiry) instead
+        /// of one person (single-use).
         #[serde(default)]
         reusable: bool,
-        /// Lifetime in hours before the grant expires (default 168 = 7 days).
+        /// Lifetime in hours before the capability expires (default 168 = 7 days).
         #[serde(default)]
         ttl_hours: Option<u64>,
     },
@@ -456,6 +525,338 @@ pub enum Request {
 
 fn default_true() -> bool {
     true
+}
+
+/// The terminal owner of a control request — the single orbital plane that
+/// serves it (plan 01, "External architecture"):
+///
+/// - **Session** — product intent/query through `IssueRouter` -> Session;
+/// - **Mechanics** — membership/admission/ceremony/custody/device work through
+///   the active Orbit/Station's mechanics;
+/// - **Station** — connect/neighbor/Contact operations;
+/// - **Observation** — status and subscription projections;
+/// - **Lifecycle** — Runtime/Orbit/Station/daemon process concerns and
+///   node-local configuration adapters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestOwner {
+    Session,
+    Mechanics,
+    Station,
+    Observation,
+    Lifecycle,
+}
+
+impl RequestOwner {
+    /// The stable lowercase label (the generated routing table's column).
+    pub fn label(&self) -> &'static str {
+        match self {
+            RequestOwner::Session => "session",
+            RequestOwner::Mechanics => "mechanics",
+            RequestOwner::Station => "station",
+            RequestOwner::Observation => "observation",
+            RequestOwner::Lifecycle => "lifecycle",
+        }
+    }
+}
+
+/// The PRODUCTION exhaustive request classifier. The daemon dispatches from
+/// this value; the classification test and the generated routing table call
+/// this same function. The match is exhaustive with no wildcard arm, so
+/// adding a `Request` variant fails compilation until its terminal owner is
+/// explicit.
+pub fn classify(req: &Request) -> RequestOwner {
+    use RequestOwner::*;
+    match req {
+        // ---- Session: product intents, queries, projections ----
+        Request::IssueNew { .. }
+        | Request::IssueEdit { .. }
+        | Request::IssueMove { .. }
+        | Request::Assign { .. }
+        | Request::Label { .. }
+        | Request::Comment { .. }
+        | Request::IssueDelete { .. }
+        | Request::IssueRestore { .. }
+        | Request::IssueLink { .. }
+        | Request::IssueUnlink { .. }
+        | Request::IssueParent { .. }
+        | Request::IssueGraph { .. }
+        | Request::IssueStart { .. }
+        | Request::IssueDone { .. }
+        | Request::IssueStop { .. }
+        | Request::IssueView { .. }
+        | Request::List { .. }
+        | Request::Board { .. }
+        | Request::History { .. }
+        | Request::ProjectNew { .. }
+        | Request::ProjectList
+        | Request::LabelNew { .. }
+        | Request::LabelList
+        | Request::Activity { .. }
+        | Request::RoleList
+        | Request::RoleShow { .. }
+        | Request::RoleCreate { .. }
+        | Request::RoleEdit { .. }
+        | Request::RoleDelete { .. }
+        | Request::RoleResolve { .. }
+        | Request::WorkflowShow { .. }
+        | Request::WorkflowValidate { .. }
+        | Request::WorkflowSet { .. } => Session,
+
+        // ---- Mechanics: membership, admission, ceremonies, custody, devices ----
+        Request::MemberAdd { .. }
+        | Request::MemberRemove { .. }
+        | Request::Members
+        | Request::MemberLog
+        | Request::AgentAdd { .. }
+        | Request::KeyRotate
+        | Request::InviteRevoke { .. }
+        | Request::DeviceInvite
+        | Request::DeviceAdd { .. }
+        | Request::DeviceRevoke { .. }
+        | Request::DeviceList
+        | Request::SpaceRecover
+        | Request::SpaceElevate { .. }
+        | Request::SpaceRecoverApprove { .. }
+        | Request::SpaceElevateApprove { .. }
+        | Request::SpaceReshare { .. }
+        | Request::SpaceCustodyExport { .. }
+        | Request::SpaceCustodyImport { .. }
+        | Request::Recover
+        | Request::Invite { .. }
+        | Request::Join { .. }
+        | Request::AccessList { .. }
+        | Request::AccessGrant { .. }
+        | Request::AccessRevoke { .. }
+        | Request::Id => Mechanics,
+
+        // ---- Station: connect/neighbor/Contact ----
+        Request::Connect { .. } | Request::Who => Station,
+
+        // ---- Observation: status, subscription, and locally derived
+        // projection surfaces (the inbox rebuilds from query after reset and
+        // is never a second source of truth) ----
+        Request::Status | Request::Subscribe { .. } | Request::Inbox { .. } => Observation,
+
+        // ---- Lifecycle/deployment: daemon process + node-local config ----
+        Request::Diagnose { .. }
+        | Request::SeedAdd { .. }
+        | Request::SeedList
+        | Request::SeedRemove { .. }
+        | Request::Log { .. }
+        | Request::ConfigReload
+        | Request::Stop
+        | Request::Hello { .. }
+        | Request::MemberAlias { .. } => Lifecycle,
+    }
+}
+
+/// One representative instance per `Request` variant — the enumeration the
+/// generated routing table and classification tests iterate. Kept beside
+/// [`classify`] so both evolve together; the classifier's exhaustive match is
+/// the compile-time guard for new variants.
+pub fn representative_requests() -> Vec<Request> {
+    let s = String::new;
+    vec![
+        Request::IssueNew {
+            title: s(),
+            project: None,
+            project_hint: None,
+            assignees: vec![],
+            priority: None,
+            labels: vec![],
+            body: None,
+        },
+        Request::IssueEdit {
+            reff: s(),
+            title: None,
+            status: None,
+            priority: None,
+            description: None,
+        },
+        Request::IssueMove {
+            reff: s(),
+            project: None,
+            pos: None,
+        },
+        Request::Assign {
+            reff: s(),
+            who: vec![],
+            add: true,
+        },
+        Request::Label {
+            reff: s(),
+            add: vec![],
+            remove: vec![],
+        },
+        Request::Comment {
+            reff: s(),
+            body: s(),
+        },
+        Request::IssueDelete { reff: s() },
+        Request::IssueRestore { reff: s() },
+        Request::IssueLink {
+            reff: s(),
+            kind: s(),
+            target: s(),
+        },
+        Request::IssueUnlink {
+            reff: s(),
+            kind: s(),
+            target: s(),
+        },
+        Request::IssueParent {
+            reff: s(),
+            parent: None,
+        },
+        Request::IssueGraph { reff: s() },
+        Request::IssueStart { reff: s() },
+        Request::IssueDone { reff: s() },
+        Request::IssueStop { reff: s() },
+        Request::IssueView { reff: s() },
+        Request::List {
+            project: None,
+            filter: Filter::default(),
+        },
+        Request::Board {
+            project: None,
+            project_hint: None,
+        },
+        Request::History { reff: s() },
+        Request::ProjectNew {
+            name: s(),
+            key: s(),
+        },
+        Request::ProjectList,
+        Request::LabelNew {
+            name: s(),
+            color: None,
+        },
+        Request::LabelList,
+        Request::Activity { since: 0 },
+        Request::RoleList,
+        Request::RoleShow { role: s() },
+        Request::RoleCreate {
+            name: s(),
+            description: None,
+            project: None,
+            capabilities: vec![],
+        },
+        Request::RoleEdit {
+            role: s(),
+            expect_revision: s(),
+            name: None,
+            description: None,
+            capabilities: None,
+        },
+        Request::RoleDelete {
+            role: s(),
+            expect_revision: s(),
+        },
+        Request::RoleResolve {
+            role: s(),
+            expect_heads: vec![],
+            body_json: s(),
+        },
+        Request::AccessList { actor: None },
+        Request::AccessGrant {
+            actor: s(),
+            role: s(),
+            project: None,
+        },
+        Request::AccessRevoke { grant_id: s() },
+        Request::WorkflowShow { project: s() },
+        Request::WorkflowValidate { body_json: s() },
+        Request::WorkflowSet {
+            project: s(),
+            expect_heads: vec![],
+            body_json: s(),
+        },
+        Request::Inbox { clear: false },
+        Request::MemberAdd {
+            who: s(),
+            admin: false,
+            as_name: None,
+        },
+        Request::MemberRemove { who: s() },
+        Request::AgentAdd { key: s() },
+        Request::KeyRotate,
+        Request::InviteRevoke { invite: s() },
+        Request::DeviceInvite,
+        Request::DeviceAdd { consent: s() },
+        Request::DeviceRevoke { device: s() },
+        Request::DeviceList,
+        Request::SpaceRecover,
+        Request::SpaceElevate {
+            cofounders: vec![],
+            k: 0,
+        },
+        Request::SpaceRecoverApprove {
+            session: s(),
+            expect: vec![],
+        },
+        Request::SpaceElevateApprove {
+            session: s(),
+            proposal: s(),
+        },
+        Request::SpaceReshare {
+            participants: vec![],
+            k: 0,
+        },
+        Request::SpaceCustodyExport {
+            path: s(),
+            passphrase: s(),
+        },
+        Request::SpaceCustodyImport {
+            path: s(),
+            passphrase: s(),
+            force: false,
+        },
+        Request::Recover,
+        Request::Members,
+        Request::MemberLog,
+        Request::MemberAlias {
+            who: s(),
+            name: s(),
+        },
+        Request::Subscribe { since: 0 },
+        Request::Status,
+        Request::Diagnose {
+            expected_space: None,
+        },
+        Request::Id,
+        Request::Invite {
+            role: None,
+            reusable: false,
+            ttl_hours: None,
+        },
+        Request::Join { ticket: s() },
+        Request::Connect { ticket: s() },
+        Request::SeedAdd { arg: s() },
+        Request::SeedList,
+        Request::SeedRemove { who: s() },
+        Request::Log { since: 0 },
+        Request::Who,
+        Request::ConfigReload,
+        Request::Stop,
+        Request::Hello {
+            protocol_version: 0,
+        },
+    ]
+}
+
+/// The generated routing rows: `(wire command tag, owner label)` per variant,
+/// derived from [`representative_requests`] and [`classify`].
+pub fn routing_rows() -> Vec<(String, &'static str)> {
+    representative_requests()
+        .iter()
+        .map(|req| {
+            let tag = serde_json::to_value(req)
+                .ok()
+                .and_then(|v| v.get("cmd").and_then(|c| c.as_str()).map(String::from))
+                .unwrap_or_default();
+            (tag, classify(req).label())
+        })
+        .collect()
 }
 
 /// A response from the daemon. A snapshot at a version — there is
@@ -507,13 +908,13 @@ pub enum Response {
     Members {
         members: Vec<MemberDto>,
     },
+    /// Effective scoped assignments (reply to [`Request::AccessList`]).
+    Assignments {
+        rows: Vec<crate::dto::AssignmentDto>,
+    },
     /// The membership audit log (reply to [`Request::MemberLog`]).
     MemberLog {
         entries: Vec<MemberLogEntry>,
-    },
-    /// Pending join requests: announced joiners that are not yet members.
-    JoinRequests {
-        requests: Vec<JoinRequestDto>,
     },
     /// Pinned seeds ("remotes") and their reachability.
     Seeds {
@@ -670,16 +1071,17 @@ pub struct StatusInfo {
     pub space: Option<String>,
     pub issues: usize,
     pub projects: usize,
+    /// Whether the issue/project counts below are UNAVAILABLE (undocked or a
+    /// failed projection query). `true` means the zeros are not data — never
+    /// read them as an empty space.
+    #[serde(default)]
+    pub counts_unavailable: bool,
     /// This node's standing in the space ACL: `admin` | `member` | `pending`.
     /// `pending` means we joined from an invite but an admin hasn't approved us
     /// yet, so we cannot decrypt the board. Lets `status` tell a joiner
     /// the truth instead of implying the join already succeeded.
     #[serde(default)]
     pub membership: String,
-    /// Joiners who have announced a join request but aren't members yet — the
-    /// host-side nudge to run `members approve`. Only meaningful for an admin.
-    #[serde(default)]
-    pub pending_requests: usize,
     /// Recovery shares this device holds that exist but cannot be used.
     ///
     /// Structured, not preformatted: the CLI and web layers render it
@@ -688,12 +1090,12 @@ pub struct StatusInfo {
     /// learn their founder share is unusable *before* the day they need it,
     /// which is exactly the day it is too late to fix.
     #[serde(default)]
-    pub degraded_recovery: Vec<crate::replica::DegradedRecoveryHolder>,
+    pub degraded_recovery: Vec<mechanics::ceremony::DegradedRecoveryHolder>,
     /// This device's recovery readiness: the standing authority's shape and our
     /// own custody standing. Reports what THIS node knows; it deliberately makes
     /// no claim about whether other holders still have their shares.
     #[serde(default)]
-    pub recovery: Option<crate::replica::RecoveryStatus>,
+    pub recovery: Option<mechanics::ceremony::RecoveryStatus>,
 }
 
 /// What probing a home's control channel found. These three must be told apart

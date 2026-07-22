@@ -1,0 +1,16 @@
+[package]
+name = "journal"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+description = "Semantics-free crash-safe object/manifest journal: immutable content-addressed objects, atomic manifest swap, fsync/directory-sync discipline, fault injection, and recovery. Knows nothing about Bodies, authority, or any product."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+blake3 = "1"
+data-encoding = "2.6"
+
+[dev-dependencies]

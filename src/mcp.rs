@@ -278,18 +278,86 @@ pub struct AgentAddArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct MemberRemoveArgs {
-    pub who: String,
+pub struct RoleShowArgs {
+    pub role: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct MemberApproveArgs {
-    /// A pending requester: a key id-prefix or a full 64-hex key. The joiner's
-    /// self-asserted nick is not accepted — it is unauthenticated.
-    pub who: String,
-    /// Optional local petname to attach to the approved key (never synced).
+pub struct RoleCreateArgs {
+    pub name: String,
     #[serde(default)]
-    pub alias: Option<String>,
+    pub description: Option<String>,
+    /// A project key/id makes it a Project-scoped role.
+    #[serde(default)]
+    pub project: Option<String>,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RoleEditArgs {
+    pub role: String,
+    pub expect_revision: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub capabilities: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RoleDeleteArgs {
+    pub role: String,
+    pub expect_revision: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RoleResolveArgs {
+    pub role: String,
+    pub expect_heads: Vec<String>,
+    /// The complete canonical JSON replacement body.
+    pub body_json: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AccessListArgs {
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AccessGrantArgs {
+    pub actor: String,
+    pub role: String,
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AccessRevokeArgs {
+    pub grant_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowShowArgs {
+    pub project: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowValidateArgs {
+    pub body_json: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowSetArgs {
+    pub project: String,
+    pub expect_heads: Vec<String>,
+    pub body_json: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemberRemoveArgs {
+    pub who: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -704,21 +772,137 @@ impl LaitMcp {
         self.run(Request::MemberLog).await
     }
 
-    #[tool(description = "List pending join requests (announced joiners not yet added).")]
-    async fn member_requests(&self) -> Result<CallToolResult, McpError> {
-        self.run(Request::MemberRequests).await
+    #[tool(description = "Every role definition: built-ins plus custom heads.")]
+    async fn role_list(&self) -> Result<CallToolResult, McpError> {
+        self.run(Request::RoleList).await
+    }
+
+    #[tool(description = "One role's pinned definition (revision, capabilities, scope).")]
+    async fn role_show(
+        &self,
+        Parameters(a): Parameters<RoleShowArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::RoleShow { role: a.role }).await
     }
 
     #[tool(
-        description = "Approve a pending join request by id-prefix / key (admin-only); seals them the space key. The joiner's nick is not a valid ref (unauthenticated) — pass `alias` to name them locally."
+        description = "Create a custom role from registered capability ids (Space-scoped, or Project-scoped with `project`)."
     )]
-    async fn member_approve(
+    async fn role_create(
         &self,
-        Parameters(a): Parameters<MemberApproveArgs>,
+        Parameters(a): Parameters<RoleCreateArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(Request::MemberApprove {
-            who: a.who,
-            as_name: a.alias,
+        self.run(Request::RoleCreate {
+            name: a.name,
+            description: a.description,
+            project: a.project,
+            capabilities: a.capabilities,
+        })
+        .await
+    }
+
+    #[tool(description = "Edit a custom role at an exact expected revision head.")]
+    async fn role_edit(
+        &self,
+        Parameters(a): Parameters<RoleEditArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::RoleEdit {
+            role: a.role,
+            expect_revision: a.expect_revision,
+            name: a.name,
+            description: a.description,
+            capabilities: a.capabilities,
+        })
+        .await
+    }
+
+    #[tool(description = "Tombstone a custom role at an exact expected revision head.")]
+    async fn role_delete(
+        &self,
+        Parameters(a): Parameters<RoleDeleteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::RoleDelete {
+            role: a.role,
+            expect_revision: a.expect_revision,
+        })
+        .await
+    }
+
+    #[tool(description = "Resolve concurrent role heads with a complete replacement body.")]
+    async fn role_resolve(
+        &self,
+        Parameters(a): Parameters<RoleResolveArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::RoleResolve {
+            role: a.role,
+            expect_heads: a.expect_heads,
+            body_json: a.body_json,
+        })
+        .await
+    }
+
+    #[tool(description = "Effective scoped capability assignments (Mechanics authority history).")]
+    async fn access_list(
+        &self,
+        Parameters(a): Parameters<AccessListArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::AccessList { actor: a.actor }).await
+    }
+
+    #[tool(
+        description = "Expand a role's pinned definition and install the exact scoped assignments (authority-first, all-or-nothing)."
+    )]
+    async fn access_grant(
+        &self,
+        Parameters(a): Parameters<AccessGrantArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::AccessGrant {
+            actor: a.actor,
+            role: a.role,
+            project: a.project,
+        })
+        .await
+    }
+
+    #[tool(description = "Revoke one effective assignment by its 64-hex grant id.")]
+    async fn access_revoke(
+        &self,
+        Parameters(a): Parameters<AccessRevokeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::AccessRevoke {
+            grant_id: a.grant_id,
+        })
+        .await
+    }
+
+    #[tool(description = "A project's workflow revision head(s).")]
+    async fn workflow_show(
+        &self,
+        Parameters(a): Parameters<WorkflowShowArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::WorkflowShow { project: a.project }).await
+    }
+
+    #[tool(description = "Validate a canonical workflow JSON body without committing anything.")]
+    async fn workflow_validate(
+        &self,
+        Parameters(a): Parameters<WorkflowValidateArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::WorkflowValidate {
+            body_json: a.body_json,
+        })
+        .await
+    }
+
+    #[tool(description = "Replace a project's workflow at exactly the current heads.")]
+    async fn workflow_set(
+        &self,
+        Parameters(a): Parameters<WorkflowSetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::WorkflowSet {
+            project: a.project,
+            expect_heads: a.expect_heads,
+            body_json: a.body_json,
         })
         .await
     }
@@ -767,7 +951,7 @@ impl LaitMcp {
     )]
     async fn invite_ticket(&self) -> Result<CallToolResult, McpError> {
         self.run(Request::Invite {
-            require_approval: false,
+            role: None,
             reusable: false,
             ttl_hours: None,
         })

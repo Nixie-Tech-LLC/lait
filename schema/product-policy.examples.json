@@ -1,0 +1,109 @@
+{
+  "negative": [
+    {
+      "def": "RoleBody",
+      "reason": "missing required fields",
+      "schemaExpressible": true,
+      "value": {
+        "role_id": "role_x"
+      }
+    },
+    {
+      "def": "WorkflowBody",
+      "reason": "a transition's demand template kind is unknown",
+      "schemaExpressible": true,
+      "value": {
+        "name": "bad",
+        "project_id": "prj_01JZX0000000000000000000",
+        "states": [],
+        "tombstone": false,
+        "transitions": [
+          {
+            "demand_template": {
+              "op": "sometimes"
+            },
+            "destination_state_id": "y",
+            "source_state_ids": [],
+            "transition_id": "x"
+          }
+        ]
+      }
+    }
+  ],
+  "positive": [
+    {
+      "def": "RoleBody",
+      "value": {
+        "capabilities": [
+          "issue.assign",
+          "issue.label"
+        ],
+        "description": "labels and assigns incoming issues",
+        "name": "triage",
+        "role_id": "role_01JZX0000000000000000000",
+        "scope_kind": "space",
+        "tombstone": false
+      }
+    },
+    {
+      "def": "WorkflowBody",
+      "value": {
+        "name": "default",
+        "project_id": "prj_01JZX0000000000000000000",
+        "states": [
+          {
+            "category": "backlog",
+            "color": "gray",
+            "name": "Backlog",
+            "state_id": "backlog"
+          },
+          {
+            "category": "done",
+            "color": "green",
+            "name": "Done",
+            "state_id": "done"
+          }
+        ],
+        "tombstone": false,
+        "transitions": [
+          {
+            "demand_template": {
+              "children": [
+                {
+                  "capability": "space.contributor",
+                  "op": "require",
+                  "resource": {
+                    "kind": "space"
+                  }
+                },
+                {
+                  "capability": "space.admin",
+                  "op": "require",
+                  "resource": {
+                    "kind": "space"
+                  }
+                }
+              ],
+              "op": "any"
+            },
+            "destination_state_id": "done",
+            "source_state_ids": [
+              "backlog"
+            ],
+            "transition_id": "ship"
+          }
+        ]
+      }
+    },
+    {
+      "def": "AssignmentDto",
+      "value": {
+        "actor": "act_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "capability": "issue.assign",
+        "grant_id": "abababababababababababababababababababababababababababababababab",
+        "resource": [],
+        "world": "com.lait.issues"
+      }
+    }
+  ]
+}

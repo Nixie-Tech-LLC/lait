@@ -31,7 +31,6 @@ pub fn is_read(req: &Request) -> bool {
         | Request::IssueGraph { .. }
         | Request::Members
         | Request::MemberLog
-        | Request::MemberRequests
         | Request::DeviceInvite
         | Request::DeviceList
         | Request::Status
@@ -40,6 +39,11 @@ pub fn is_read(req: &Request) -> bool {
         | Request::SeedList
         | Request::Log { .. }
         | Request::Who
+        | Request::RoleList
+        | Request::RoleShow { .. }
+        | Request::AccessList { .. }
+        | Request::WorkflowShow { .. }
+        | Request::WorkflowValidate { .. }
         | Request::Hello { .. } => true,
 
         // Reads the inbox, but `clear` advances the watermark on the way out.
@@ -67,7 +71,6 @@ pub fn is_read(req: &Request) -> bool {
         // …the ACL, every op of which is signed by whoever's daemon runs it…
         | Request::MemberAdd { .. }
         | Request::MemberRemove { .. }
-        | Request::MemberApprove { .. }
         | Request::MemberAlias { .. }
         | Request::KeyRotate
         | Request::InviteRevoke { .. }
@@ -78,6 +81,7 @@ pub fn is_read(req: &Request) -> bool {
         | Request::SpaceElevate { .. }
         | Request::SpaceRecoverApprove { .. }
         | Request::SpaceElevateApprove { .. }
+        | Request::SpaceReshare { .. }
         // …and custody, which handles a holder's own key material and a
         // passphrase, so it belongs to the operator at the machine and not to a
         // browser session…
@@ -89,6 +93,14 @@ pub fn is_read(req: &Request) -> bool {
         | Request::Connect { .. }
         | Request::SeedAdd { .. }
         | Request::SeedRemove { .. }
+        // …role/access/workflow authoring mutates replicated policy…
+        | Request::RoleCreate { .. }
+        | Request::RoleEdit { .. }
+        | Request::RoleDelete { .. }
+        | Request::RoleResolve { .. }
+        | Request::AccessGrant { .. }
+        | Request::AccessRevoke { .. }
+        | Request::WorkflowSet { .. }
         // …and node control.
         | Request::ConfigReload
         | Request::Stop => false,
@@ -125,7 +137,7 @@ mod tests {
         }));
         assert!(!is_read(&Request::KeyRotate));
         assert!(!is_read(&Request::Invite {
-            require_approval: false,
+            role: None,
             reusable: false,
             ttl_hours: None,
         }));

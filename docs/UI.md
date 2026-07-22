@@ -122,7 +122,8 @@ address, and optionally an admin-signed admission grant. Joining creates a new
 local store before the daemon starts.
 
 An authorized reusable or single-use invite may admit the joining actor
-automatically. Otherwise the join remains pending until an admin approves it.
+automatically: accepting the invite is the approval, and redemption completes
+on the joiner's first contact with a member — there is no approval queue.
 Pending nodes may discover peers and exchange membership state but cannot read
 encrypted collaborative content.
 

@@ -19,7 +19,6 @@ use crate::{
     control::{self, request, ErrorKind, Event, EventKind, Request, Response},
     diagnose::{DiagnosisView, GateState},
     dto::{BoardView, IssueView, Priority, Row},
-    proto::SpaceTicket,
     spaces::{self, SpaceEntry, StorePresence},
 };
 
@@ -412,7 +411,7 @@ pub async fn ensure_daemon_as(home: &Path, identity: Option<&Path>) -> Result<()
     // A daemon can only open an initialized store — fail fast with guidance
     // instead of spawning a doomed process and timing out 20s later. This is a
     // missing store, not an unreachable daemon: `1`, not `3`.
-    if !crate::store::initialized_at(home) {
+    if !crate::orbital::space_store_present(home) {
         return Err(anyhow!(
             "no space at {} — found one with `lait init`, or join one with `lait join <link>`",
             home.display()
@@ -733,15 +732,16 @@ fn print_diagnosis(v: &DiagnosisView, out: Out) {
 /// and named immediately instead of surfacing later as a blank board. Under
 /// `--json` we emit only the join DTO (no verifier chrome), mirroring `run_invite`.
 pub async fn run_join(home: &Path, ticket: String, out: Out) -> Result<()> {
-    // Parse client-side to recover the intended space before the ticket is
-    // moved into the request. A malformed ticket simply yields no expectation; the
-    // daemon returns the real parse error.
-    let parsed = ticket.parse::<SpaceTicket>().ok();
-    // A pass-carrying ticket (Pattern A) admits automatically within seconds, so
-    // a pending membership is worth polling out; a pass-less ticket waits on a
-    // human admin and would only stall the readout.
-    let has_pass = parsed.as_ref().is_some_and(|t| t.invite.is_some());
-    let expected = parsed.map(|t| t.space);
+    // Parse client-side to recover the intended space before the link is
+    // moved into the request. A malformed link simply yields no expectation;
+    // the daemon returns the real parse error.
+    let parsed = runtime::SignedCoordinates::parse_link(ticket.trim())
+        .ok()
+        .and_then(|c| c.verify().ok());
+    // An admission-carrying link admits automatically within seconds, so a
+    // pending membership is worth polling out.
+    let has_pass = parsed.as_ref().is_some_and(|v| v.admission.is_some());
+    let expected = parsed.map(|v| v.space.as_str().to_string());
     let resp = client(home, Request::Join { ticket }).await?;
     match &resp {
         Response::Ok { message } => {
@@ -1326,6 +1326,26 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
             }
             0
         }
+        Response::Assignments { rows } => {
+            if rows.is_empty() {
+                println!("(no effective assignments)");
+            }
+            for r in rows.iter() {
+                let scope = if r.resource.is_empty() {
+                    "space".to_string()
+                } else {
+                    r.resource.join("/")
+                };
+                println!(
+                    "{}  {:<24} {:<28} {}",
+                    &r.grant_id[..12.min(r.grant_id.len())],
+                    r.capability,
+                    scope,
+                    r.actor
+                );
+            }
+            0
+        }
         Response::Members { members } => {
             if members.is_empty() {
                 println!("(no members)");
@@ -1370,25 +1390,6 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
                     .map(|r| format!(" {r}"))
                     .unwrap_or_default();
                 println!("{mark} {actor}  {:<13} {subject}{role}", e.kind);
-            }
-            0
-        }
-        Response::JoinRequests { requests } => {
-            if requests.is_empty() {
-                println!("(no pending join requests)");
-            } else {
-                // The key is authenticated; the nick is a self-asserted claim.
-                // Approve BY KEY after confirming the short id out-of-band.
-                eprintln!("approve by key/prefix — nick is an unverified claim:");
-            }
-            for r in requests {
-                let short: String = r.key.chars().take(12).collect();
-                let claim = if r.nick.is_empty() {
-                    String::new()
-                } else {
-                    format!("  (claims \"{}\")", r.nick)
-                };
-                println!("{}{}", short, claim);
             }
             0
         }
@@ -1439,8 +1440,14 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
                 };
                 println!("you:       {}", paint(out.color, code, &s.membership));
             }
-            println!("issues:    {}", s.issues);
-            println!("projects:  {}", s.projects);
+            if s.counts_unavailable {
+                // Never render an unavailable projection as an empty space.
+                println!("issues:    (unavailable)");
+                println!("projects:  (unavailable)");
+            } else {
+                println!("issues:    {}", s.issues);
+                println!("projects:  {}", s.projects);
+            }
             println!("online:    {} peer(s)", s.online_peers);
             // Directional nudges so neither side of a join stalls silently.
             if s.membership == "pending" {
@@ -1450,34 +1457,19 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
                     paint(
                         out.color,
                         ansi::CYAN,
-                        "⌛ you've requested to join — waiting for an admin to approve you."
+                        "⌛ admission in progress — it completes automatically on the next contact with a member."
                     )
                 );
                 println!("   the board stays encrypted until then; it syncs automatically once you're in.");
-            } else if s.pending_requests > 0 {
-                let n = s.pending_requests;
-                let plural = if n == 1 { "" } else { "s" };
-                println!();
-                println!(
-                    "{}",
-                    paint(
-                        out.color,
-                        ansi::YELLOW,
-                        &format!(
-                            "⚠ {n} pending join request{plural} — someone is waiting to be let in."
-                        )
-                    )
-                );
-                println!("   review: `lait members requests`   approve: `lait members approve <id> --as <name>`");
             }
             // A degraded recovery holder is reported on every status, not only
             // when break-glass is attempted: by then it is too late to fix.
             for h in &s.degraded_recovery {
                 let why = match &h.reason {
-                    crate::replica::RecoveryArtifactFailure::Undecryptable(_) => {
+                    mechanics::ceremony::RecoveryArtifactFailure::Undecryptable(_) => {
                         "it was protected under another Windows account or machine"
                     }
-                    crate::replica::RecoveryArtifactFailure::Io(_) => {
+                    mechanics::ceremony::RecoveryArtifactFailure::Io(_) => {
                         "it is present but could not be read"
                     }
                 };
@@ -1671,7 +1663,7 @@ fn print_issue(v: &IssueView, out: Out) {
 pub async fn run_invite(
     home: &Path,
     email: Option<String>,
-    require_approval: bool,
+    role: Option<String>,
     reusable: bool,
     ttl_hours: Option<u64>,
     out: Out,
@@ -1679,7 +1671,7 @@ pub async fn run_invite(
     let resp = client(
         home,
         Request::Invite {
-            require_approval,
+            role,
             reusable,
             ttl_hours,
         },
@@ -1698,10 +1690,7 @@ pub async fn run_invite(
         emit_text(&token, out);
         return Ok(());
     }
-    let link = token
-        .parse::<SpaceTicket>()
-        .map(|t| t.link())
-        .unwrap_or_else(|_| format!("lait://join/{token}"));
+    let link = format!("lait://join/{token}");
     println!("{token}");
     println!("{link}");
     let copied = copy_to_clipboard(&token);
@@ -1727,11 +1716,9 @@ pub async fn run_invite(
     if copied {
         println!("(copied to clipboard)");
     }
-    // Tell the host what this ticket actually does, so the mental model matches
-    // the flow (Pattern A: default tickets self-approve).
-    let hint = if require_approval {
-        "your teammate runs `lait join <link>`, then you `lait members approve` them"
-    } else if reusable {
+    // Tell the host what this link actually does, so the mental model matches
+    // the flow: accepting the invite IS the approval.
+    let hint = if reusable {
         "anyone who runs `lait join <link>` is admitted automatically until it expires"
     } else {
         "your teammate runs `lait join <link>` and is admitted automatically — no approve step"
@@ -1880,8 +1867,8 @@ fn kind_str(k: &EventKind) -> &'static str {
 
 fn print_event(e: &Event) {
     match e.kind {
-        // Surface the joiner's short key so an admin can approve them straight from
-        // the log (`lait members approve <that-prefix>`), not just `--json`.
+        // Surface the joiner's short key so an admin can recognize them straight
+        // from the log, not just `--json`.
         EventKind::Join => {
             let short: String = e.id.chars().take(8).collect();
             println!("[join] {} ({}): {}", e.nick, short, e.text);

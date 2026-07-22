@@ -149,8 +149,10 @@ you're in — get to work.
 ```
 
 Everything is end-to-end encrypted; membership is a signed key graph, so
-`lait members remove bob` rotates the key and revokes future reads. Prefer a
-human gate? `lait invite --require-approval`, then `lait members approve`.
+`lait members remove bob` rotates the key and revokes future reads. Accepting
+an invite IS the approval: redemption is automatic on the next contact with a
+member, and `lait invite --role viewer|contributor|administrator` decides what
+the invite admits as.
 
 ### 3 · The daily loop, on a branch
 
@@ -287,11 +289,11 @@ Registries + node:
 | `config [get \| set \| unset \| ls]` | Layered local settings (`user.nick`, `project.default`); store wins over global |
 | `projects [add KEY [NAME] \| ls]` | Manage the project registry (name defaults to the key) |
 | `labels [new <name> --color C \| ls]` | Manage the label registry |
-| `members [add \| remove \| requests \| approve \| name \| rotate-key \| ls]` | Manage E2EE membership (signed ACL); `add` seals the key, `remove` rotates it, `approve` admits a pending joiner, `name` sets a local label for a key |
+| `members [add \| remove \| name \| rotate-key \| ls]` | Manage E2EE membership (signed ACL); `add` seals the key, `remove` rotates it, `name` sets a local label for a key |
 | `activity [--since N]` | Space-wide recent transitions |
 | `serve [--port N] [--open]` | Open your spaces in a browser (loopback-only) |
 | `status` · `id` · `shutdown` | Node/space status · endpoint id · stop the daemon |
-| `invite [--require-approval] [--reusable] [--ttl-hours N]` · `join <link> [--dir D]` | Invite a teammate; `join` creates the joiner's store (cwd or `--dir`) and the default pass admits them automatically (add `--require-approval` for the gated `members requests`/`members approve` flow) |
+| `invite [--role R] [--reusable] [--ttl-hours N]` · `join <link> [--dir D]` | Invite a teammate; `join` creates the joiner's store (cwd or `--dir`) and accepting the invite admits them automatically with the invited role's exact capabilities |
 | `who` · `watch` | Peers online · follow the event stream |
 | `profiles` / `resume <name>` | List profiles / switch to a named profile (each a separate identity + store) |
 
@@ -354,28 +356,23 @@ lait status                        # you: member   ← board decrypts and syncs
 lait members remove bob
 ```
 
-The pass is a **bearer** capability: authority rides the channel you send the link
-over, bounded by expiry (`--ttl-hours`, default 7 days) and one use. Tune it, or
-keep a human in the loop:
+The link carries a **bearer** admission capability: authority rides the channel
+you send it over, bounded by expiry (`--ttl-hours`, default 7 days) and one use.
+Accepting the invite is the approval — there is no queue and no approve step;
+redemption completes automatically on the joiner's first contact with a member.
+Tune what it admits:
 
 ```bash
 lait invite --reusable --ttl-hours 24   # one link admits the whole team for a day
-lait invite --require-approval          # pass-less link — the classic gated flow:
-
-# teammate — join lands as a *request*; you stay encrypted until an admin approves
-lait join <INVITE> --nick bob
-lait status                             # you: pending   ← waiting to be approved
-
-# host — see who's waiting, confirm the short key out-of-band, then approve by
-# key/prefix (the nick is an unverified claim; `--as` is a local name you assign)
-lait members requests                   # bob  (claims "bob")   <key-prefix>
-lait members approve <key-prefix> --as bob
+lait invite --role viewer               # read-only membership
+lait invite --role administrator        # full policy administration (issuer must hold it)
 ```
 
 Space data is E2EE: issues sync as ciphertext, and a node that isn't in the
-signed ACL (or has been removed) sees only ciphertext. Auto-approval never weakens
-this — the seal still happens key-side on an admin node holding the space key;
-the pass only removes the manual keystroke. Changes propagate live P2P over iroh
+signed ACL (or has been removed) sees only ciphertext. Automatic redemption
+never weakens this — the seal still happens key-side on an admin node holding
+the space key, which also verifies the capability, its signed role expansion,
+and the issuer's authority to delegate every capability it grants. Changes propagate live P2P over iroh
 with no central server; any always-on node advertised in a ticket acts as a
 portable seed that backfills cold clients.
 

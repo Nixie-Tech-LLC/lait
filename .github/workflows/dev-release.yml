@@ -29,7 +29,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: namespace-profile-nixiesoftware, target: x86_64-unknown-linux-gnu }
           # arm64 Linux builds natively on GitHub's hosted arm64 runner, matching
           # the stable dist matrix (which ships aarch64-unknown-linux-gnu). Without
           # this, arm64 Linux had no nightly channel.
@@ -98,7 +98,7 @@ jobs:
   publish:
     name: publish rolling `dev` prerelease
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-nixiesoftware
     permissions:
       contents: write
     steps:

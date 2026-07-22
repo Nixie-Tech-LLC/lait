@@ -701,6 +701,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "comms"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "data-encoding",
+ "ed25519-dalek 2.2.0",
+ "iroh",
+ "iroh-base",
+ "iroh-gossip",
+ "iroh-relay",
+ "mechanics",
+ "n0-future",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "compact_str"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1488,6 +1506,23 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "fabric"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "data-encoding",
+ "ed25519-dalek 2.2.0",
+ "getrandom 0.3.4",
+ "journal",
+ "loro",
+ "mechanics",
+ "postcard",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2827,6 +2862,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "journal"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "data-encoding",
+ "postcard",
+ "serde",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.99"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2850,27 +2895,29 @@ dependencies = [
  "clap",
  "clap_complete",
  "clap_mangen",
+ "comms",
  "crossterm",
  "data-encoding",
  "directories",
  "ed25519-dalek 2.2.0",
+ "fabric",
  "flate2",
  "frost-ed25519",
  "fs2",
  "getrandom 0.3.4",
  "include_dir",
  "interprocess",
- "lait-fabric",
- "lait-kernel",
- "lait-net",
  "libc",
+ "mechanics",
  "n0-future",
  "postcard",
  "proptest",
  "qrcode",
  "rand_core 0.6.4",
  "ratatui",
+ "replica",
  "rmcp",
+ "runtime",
  "schemars",
  "self_update",
  "serde",
@@ -2884,61 +2931,6 @@ dependencies = [
  "tracing-subscriber",
  "windows-sys 0.61.2",
  "zip",
-]
-
-[[package]]
-name = "lait-fabric"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "blake3",
- "data-encoding",
- "ed25519-dalek 2.2.0",
- "getrandom 0.3.4",
- "lait-kernel",
- "loro",
- "postcard",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "lait-kernel"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "argon2",
- "blake3",
- "chacha20poly1305",
- "curve25519-dalek 4.1.3",
- "data-encoding",
- "ed25519-dalek 2.2.0",
- "frost-ed25519",
- "getrandom 0.3.4",
- "postcard",
- "rand_core 0.6.4",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "x25519-dalek",
-]
-
-[[package]]
-name = "lait-net"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "data-encoding",
- "ed25519-dalek 2.2.0",
- "iroh",
- "iroh-base",
- "iroh-gossip",
- "iroh-relay",
- "lait-kernel",
- "n0-future",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -3225,6 +3217,30 @@ name = "md5"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
+
+[[package]]
+name = "mechanics"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "blake3",
+ "chacha20poly1305",
+ "curve25519-dalek 4.1.3",
+ "data-encoding",
+ "ed25519-dalek 2.2.0",
+ "frost-ed25519",
+ "getrandom 0.3.4",
+ "journal",
+ "postcard",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tracing",
+ "windows-sys 0.61.2",
+ "x25519-dalek",
+]
 
 [[package]]
 name = "memchr"
@@ -4481,9 +4497,9 @@ dependencies = [
 
 [[package]]
 name = "regex"
-version = "1.12.3"
+version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e10754a14b9137dd7b1e3e5b0493cc9171fdd105e0ab477f51b72e7f3ac0e276"
+checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -4493,9 +4509,9 @@ dependencies = [
 
 [[package]]
 name = "regex-automata"
-version = "0.4.14"
+version = "0.4.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e1dd4122fc1595e8162618945476892eefca7b88c52820e74af6262213cae8f"
+checksum = "8fcfdb36bda0c880c5931cdc7a2bcdc8ba4556847b9d912bca70bc94708711ad"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -4504,9 +4520,9 @@ dependencies = [
 
 [[package]]
 name = "regex-syntax"
-version = "0.8.10"
+version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
+checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reloadable-core"
@@ -4523,6 +4539,22 @@ dependencies = [
  "arc-swap",
  "reloadable-core",
  "tokio",
+]
+
+[[package]]
+name = "replica"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "data-encoding",
+ "fabric",
+ "getrandom 0.3.4",
+ "mechanics",
+ "postcard",
+ "serde",
+ "serde-byte-array",
+ "serde_json",
 ]
 
 [[package]]
@@ -4627,6 +4659,28 @@ name = "roff"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "323c417e1d9665a65b263ec744ba09030cfb277e9daa0b018a4ab62e57bc8189"
+
+[[package]]
+name = "runtime"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "comms",
+ "data-encoding",
+ "fs2",
+ "getrandom 0.3.4",
+ "mechanics",
+ "postcard",
+ "regex",
+ "replica",
+ "schemars",
+ "serde",
+ "serde-byte-array",
+ "serde_json",
+ "tokio",
+ "unicode-normalization",
+]
 
 [[package]]
 name = "rustc-hash"
@@ -5908,6 +5962,15 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "unicode-segmentation"

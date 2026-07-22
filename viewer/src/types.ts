@@ -217,18 +217,11 @@ export interface MemberLogEntry {
   subject?: string | null;
   /** `admin` | `member`, for role-bearing ops. */
   role?: string | null;
-  /** Whether replay honored the op. `false` = unauthorized or undecodable. */
+  /** Whether replay honored the op (false = unauthorized or undecodable). */
   authorized: boolean;
 }
 
-export interface JoinRequestDto {
-  /** ed25519 key (64-hex) — feed straight to `members approve`. Note: `key`, not `id`. */
-  key: string;
-  /** Advisory nick they announced — an unverified claim. */
-  nick: string;
-  ts: number;
-}
-
+/** A pinned seed ("remote") — a bootstrap + backfill anchor, never trust. */
 export interface SeedDto {
   id: string;
   nick: string;
@@ -255,10 +248,8 @@ export interface Event {
 /**
  * `control.rs` `StatusInfo`.
  *
- * The shape the old viewer got wrong: there is no `room` (it is `name`),
- * `space` is nullable, and `membership`/`pending_requests` are new — the
- * latter two being how a *pending* joiner learns they are pending rather than
- * staring at an empty board.
+ * `space` is nullable, and `membership` is how a still-unadmitted joiner
+ * learns admission is in progress rather than staring at an empty board.
  */
 export interface StatusInfo {
   id: string;
@@ -271,7 +262,6 @@ export interface StatusInfo {
   projects: number;
   /** `admin` | `member` | `pending`. */
   membership: string;
-  pending_requests: number;
 }
 
 // ---- the supervisor surface (serve-level, not control-plane) ----------------
@@ -388,14 +378,12 @@ export type Request =
   | { cmd: "member_remove"; who: string }
   | { cmd: "key_rotate" }
   | { cmd: "members" }
-  | { cmd: "member_requests" }
   | { cmd: "member_log" }
-  | { cmd: "member_approve"; who: string; as_name?: string | null }
   | { cmd: "member_alias"; who: string; name: string }
   | { cmd: "status" }
   | { cmd: "diagnose"; expected_space?: string | null }
   | { cmd: "id" }
-  | { cmd: "invite"; require_approval?: boolean; reusable?: boolean; ttl_hours?: number | null }
+  | { cmd: "invite"; role?: string | null; reusable?: boolean; ttl_hours?: number | null }
   | { cmd: "join"; ticket: string }
   | { cmd: "seed_list" }
   | { cmd: "log"; since: number }
@@ -422,7 +410,6 @@ export type Response =
   | { kind: "labels"; labels: LabelDto[] }
   | { kind: "members"; members: MemberDto[] }
   | { kind: "member_log"; entries: MemberLogEntry[] }
-  | { kind: "join_requests"; requests: JoinRequestDto[] }
   | { kind: "seeds"; seeds: SeedDto[] }
   /** A ref resolved to several — a first-class outcome (exit 2), never an error. */
   | { kind: "candidates"; candidates: Candidate[]; near_miss_for: string | null }

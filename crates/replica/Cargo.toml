@@ -1,0 +1,29 @@
+[package]
+name = "replica"
+version = "0.6.0"
+edition = "2021"
+rust-version = "1.91"
+description = "LAIT Replica semantics: Body identity, schemas, descriptors, semantic frontiers, transaction plans, incorporation, and Convergence — above mechanics and Fabric, naming neither the CRDT engine nor any product/consumer type."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# mechanics — identity, authority, custody, key legitimacy. Replica combines
+# these facts with Fabric durability into orbital Replica semantics.
+mechanics = { path = "../mechanics" }
+# fabric — the sealed convergence component. Replica translates validated semantic
+# plans into Fabric requests and advances its frontier only from a Fabric commit
+# receipt. `loro` is intentionally ABSENT from this manifest: the seal is the
+# dependency edge, so the CRDT engine cannot be named here.
+fabric = { path = "../fabric" }
+
+serde = { version = "1", features = ["derive"] }
+# `[u8; 64]` signature fields on the S5 Body-transaction records.
+serde-byte-array = "0.1"
+postcard = { version = "1", features = ["use-std"] }
+blake3 = "1"
+data-encoding = "2.6"
+getrandom = "0.3"
+anyhow = "1"
+
+[dev-dependencies]
+serde_json = "1"

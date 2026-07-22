@@ -1,0 +1,50 @@
+[package]
+name = "runtime"
+version = "0.6.0"
+edition = "2021"
+rust-version = "1.91"
+description = "LAIT orbital lifecycle: Runtime, Orbit, Station, World hosting, Dock/Session, Contact policy, and Observation publication. Exposes no CRDT, iroh, stream, file, key, ciphertext, mutex, or product request types."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# mechanics — Space/Actor/Device/Station identity and authority facts.
+mechanics = { path = "../mechanics" }
+# replica — Body semantics, schemas, descriptors, frontiers, Convergence.
+replica = { path = "../replica" }
+# comms — gossip, presence dial, framed streams, ALPN adapters. Runtime drives
+# the transport seam; `iroh` is absent from this manifest by construction.
+comms = { path = "../comms" }
+
+serde = { version = "1", features = ["derive"] }
+# `[u8; 64]` signature fields: serde only derives arrays up to length 32.
+serde-byte-array = "0.1"
+# Canonical wire encoding for the signed World-action envelope (and later public
+# envelopes). postcard is the workspace-pinned canonical codec.
+postcard = { version = "1", features = ["use-std"] }
+# base32 for the Coordinates v1 link form.
+data-encoding = "2.6"
+# Payload commitment in the World-action header.
+blake3 = "1"
+# The external DTO surface (S7): versioned JSON, strict unknown-field
+# rejection.
+serde_json = "1"
+# JSON Schema 2020-12 generation for the committed external DTO contract.
+schemars = "1"
+# NFC validation of the human-facing display-name/nick hints in Coordinates v1
+# (the canonical form rejects non-NFC UTF-8).
+unicode-normalization = "0.1"
+# Cross-platform advisory file lock: the Orbit's exclusive store lock (the typed
+# double-lock). Same lock the product's single-instance daemon guard uses.
+fs2 = "0.4"
+# The Station's Contact plane: one tracked driver thread runs a current-thread
+# tokio runtime to drive the comms transport (accept loop, scheduler, gossip).
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+# Minting a fresh SpaceId digest at formation.
+getrandom = "0.3"
+anyhow = "1"
+
+[dev-dependencies]
+regex = "1.13.1"
+# The real-iroh Contact gate test builds two loopback endpoints on a
+# multi-thread runtime that outlives the Stations driving them.
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }

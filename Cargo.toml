@@ -1,5 +1,12 @@
 [workspace]
-members = ["crates/lait-kernel", "crates/lait-fabric", "crates/lait-net"]
+members = [
+    "crates/journal",
+    "crates/mechanics",
+    "crates/fabric",
+    "crates/comms",
+    "crates/replica",
+    "crates/runtime",
+]
 # Pin resolver 2 explicitly: the release binary's non-linkage of the dev-only
 # `test-utils` feature (which would flip presets::N0 from prod to staging relays)
 # depends on it, and must not silently regress to v1 if this ever becomes a
@@ -69,17 +76,23 @@ path = "src/main.rs"
 # lait's roots — identity, trust regimes, derivation rules. Depends on no
 # scaffold; re-exported at this crate's root so the app layer reaches it by its
 # historical paths (`crate::acl`, `lait::ids`, …).
-lait-kernel = { path = "crates/lait-kernel" }
+mechanics = { path = "crates/mechanics" }
 # The fabric — the shared world; Loro sealed behind typed wrappers. The app
 # depends on this, not on Loro: `loro` is intentionally absent from THIS
 # manifest, so `loro::*` cannot be named in the app layer. The seal is the
 # dependency edge.
-lait-fabric = { path = "crates/lait-fabric" }
+fabric = { path = "crates/fabric" }
+# The orbital runtime + Replica semantics. The product adopts the orbital
+# lifecycle through these — hosting a World, docking Sessions, and committing
+# through the Replica/Fabric path — the same public API any consumer uses. This
+# is the S5c adoption edge: the root application depends on the new crates.
+runtime = { path = "crates/runtime" }
+replica = { path = "crates/replica" }
 # The network adapter — how independently held replicas exchange their material.
 # `iroh` is intentionally absent from THIS manifest: the app composes the seam
 # (`Transport`, framed `Stream`s, gossip rooms) and never names the contractor
 # behind it. Swapping the adapter is a manifest change, not a daemon rewrite.
-lait-net = { path = "crates/lait-net" }
+comms = { path = "crates/comms" }
 # randomness for ULID minting (app-minted DocId/ProjectId/… ids).
 getrandom = "0.3"
 
@@ -91,10 +104,10 @@ ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 
 # E2EE (P3) is the KERNEL's job now: ed25519 signing, X25519 sealed boxes, and
-# the ChaCha20-Poly1305 envelope all live in `lait-kernel::crypto`, which is the
+# the ChaCha20-Poly1305 envelope all live in `mechanics::crypto`, which is the
 # only crate that names those primitives. The app deliberately lists NONE of
 # them, so reaching around the kernel to hand-roll a key derivation does not
-# compile — the same manifest-edge enforcement that seals Loro into lait-fabric.
+# compile — the same manifest-edge enforcement that seals Loro into fabric.
 # (`ed25519-dalek` remains a dev-dependency: interop tests forge raw keys.)
 # async runtime + streams
 tokio = { version = "1", features = ["full"] }
@@ -196,7 +209,7 @@ async-trait = "0.1"
 # Raw crypto primitives are TEST-ONLY at this layer: `identity_interop.rs` and
 # `frost_interop.rs` forge keys and drive ceremony rounds against the kernel's
 # public surface, which is exactly the kind of adversarial construction that has
-# to reach past `lait-kernel::crypto`. Production code goes through the kernel.
+# to reach past `mechanics::crypto`. Production code goes through the kernel.
 ed25519-dalek = "2"
 frost-ed25519 = "3"
 rand_core = { version = "0.6", features = ["getrandom"] }

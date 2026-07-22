@@ -1,0 +1,372 @@
+{
+  "$defs": {
+    "CommittedEffectDto": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "A submit response DTO: the committed effect, frontier, and touched scopes.\nCarries no replicated state. An identical replay returns the identical DTO.",
+      "properties": {
+        "effectB64": {
+          "description": "Base64 of the application effect bytes.",
+          "type": "string"
+        },
+        "frontierRootHex": {
+          "description": "Hex of the 32-byte Replica frontier root.",
+          "type": "string"
+        },
+        "frontierTransactionCount": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "protocolVersion": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "scopeBodyIdsHex": {
+          "description": "Hex of the touched 16-byte Body ids.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "effectB64",
+        "frontierRootHex",
+        "frontierTransactionCount",
+        "scopeBodyIdsHex"
+      ],
+      "title": "CommittedEffectDto",
+      "type": "object"
+    },
+    "ErrorDto": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "The typed error DTO: a stable machine `code` (kebab-case) plus optional\nhuman prose. Codes mirror the public error taxonomies; consumers match on\nthe code, never the message.",
+      "properties": {
+        "code": {
+          "description": "One of the stable error codes (e.g. `invalid-request`, `denied`,\n`unsupported-schema`, `authority-changed`, `request-id-conflict`,\n`station-dormant`, `limit-exceeded`, `persistence`, `reset-required`).",
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "protocolVersion": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "code",
+        "message"
+      ],
+      "title": "ErrorDto",
+      "type": "object"
+    },
+    "ObservationCursorDto": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "An observation cursor DTO. `sequence` is exclusive: replay delivers records\nwith a greater sequence.",
+      "properties": {
+        "epoch": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "protocolVersion": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sequence": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "epoch",
+        "sequence"
+      ],
+      "title": "ObservationCursorDto",
+      "type": "object"
+    },
+    "ObservationDto": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "An observation DTO — a bounded invalidation signal, carrying no state.\n`reset: true` means the consumer must rebaseline and re-query.",
+      "properties": {
+        "epoch": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "frontierRootHex": {
+          "type": "string"
+        },
+        "frontierTransactionCount": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "protocolVersion": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reset": {
+          "type": "boolean"
+        },
+        "scopeBodyIdsHex": {
+          "description": "Hex of the affected 16-byte Body ids (empty on reset).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "sequence": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "world": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "epoch",
+        "sequence",
+        "reset",
+        "world",
+        "scopeBodyIdsHex",
+        "frontierRootHex",
+        "frontierTransactionCount"
+      ],
+      "title": "ObservationDto",
+      "type": "object"
+    },
+    "ProjectionDto": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "A projection DTO — derived local output, never replicated state.",
+      "properties": {
+        "bytesB64": {
+          "description": "Base64 of the projection bytes.",
+          "type": "string"
+        },
+        "frontierRootHex": {
+          "type": "string"
+        },
+        "frontierTransactionCount": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "protocolVersion": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "schema": {
+          "type": "string"
+        },
+        "schemaVersion": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "schema",
+        "schemaVersion",
+        "bytesB64",
+        "frontierRootHex",
+        "frontierTransactionCount"
+      ],
+      "title": "ProjectionDto",
+      "type": "object"
+    },
+    "QueryRequestDto": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "A query request DTO.",
+      "properties": {
+        "payloadB64": {
+          "type": "string"
+        },
+        "protocolVersion": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "schema": {
+          "type": "string"
+        },
+        "schemaVersion": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "world": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "world",
+        "schema",
+        "schemaVersion",
+        "payloadB64"
+      ],
+      "title": "QueryRequestDto",
+      "type": "object"
+    },
+    "SignedSubmitDto": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "A **signed** submit DTO: the canonical signed World action (postcard bytes,\nopaque, produced and verified only by the Rust protocol layer) together\nwith the coordinates a consumer can read without decoding postcard. Every\nspelled coordinate is validated against its identifier grammar; the signed\nbytes are size-bounded and never interpreted at this layer — signature and\nheader verification happen in [`crate::action`], not in JSON.",
+      "properties": {
+        "actorId": {
+          "description": "The acting principal (`act_` + 64 lowercase hex chars).",
+          "type": "string"
+        },
+        "deviceHex": {
+          "description": "The signing device key (64 lowercase hex chars).",
+          "type": "string"
+        },
+        "protocolVersion": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requestIdHex": {
+          "description": "Hex (lowercase) of the action's 16-byte request id.",
+          "type": "string"
+        },
+        "signedActionB64": {
+          "description": "Base64 (standard, padded) of the complete signed action bytes.",
+          "type": "string"
+        },
+        "spaceId": {
+          "description": "The Space the action addresses (`ws_` + 26 base32 chars).",
+          "type": "string"
+        },
+        "world": {
+          "description": "The World the action addresses (reverse-domain form).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "spaceId",
+        "world",
+        "actorId",
+        "deviceHex",
+        "requestIdHex",
+        "signedActionB64"
+      ],
+      "title": "SignedSubmitDto",
+      "type": "object"
+    },
+    "SubmitRequestDto": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "A submit request DTO. The application `payload` is base64 in JSON (arbitrary\nbytes are not JSON-safe); everything else is a bounded string.",
+      "properties": {
+        "payloadB64": {
+          "description": "Base64 (standard, padded) of the application intent bytes.",
+          "type": "string"
+        },
+        "protocolVersion": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requestIdHex": {
+          "description": "Hex (lowercase) of the caller's 16-byte request id (the idempotency\nscope component).",
+          "type": "string"
+        },
+        "schema": {
+          "type": "string"
+        },
+        "schemaVersion": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "world": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "world",
+        "schema",
+        "schemaVersion",
+        "requestIdHex",
+        "payloadB64"
+      ],
+      "title": "SubmitRequestDto",
+      "type": "object"
+    }
+  },
+  "$id": "https://lait.dev/schema/dto/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "identifiers": {
+    "ActorId": {
+      "description": "Actor id: act_ + 64 lowercase hex chars (incept-event content address)",
+      "pattern": "^act_[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "BodyIdHex": {
+      "description": "Body id: 32 lowercase hex chars (16 canonical bytes)",
+      "pattern": "^[0-9a-f]{32}$",
+      "type": "string"
+    },
+    "DeviceId": {
+      "description": "Device id: 64 lowercase hex chars (an ed25519 public key)",
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "FrontierRootHex": {
+      "description": "Manifest frontier root: 64 lowercase hex chars (32 bytes)",
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "RequestIdHex": {
+      "description": "Request id: 32 lowercase hex chars (16-byte idempotency scope component)",
+      "pattern": "^[0-9a-f]{32}$",
+      "type": "string"
+    },
+    "SchemaId": {
+      "description": "Schema/encoding id: 1-63 lowercase ASCII, [a-z0-9][a-z0-9._-]*",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,62}$",
+      "type": "string"
+    },
+    "SpaceId": {
+      "description": "Space id: ws_ + 26 base32 chars (case-insensitive)",
+      "pattern": "^ws_[0-9A-Va-v]{26}$",
+      "type": "string"
+    },
+    "StationId": {
+      "description": "Station id in display form: 64 lowercase hex chars (the same key bytes as its DeviceId)",
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "WorldId": {
+      "description": "World id: reverse-domain, >=2 labels of [a-z0-9-] with no leading/trailing hyphen, 3-63 chars",
+      "maxLength": 63,
+      "minLength": 3,
+      "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$",
+      "type": "string"
+    }
+  },
+  "title": "LAIT external DTO surface v1"
+}
