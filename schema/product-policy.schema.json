@@ -1,0 +1,509 @@
+{
+  "$defs": {
+    "AssignmentDto": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "One effective scoped capability assignment (Mechanics authority history,\nprojected for `access ls`).",
+      "properties": {
+        "actor": {
+          "description": "The subject actor id.",
+          "type": "string"
+        },
+        "capability": {
+          "description": "The capability name.",
+          "type": "string"
+        },
+        "grant_id": {
+          "description": "The grant id (64-hex) — the revocation handle.",
+          "type": "string"
+        },
+        "resource": {
+          "description": "The exact resource segments (empty = the Space resource).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "world": {
+          "description": "The capability's World namespace.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "grant_id",
+        "actor",
+        "world",
+        "capability",
+        "resource"
+      ],
+      "title": "AssignmentDto",
+      "type": "object"
+    },
+    "DemandTemplate": {
+      "$defs": {
+        "ResourceTemplate": {
+          "description": "A bounded resource placeholder: the Space, or the issue's project.",
+          "oneOf": [
+            {
+              "properties": {
+                "kind": {
+                  "const": "space",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "kind": {
+                  "const": "project",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "The bounded demand template a transition stores. Mirrors\n`Require`/`All`/`Any`; `require` names a capability and a\n[`ResourceTemplate`]. The exact canonical JSON tags are frozen:\n`{\"op\":\"require\",\"capability\":…,\"resource\":{\"kind\":…}}`,\n`{\"op\":\"all\",\"children\":[…]}`, `{\"op\":\"any\",\"children\":[…]}`.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "capability": {
+              "type": "string"
+            },
+            "op": {
+              "const": "require",
+              "type": "string"
+            },
+            "resource": {
+              "$ref": "#/$defs/ResourceTemplate"
+            }
+          },
+          "required": [
+            "op",
+            "capability",
+            "resource"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "children": {
+              "items": {
+                "$ref": "#"
+              },
+              "type": "array"
+            },
+            "op": {
+              "const": "all",
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "children"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "children": {
+              "items": {
+                "$ref": "#"
+              },
+              "type": "array"
+            },
+            "op": {
+              "const": "any",
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "children"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "DemandTemplate"
+    },
+    "RoleBody": {
+      "$defs": {
+        "ScopeKind": {
+          "description": "A role's scope kind.",
+          "enum": [
+            "space",
+            "project"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "The complete canonical role-definition body (excludes its revision id).",
+      "properties": {
+        "capabilities": {
+          "description": "Sorted, unique capability ids from the Issues capability registry.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "description": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "role_id": {
+          "type": "string"
+        },
+        "scope_kind": {
+          "$ref": "#/$defs/ScopeKind"
+        },
+        "tombstone": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "role_id",
+        "scope_kind",
+        "name",
+        "description",
+        "capabilities",
+        "tombstone"
+      ],
+      "title": "RoleBody",
+      "type": "object"
+    },
+    "WorkflowBody": {
+      "$defs": {
+        "DemandTemplate": {
+          "description": "The bounded demand template a transition stores. Mirrors\n`Require`/`All`/`Any`; `require` names a capability and a\n[`ResourceTemplate`]. The exact canonical JSON tags are frozen:\n`{\"op\":\"require\",\"capability\":…,\"resource\":{\"kind\":…}}`,\n`{\"op\":\"all\",\"children\":[…]}`, `{\"op\":\"any\",\"children\":[…]}`.",
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "capability": {
+                  "type": "string"
+                },
+                "op": {
+                  "const": "require",
+                  "type": "string"
+                },
+                "resource": {
+                  "$ref": "#/$defs/ResourceTemplate"
+                }
+              },
+              "required": [
+                "op",
+                "capability",
+                "resource"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "children": {
+                  "items": {
+                    "$ref": "#/$defs/DemandTemplate"
+                  },
+                  "type": "array"
+                },
+                "op": {
+                  "const": "all",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "op",
+                "children"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "children": {
+                  "items": {
+                    "$ref": "#/$defs/DemandTemplate"
+                  },
+                  "type": "array"
+                },
+                "op": {
+                  "const": "any",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "op",
+                "children"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "ResourceTemplate": {
+          "description": "A bounded resource placeholder: the Space, or the issue's project.",
+          "oneOf": [
+            {
+              "properties": {
+                "kind": {
+                  "const": "space",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "kind": {
+                  "const": "project",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "WorkflowState": {
+          "additionalProperties": false,
+          "description": "A workflow state.",
+          "properties": {
+            "category": {
+              "description": "`backlog` | `active` | `done` — the category the work verbs target.",
+              "type": "string"
+            },
+            "color": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "state_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "state_id",
+            "name",
+            "category",
+            "color"
+          ],
+          "type": "object"
+        },
+        "WorkflowTransition": {
+          "additionalProperties": false,
+          "description": "A workflow transition: id, allowed sources (the complete product\nprerequisite in this format), destination, and the demand template its\nauthorization receipt binds.",
+          "properties": {
+            "demand_template": {
+              "$ref": "#/$defs/DemandTemplate"
+            },
+            "destination_state_id": {
+              "type": "string"
+            },
+            "source_state_ids": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "transition_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "transition_id",
+            "source_state_ids",
+            "destination_state_id",
+            "demand_template"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "The complete canonical workflow body (excludes its revision id).",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "states": {
+          "items": {
+            "$ref": "#/$defs/WorkflowState"
+          },
+          "type": "array"
+        },
+        "tombstone": {
+          "type": "boolean"
+        },
+        "transitions": {
+          "items": {
+            "$ref": "#/$defs/WorkflowTransition"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "project_id",
+        "name",
+        "states",
+        "transitions",
+        "tombstone"
+      ],
+      "title": "WorkflowBody",
+      "type": "object"
+    },
+    "WorkflowTransition": {
+      "$defs": {
+        "DemandTemplate": {
+          "description": "The bounded demand template a transition stores. Mirrors\n`Require`/`All`/`Any`; `require` names a capability and a\n[`ResourceTemplate`]. The exact canonical JSON tags are frozen:\n`{\"op\":\"require\",\"capability\":…,\"resource\":{\"kind\":…}}`,\n`{\"op\":\"all\",\"children\":[…]}`, `{\"op\":\"any\",\"children\":[…]}`.",
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "capability": {
+                  "type": "string"
+                },
+                "op": {
+                  "const": "require",
+                  "type": "string"
+                },
+                "resource": {
+                  "$ref": "#/$defs/ResourceTemplate"
+                }
+              },
+              "required": [
+                "op",
+                "capability",
+                "resource"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "children": {
+                  "items": {
+                    "$ref": "#/$defs/DemandTemplate"
+                  },
+                  "type": "array"
+                },
+                "op": {
+                  "const": "all",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "op",
+                "children"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "children": {
+                  "items": {
+                    "$ref": "#/$defs/DemandTemplate"
+                  },
+                  "type": "array"
+                },
+                "op": {
+                  "const": "any",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "op",
+                "children"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "ResourceTemplate": {
+          "description": "A bounded resource placeholder: the Space, or the issue's project.",
+          "oneOf": [
+            {
+              "properties": {
+                "kind": {
+                  "const": "space",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "kind": {
+                  "const": "project",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "A workflow transition: id, allowed sources (the complete product\nprerequisite in this format), destination, and the demand template its\nauthorization receipt binds.",
+      "properties": {
+        "demand_template": {
+          "$ref": "#/$defs/DemandTemplate"
+        },
+        "destination_state_id": {
+          "type": "string"
+        },
+        "source_state_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "transition_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "transition_id",
+        "source_state_ids",
+        "destination_state_id",
+        "demand_template"
+      ],
+      "title": "WorkflowTransition",
+      "type": "object"
+    }
+  },
+  "$id": "https://lait.dev/schema/product-policy/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LAIT Issues policy surface v1"
+}

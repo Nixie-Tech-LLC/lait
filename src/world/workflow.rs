@@ -23,7 +23,7 @@ pub const MAX_WORKFLOW_BODY: usize = 1024 * 1024;
 pub const MAX_PREDECESSORS: usize = 8;
 
 /// A workflow state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowState {
     pub state_id: String,
@@ -34,7 +34,7 @@ pub struct WorkflowState {
 }
 
 /// A bounded resource placeholder: the Space, or the issue's project.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ResourceTemplate {
     Space,
@@ -46,7 +46,7 @@ pub enum ResourceTemplate {
 /// [`ResourceTemplate`]. The exact canonical JSON tags are frozen:
 /// `{"op":"require","capability":…,"resource":{"kind":…}}`,
 /// `{"op":"all","children":[…]}`, `{"op":"any","children":[…]}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DemandTemplate {
     Require {
@@ -111,7 +111,7 @@ impl DemandTemplate {
 /// A workflow transition: id, allowed sources (the complete product
 /// prerequisite in this format), destination, and the demand template its
 /// authorization receipt binds.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowTransition {
     pub transition_id: String,
@@ -121,7 +121,7 @@ pub struct WorkflowTransition {
 }
 
 /// The complete canonical workflow body (excludes its revision id).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowBody {
     pub project_id: String,

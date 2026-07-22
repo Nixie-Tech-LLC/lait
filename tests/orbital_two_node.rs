@@ -270,6 +270,34 @@ fn two_orbital_daemons_join_admit_and_converge_over_the_socket() {
         "the joiner's comment never converged back to the founder"
     );
 
+    // Inbox reconstruction (plan 04): the founder assigns itself by starting
+    // the issue, so the JOINER's converged comment is addressed to it — the
+    // inbox is a pure projection over the synced state, rebuilt from query.
+    let resp = req(
+        &client,
+        &founder_home,
+        Request::IssueStart {
+            reff: "CORE-1".into(),
+        },
+    );
+    assert!(!matches!(resp, Response::Error { .. }), "{resp:?}");
+    let inboxed = poll_until(Duration::from_secs(10), || {
+        match req(&client, &founder_home, Request::Inbox { clear: false }) {
+            Response::Inbox { entries, .. }
+                if entries
+                    .iter()
+                    .any(|e| e.kind == "comment" && e.detail == "joined over the socket") =>
+            {
+                Some(())
+            }
+            _ => None,
+        }
+    });
+    assert!(
+        inboxed.is_some(),
+        "the joiner's comment never surfaced in the founder's inbox projection"
+    );
+
     // Teardown.
     let _ = req(&client, &joiner_home, Request::Stop);
     let _ = req(&client, &founder_home, Request::Stop);

@@ -229,7 +229,7 @@ jobs:
           - job: orbital-authority
             filter: "binary(authority_history) + binary(authority_checkpoint) + binary(world_policy) + binary(ceremony_frontier_isolation)"
           - job: orbital-formats
-            filter: "binary(dto_schema) + binary(coordinates_fixtures) + binary(contact_fixtures) + binary(beacon_presence_fixtures) + binary(manifest_fixtures) + binary(transaction_marker_fixtures) + binary(canonical_ids) + binary(canonical_store) + binary(algebra_fixtures)"
+            filter: "binary(dto_schema) + binary(product_schema) + binary(coordinates_fixtures) + binary(contact_fixtures) + binary(beacon_presence_fixtures) + binary(manifest_fixtures) + binary(transaction_marker_fixtures) + binary(canonical_ids) + binary(canonical_store) + binary(algebra_fixtures)"
           - job: orbital-faults
             filter: "binary(journal_faults) + binary(journal_child_crash) + binary(manifest_atomicity) + binary(orbital_catalog) + binary(concurrent_heads)"
           - job: orbital-contact-real

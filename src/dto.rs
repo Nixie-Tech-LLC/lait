@@ -16,6 +16,40 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{ActorId, DeviceId, DocId, LabelId, ProjectId, SpaceId};
 
+/// Generate the committed JSON Schema 2020-12 bundle for the product policy
+/// surface — every role/access/workflow definition shape plan 04 names —
+/// deterministically (used by the drift gate in `tests/product_schema.rs` and
+/// the language-neutral validator in `ci/validate-dto-schema.py`).
+pub fn product_policy_schema_bundle() -> serde_json::Value {
+    use schemars::generate::SchemaSettings;
+    let settings = SchemaSettings::draft2020_12();
+    let generator = settings.into_generator();
+    let mut defs = serde_json::Map::new();
+    macro_rules! add {
+        ($ty:ty, $name:literal) => {
+            let schema = generator.clone().into_root_schema_for::<$ty>();
+            defs.insert(
+                $name.to_string(),
+                serde_json::to_value(schema).expect("schema json"),
+            );
+        };
+    }
+    add!(crate::world::roles::RoleBody, "RoleBody");
+    add!(crate::world::workflow::WorkflowBody, "WorkflowBody");
+    add!(
+        crate::world::workflow::WorkflowTransition,
+        "WorkflowTransition"
+    );
+    add!(crate::world::workflow::DemandTemplate, "DemandTemplate");
+    add!(AssignmentDto, "AssignmentDto");
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://lait.dev/schema/product-policy/v1",
+        "title": "LAIT Issues policy surface v1",
+        "$defs": defs,
+    })
+}
+
 /// Schema version gate. Every top-level DTO carries it so a reader
 /// can detect drift; bump on any additive change.
 ///
@@ -513,7 +547,8 @@ pub struct MemberLogEntry {
 
 /// One effective scoped capability assignment (Mechanics authority history,
 /// projected for `access ls`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AssignmentDto {
     /// The grant id (64-hex) — the revocation handle.
     pub grant_id: String,

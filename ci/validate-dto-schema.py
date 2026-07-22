@@ -20,13 +20,33 @@ from pathlib import Path
 import jsonschema
 
 SCHEMA_DIR = Path(__file__).resolve().parent.parent / "crates" / "runtime" / "schema"
+PRODUCT_DIR = Path(__file__).resolve().parent.parent / "schema"
 
 
 def main() -> int:
-    bundle = json.loads((SCHEMA_DIR / "dto.schema.json").read_text(encoding="utf-8"))
-    examples = json.loads((SCHEMA_DIR / "dto.examples.json").read_text(encoding="utf-8"))
-
     failures = []
+    counts = []
+    for name, schema_file, examples_file in [
+        ("runtime", SCHEMA_DIR / "dto.schema.json", SCHEMA_DIR / "dto.examples.json"),
+        (
+            "product",
+            PRODUCT_DIR / "product-policy.schema.json",
+            PRODUCT_DIR / "product-policy.examples.json",
+        ),
+    ]:
+        bundle = json.loads(schema_file.read_text(encoding="utf-8"))
+        examples = json.loads(examples_file.read_text(encoding="utf-8"))
+        check_bundle(name, bundle, examples, failures, counts)
+
+    if failures:
+        for f in failures:
+            print(f"error: {f}", file=sys.stderr)
+        return 1
+    print("dto schemas OK — " + "; ".join(counts))
+    return 0
+
+
+def check_bundle(name, bundle, examples, failures, counts):
 
     def validator_for(def_name: str) -> jsonschema.Draft202012Validator:
         schema = dict(bundle["$defs"][def_name])
@@ -48,26 +68,22 @@ def main() -> int:
                 f"negative {ex['def']} ({ex['reason']}) was NOT rejected by the schema"
             )
 
-    for name, ident in bundle["identifiers"].items():
+    idents = bundle.get("identifiers", {})
+    for iname, ident in idents.items():
         pattern = ident.get("pattern", "")
         if not (pattern.startswith("^") and pattern.endswith("$")):
-            failures.append(f"identifier {name} pattern is not anchored: {pattern!r}")
+            failures.append(f"identifier {iname} pattern is not anchored: {pattern!r}")
             continue
         try:
             re.compile(pattern)
         except re.error as e:
-            failures.append(f"identifier {name} pattern does not compile: {e}")
+            failures.append(f"identifier {iname} pattern does not compile: {e}")
 
-    if failures:
-        for f in failures:
-            print(f"error: {f}", file=sys.stderr)
-        return 1
-    print(
-        f"dto schema OK — {len(examples['positive'])} positives, "
+    counts.append(
+        f"{name}: {len(examples['positive'])} positives, "
         f"{len(examples['negative'])} negatives, "
-        f"{len(bundle['identifiers'])} identifier grammars"
+        f"{len(idents)} identifier grammars"
     )
-    return 0
 
 
 if __name__ == "__main__":
