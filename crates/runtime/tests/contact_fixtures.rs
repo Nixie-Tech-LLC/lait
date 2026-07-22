@@ -40,11 +40,13 @@ fn body_key() -> BodyKey {
 
 fn hello() -> ContactHello {
     ContactHello::sign(
-        1,
+        2,
         space_bytes(),
         station_of(&RESPONDER_SEED).key_bytes(),
         [3u8; 32],
         contact(),
+        0,
+        [0u8; 32],
         &INITIATOR_SEED,
     )
     .unwrap()
@@ -67,6 +69,8 @@ fn an_unsupported_contact_protocol_is_refused() {
         station_of(&RESPONDER_SEED).key_bytes(),
         [3u8; 32],
         contact(),
+        0,
+        [0u8; 32],
         &INITIATOR_SEED,
     )
     .unwrap();
@@ -103,11 +107,13 @@ fn hello_substitution_and_replay_are_rejected() {
 fn ack_binds_the_exact_hello_and_a_fresh_nonce() {
     let h1 = hello();
     let h2 = ContactHello::sign(
-        1,
+        2,
         space_bytes(),
         station_of(&RESPONDER_SEED).key_bytes(),
         [30u8; 32],
         contact(),
+        0,
+        [0u8; 32],
         &INITIATOR_SEED,
     )
     .unwrap();
@@ -732,4 +738,87 @@ fn manifest_requests_must_reference_the_offer_in_range() {
         ),
         Err(abort::WRONG_STATE)
     );
+}
+
+// ---------------------------------------------------------------------------
+// Holdings declaration (O(changed) Contact)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_signed_hello_binds_the_holdings_declaration() {
+    use runtime::contact::{encode_holdings, holdings_digest};
+    let held = vec![(body_key(), [7u8; 32]), (body_key(), [5u8; 32])];
+    let bytes = encode_holdings(&held);
+    let digest = holdings_digest(&bytes);
+    let h = ContactHello::sign(
+        2,
+        space_bytes(),
+        station_of(&RESPONDER_SEED).key_bytes(),
+        [3u8; 32],
+        contact(),
+        held.len() as u32,
+        digest,
+        &INITIATOR_SEED,
+    )
+    .unwrap();
+    h.verify(&space_bytes(), &station_of(&INITIATOR_SEED))
+        .unwrap();
+    // Tampering with either bound field breaks the signature.
+    let mut bad = h.clone();
+    bad.holdings_count = 1;
+    assert_eq!(
+        bad.verify(&space_bytes(), &station_of(&INITIATOR_SEED)),
+        Err(ContactWireError::BadSignature)
+    );
+    let mut bad = h.clone();
+    bad.holdings_digest[0] ^= 0xff;
+    assert_eq!(
+        bad.verify(&space_bytes(), &station_of(&INITIATOR_SEED)),
+        Err(ContactWireError::BadSignature)
+    );
+}
+
+#[test]
+fn holdings_encoding_is_canonical_sorted_and_deduplicated() {
+    use runtime::contact::{decode_holdings, encode_holdings};
+    let a = vec![(body_key(), [7u8; 32]), (body_key(), [5u8; 32])];
+    let b = vec![
+        (body_key(), [5u8; 32]),
+        (body_key(), [7u8; 32]),
+        (body_key(), [5u8; 32]),
+    ];
+    assert_eq!(
+        encode_holdings(&a),
+        encode_holdings(&b),
+        "order and duplicates never change the canonical bytes"
+    );
+    let decoded = decode_holdings(&encode_holdings(&a)).unwrap();
+    assert_eq!(decoded.len(), 2);
+}
+
+#[test]
+fn holdings_frames_roundtrip_and_stay_out_of_the_transfer_plane() {
+    let chunk = ContactFrame::HoldingsChunk {
+        index: 0,
+        bytes: vec![1, 2, 3],
+    };
+    let end = ContactFrame::HoldingsEnd {
+        count: 2,
+        digest: [9u8; 32],
+    };
+    for f in [chunk, end] {
+        let enc = f.encode(&contact());
+        let (c, back) = ContactFrame::decode(&enc).unwrap();
+        assert_eq!(c, contact());
+        assert_eq!(back, f);
+    }
+    // The initiator's transfer state machine refuses holdings frames — they
+    // flow initiator -> accepter only, before the Ack.
+    let mut rx = runtime::InitiatorReceiver::new(contact());
+    let enc = ContactFrame::HoldingsChunk {
+        index: 0,
+        bytes: vec![1],
+    }
+    .encode(&contact());
+    assert!(rx.on_frame(&enc).is_err());
 }

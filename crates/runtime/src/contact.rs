@@ -36,7 +36,15 @@ pub const CONTACT_ALPN: &[u8] = b"lait/contact/1";
 /// The only Contact protocol version this build speaks. There is no
 /// mixed-version window: an unknown version is refused by name, never
 /// negotiated (clean-break formats).
-pub const CONTACT_PROTOCOL: u16 = 1;
+pub const CONTACT_PROTOCOL: u16 = 2;
+
+/// Domain for the initiator's holdings declaration digest (bound into the
+/// SIGNED hello, so the declaration cannot be altered in transit).
+const HOLDINGS_DOMAIN: &[u8] = b"lait/contact-holdings/1";
+
+/// Hard bound on a declared holdings encoding. Generous: ~64 bytes per head
+/// puts a million declared heads well inside it.
+pub const MAX_HOLDINGS_BYTES: usize = 64 * 1024 * 1024;
 /// Hello signing domain.
 pub const HELLO_DOMAIN: &[u8] = b"lait/contact/1/hello";
 /// HelloAck signing domain.
@@ -152,6 +160,17 @@ pub struct ContactHello {
     pub initiator_transport: [u8; 32],
     pub nonce: [u8; 32],
     pub contact: ContactId,
+    /// How many `(key, transaction commitment)` heads the initiator DECLARES
+    /// it already holds (0 = full transfer). The declaration itself follows
+    /// the hello as `HoldingsChunk`/`HoldingsEnd` frames; the accepter serves
+    /// only the difference (O(changed) Contact). A false declaration can only
+    /// starve the claimant: adoption is still judged whole by the receiver's
+    /// root-completeness rule.
+    pub holdings_count: u32,
+    /// BLAKE3 domain digest of the canonical holdings encoding (zeros when
+    /// `holdings_count` is 0). Signed, so the streamed declaration is
+    /// tamper-evident.
+    pub holdings_digest: [u8; 32],
     pub signature_algorithm: u8,
     #[serde(with = "serde_byte_array")]
     pub signature: [u8; 64],
@@ -212,6 +231,8 @@ impl ContactHello {
         initiator_transport: &[u8; 32],
         nonce: &[u8; 32],
         contact: &ContactId,
+        holdings_count: u32,
+        holdings_digest: &[u8; 32],
     ) -> Vec<u8> {
         let body = postcard::to_stdvec(&(
             protocol,
@@ -221,6 +242,8 @@ impl ContactHello {
             initiator_transport,
             nonce,
             contact,
+            holdings_count,
+            holdings_digest,
         ))
         .expect("postcard hello body");
         length_framed(HELLO_DOMAIN, &body)
@@ -228,12 +251,15 @@ impl ContactHello {
 
     /// Sign a Hello from the initiator's device seed (the seed's key is both
     /// the Station and transport identity — a peer is its key).
+    #[allow(clippy::too_many_arguments)]
     pub fn sign(
         protocol: u16,
         space: [u8; 29],
         responder_station: [u8; 32],
         nonce: [u8; 32],
         contact: ContactId,
+        holdings_count: u32,
+        holdings_digest: [u8; 32],
         initiator_seed: &[u8; 32],
     ) -> Option<Self> {
         let station = mechanics::crypto::device_from_seed(initiator_seed).key_bytes()?;
@@ -245,6 +271,8 @@ impl ContactHello {
             &station,
             &nonce,
             &contact,
+            holdings_count,
+            &holdings_digest,
         );
         let signature = mechanics::crypto::sign_detached(initiator_seed, &preimage);
         Some(Self {
@@ -255,6 +283,8 @@ impl ContactHello {
             initiator_transport: station,
             nonce,
             contact,
+            holdings_count,
+            holdings_digest,
             signature_algorithm: SIG_ALG_ED25519,
             signature,
         })
@@ -280,6 +310,8 @@ impl ContactHello {
                 &self.initiator_transport,
                 &self.nonce,
                 &self.contact,
+                self.holdings_count,
+                &self.holdings_digest,
             ),
         )
     }
@@ -314,6 +346,8 @@ impl ContactHello {
             &self.initiator_transport,
             &self.nonce,
             &self.contact,
+            self.holdings_count,
+            &self.holdings_digest,
         );
         if !mechanics::crypto::verify_detached(&self.initiator_station, &preimage, &self.signature)
         {
@@ -460,6 +494,18 @@ pub enum ContactFrame {
     Abort {
         code: u16,
     },
+    /// One chunk of the initiator's holdings declaration (initiator → accepter,
+    /// between Hello and Ack). Integrity rides the SIGNED hello digest.
+    HoldingsChunk {
+        index: u32,
+        bytes: Vec<u8>,
+    },
+    /// Terminates the holdings declaration; must match the signed hello's
+    /// count and digest exactly.
+    HoldingsEnd {
+        count: u32,
+        digest: [u8; 32],
+    },
 }
 
 impl ContactFrame {
@@ -478,6 +524,8 @@ impl ContactFrame {
             ContactFrame::TransferEnd { .. } => 10,
             ContactFrame::TransferAck { .. } => 11,
             ContactFrame::Abort { .. } => 12,
+            ContactFrame::HoldingsChunk { .. } => 13,
+            ContactFrame::HoldingsEnd { .. } => 14,
         }
     }
 
@@ -503,7 +551,7 @@ impl ContactFrame {
             return Err(ContactWireError::NonCanonical);
         }
         let tag = bytes[0];
-        if !(1..=12).contains(&tag) {
+        if !(1..=14).contains(&tag) {
             return Err(ContactWireError::UnknownTag(tag));
         }
         let contact = ContactId::from_bytes(bytes[1..17].try_into().expect("16 bytes"));
@@ -514,6 +562,32 @@ impl ContactFrame {
         let frame: ContactFrame = decode_canonical(&enc)?;
         Ok((contact, frame))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Holdings declaration (O(changed) Contact)
+// ---------------------------------------------------------------------------
+
+/// Canonically encode a holdings declaration: `(key, transaction commitment)`
+/// pairs, sorted and deduplicated, postcard-encoded.
+pub fn encode_holdings(held: &[(BodyKey, [u8; 32])]) -> Vec<u8> {
+    let mut sorted: Vec<&(BodyKey, [u8; 32])> = held.iter().collect();
+    sorted.sort();
+    sorted.dedup();
+    postcard::to_stdvec(&sorted).expect("postcard holdings")
+}
+
+/// The signed-hello digest over a canonical holdings encoding.
+pub fn holdings_digest(bytes: &[u8]) -> [u8; 32] {
+    domain_hash(HOLDINGS_DOMAIN, bytes)
+}
+
+/// Decode a holdings declaration (canonical, bounded).
+pub fn decode_holdings(bytes: &[u8]) -> Result<Vec<(BodyKey, [u8; 32])>, ContactWireError> {
+    if bytes.len() > MAX_HOLDINGS_BYTES {
+        return Err(ContactWireError::FrameTooLarge);
+    }
+    decode_canonical(bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -660,6 +734,11 @@ impl InitiatorReceiver {
             self.transcript.update(raw);
         }
         match frame {
+            // Holdings frames flow initiator -> accepter only, before the
+            // Ack; receiving one here is a protocol violation.
+            ContactFrame::HoldingsChunk { .. } | ContactFrame::HoldingsEnd { .. } => {
+                Err(self.abort(abort::BAD_REQUEST))
+            }
             ContactFrame::Abort { code } => {
                 self.abort(0);
                 Ok(Progress::PeerAborted(code))

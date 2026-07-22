@@ -332,12 +332,21 @@ fn two_stations_converge_through_the_public_contact_api() {
     assert_eq!(read_kv(&station_b, "greeting"), b"hello");
     assert_eq!(read_kv(&station_b, "farewell"), b"bye");
 
-    // An unchanged second Contact converges nothing new.
+    // An unchanged second Contact converges nothing new — and under the
+    // O(changed) protocol it also SHIPS nothing new: B's signed holdings
+    // declaration covers every head, so the accepter serves only the
+    // manifest advertisement and the idle pull is a fraction of the first.
     let again = station_b
         .contact(&station_id(&STATION_A_SEED), ContactOptions)
         .unwrap();
     assert_eq!(again.convergence.accepted, 0);
-    assert!(again.convergence.unchanged >= 1);
+    assert!(!again.convergence.advanced());
+    assert!(
+        again.bytes_moved < outcome.bytes_moved,
+        "idle delta pull ({}) must move fewer bytes than the first sync ({})",
+        again.bytes_moved,
+        outcome.bytes_moved
+    );
 
     // Restart B: incorporated material is durable, and a further Contact is
     // still unchanged.

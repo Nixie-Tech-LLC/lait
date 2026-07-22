@@ -2067,11 +2067,50 @@ impl Replica {
         Ok((root.encode(), pages.iter().map(|p| p.encode()).collect()))
     }
 
+    /// The complete per-head holdings summary: every `(key, transaction
+    /// commitment)` pair this Replica's index carries — exactly the vocabulary
+    /// the Manifest advertises (one entry per constituent head), so a peer can
+    /// declare "I already hold these" and be served only the difference. The
+    /// summary commits to nothing on its own: a receiver's adoption is still
+    /// judged by the full completeness rule, so a wrong or lying summary can
+    /// only cost bandwidth or starve the claimant, never corrupt state.
+    pub fn head_commitments(&self) -> Vec<(BodyKey, [u8; 32])> {
+        let mut out = Vec::new();
+        for (key, record) in &self.bodies {
+            // OPAQUE heads are deliberately NOT declared: upgrading retained
+            // material to interpreted happens through the incorporation path
+            // (re-receipt once the schema and key epoch are available), so a
+            // declaration that suppressed re-transfer would freeze a joiner's
+            // pre-admission material opaque forever.
+            if !record.interpreted {
+                continue;
+            }
+            for head in &record.heads {
+                out.push((key.clone(), head.tx_commitment));
+            }
+        }
+        out
+    }
+
     /// Export this Replica's current material for a peer: for each Body, its
     /// **retained** signed transaction record and protected payload bytes —
     /// byte-identical to what was committed or incorporated, grouped by
     /// transaction. Opaque Bodies forward their retained bytes unchanged.
     pub fn export_material(&self) -> Result<ExportedMaterial, ReplicaCommitError> {
+        self.export_material_excluding(&std::collections::BTreeSet::new())
+    }
+
+    /// [`Replica::export_material`], omitting every head whose `(key,
+    /// transaction commitment)` the peer DECLARED it already holds — the
+    /// O(changed) Contact transfer. The advertised Manifest still names every
+    /// head; the receiver's root-completeness validation reconstructs omitted
+    /// entries from its own byte-equivalent local material (the same rule that
+    /// admits any partial transfer), so omission is pure bandwidth: a stale or
+    /// false declaration fails the CLAIMANT's adoption, nothing else.
+    pub fn export_material_excluding(
+        &self,
+        held: &std::collections::BTreeSet<(BodyKey, [u8; 32])>,
+    ) -> Result<ExportedMaterial, ReplicaCommitError> {
         type Grouped = BTreeMap<[u8; 32], (BodyTransaction, Vec<(BodyKey, Vec<u8>)>)>;
         let mut by_tx: Grouped = BTreeMap::new();
         for (key, record) in &self.bodies {
@@ -2081,6 +2120,9 @@ impl Replica {
             // root that names material it cannot supply, which every peer
             // correctly rejects whole.
             for head in &record.heads {
+                if held.contains(&(key.clone(), head.tx_commitment)) {
+                    continue;
+                }
                 let raw = self
                     .raw_material
                     .get(key)

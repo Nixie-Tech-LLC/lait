@@ -444,12 +444,28 @@ async fn initiate(
     let contact = ContactId::mint();
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|e| ContactError::Transfer(e.to_string()))?;
+    // The O(changed) declaration: every head this replica already holds, so
+    // the accepter serves only the difference. Bound into the SIGNED hello
+    // (count + digest) and streamed as chunked frames right after it.
+    let held = ctx
+        .core
+        .with_replica(|replica| Ok(replica.head_commitments()))
+        .map_err(|e: replica::ReplicaCommitError| ContactError::Transfer(e.to_string()))?;
+    let holdings_bytes = crate::contact::encode_holdings(&held);
+    let holdings_count = held.len() as u32;
+    let holdings_digest = if held.is_empty() {
+        [0u8; 32]
+    } else {
+        crate::contact::holdings_digest(&holdings_bytes)
+    };
     let hello = ContactHello::sign(
         CONTACT_PROTOCOL,
         ctx.space_bytes,
         responder.key_bytes(),
         nonce,
         contact,
+        holdings_count,
+        holdings_digest,
         &ctx.options.station_seed,
     )
     .ok_or_else(|| ContactError::Transfer("sign hello".into()))?;
@@ -457,6 +473,31 @@ async fn initiate(
         .await
         .map_err(|_| ContactError::Unreachable)?
         .map_err(|e| ContactError::Transfer(e.to_string()))?;
+    let mut holdings_sent = 0u64;
+    if holdings_count > 0 {
+        for (index, chunk) in holdings_bytes.chunks(crate::contact::MAX_CHUNK).enumerate() {
+            let frame = ContactFrame::HoldingsChunk {
+                index: index as u32,
+                bytes: chunk.to_vec(),
+            }
+            .encode(&contact);
+            holdings_sent += frame.len() as u64;
+            step(deadline, progress, stream.send(&frame))
+                .await
+                .map_err(|_| ContactError::Unreachable)?
+                .map_err(|e| ContactError::Transfer(e.to_string()))?;
+        }
+        let end = ContactFrame::HoldingsEnd {
+            count: holdings_count,
+            digest: holdings_digest,
+        }
+        .encode(&contact);
+        holdings_sent += end.len() as u64;
+        step(deadline, progress, stream.send(&end))
+            .await
+            .map_err(|_| ContactError::Unreachable)?
+            .map_err(|e| ContactError::Transfer(e.to_string()))?;
+    }
 
     let ack_bytes = step(deadline, progress, stream.recv())
         .await
@@ -471,7 +512,7 @@ async fn initiate(
         .map_err(|e| ContactError::Transfer(e.to_string()))?;
 
     let mut receiver = InitiatorReceiver::new(contact);
-    let mut bytes_moved = (hello.encode().len() + ack_bytes.len()) as u64;
+    let mut bytes_moved = (hello.encode().len() + ack_bytes.len()) as u64 + holdings_sent;
     loop {
         let frame = step(deadline, progress, stream.recv())
             .await
@@ -542,6 +583,60 @@ async fn serve_contact(
         let mut registry = ctx.registry.lock().unwrap_or_else(|p| p.into_inner());
         let _ = registry.note_reciprocable(&transport_peer, now_ms(), lease_ms);
     }
+    // Receive the holdings declaration the signed hello committed to; a
+    // digest/count mismatch is a protocol violation, and a wrong (or lying)
+    // declaration can only starve the initiator — the transfer we build from
+    // it still advertises the FULL manifest, and adoption is judged whole.
+    let mut held: std::collections::BTreeSet<(replica::BodyKey, [u8; 32])> =
+        std::collections::BTreeSet::new();
+    if hello.holdings_count > 0 {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut next_index = 0u32;
+        loop {
+            let frame_bytes = step(deadline, progress, stream.recv())
+                .await
+                .map_err(|_| ContactError::Unreachable)?
+                .map_err(|e| ContactError::Transfer(e.to_string()))?
+                .ok_or(ContactError::Unreachable)?;
+            let (frame_contact, frame) = ContactFrame::decode(&frame_bytes)
+                .map_err(|e| ContactError::Transfer(format!("holdings frame: {e:?}")))?;
+            if frame_contact != hello.contact {
+                return Err(ContactError::Transfer("holdings contact mismatch".into()));
+            }
+            match frame {
+                ContactFrame::HoldingsChunk { index, bytes } => {
+                    if index != next_index {
+                        return Err(ContactError::Transfer("holdings chunk order".into()));
+                    }
+                    next_index += 1;
+                    if buf.len() + bytes.len() > crate::contact::MAX_HOLDINGS_BYTES {
+                        return Err(ContactError::Transfer("holdings too large".into()));
+                    }
+                    buf.extend_from_slice(&bytes);
+                }
+                ContactFrame::HoldingsEnd { count, digest } => {
+                    if count != hello.holdings_count
+                        || digest != hello.holdings_digest
+                        || crate::contact::holdings_digest(&buf) != hello.holdings_digest
+                    {
+                        return Err(ContactError::Transfer(
+                            "holdings do not match the signed hello".into(),
+                        ));
+                    }
+                    let decoded = crate::contact::decode_holdings(&buf)
+                        .map_err(|e| ContactError::Transfer(format!("holdings: {e:?}")))?;
+                    if decoded.len() != hello.holdings_count as usize {
+                        return Err(ContactError::Transfer(
+                            "holdings count does not match the declaration".into(),
+                        ));
+                    }
+                    held = decoded.into_iter().collect();
+                    break;
+                }
+                _ => return Err(ContactError::Transfer("unexpected pre-ack frame".into())),
+            }
+        }
+    }
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|e| ContactError::Transfer(e.to_string()))?;
     let ack = ContactHelloAck::sign(&hello, nonce, &ctx.options.station_seed)
@@ -571,7 +666,7 @@ async fn serve_contact(
                     signer: &signer,
                     authority_frontier: frontier.clone(),
                 };
-                let material = replica.export_material()?;
+                let material = replica.export_material_excluding(&held)?;
                 let manifest = replica.export_manifest(&commit_ctx)?;
                 Ok((material, manifest))
             })

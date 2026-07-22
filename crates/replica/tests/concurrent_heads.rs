@@ -193,6 +193,37 @@ fn commit_register(
     )
 }
 
+/// Stage a replica's export as untrusted Contact material, omitting heads the
+/// peer declared it holds (the O(changed) delta path; empty = full transfer).
+fn stage_excluding(
+    r: &Replica,
+    seed: &'static [u8; 32],
+    held: &std::collections::BTreeSet<(BodyKey, [u8; 32])>,
+) -> StagedContactMaterial {
+    let (space, signer) = ctx_for(seed);
+    let ctx = CommitContext {
+        space: &space,
+        signer: &signer,
+        authority_frontier: authority_frontier(),
+    };
+    let material = r.export_material_excluding(held).unwrap();
+    let (root, pages) = r.export_manifest(&ctx).unwrap();
+    let mut authority_records = Vec::new();
+    let mut bodies = Vec::new();
+    for (tx, payloads) in &material {
+        authority_records.push(tx.encode());
+        for (key, envelope) in payloads {
+            bodies.push((tx.id(), key.clone(), envelope.clone()));
+        }
+    }
+    StagedContactMaterial {
+        authority_records,
+        manifest_root_bytes: root,
+        manifest_pages: pages,
+        bodies,
+    }
+}
+
 /// Stage a replica's full export as untrusted Contact material.
 fn stage(r: &Replica, seed: &'static [u8; 32]) -> StagedContactMaterial {
     let (space, signer) = ctx_for(seed);
@@ -320,4 +351,132 @@ fn a_local_commit_collapses_the_head_set() {
     assert_eq!(register_of(&c, "froma").as_deref(), Some("alpha"));
     assert_eq!(register_of(&c, "fromb").as_deref(), Some("beta"));
     assert_eq!(register_of(&c, "sealed").as_deref(), Some("yes"));
+}
+
+/// Validate + incorporate an explicit staging into `into` (the delta-path
+/// twin of `pull`, which always stages the full export).
+fn pull_staged(
+    into: &mut Replica,
+    into_seed: &'static [u8; 32],
+    staged: &StagedContactMaterial,
+) -> Result<replica::ConvergenceOutcome, replica::ReplicaCommitError> {
+    let (space, signer) = ctx_for(into_seed);
+    let ctx = CommitContext {
+        space: &space,
+        signer: &signer,
+        authority_frontier: authority_frontier(),
+    };
+    let mut incorporator = AcceptingIncorporator;
+    let bundle = into.validate_contact(staged, &AnyWriter, &mut incorporator)?;
+    into.incorporate_bundle(&ctx, bundle, &AnyWriter)
+}
+
+fn holdings(r: &Replica) -> std::collections::BTreeSet<(BodyKey, [u8; 32])> {
+    r.head_commitments().into_iter().collect()
+}
+
+fn second_body() -> BodyKey {
+    BodyKey::new(world(), BodyId::from_bytes([10u8; 16]))
+}
+
+#[test]
+fn a_delta_pull_ships_only_missing_heads_and_converges() {
+    // B fully syncs A, then A advances (a new write on the shared body AND a
+    // brand-new body). B's next pull declares its holdings: the staging must
+    // carry ONLY the new material, and adoption must land the identical state
+    // a full transfer would.
+    let mut a = keyed_replica();
+    let mut b = keyed_replica();
+    commit_register(&mut a, &SEED_A, [11u8; 16], "froma", "alpha").unwrap();
+    pull(&mut b, &SEED_B, &a, &SEED_A);
+    assert_eq!(register_of(&b, "froma").as_deref(), Some("alpha"));
+
+    let (space, signer) = ctx_for(&SEED_A);
+    let ctx = CommitContext {
+        space: &space,
+        signer: &signer,
+        authority_frontier: authority_frontier(),
+    };
+    a.commit_action(
+        &ctx,
+        &CommitAuthorization {
+            actor: "actor",
+            parent_manifest_root: [0u8; 32],
+            demand: test_demand(),
+            intent_digest: [7u8; 32],
+            authorizer: &test_auth(),
+        },
+        &world(),
+        &mechanics::crypto::device_from_seed(&SEED_A),
+        &[13u8; 16],
+        &[7u8; 32],
+        vec![],
+        vec![],
+        "note",
+        &[(
+            second_body(),
+            BodyOp::RegisterSet {
+                path: "fresh".into(),
+                value: b"new-body".to_vec(),
+            },
+        )],
+        &[(second_body(), binding())],
+    )
+    .unwrap();
+
+    let full = stage(&a, &SEED_A);
+    let delta = stage_excluding(&a, &SEED_A, &holdings(&b));
+    assert!(
+        delta.bodies.len() < full.bodies.len(),
+        "delta ({}) must ship fewer heads than full ({})",
+        delta.bodies.len(),
+        full.bodies.len()
+    );
+    // Exactly ONE new head: the fresh body. The shared body's head commitment
+    // is unchanged and B declared it, so it ships nothing.
+    assert_eq!(delta.bodies.len(), 1);
+    assert_eq!(full.bodies.len(), 2);
+
+    let outcome = pull_staged(&mut b, &SEED_B, &delta).unwrap();
+    assert!(outcome.advanced(), "the delta adopts");
+    assert_eq!(register_of(&b, "froma").as_deref(), Some("alpha"));
+    let fresh = b
+        .read_collaborative(&second_body())
+        .and_then(|v| v.registers.get("fresh").cloned());
+    assert_eq!(fresh.as_deref(), Some(b"new-body".as_slice()));
+
+    // Steady state: a re-pull with up-to-date holdings ships NOTHING and
+    // adopts nothing new — the O(changed) idle pump.
+    let idle = stage_excluding(&a, &SEED_A, &holdings(&b));
+    assert!(idle.bodies.is_empty(), "idle delta ships no bodies");
+    let outcome = pull_staged(&mut b, &SEED_B, &idle).unwrap();
+    assert!(!outcome.advanced(), "an empty delta changes nothing");
+}
+
+#[test]
+fn a_false_holdings_declaration_starves_only_the_claimant() {
+    // B claims to hold A's head without having it. The server honestly omits
+    // it; B's own root-completeness validation then rejects the WHOLE root
+    // ("neither held nor transferred") and B adopts nothing — a lying (or
+    // stale) declaration cannot corrupt state, it can only stall the liar.
+    let mut a = keyed_replica();
+    let mut b = keyed_replica();
+    commit_register(&mut a, &SEED_A, [14u8; 16], "froma", "alpha").unwrap();
+
+    let lie: std::collections::BTreeSet<(BodyKey, [u8; 32])> = holdings(&a).into_iter().collect();
+    let starved = stage_excluding(&a, &SEED_A, &lie);
+    assert!(starved.bodies.is_empty());
+    let err = pull_staged(&mut b, &SEED_B, &starved).unwrap_err();
+    assert!(
+        format!("{err:?}").contains("neither held nor transferred"),
+        "whole-root rejection, got {err:?}"
+    );
+    assert!(
+        register_of(&b, "froma").is_none(),
+        "nothing was partially adopted"
+    );
+
+    // A truthful retry (no exclusions) recovers completely.
+    pull(&mut b, &SEED_B, &a, &SEED_A);
+    assert_eq!(register_of(&b, "froma").as_deref(), Some("alpha"));
 }
