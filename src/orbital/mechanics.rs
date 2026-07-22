@@ -171,20 +171,14 @@ impl Inner {
     /// Unseal every authorized epoch key addressed to this device, bound to
     /// the signed mint's commitment.
     pub(super) fn refresh_keyring(&mut self) {
-        for e in self.acl().epochs() {
-            if self.keyring.contains_key(&e.id) {
-                continue;
-            }
-            if let Some(sealed) = self.ledger.sealed_for(&e.id, &self.me) {
-                if let Some(raw) = crypto::open_sealed(&self.seed, &self.me, &sealed) {
-                    if let Ok(key) = <SpaceKey>::try_from(raw.as_slice()) {
-                        if *blake3::hash(&key).as_bytes() == e.key_commit {
-                            self.keyring.insert(e.id, key);
-                        }
-                    }
-                }
-            }
-        }
+        let Inner {
+            ledger,
+            keyring,
+            seed,
+            me,
+            ..
+        } = self;
+        refresh_keyring_into(ledger, keyring, seed, me);
     }
 
     /// Whether this device's actor currently holds admin standing.
@@ -313,46 +307,14 @@ impl Inner {
     /// to hold the active key (so it can carry the plaintext into the new
     /// envelopes) and admin standing (mint authorization).
     pub(super) fn rotate_key(&mut self) -> Result<()> {
-        self.refresh_keyring();
-        let me = self
-            .my_actor()
-            .ok_or_else(|| anyhow!("no actor identity"))?;
-        let next_gen = self.active_epoch().map(|e| e.gen + 1).unwrap_or(0);
-        let id = super::rand16();
-        let key = crypto::random_key();
-        let key_commit = *blake3::hash(&key).as_bytes();
-        let members: Vec<ActorId> = self.acl().members().into_iter().map(|(a, _)| a).collect();
-        // Seal the fresh key to every current member device before the mint
-        // lands, so the batch that authorizes the epoch also distributes it.
-        let mut sealed_records = Vec::new();
-        for actor in &members {
-            for d in self.actor_plane().devices_of(actor) {
-                if let Some(sealed) = crypto::seal_to(&d, &key) {
-                    sealed_records.push(
-                        SealedKeyRecord {
-                            epoch: id,
-                            device: d,
-                            sealed,
-                        }
-                        .encode(),
-                    );
-                }
-            }
-        }
-        self.author(
-            AclAction::MintEpoch {
-                id,
-                gen: next_gen,
-                key_commit,
-                members,
-            },
-            None,
-            vec![],
-            sealed_records,
-        )?;
-        let _ = me;
-        self.keyring.insert(id, key);
-        Ok(())
+        let Inner {
+            ledger,
+            keyring,
+            seed,
+            me,
+            ..
+        } = self;
+        rotate_epoch(ledger, keyring, seed, me)
     }
 
     /// This device's offline **actor** recovery seed, if it was escrowed here
@@ -521,6 +483,122 @@ impl Inner {
         }
         Ok(())
     }
+}
+
+/// Unseal every authorized epoch key addressed to `me` into `keyring`, bound
+/// to the signed mint's commitment (the free-function form, so the ceremony
+/// engine's fence can run while the ledger is mutably borrowed).
+pub(super) fn refresh_keyring_into(
+    ledger: &mut AuthorityLedger,
+    keyring: &mut BTreeMap<[u8; 16], SpaceKey>,
+    seed: &[u8; 32],
+    me: &DeviceId,
+) {
+    let acl_state = ledger.acl_state().unwrap_or_default();
+    for e in acl_state.epochs() {
+        if keyring.contains_key(&e.id) {
+            continue;
+        }
+        if let Some(sealed) = ledger.sealed_for(&e.id, me) {
+            if let Some(raw) = crypto::open_sealed(seed, me, &sealed) {
+                if let Ok(key) = <SpaceKey>::try_from(raw.as_slice()) {
+                    if *blake3::hash(&key).as_bytes() == e.key_commit {
+                        keyring.insert(e.id, key);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Mint a fresh key epoch for the current member set (see
+/// [`Inner::rotate_key`]) — the free-function form over disjoint borrows.
+pub(super) fn rotate_epoch(
+    ledger: &mut AuthorityLedger,
+    keyring: &mut BTreeMap<[u8; 16], SpaceKey>,
+    seed: &[u8; 32],
+    me: &DeviceId,
+) -> Result<()> {
+    refresh_keyring_into(ledger, keyring, seed, me);
+    let plane = ledger.actor_plane();
+    let my_actor = plane
+        .actor_of_device(me)
+        .cloned()
+        .ok_or_else(|| anyhow!("no actor identity"))?;
+    let acl_state = ledger.acl_state().unwrap_or_default();
+    let next_gen = acl_state
+        .epochs()
+        .into_iter()
+        .max_by(|a, b| a.gen.cmp(&b.gen).then_with(|| a.id.cmp(&b.id)))
+        .map(|e| e.gen + 1)
+        .unwrap_or(0);
+    let id = super::rand16();
+    let key = crypto::random_key();
+    let key_commit = *blake3::hash(&key).as_bytes();
+    let members: Vec<ActorId> = acl_state.members().into_iter().map(|(a, _)| a).collect();
+    // Seal the fresh key to every current member device before the mint lands,
+    // so the batch that authorizes the epoch also distributes it.
+    let mut sealed_records = Vec::new();
+    for actor in &members {
+        for d in plane.devices_of(actor) {
+            if let Some(sealed) = crypto::seal_to(&d, &key) {
+                sealed_records.push(
+                    SealedKeyRecord {
+                        epoch: id,
+                        device: d,
+                        sealed,
+                    }
+                    .encode(),
+                );
+            }
+        }
+    }
+    let op = acl::sign_op(
+        seed,
+        &AclOp {
+            action: AclAction::MintEpoch {
+                id,
+                gen: next_gen,
+                key_commit,
+                members,
+            },
+            by: my_actor.clone(),
+            actor_asof: ledger.actor_heads(&my_actor),
+            nonce: None,
+        },
+        ledger.acl_heads(),
+        &space_of(ledger),
+    );
+    ledger
+        .commit_batch(&[LedgerEffect::Acl(op).encode()], &sealed_records)
+        .map_err(|e| anyhow!("authority commit: {e}"))?;
+    keyring.insert(id, key);
+    Ok(())
+}
+
+fn space_of(ledger: &AuthorityLedger) -> SpaceId {
+    ledger.space().clone()
+}
+
+/// The Body-key epoch fence the ceremony engine calls after a terminal
+/// install: when this device's actor is an admin holding no authorized active
+/// epoch, mint a fresh one (idempotent otherwise). A departed root's epochs
+/// are de-authorized by the re-root, so this is what re-keys the space.
+pub(super) fn fence_epoch(
+    ledger: &mut AuthorityLedger,
+    keyring: &mut BTreeMap<[u8; 16], SpaceKey>,
+    seed: &[u8; 32],
+    me: &DeviceId,
+) -> Result<()> {
+    let Some(actor) = ledger.actor_plane().actor_of_device(me).cloned() else {
+        return Ok(());
+    };
+    let acl_state = ledger.acl_state().unwrap_or_default();
+    let has_active = !acl_state.epochs().is_empty();
+    if acl_state.is_admin(&actor) && !has_active {
+        rotate_epoch(ledger, keyring, seed, me)?;
+    }
+    Ok(())
 }
 
 /// Unix seconds now.

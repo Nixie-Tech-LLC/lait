@@ -42,7 +42,6 @@ pub mod presence;
 pub mod proto;
 pub mod registry;
 pub mod replica;
-pub mod secretfs;
 pub mod serve;
 pub mod spaces;
 pub mod sync;
@@ -57,7 +56,7 @@ pub mod world;
 // by these aliases.
 pub use mechanics::{
     acl, actor, authority, authz, compile, crypto, custody, dkg, dto, expand, genesis, ids, policy,
-    sigdag, space, transition,
+    secretfs, sigdag, space, transition,
 };
 
 // The **fabric** (`fabric`) maintains the shared world — documents,

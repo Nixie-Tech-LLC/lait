@@ -2,142 +2,14 @@
 
 use super::*;
 
-/// What a break-glass space recovery did.
-///
-/// The two arms are not success-and-failure: a group recovery that has not yet
-/// gathered its threshold is a correct, expected outcome that the operator must
-/// act on. Both are committed changes.
-#[derive(Debug)]
-pub enum SpaceRecovery {
-    /// The re-root is installed and this device is the new root.
-    Installed(SpaceRecovered),
-    /// A signing ceremony is open and needs the other holders.
-    Pending {
-        session: crate::dkg::TranscriptId,
-        /// A local step that did not complete *after* the request landed on the
-        /// board. Carried rather than returned as an error: the request is
-        /// durable and other holders can see it, so the change must still be
-        /// announced even though this device's own contribution did not land.
-        incomplete: Option<anyhow::Error>,
-    },
-}
-
-/// A completed re-root.
-#[derive(Debug)]
-pub struct SpaceRecovered {
-    pub root: ActorId,
-    /// The re-root landed; this says whether the follow-on content re-key did.
-    ///
-    /// A failure here leaves the space re-rooted but still under the old key —
-    /// a degraded state the operator must be told about and can retry. It is
-    /// never reported as a plain error, because the re-root is already durable
-    /// and an error would suppress its doorbell.
-    pub rekey_failed: Option<anyhow::Error>,
-}
-
-/// A proposed K-of-N recovery arrangement.
-///
-/// The proposal is durable by the time this exists — that is what makes the
-/// optional fields honest rather than sloppy. `grant_request` names the signing
-/// transcript when the standing authority is a group and must authorize the
-/// change; `incomplete` carries a step that did not finish after the proposal
-/// was posted, which the operator needs to know without being told the whole
-/// elevation failed.
-#[derive(Debug)]
-pub struct Elevation {
-    pub k: u16,
-    pub n: u16,
-    pub proposal: crate::dkg::TranscriptId,
-    pub grant_request: Option<crate::dkg::TranscriptId>,
-    pub incomplete: Option<anyhow::Error>,
-}
-
-/// A holder co-signed an authorization for a proposed arrangement.
-#[derive(Debug)]
-pub struct ElevationApproved {
-    pub k: u16,
-    pub n: usize,
-}
-
-/// A share package written to disk and verified by reopening it.
-///
-/// `indispensable` and `outstanding` are the facts; which of the three notes a
-/// custodian reads is derived from them at the adapter.
-#[derive(Debug)]
-pub struct CustodyExport {
-    pub path: String,
-    pub indispensable: bool,
-    pub outstanding: usize,
-}
-
-/// A share restored from a portable package.
-#[derive(Debug)]
-pub struct CustodyImport {
-    pub ceremony: crate::dkg::TranscriptId,
-    /// The share is durable by the time this exists; this carries a follow-on
-    /// step that did not complete.
-    pub incomplete: Option<anyhow::Error>,
-}
-
-/// What one pass over the ceremony board accomplished.
-///
-/// Two kinds of failure come out of a pass, and they must not share a channel.
-/// A per-transcript fault — a malformed package from one participant — is
-/// isolated and logged, because propagating it would wedge membership sync
-/// permanently on an already-persisted event. `install_incomplete` is the other
-/// kind: *this* node installed something durable and the follow-on step failed.
-/// That is our failure, it is not isolatable, and on the recovery path it is a
-/// security claim, so it travels back to the caller.
-#[derive(Debug, Default)]
-pub struct CeremonyProgress {
-    pub progressed: bool,
-    pub install_incomplete: Option<anyhow::Error>,
-}
-
-/// A holder co-signed a pending recovery.
-///
-/// Co-signing can *be* the last signature: the threshold completes inside this
-/// command, the re-root installs, and the re-key runs — so `incomplete` carries
-/// a re-key failure for the same reason the recovery outcomes do. Without it a
-/// holder would be told the recovery "installs once the threshold has
-/// co-signed" at the exact moment it had installed unfenced.
-#[derive(Debug)]
-pub struct RecoveryApproved {
-    pub roots: Vec<ActorId>,
-    pub incomplete: Option<anyhow::Error>,
-}
-
-/// Persist the recovery secret beside the store. This is a root credential (the
-/// pre-rotation escrow — losing it forfeits recovery, never space access),
-/// so it is created **owner-only from the start** (never world-readable, even
-/// for an instant) and any permission error is propagated, never swallowed.
-/// The state of a device-local ceremony artifact.
-///
-/// Three states, not two: an artifact that is present but unreadable is neither
-/// usable nor absent, and reporting it as absent would hide the loss of a
-/// holder's recovery capability.
-///
-/// `Unreadable` keeps the **typed** cause rather than a rendered string. An
-/// access-denied error, a corrupt file or a transient I/O fault must not be
-/// diagnosed as "this belongs to another Windows account": that is one specific
-/// cause among several, and guessing it sends an operator to the wrong remedy.
-#[derive(Debug)]
-pub enum ArtifactRead {
-    Missing,
-    Present(Vec<u8>),
-    Unreadable(crate::secretfs::SecretError),
-}
-
-/// Why a recovery artifact could not be produced, for structured reporting.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", content = "detail", rename_all = "snake_case")]
-pub enum RecoveryArtifactFailure {
-    /// Wrapped for a different Windows account or machine. The bytes are intact;
-    /// this identity cannot open them.
-    Undecryptable(String),
-    /// Present but could not be read at all — permissions, corruption, I/O.
-    Io(String),
-}
+// The semantic ceremony result types now live in `mechanics::ceremony`
+// (the generic engine owns them); re-imported here so this legacy module
+// keeps compiling until its M5 deletion.
+pub use mechanics::ceremony::{
+    ArtifactRead, CeremonyProgress, CustodyExport, CustodyImport, DegradedRecoveryHolder,
+    Elevation, ElevationApproved, LocalCustodyState, RecoveryApproved, RecoveryArtifactFailure,
+    RecoveryStatus, SpaceRecovered, SpaceRecovery,
+};
 
 /// Argon2 cost for a share package's passphrase slot.
 ///
@@ -156,60 +28,6 @@ fn custody_kdf_params() -> crate::custody::Argon2Params {
         t_cost: 1,
         p_cost: 1,
     }
-}
-
-/// What this device can say about recovery readiness.
-///
-/// Deliberately does NOT assert that recovery is possible. This node knows its
-/// own custody and the arrangement's shape; it does not know whether other
-/// holders still have their shares, and claiming they do would be the most
-/// dangerous kind of reassurance — believed, unverifiable, and only disproved
-/// during an actual emergency.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct RecoveryStatus {
-    /// Short form of the standing authority's key, or `None` when this device
-    /// cannot attribute the standing key to any arrangement it has seen.
-    pub authority: Option<String>,
-    pub scheme: crate::authority::AuthorityScheme,
-    /// Phase B reports the shape. Phase D will report policy branches and
-    /// qualified-set readiness instead.
-    pub k: u16,
-    pub n: u16,
-    pub local_custody: LocalCustodyState,
-}
-
-/// This device's standing as a custodian.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "state", content = "detail", rename_all = "snake_case")]
-pub enum LocalCustodyState {
-    /// Not a holder — nothing is expected of this device.
-    NotAHolder,
-    /// Holding usable material.
-    Ready,
-    /// Expected to hold a share and does not.
-    Missing,
-    /// The share is present but cannot be produced.
-    Unreadable(RecoveryArtifactFailure),
-    /// Holding a share of an **indispensable** arrangement with no verified
-    /// portable backup. Distinct from `Ready` because the share is usable today
-    /// and unrecoverable tomorrow, and that difference is invisible until it
-    /// matters.
-    BackupUnverified,
-}
-
-/// A holder whose share exists on this device but cannot be used.
-///
-/// Structured rather than preformatted, so status, diagnosis and the CLI can
-/// each render it as they see fit.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct DegradedRecoveryHolder {
-    /// The DKG transcript whose share is unusable.
-    pub transcript: String,
-    pub reason: RecoveryArtifactFailure,
-    /// `Some(true)` when this transcript IS the standing recovery authority,
-    /// `None` when currency could not be established (the public-key package
-    /// was itself unreadable).
-    pub is_current_authority: Option<bool>,
 }
 
 pub(super) fn persist_recovery_key(store: &Store, seed: &[u8; 32]) -> Result<()> {

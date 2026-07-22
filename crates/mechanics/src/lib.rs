@@ -47,6 +47,7 @@ pub mod ledger;
 pub mod policy;
 pub mod refresh;
 pub mod reshare;
+pub mod secretfs;
 pub mod sigdag;
 pub mod space;
 pub mod status;
