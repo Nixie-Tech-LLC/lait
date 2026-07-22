@@ -35,7 +35,7 @@ permissions:
 jobs:
   crates:
     name: cargo publish
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-nixiesoftware
     permissions:
       contents: read
       # Mint the OIDC token that crates.io trades for a short-lived publish token.

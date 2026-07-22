@@ -26,7 +26,7 @@ jobs:
   # this job rebuilds and fails if the result differs from what's in git.
   viewer:
     name: viewer
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-nixiesoftware
     steps:
       # SHA-pinned like every other action here: a tag is mutable, and CI is
       # exactly where you don't want a dependency that can change under you.
@@ -73,7 +73,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [namespace-profile-nixiesoftware, macos-latest, windows-latest]
     env:
       RUSTFLAGS: "-D warnings"
     steps:
@@ -217,7 +217,7 @@ jobs:
   # and an expression that matches nothing fails the run rather than skipping.
   orbital-gates:
     name: ${{ matrix.job }}
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-nixiesoftware
     strategy:
       fail-fast: false
       matrix:
@@ -279,7 +279,7 @@ jobs:
   # a skipped or cancelled gate can never satisfy the release bar.
   orbital-complete:
     name: orbital-complete
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-nixiesoftware
     needs: [check, orbital-gates, viewer]
     if: always()
     steps:
@@ -296,7 +296,7 @@ jobs:
   # 1.91). If this breaks, either the floor moved or a dep raised its MSRV.
   msrv:
     name: msrv (1.91)
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-nixiesoftware
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       # dtolnay/rust-toolchain@1.91.0 (branch head at time of pinning) — the same
@@ -325,7 +325,7 @@ jobs:
   # drift in transitively.
   supply-chain:
     name: cargo-deny
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-nixiesoftware
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: cargo-deny
@@ -339,7 +339,7 @@ jobs:
   # tag is pushed. It only PLANS — it never builds or publishes.
   release-dry-run:
     name: release dry-run (dist plan)
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-nixiesoftware
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: Install dist
@@ -369,7 +369,7 @@ jobs:
   # CI here rather than stranding users on a binary that cannot update itself.
   updater-contract:
     name: self-updater archive contract
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-nixiesoftware
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
@@ -414,7 +414,7 @@ jobs:
   # and silently break a publish job weeks later at release time.
   packaging:
     name: packaging manifests
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-nixiesoftware
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 

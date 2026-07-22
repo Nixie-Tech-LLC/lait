@@ -33,7 +33,7 @@ permissions:
 jobs:
   sbom:
     name: generate + attach CycloneDX SBOM
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-nixiesoftware
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
