@@ -134,6 +134,34 @@ fn issues_registry() -> Result<WorldRegistry> {
         .map_err(|e| anyhow::anyhow!("world registry: {e:?}"))
 }
 
+/// The reviewed IssuesWorld implementation id this build ships — the authority
+/// identity the founder activates and every product transaction pins.
+pub fn issues_implementation_id() -> [u8; 32] {
+    IssuesWorld::implementation_descriptor()
+        .id()
+        .expect("canonical IssuesWorld descriptor")
+}
+
+/// The founder product-authority bootstrap: activate the IssuesWorld
+/// implementation and grant the founder the Space capabilities. Idempotent —
+/// an exact replay changes nothing (both the activation and each grant are
+/// idempotent through the authority ledger). Public so a caller forming a
+/// Space directly through [`OrbitalMechanics::form`] can run the same
+/// deterministic bootstrap the CLI composition root does.
+pub fn seed_founder_policy(mechanics: &OrbitalMechanics) -> Result<()> {
+    mechanics.activate_implementation(
+        crate::world::contract::PRODUCT_WORLD,
+        issues_implementation_id(),
+    )?;
+    for (i, (capability, resource)) in crate::world::contract::founder_capabilities()
+        .into_iter()
+        .enumerate()
+    {
+        mechanics.grant_self_capability(capability, resource, [i as u8; 16])?;
+    }
+    Ok(())
+}
+
 /// Found a fresh Space's full orbital footprint under `home` — the `lait init`
 /// heir. Mints the mechanics material ([`OrbitalMechanics::form`]: genesis,
 /// founding inception, epoch-0), then materializes the Runtime Orbit store
@@ -150,6 +178,12 @@ pub fn form_space(
     }
     let root = orbital_store_root(home);
     let (mechanics, coords) = OrbitalMechanics::form(&root, device_seed, display_name, vec![])?;
+    // The LAIT composition root's product-authority bootstrap: activate the
+    // reviewed IssuesWorld implementation id and grant the founder the Space
+    // capabilities its own submits require, as one deterministic idempotent
+    // step under the founder's genesis policy-admin standing. This precedes any
+    // product submit, so the founder's SpaceInit/ProjectNew are authorized.
+    seed_founder_policy(&mechanics)?;
     // Materialize the Runtime Orbit store at the mechanics Space by entering
     // the founder's own Coordinates (creates the store if absent), then seed
     // the catalog Body so the space is usable immediately.

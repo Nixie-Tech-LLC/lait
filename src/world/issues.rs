@@ -78,6 +78,23 @@ impl IssuesWorld {
             limits: runtime::WorldLimits::default(),
         }
     }
+
+    /// The reviewed implementation descriptor this build ships. Its canonical
+    /// id is the authority identity the founder activates and every product
+    /// transaction pins. `policy_protocol`/`implementation_version` are 1; the
+    /// policy-table commitment and artifact identity are build-embedded
+    /// release ids (fixed here until a versioned policy table lands).
+    pub fn implementation_descriptor() -> runtime::implementation::WorldImplementationDescriptor {
+        let world = Self::new();
+        runtime::implementation::WorldImplementationDescriptor::from_schemas(
+            world.id.clone(),
+            1,
+            1,
+            &world.schemas,
+            *blake3::hash(b"lait.issues.policy-table.v1").as_bytes(),
+            *blake3::hash(b"lait.issues.artifact.v1").as_bytes(),
+        )
+    }
 }
 
 /// A staged transaction under construction.

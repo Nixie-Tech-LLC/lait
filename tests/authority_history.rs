@@ -24,8 +24,13 @@ use replica::transaction::NO_PARENT_ROOT;
 use replica::{
     AuthorityIncorporator, BodyBinding, BodyId, BodyKey, BodyOp, CommitAuthorization,
     CommitContext, EncodingId, Replica, SchemaId, SeedSigner, StagedContactMaterial,
-    StaticAuthorizer, SupportedSchemas, WorldId, MUTATION_COLLABORATIVE,
+    SupportedSchemas, WorldId, MUTATION_COLLABORATIVE,
 };
+
+type SignedUnit = (
+    replica::transaction::BodyTransaction,
+    Vec<(BodyKey, Vec<u8>)>,
+);
 
 const FOUNDER_SEED: [u8; 32] = [21u8; 32];
 const JOINER_SEED: [u8; 32] = [22u8; 32];
@@ -41,23 +46,71 @@ fn temp_home(tag: &str) -> PathBuf {
 }
 
 fn world() -> WorldId {
-    WorldId::parse("com.example.notes").unwrap()
+    // The product World: its implementation id is what the founder activates,
+    // and its Space capabilities are what admission grants — so a transaction's
+    // demand is satisfiable through the real authority ledger.
+    WorldId::parse("com.lait.issues").unwrap()
 }
 
 fn commit_demand() -> Vec<u8> {
-    mechanics::demand::AuthorizationDemand::require(
-        mechanics::demand::PolicyCapability::new("com.example.notes", "write"),
-        mechanics::demand::PolicyResource::space("com.example.notes"),
-    )
+    // The default contributor demand (what admission grants a joiner).
+    mechanics::demand::AuthorizationDemand::Any(vec![
+        mechanics::demand::AuthorizationDemand::require(
+            mechanics::demand::PolicyCapability::new("com.lait.issues", "space.contributor"),
+            mechanics::demand::PolicyResource::space("com.lait.issues"),
+        ),
+        mechanics::demand::AuthorizationDemand::require(
+            mechanics::demand::PolicyCapability::new("com.lait.issues", "space.admin"),
+            mechanics::demand::PolicyResource::space("com.lait.issues"),
+        ),
+    ])
     .encode_canonical()
     .unwrap()
 }
 
-fn static_auth() -> StaticAuthorizer {
-    StaticAuthorizer {
-        world: world(),
-        implementation_id: [0u8; 32],
+/// A mechanics-backed authorizer: produces the real AuthorizationReceipt for a
+/// mutation core by evaluating the demand at the pinned frontier — the same
+/// path the daemon Session uses.
+struct MechAuthorizer<'a> {
+    mech: &'a OrbitalMechanics,
+    world: WorldId,
+    implementation_id: [u8; 32],
+}
+
+impl replica::TransactionAuthorizer for MechAuthorizer<'_> {
+    fn authorize(&self, core: &replica::BodyTransactionCore) -> Result<Vec<u8>, String> {
+        use runtime::AuthorityView;
+        let actor = mechanics::ids::ActorId::parse(&core.actor).ok_or("actor")?;
+        let device = mechanics::ids::DeviceId::from_key_bytes(&core.signer);
+        self.mech.authorize_mutation(
+            &self.mech.space(),
+            &self.world,
+            &actor,
+            &device,
+            &core.authority_frontier,
+            core.parent_manifest_root,
+            self.implementation_id,
+            core.intent_digest,
+            &core.demand,
+            core.operations_digest,
+            core.digest(),
+        )
     }
+}
+
+/// The active IssuesWorld implementation id (matches what the founder seeds).
+fn impl_id() -> [u8; 32] {
+    lait::orbital::issues_implementation_id()
+}
+
+/// The actor a device seed speaks for in this mechanics Space.
+fn actor_of(mech: &OrbitalMechanics, seed: &[u8; 32]) -> String {
+    use runtime::AuthorityView;
+    mech.resolve(&mechanics::crypto::device_from_seed(seed))
+        .expect("device has standing")
+        .actor
+        .as_str()
+        .to_string()
 }
 
 fn body(n: u8) -> BodyKey {
@@ -89,6 +142,9 @@ fn supported() -> SupportedSchemas {
 fn form(tag: &str) -> (PathBuf, OrbitalMechanics) {
     let root = temp_home(tag);
     let (mech, _coords) = OrbitalMechanics::form(&root, &FOUNDER_SEED, "authist", vec![]).unwrap();
+    // The founder product-authority bootstrap (activate impl + grant caps), so
+    // the founder's own transactions authorize through the real ledger.
+    lait::orbital::seed_founder_policy(&mech).unwrap();
     (root, mech)
 }
 
@@ -104,19 +160,35 @@ fn admit_joiner(mech: &OrbitalMechanics) -> mechanics::ids::ActorId {
     ])
     .unwrap();
     mech.member_add(actor_id.as_str(), false).unwrap();
+    // Expand the default-contributor role (member_add does not itself grant
+    // capabilities; the admission path and the IAM designer do).
+    let res = mechanics::demand::PolicyResource::space("com.lait.issues");
+    for (i, name) in ["space.contributor", "space.issue.read"]
+        .into_iter()
+        .enumerate()
+    {
+        mech.grant_actor_capability(
+            &actor_id,
+            mechanics::demand::PolicyCapability::new("com.lait.issues", name),
+            res.clone(),
+            [i as u8 + 100; 16],
+        )
+        .unwrap();
+    }
     actor_id
 }
 
-/// Sign one collaborative-note transaction at the given authority frontier.
+/// Sign one collaborative-note transaction at the given authority frontier,
+/// through the **real** mechanics authorizer — so the receipt is bound to
+/// signed history and `verify_authorized` exercises historical evaluation.
+/// Returns the durable commit result (an unauthorized author fails here).
 fn signed_note_tx(
     mech: &OrbitalMechanics,
     signer_seed: &[u8; 32],
+    actor: &str,
     frontier: replica::frontier::AuthorityFrontier,
     n: u8,
-) -> (
-    replica::transaction::BodyTransaction,
-    Vec<(BodyKey, Vec<u8>)>,
-) {
+) -> Result<SignedUnit, replica::ReplicaCommitError> {
     let space = mech.space();
     let mut r = Replica::loro().with_keys(Arc::new(mech.clone()));
     r.set_supported(supported());
@@ -127,14 +199,19 @@ fn signed_note_tx(
         authority_frontier: frontier,
     };
     let device = mechanics::crypto::device_from_seed(signer_seed);
+    let authorizer = MechAuthorizer {
+        mech,
+        world: world(),
+        implementation_id: impl_id(),
+    };
     r.commit_action(
         &ctx,
         &CommitAuthorization {
-            actor: "actor",
+            actor,
             parent_manifest_root: NO_PARENT_ROOT,
             demand: commit_demand(),
             intent_digest: [7u8; 32],
-            authorizer: &static_auth(),
+            authorizer: &authorizer,
         },
         &world(),
         &device,
@@ -151,52 +228,67 @@ fn signed_note_tx(
             },
         )],
         &[(body(n), binding())],
-    )
-    .unwrap();
+    )?;
     let material = r.export_material().unwrap();
-    material.into_iter().next().unwrap()
+    Ok(material.into_iter().next().unwrap())
 }
 
 #[test]
 fn historical_authorized_but_currently_removed_remains_legitimate() {
     let (_root, mech) = form("hist-ok");
     let joiner = admit_joiner(&mech);
+    let joiner_actor = actor_of(&mech, &JOINER_SEED);
     let member_frontier = mech.current_frontier();
-    let (tx, _) = signed_note_tx(&mech, &JOINER_SEED, member_frontier.clone(), 1);
+    // The joiner signs a contributor mutation while admitted — the receipt is
+    // bound to signed history at the member frontier.
+    let (tx, _) = signed_note_tx(
+        &mech,
+        &JOINER_SEED,
+        &joiner_actor,
+        member_frontier.clone(),
+        1,
+    )
+    .expect("an admitted contributor authorizes");
 
     mech.member_remove(joiner.as_str()).unwrap();
     let removed_frontier = mech.current_frontier();
     assert_ne!(member_frontier, removed_frontier);
 
-    // The old transaction — referencing the frontier where the author WAS a
-    // member — remains legitimate after the removal.
+    // The old transaction — bound to the frontier where the author WAS a
+    // contributor — remains legitimate after the removal (historical
+    // evaluation, verified against signed history without any World callback).
     tx.verify_authorized(&mech)
         .expect("historically authorized transaction stays legitimate");
 
-    // The same author signing at the *current* frontier is rejected.
-    let (tx_now, _) = signed_note_tx(&mech, &JOINER_SEED, removed_frontier, 2);
+    // The same author signing at the *current* frontier cannot even produce a
+    // receipt: its demand is unsatisfied now that it is removed.
+    let err = signed_note_tx(&mech, &JOINER_SEED, &joiner_actor, removed_frontier, 2).unwrap_err();
     assert!(
-        tx_now.verify_authorized(&mech).is_err(),
-        "a removed author cannot author at the removal frontier"
+        matches!(err, replica::ReplicaCommitError::Unauthorized(_)),
+        "a removed author cannot author at the removal frontier: {err:?}"
     );
 }
 
 #[test]
-fn unauthorized_at_referenced_frontier_despite_current_standing_rejects() {
+fn unauthorized_at_referenced_frontier_is_denied_at_signing() {
     let (_root, mech) = form("hist-no");
-    let before_frontier = mech.current_frontier();
-    // Sign BEFORE admission, referencing the pre-admission frontier.
-    let (tx, _) = signed_note_tx(&mech, &JOINER_SEED, before_frontier, 1);
-    // Now admit the author.
-    let _ = admit_joiner(&mech);
+    // Incept the joiner but do NOT admit it — no membership, no contributor
+    // capability. Signing a contributor mutation is denied by the real
+    // authorizer at the pinned frontier (there is no receipt for a demand the
+    // author does not satisfy).
+    let space = mech.space();
+    let (inception, joiner_actor) =
+        mechanics::actor::incept_single(&JOINER_SEED, &space, [9u8; 16], [8u8; 16], None);
+    let mut m = mech.clone();
+    m.incorporate_authority(&[
+        AuthorityRecord::Effect(LedgerEffect::Actor(inception).encode()).encode(),
+    ])
+    .unwrap();
+    let frontier = mech.current_frontier();
+    let err = signed_note_tx(&mech, &JOINER_SEED, joiner_actor.as_str(), frontier, 1).unwrap_err();
     assert!(
-        mech.am_i_member(),
-        "sanity: the founder's handle is a member"
-    );
-    // Current standing does not rescue a historically unauthorized signature.
-    assert!(
-        tx.verify_authorized(&mech).is_err(),
-        "authorization is at the referenced frontier, not current state"
+        matches!(err, replica::ReplicaCommitError::Unauthorized(_)),
+        "an unadmitted author is denied: {err:?}"
     );
 }
 
@@ -271,15 +363,21 @@ fn authority_survives_a_body_crash_and_the_retry_incorporates_exactly_once() {
         authority_frontier: mech_a.current_frontier(),
     };
     let device = mechanics::crypto::device_from_seed(&FOUNDER_SEED);
+    let founder_actor = actor_of(&mech_a, &FOUNDER_SEED);
+    let authorizer = MechAuthorizer {
+        mech: &mech_a,
+        world: world(),
+        implementation_id: impl_id(),
+    };
     source
         .commit_action(
             &ctx,
             &CommitAuthorization {
-                actor: "actor",
+                actor: &founder_actor,
                 parent_manifest_root: NO_PARENT_ROOT,
                 demand: commit_demand(),
                 intent_digest: [7u8; 32],
-                authorizer: &static_auth(),
+                authorizer: &authorizer,
             },
             &world(),
             &device,

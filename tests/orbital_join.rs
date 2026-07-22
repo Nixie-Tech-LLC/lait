@@ -152,6 +152,10 @@ fn form_invite_join_autoapprove_and_e2ee_convergence() {
     let root_f = temp_root("founder");
     let (mech_f, coords) =
         OrbitalMechanics::form(&root_f, &FOUNDER_SEED, "Joined Space", vec![]).unwrap();
+    // The founder product-authority bootstrap the CLI composition root runs:
+    // activate the IssuesWorld implementation + grant the founder Space caps,
+    // so its own admin/contributor submits are authorized.
+    lait::orbital::seed_founder_policy(&mech_f).unwrap();
     assert!(mech_f.am_i_member(), "the founder holds standing at birth");
     let (_rt_f, station_f) = activate(&root_f, FOUNDER_SEED, &mech_f, &coords, t_founder);
     let session_f = dock(&station_f, &FOUNDER_SEED);

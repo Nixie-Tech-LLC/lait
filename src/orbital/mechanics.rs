@@ -261,8 +261,60 @@ impl Inner {
             vec![inception_effect],
             sealed_records,
         )?;
+        // Admission installs the mandatory baseline read access plus the
+        // selected role expansion (plan 04). The default invite role is
+        // `contributor` — [space.contributor, space.issue.read] — so its
+        // Session queries and ordinary mutations authorize. The exact
+        // expansion will ride the admission-v2 evidence in M2; until then the
+        // default-contributor expansion is granted here.
+        let res = mechanics::demand::PolicyResource::space(crate::world::contract::PRODUCT_WORLD);
+        for (i, name) in ["space.contributor", "space.issue.read"]
+            .into_iter()
+            .enumerate()
+        {
+            let capability = mechanics::demand::PolicyCapability::new(
+                crate::world::contract::PRODUCT_WORLD,
+                name,
+            );
+            let salt = {
+                let mut s = super::rand16();
+                s[0] = i as u8;
+                s
+            };
+            if inner_grant(self, &joiner_actor, capability, res.clone(), salt).is_err() {
+                // A grant failure inside redemption is a durable-store fault;
+                // surface it rather than admitting without authority.
+                return Err(anyhow!("seal joiner capability"));
+            }
+        }
         Ok(())
     }
+}
+
+/// Author a GrantCapability for an arbitrary actor (used by redemption to
+/// install a joiner's role expansion). The author is this device's founding
+/// actor, which holds policy-admin standing.
+fn inner_grant(
+    inner: &mut Inner,
+    actor: &ActorId,
+    capability: mechanics::demand::PolicyCapability,
+    resource: mechanics::demand::PolicyResource,
+    salt: [u8; 16],
+) -> Result<()> {
+    let grant_id = acl::capability_grant_id(actor, &capability, &resource, &salt)
+        .ok_or_else(|| anyhow!("grant id"))?;
+    inner.author(
+        AclAction::GrantCapability {
+            grant_id,
+            actor: actor.clone(),
+            capability,
+            resource,
+            salt,
+        },
+        None,
+        vec![],
+        vec![],
+    )
 }
 
 /// The shared, thread-safe mechanics composition handle. Clone freely; every
@@ -720,6 +772,87 @@ impl OrbitalMechanics {
     pub fn current_frontier(&self) -> AuthorityFrontier {
         self.lock().frontier()
     }
+
+    /// Activate a World implementation id for this Space — an admin-authored
+    /// authority effect. Idempotent (re-activation of the same id is a no-op
+    /// commit through the ledger's batch idempotency).
+    pub fn activate_implementation(&self, world: &str, implementation_id: [u8; 32]) -> Result<()> {
+        let mut inner = self.lock();
+        if inner
+            .acl()
+            .active_implementation(world)
+            .is_some_and(|id| id == implementation_id)
+        {
+            return Ok(());
+        }
+        inner.author(
+            AclAction::ActivateWorldImplementation {
+                world: world.to_string(),
+                implementation_id,
+            },
+            None,
+            vec![],
+            vec![],
+        )
+    }
+
+    /// Grant one scoped capability to an actor — an admin/policy-admin authored
+    /// authority effect (the IAM assignment seam). Idempotent by grant id.
+    pub fn grant_actor_capability(
+        &self,
+        actor: &ActorId,
+        capability: mechanics::demand::PolicyCapability,
+        resource: mechanics::demand::PolicyResource,
+        salt: [u8; 16],
+    ) -> Result<()> {
+        let mut inner = self.lock();
+        let grant_id = acl::capability_grant_id(actor, &capability, &resource, &salt)
+            .ok_or_else(|| anyhow!("grant id"))?;
+        if inner
+            .acl()
+            .effective_capability_grants(actor, &capability, &resource)
+            .contains(&grant_id)
+        {
+            return Ok(());
+        }
+        inner_grant(&mut inner, actor, capability, resource, salt)
+    }
+
+    /// Grant one scoped capability to this device's founding actor — the
+    /// product-authority bootstrap seam (idempotent by grant id).
+    pub fn grant_self_capability(
+        &self,
+        capability: mechanics::demand::PolicyCapability,
+        resource: mechanics::demand::PolicyResource,
+        salt: [u8; 16],
+    ) -> Result<()> {
+        let mut inner = self.lock();
+        let me = inner
+            .my_actor()
+            .ok_or_else(|| anyhow!("no actor identity"))?;
+        let grant_id = acl::capability_grant_id(&me, &capability, &resource, &salt)
+            .ok_or_else(|| anyhow!("grant id"))?;
+        // Idempotent: an already-effective identical grant needs no new op.
+        if inner
+            .acl()
+            .effective_capability_grants(&me, &capability, &resource)
+            .contains(&grant_id)
+        {
+            return Ok(());
+        }
+        inner.author(
+            AclAction::GrantCapability {
+                grant_id,
+                actor: me,
+                capability,
+                resource,
+                salt,
+            },
+            None,
+            vec![],
+            vec![],
+        )
+    }
 }
 
 impl runtime::AuthorityView for OrbitalMechanics {
@@ -737,19 +870,104 @@ impl runtime::AuthorityView for OrbitalMechanics {
             authority_frontier: inner.frontier(),
         })
     }
+
+    fn active_implementation(
+        &self,
+        world: &replica::ids::WorldId,
+        authority_frontier: &AuthorityFrontier,
+    ) -> Option<[u8; 32]> {
+        let mut inner = self.lock();
+        inner
+            .ledger
+            .active_implementation_at(authority_frontier.as_bytes(), world.as_str())
+            .ok()
+            .flatten()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_mutation(
+        &self,
+        _space: &SpaceId,
+        world: &replica::ids::WorldId,
+        actor: &ActorId,
+        device: &DeviceId,
+        authority_frontier: &AuthorityFrontier,
+        parent_manifest_root: [u8; 32],
+        implementation_id: [u8; 32],
+        intent_digest: [u8; 32],
+        demand: &[u8],
+        operations_digest: [u8; 32],
+        core_digest: [u8; 32],
+    ) -> Result<Vec<u8>, String> {
+        let mut inner = self.lock();
+        let receipt = inner
+            .ledger
+            .authorize(&mechanics::ledger::AuthorizationRequest {
+                world: world.as_str(),
+                actor: actor.as_str(),
+                device: device.key_bytes().ok_or("device key")?,
+                authority_frontier: authority_frontier.as_bytes(),
+                parent_manifest_root,
+                implementation_id,
+                intent_digest,
+                demand,
+                effect_operations_digest: operations_digest,
+                body_transaction_core_digest: core_digest,
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(receipt.encode())
+    }
+
+    fn evaluate_read(
+        &self,
+        actor: &ActorId,
+        authority_frontier: &AuthorityFrontier,
+        demand: &[u8],
+    ) -> bool {
+        let parsed = match mechanics::demand::AuthorizationDemand::decode_canonical(demand) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        let mut inner = self.lock();
+        match inner.ledger.state_at(authority_frontier.as_bytes()) {
+            Ok(view) => view.acl.evaluate_demand(actor, &parsed).is_some(),
+            Err(_) => false,
+        }
+    }
 }
 
 impl replica::AuthoritySource for OrbitalMechanics {
     fn signer_authorized(&self, signer: &[u8; 32], frontier: &AuthorityFrontier) -> bool {
-        // Historical authorization: standing is evaluated at the transaction's
-        // **referenced** frontier — the exact effect closure its heads name —
-        // never against current state. An author authorized then and removed
-        // now remains legitimate; an author unauthorized then and authorized
-        // now is rejected; an unknown frontier is missing history, not a pass.
+        // The Manifest-advertisement legitimacy check: standing is evaluated at
+        // the **referenced** frontier — the exact effect closure its heads name
+        // — never against current state.
         let mut inner = self.lock();
         inner
             .ledger
             .signer_authorized_at(signer, frontier.as_bytes())
+    }
+
+    fn verify_transaction(&self, tx: &replica::BodyTransaction) -> Result<(), String> {
+        // Remote historical authorization: verify the transaction's
+        // authorization receipt against signed mechanics history at its
+        // referenced frontier. No World callback runs.
+        let receipt = tx.receipt().map_err(|e| e.to_string())?;
+        let mut inner = self.lock();
+        inner
+            .ledger
+            .verify_receipt(
+                &receipt,
+                &mechanics::ledger::ReceiptExpectations {
+                    device: &tx.core.signer,
+                    authority_frontier: tx.core.authority_frontier.as_bytes(),
+                    parent_manifest_root: &tx.core.parent_manifest_root,
+                    intent_digest: &tx.core.intent_digest,
+                    demand: &tx.core.demand,
+                    effect_operations_digest: &tx.core.operations_digest,
+                    body_transaction_core_digest: &tx.core.digest(),
+                },
+            )
+            .map_err(|e| e.to_string())
     }
 }
 
