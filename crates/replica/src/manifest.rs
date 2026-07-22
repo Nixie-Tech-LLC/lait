@@ -171,7 +171,13 @@ impl ManifestPage {
             return Err(ManifestError::Bounds);
         }
         for w in self.entries.windows(2) {
-            if w[0].key >= w[1].key {
+            // Strict order over (key, transaction commitment): a multi-writer
+            // Body is advertised as several heads under one key, so the
+            // commitment is the tiebreaker; an exact duplicate is still a
+            // violation.
+            if (&w[0].key, &w[0].transaction_commitment)
+                >= (&w[1].key, &w[1].transaction_commitment)
+            {
                 return Err(ManifestError::OrderViolation);
             }
         }
@@ -298,7 +304,7 @@ impl ManifestRoot {
         if pages.len() != self.ordered_page_hashes.len() {
             return Err(ManifestError::PageNotInRoot);
         }
-        let mut last_key: Option<&BodyKey> = None;
+        let mut last_pair: Option<(&BodyKey, &[u8; 32])> = None;
         for (i, page) in pages.iter().enumerate() {
             page.validate()?;
             if page.space != self.space {
@@ -307,14 +313,15 @@ impl ManifestRoot {
             if page.page_index as usize != i || page.hash() != self.ordered_page_hashes[i] {
                 return Err(ManifestError::PageNotInRoot);
             }
-            if let (Some(prev), Some(first)) = (last_key, page.entries.first()) {
-                // Every page's first key must exceed the previous page's last.
-                if &first.key <= prev {
+            if let (Some(prev), Some(first)) = (last_pair, page.entries.first()) {
+                // Every page's first (key, commitment) must exceed the
+                // previous page's last.
+                if (&first.key, &first.transaction_commitment) <= prev {
                     return Err(ManifestError::OrderViolation);
                 }
             }
             if let Some(last) = page.entries.last() {
-                last_key = Some(&last.key);
+                last_pair = Some((&last.key, &last.transaction_commitment));
             }
         }
         Ok(())

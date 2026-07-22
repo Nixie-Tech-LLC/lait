@@ -327,12 +327,13 @@ pub enum BodyExport {
 /// nothing. The receipt's causal token digests the touched Bodies' post-commit
 /// positions.
 ///
-/// **Known limitation** (documented, not hidden): two peers *creating the same
-/// fresh path concurrently* create distinct child containers, and the map's LWW
-/// register keeps one — edits made in the loser before the first sync are
-/// shadowed. Initialize a Body's paths in its creating transaction (before
-/// concurrent editing starts), as the conformance Worlds do; deep container
-/// merge is future work.
+/// **Concurrent path creation.** Every typed path resolves to a ROOT
+/// container named `<tag>:<path>` (registers are keys in the `body` root
+/// map). Root containers are identified by NAME, so two peers creating the
+/// same fresh path concurrently address the SAME container and their edits
+/// merge — the child-container/LWW shadowing that op-identified containers
+/// suffer under concurrency cannot occur (the multi-writer reference corpus
+/// proved that shadowing fatal for a shared catalog).
 pub struct CrdtFabric {
     bodies: BTreeMap<FabricKey, BodyState>,
 }
@@ -450,60 +451,40 @@ impl CrdtFabric {
     }
 
     /// Enforce "a path is bound to exactly one collaborative type": no other
-    /// type tag may already exist at this path.
-    fn check_path_type(body: &loro::LoroMap, tag: &str, path: &str) -> Result<(), FabricError> {
+    /// type tag may already hold state at this path. Containers live at doc
+    /// ROOTS (name-identified — see the struct docs); a register is a key in
+    /// the `body` root map.
+    fn check_path_type(doc: &loro::LoroDoc, tag: &str, path: &str) -> Result<(), FabricError> {
+        let body = doc.get_map(BODY_MAP);
         for other in TYPE_TAGS {
-            if other != tag && body.get(&typed_key(other, path)).is_some() {
+            if other == tag {
+                continue;
+            }
+            let name = typed_key(other, path);
+            let bound = match other {
+                "reg" => body.get(&name).is_some(),
+                "list" => !doc.get_movable_list(name.as_str()).is_empty(),
+                "text" => !doc.get_text(name.as_str()).is_empty(),
+                _ => !doc.get_map(name.as_str()).is_empty(),
+            };
+            if bound {
                 return Err(FabricError::TypeConflict);
             }
         }
         Ok(())
     }
 
-    /// The Body's collaborative root for a typed-path write, with the path-type
-    /// binding enforced. Returns the root map and the doc's peer id (for
-    /// per-peer counter keys).
-    fn body_for(
+    /// The Body's doc for a typed-path write, with the path-type binding
+    /// enforced.
+    fn doc_for(
         &mut self,
         key: &FabricKey,
         tag: &str,
         path: &str,
-    ) -> Result<(loro::LoroMap, u64), FabricError> {
+    ) -> Result<&loro::LoroDoc, FabricError> {
         let doc = self.collab_doc(key, true)?.expect("created on demand");
-        let peer = doc.peer_id();
-        let body = doc.get_map(BODY_MAP);
-        Self::check_path_type(&body, tag, path)?;
-        Ok((body, peer))
-    }
-
-    fn child_map(body: &loro::LoroMap, key: &str) -> Result<loro::LoroMap, FabricError> {
-        match body.get(key) {
-            Some(loro::ValueOrContainer::Container(loro::Container::Map(m))) => Ok(m),
-            Some(_) => Err(FabricError::TypeConflict),
-            None => body
-                .insert_container(key, loro::LoroMap::new())
-                .map_err(Self::loro_err),
-        }
-    }
-
-    fn child_list(body: &loro::LoroMap, key: &str) -> Result<loro::LoroMovableList, FabricError> {
-        match body.get(key) {
-            Some(loro::ValueOrContainer::Container(loro::Container::MovableList(l))) => Ok(l),
-            Some(_) => Err(FabricError::TypeConflict),
-            None => body
-                .insert_container(key, loro::LoroMovableList::new())
-                .map_err(Self::loro_err),
-        }
-    }
-
-    fn child_text(body: &loro::LoroMap, key: &str) -> Result<loro::LoroText, FabricError> {
-        match body.get(key) {
-            Some(loro::ValueOrContainer::Container(loro::Container::Text(t))) => Ok(t),
-            Some(_) => Err(FabricError::TypeConflict),
-            None => body
-                .insert_container(key, loro::LoroText::new())
-                .map_err(Self::loro_err),
-        }
+        Self::check_path_type(doc, tag, path)?;
+        Ok(doc)
     }
 
     /// The `(index, decoded element blob)` pairs of a list, skipping malformed
@@ -573,12 +554,14 @@ impl CrdtFabric {
                 Ok(())
             }
             FabricOp::RegisterSet { key, path, value } => {
-                let (body, _) = self.body_for(key, "reg", path)?;
+                let doc = self.doc_for(key, "reg", path)?;
+                let body = doc.get_map(BODY_MAP);
                 body.insert(&typed_key("reg", path), value.as_slice())
                     .map_err(Self::loro_err)
             }
             FabricOp::RegisterClear { key, path } => {
-                let (body, _) = self.body_for(key, "reg", path)?;
+                let doc = self.doc_for(key, "reg", path)?;
+                let body = doc.get_map(BODY_MAP);
                 let k = typed_key("reg", path);
                 if body.get(&k).is_some() {
                     body.delete(&k).map_err(Self::loro_err)?;
@@ -591,13 +574,13 @@ impl CrdtFabric {
                 entry,
                 value,
             } => {
-                let (body, _) = self.body_for(key, "map", path)?;
-                let m = Self::child_map(&body, &typed_key("map", path))?;
+                let doc = self.doc_for(key, "map", path)?;
+                let m = doc.get_map(typed_key("map", path).as_str());
                 m.insert(entry, value.as_slice()).map_err(Self::loro_err)
             }
             FabricOp::MapRemove { key, path, entry } => {
-                let (body, _) = self.body_for(key, "map", path)?;
-                let m = Self::child_map(&body, &typed_key("map", path))?;
+                let doc = self.doc_for(key, "map", path)?;
+                let m = doc.get_map(typed_key("map", path).as_str());
                 if m.get(entry).is_some() {
                     m.delete(entry).map_err(Self::loro_err)?;
                 }
@@ -609,8 +592,8 @@ impl CrdtFabric {
                 index,
                 value,
             } => {
-                let (body, _) = self.body_for(key, "list", path)?;
-                let l = Self::child_list(&body, &typed_key("list", path))?;
+                let doc = self.doc_for(key, "list", path)?;
+                let l = doc.get_movable_list(typed_key("list", path).as_str());
                 let index = *index as usize;
                 if index > l.len() {
                     return Err(FabricError::InvalidOp("list index out of bounds".into()));
@@ -624,8 +607,8 @@ impl CrdtFabric {
                 l.insert(index, blob.as_slice()).map_err(Self::loro_err)
             }
             FabricOp::ListRemove { key, path, element } => {
-                let (body, _) = self.body_for(key, "list", path)?;
-                let l = Self::child_list(&body, &typed_key("list", path))?;
+                let doc = self.doc_for(key, "list", path)?;
+                let l = doc.get_movable_list(typed_key("list", path).as_str());
                 let Some((i, _, _)) = Self::list_entries(&l)
                     .into_iter()
                     .find(|(_, id, _)| id == element)
@@ -640,8 +623,8 @@ impl CrdtFabric {
                 element,
                 index,
             } => {
-                let (body, _) = self.body_for(key, "list", path)?;
-                let l = Self::child_list(&body, &typed_key("list", path))?;
+                let doc = self.doc_for(key, "list", path)?;
+                let l = doc.get_movable_list(typed_key("list", path).as_str());
                 let Some((from, _, _)) = Self::list_entries(&l)
                     .into_iter()
                     .find(|(_, id, _)| id == element)
@@ -661,8 +644,8 @@ impl CrdtFabric {
                 delete,
                 insert,
             } => {
-                let (body, _) = self.body_for(key, "text", path)?;
-                let t = Self::child_text(&body, &typed_key("text", path))?;
+                let doc = self.doc_for(key, "text", path)?;
+                let t = doc.get_text(typed_key("text", path).as_str());
                 let len = t.to_string().chars().count();
                 let index = *index as usize;
                 let delete = *delete as usize;
@@ -678,8 +661,8 @@ impl CrdtFabric {
                 Ok(())
             }
             FabricOp::SetAdd { key, path, value } => {
-                let (body, _) = self.body_for(key, "set", path)?;
-                let m = Self::child_map(&body, &typed_key("set", path))?;
+                let doc = self.doc_for(key, "set", path)?;
+                let m = doc.get_map(typed_key("set", path).as_str());
                 // Observed-remove set: every add mints a fresh tag, so a remove
                 // only deletes the adds it has seen — a concurrent add survives.
                 let tag: [u8; 8] = mint_bytes();
@@ -691,8 +674,8 @@ impl CrdtFabric {
                 m.insert(&member, value.as_slice()).map_err(Self::loro_err)
             }
             FabricOp::SetRemove { key, path, value } => {
-                let (body, _) = self.body_for(key, "set", path)?;
-                let m = Self::child_map(&body, &typed_key("set", path))?;
+                let doc = self.doc_for(key, "set", path)?;
+                let m = doc.get_map(typed_key("set", path).as_str());
                 let prefix = format!("{}:", set_member_prefix(value));
                 for k in crate::loro_ext::map_keys(&m) {
                     if k.starts_with(&prefix) {
@@ -702,8 +685,9 @@ impl CrdtFabric {
                 Ok(())
             }
             FabricOp::CounterAdd { key, path, delta } => {
-                let (body, peer) = self.body_for(key, "cnt", path)?;
-                let m = Self::child_map(&body, &typed_key("cnt", path))?;
+                let doc = self.doc_for(key, "cnt", path)?;
+                let peer = doc.peer_id();
+                let m = doc.get_map(typed_key("cnt", path).as_str());
                 // PN-counter: each doc session sums into its own peer key;
                 // concurrent increments land in disjoint keys and always sum.
                 let me = peer.to_string();
@@ -818,70 +802,81 @@ impl Fabric for CrdtFabric {
         let BodyState::Collab(doc) = self.bodies.get(key)? else {
             return None;
         };
-        let body = doc.get_map(BODY_MAP);
+        // The projection walks the doc's ROOT value tree once: registers live
+        // as `reg:<path>` keys in the `body` root map; every other typed path
+        // is a name-identified root container `<tag>:<path>`.
         let mut view = CollaborativeView::default();
-        for full_key in crate::loro_ext::map_keys(&body) {
-            let Some((tag, path)) = full_key.split_once(':') else {
+        let loro::LoroValue::Map(roots) = doc.get_deep_value() else {
+            return Some(view);
+        };
+        for (name, value) in roots.iter() {
+            if name == BODY_MAP {
+                let loro::LoroValue::Map(body) = value else {
+                    continue;
+                };
+                for (k, v) in body.iter() {
+                    if let (Some(path), loro::LoroValue::Binary(bytes)) =
+                        (k.strip_prefix("reg:"), v)
+                    {
+                        view.registers.insert(path.to_string(), bytes.to_vec());
+                    }
+                }
+                continue;
+            }
+            let Some((tag, path)) = name.split_once(':') else {
                 continue;
             };
             let path = path.to_string();
-            match tag {
-                "reg" => {
-                    if let Some(bytes) = crate::loro_ext::get_bytes(&body, &full_key) {
-                        view.registers.insert(path, bytes);
-                    }
-                }
-                "map" => {
-                    if let Some(m) = crate::loro_ext::get_map(&body, &full_key) {
-                        let mut entries = BTreeMap::new();
-                        for k in crate::loro_ext::map_keys(&m) {
-                            if let Some(bytes) = crate::loro_ext::get_bytes(&m, &k) {
-                                entries.insert(k, bytes);
-                            }
+            match (tag, value) {
+                ("map", loro::LoroValue::Map(m)) => {
+                    let mut entries = BTreeMap::new();
+                    for (k, v) in m.iter() {
+                        if let loro::LoroValue::Binary(bytes) = v {
+                            entries.insert(k.clone(), bytes.to_vec());
                         }
-                        view.maps.insert(path, entries);
                     }
+                    view.maps.insert(path, entries);
                 }
-                "list" => {
-                    if let Some(loro::ValueOrContainer::Container(loro::Container::MovableList(
-                        l,
-                    ))) = body.get(&full_key)
-                    {
-                        view.lists.insert(
-                            path,
-                            Self::list_entries(&l)
-                                .into_iter()
-                                .map(|(_, element, value)| ListElement { element, value })
-                                .collect(),
-                        );
+                ("list", loro::LoroValue::List(items)) => {
+                    let mut elements = Vec::new();
+                    for v in items.iter() {
+                        let loro::LoroValue::Binary(bytes) = v else {
+                            continue;
+                        };
+                        if bytes.len() < ELEMENT_ID_LEN {
+                            continue;
+                        }
+                        elements.push(ListElement {
+                            element: data_encoding::HEXLOWER.encode(&bytes[..ELEMENT_ID_LEN]),
+                            value: bytes[ELEMENT_ID_LEN..].to_vec(),
+                        });
                     }
+                    view.lists.insert(path, elements);
                 }
-                "text" => {
-                    if let Some(loro::ValueOrContainer::Container(loro::Container::Text(t))) =
-                        body.get(&full_key)
-                    {
-                        view.texts.insert(path, t.to_string());
-                    }
+                ("text", loro::LoroValue::String(text)) => {
+                    view.texts.insert(path, text.to_string());
                 }
-                "set" => {
-                    if let Some(m) = crate::loro_ext::get_map(&body, &full_key) {
-                        let mut members: Vec<Vec<u8>> = crate::loro_ext::map_keys(&m)
-                            .into_iter()
-                            .filter_map(|k| crate::loro_ext::get_bytes(&m, &k))
-                            .collect();
-                        members.sort();
-                        members.dedup();
-                        view.sets.insert(path, members);
-                    }
+                ("set", loro::LoroValue::Map(m)) => {
+                    let mut members: Vec<Vec<u8>> = m
+                        .values()
+                        .filter_map(|v| match v {
+                            loro::LoroValue::Binary(bytes) => Some(bytes.to_vec()),
+                            _ => None,
+                        })
+                        .collect();
+                    members.sort();
+                    members.dedup();
+                    view.sets.insert(path, members);
                 }
-                "cnt" => {
-                    if let Some(m) = crate::loro_ext::get_map(&body, &full_key) {
-                        let total = crate::loro_ext::map_keys(&m)
-                            .into_iter()
-                            .filter_map(|k| crate::loro_ext::get_i64(&m, &k))
-                            .fold(0i64, i64::saturating_add);
-                        view.counters.insert(path, total);
-                    }
+                ("cnt", loro::LoroValue::Map(m)) => {
+                    let total = m
+                        .values()
+                        .filter_map(|v| match v {
+                            loro::LoroValue::I64(n) => Some(*n),
+                            _ => None,
+                        })
+                        .fold(0i64, i64::saturating_add);
+                    view.counters.insert(path, total);
                 }
                 _ => {}
             }

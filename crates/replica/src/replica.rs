@@ -333,21 +333,20 @@ impl SupportedSchemas {
     }
 }
 
-/// One Body's record in the Replica index.
+/// One constituent **head** of a Body: a single author-signed transaction and
+/// its sealed envelope. A Body converged from concurrent writers carries
+/// several heads whose engine-merged union is the current state — every byte
+/// that ever crosses a wire or lands durable is one author's original signed
+/// material; a replica never re-signs what it merged. A local commit collapses
+/// the set back to one head (its sealed envelope is the full merged snapshot).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct BodyRecord {
-    binding: BodyBinding,
-    /// The per-Body chain frontier: a commitment to this Body's transaction
-    /// chain (root, height). Atomic concurrent writes resolve to the
-    /// deterministic maximum of `(height, root)`; collaborative chains are
-    /// bookkeeping (the engine's causal merge is authoritative).
-    chain: ReplicaFrontier,
-    /// The id (full signed-envelope digest) of the transaction that last wrote
-    /// this Body — the export-grouping key.
+struct BodyHead {
+    /// The id (full signed-envelope digest) of this head's transaction —
+    /// the export-grouping key.
     tx: [u8; 32],
-    /// Hash of this Body's current descriptor (manifest entry input).
+    /// Hash of this head's descriptor (manifest entry input).
     descriptor_hash: [u8; 32],
-    /// Commitment to this Body's current signed transaction bytes.
+    /// Commitment to this head's signed transaction bytes.
     tx_commitment: [u8; 32],
     /// The sealed protected payload object (durable stores only).
     protected: Option<ObjectRef>,
@@ -358,9 +357,45 @@ struct BodyRecord {
     /// The signed transaction record length (quota ledger input; distinct
     /// transactions count once).
     tx_len: u64,
+}
+
+/// One Body's record in the Replica index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct BodyRecord {
+    binding: BodyBinding,
+    /// The per-Body chain frontier: a commitment to this Body's transaction
+    /// chain (root, height). Atomic concurrent writes resolve to the
+    /// deterministic maximum of `(height, root)`; collaborative chains are
+    /// bookkeeping (the engine's causal merge is authoritative).
+    chain: ReplicaFrontier,
+    /// The constituent heads (never empty). One after any local commit;
+    /// several while concurrent remote writes are held merged but not yet
+    /// re-sealed by a local write.
+    heads: Vec<BodyHead>,
     /// Whether the Body is interpreted by the local engine. `false` is the
     /// opaque branch: retained byte-identically, absent from reads.
     interpreted: bool,
+}
+
+impl BodyRecord {
+    /// The primary head — the only head on every single-writer path.
+    fn head(&self) -> &BodyHead {
+        &self.heads[0]
+    }
+    fn head_mut(&mut self) -> &mut BodyHead {
+        &mut self.heads[0]
+    }
+    /// Total sealed-envelope bytes across heads (quota ledger input).
+    fn protected_total(&self) -> u64 {
+        self.heads
+            .iter()
+            .fold(0u64, |a, h| a.saturating_add(h.protected_len))
+    }
+    /// Whether some head carries this transaction commitment (already-known
+    /// staged material).
+    fn has_commitment(&self, commitment: &[u8; 32]) -> bool {
+        self.heads.iter().any(|h| &h.tx_commitment == commitment)
+    }
 }
 
 /// The store's opaque caller metadata: the complete Replica index, persisted
@@ -392,8 +427,12 @@ pub struct Replica {
     /// Opaque retained material kept in memory for non-durable replicas (a
     /// durable store keeps it as objects; this map indexes the raw envelope
     /// bytes + transaction bytes for byte-identical forwarding either way).
-    raw_material: BTreeMap<BodyKey, (Vec<u8>, Vec<u8>)>,
+    raw_material: BTreeMap<BodyKey, Vec<RetainedHead>>,
 }
+
+/// One retained head's raw material: `(transaction id, envelope bytes,
+/// transaction bytes)`.
+type RetainedHead = ([u8; 32], Vec<u8>, Vec<u8>);
 
 /// The canonical Fabric key for a Body: `BLAKE3(domain || world || 0x00 || body)`.
 fn fabric_key(key: &BodyKey) -> FabricKey {
@@ -539,8 +578,10 @@ impl Replica {
         let mut bytes: u64 = 0;
         let mut tx_seen: std::collections::BTreeMap<[u8; 32], u64> = BTreeMap::new();
         for record in self.bodies.values() {
-            bytes = bytes.saturating_add(record.protected_len);
-            tx_seen.entry(record.tx).or_insert(record.tx_len);
+            for head in &record.heads {
+                bytes = bytes.saturating_add(head.protected_len);
+                tx_seen.entry(head.tx).or_insert(head.tx_len);
+            }
         }
         for len in tx_seen.values() {
             bytes = bytes.saturating_add(*len);
@@ -557,7 +598,7 @@ impl Replica {
         let mut count: u64 = 0;
         for (key, record) in &self.bodies {
             if !record.interpreted && &key.world == world {
-                bytes = bytes.saturating_add(record.protected_len);
+                bytes = bytes.saturating_add(record.protected_total());
                 count += 1;
             }
         }
@@ -598,46 +639,74 @@ impl Replica {
         replica.space = meta.space.clone();
         replica.quota = meta.quota.clamped();
         for (key, mut record) in meta.bodies {
-            let (Some(protected_ref), Some(tx_ref)) = (record.protected, record.transaction) else {
+            if record.heads.is_empty() {
                 return Err(ReplicaCommitError::Integrity(
-                    "body record without durable objects".into(),
+                    "body record without heads".into(),
                 ));
-            };
-            // The transaction record must decode and verify structurally.
-            let tx_bytes = store
-                .read_object(&tx_ref)
-                .map_err(|e| ReplicaCommitError::Integrity(e.to_string()))?;
-            let tx = BodyTransaction::decode_canonical(&tx_bytes)
-                .map_err(|e| ReplicaCommitError::Integrity(format!("transaction: {e}")))?;
-            tx.verify()
-                .map_err(|e| ReplicaCommitError::Integrity(format!("transaction: {e}")))?;
-            let envelope = store
-                .read_object(&protected_ref)
-                .map_err(|e| ReplicaCommitError::Integrity(e.to_string()))?;
-            let epoch = mechanics::crypto::body_epoch_id(&envelope).ok_or_else(|| {
-                ReplicaCommitError::Integrity("protected object without epoch prefix".into())
-            })?;
+            }
+            // Load and verify EVERY constituent head; a multi-writer Body's
+            // state is the engine merge of all of them, restored in order.
+            let mut loaded: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            for head in &record.heads {
+                let (Some(protected_ref), Some(tx_ref)) = (head.protected, head.transaction) else {
+                    return Err(ReplicaCommitError::Integrity(
+                        "body record without durable objects".into(),
+                    ));
+                };
+                // The transaction record must decode and verify structurally.
+                let tx_bytes = store
+                    .read_object(&tx_ref)
+                    .map_err(|e| ReplicaCommitError::Integrity(e.to_string()))?;
+                let tx = BodyTransaction::decode_canonical(&tx_bytes)
+                    .map_err(|e| ReplicaCommitError::Integrity(format!("transaction: {e}")))?;
+                tx.verify()
+                    .map_err(|e| ReplicaCommitError::Integrity(format!("transaction: {e}")))?;
+                let envelope = store
+                    .read_object(&protected_ref)
+                    .map_err(|e| ReplicaCommitError::Integrity(e.to_string()))?;
+                loaded.push((envelope, tx_bytes));
+            }
             // A Body retained opaquely stays opaque at reopen: interpreting it
             // later requires explicit revalidation through the incorporation
             // path, never a silent flip on restart. A Body that WAS
             // interpreted must open again — if its epoch key has since gone
             // away it degrades to opaque (retained, unread) rather than
             // failing the whole store.
-            match (record.interpreted, keys.opening_key(&epoch)) {
-                (true, Some(key_cap)) => {
-                    let payload = ProtectedBodyPayload::open(&key_cap, &envelope)
-                        .map_err(|e| ReplicaCommitError::Integrity(format!("protected: {e}")))?;
-                    replica
-                        .fabric
-                        .import_body(&fabric_key(&key), &payload.payload)
-                        .map_err(|e| ReplicaCommitError::Integrity(e.to_string()))?;
+            let mut degraded = !record.interpreted;
+            if record.interpreted {
+                for (envelope, _) in &loaded {
+                    let epoch = mechanics::crypto::body_epoch_id(envelope).ok_or_else(|| {
+                        ReplicaCommitError::Integrity(
+                            "protected object without epoch prefix".into(),
+                        )
+                    })?;
+                    match keys.opening_key(&epoch) {
+                        Some(key_cap) => {
+                            let payload =
+                                ProtectedBodyPayload::open(&key_cap, envelope).map_err(|e| {
+                                    ReplicaCommitError::Integrity(format!("protected: {e}"))
+                                })?;
+                            replica
+                                .fabric
+                                .import_body(&fabric_key(&key), &payload.payload)
+                                .map_err(|e| ReplicaCommitError::Integrity(e.to_string()))?;
+                        }
+                        None => {
+                            degraded = true;
+                            break;
+                        }
+                    }
                 }
-                (true, None) | (false, _) => {
-                    record.interpreted = false;
-                    replica
-                        .raw_material
-                        .insert(key.clone(), (envelope, tx_bytes));
-                }
+            }
+            if degraded {
+                record.interpreted = false;
+                let entries: Vec<([u8; 32], Vec<u8>, Vec<u8>)> = record
+                    .heads
+                    .iter()
+                    .zip(loaded)
+                    .map(|(h, (envelope, tx_bytes))| (h.tx, envelope, tx_bytes))
+                    .collect();
+                replica.raw_material.insert(key.clone(), entries);
             }
             replica.bodies.insert(key, record);
         }
@@ -892,13 +961,17 @@ impl Replica {
                         Some(BodyRecord {
                             binding,
                             chain,
-                            tx: [0u8; 32], // filled once the transaction is signed
-                            descriptor_hash: [0u8; 32], // filled below
-                            tx_commitment: [0u8; 32], // filled below
-                            protected: None,
-                            transaction: None,
-                            protected_len: envelope.len() as u64,
-                            tx_len: 0, // filled once the transaction is signed
+                            // A local commit's sealed envelope is the full
+                            // merged snapshot: the head set collapses to one.
+                            heads: vec![BodyHead {
+                                tx: [0u8; 32],              // filled once the transaction is signed
+                                descriptor_hash: [0u8; 32], // filled below
+                                tx_commitment: [0u8; 32],   // filled below
+                                protected: None,
+                                transaction: None,
+                                protected_len: envelope.len() as u64,
+                                tx_len: 0, // filled once the transaction is signed
+                            }],
                             interpreted: true,
                         }),
                     );
@@ -948,7 +1021,7 @@ impl Replica {
             // Stamp the resolved transaction id into every touched record.
             for key in &touched {
                 if let Some(Some(record)) = new_records.get_mut(key) {
-                    record.tx = tx_id;
+                    record.head_mut().tx = tx_id;
                 }
             }
             let receipt_record = RequestReceipt {
@@ -976,7 +1049,7 @@ impl Replica {
                 }
                 projected = projected.saturating_add(envelope.len() as u64);
                 if let Some(old) = self.bodies.get(key) {
-                    projected = projected.saturating_sub(old.protected_len);
+                    projected = projected.saturating_sub(old.protected_total());
                 }
             }
             projected = projected.saturating_add(tx.encode().len() as u64);
@@ -999,13 +1072,16 @@ impl Replica {
                 // so it can be exported byte-identically.
                 let tx_bytes = tx.encode();
                 for (key, envelope, _) in &sealed {
-                    self.raw_material
-                        .insert(key.clone(), (envelope.clone(), tx_bytes.clone()));
+                    self.raw_material.insert(
+                        key.clone(),
+                        vec![(tx.id(), envelope.clone(), tx_bytes.clone())],
+                    );
                     if let Some(Some(record)) = new_records.get_mut(key) {
-                        record.tx_len = tx_bytes.len() as u64;
-                        record.tx_commitment = tx_commitment(&tx_bytes);
+                        let head = record.head_mut();
+                        head.tx_len = tx_bytes.len() as u64;
+                        head.tx_commitment = tx_commitment(&tx_bytes);
                         if let Some(d) = tx.core.descriptors.iter().find(|d| &d.key() == key) {
-                            record.descriptor_hash = descriptor_hash(d);
+                            head.descriptor_hash = descriptor_hash(d);
                         }
                     }
                 }
@@ -1160,6 +1236,12 @@ impl Replica {
             /// `None` for the opaque branch.
             payload: Option<ProtectedBodyPayload>,
             record: BodyRecord,
+            /// A concurrent collaborative merge: the staged head JOINS the
+            /// existing record's head set (the union is the state) instead of
+            /// replacing it — replacing would advertise a single-author
+            /// envelope as if it contained the merge, which restart and every
+            /// downstream Contact would then silently lose.
+            merge_append: bool,
         }
         let mut planned: Vec<Planned> = Vec::new();
         // Overlay: the latest staged (chain, interpreted) per key.
@@ -1198,6 +1280,21 @@ impl Replica {
                         outcome.rejected += 1;
                         continue;
                     }
+                    // A head an INTERPRETED record already carries (same
+                    // transaction commitment) is known material regardless of
+                    // chain bookkeeping. An opaque record's known head must
+                    // still fall through: re-receiving it with the schema and
+                    // key epoch now available IS the upgrade/revalidation
+                    // path.
+                    let staged_commitment = tx_commitment(&units[*unit].0.encode());
+                    if self
+                        .bodies
+                        .get(&key)
+                        .is_some_and(|r| r.interpreted && r.has_commitment(&staged_commitment))
+                    {
+                        outcome.unchanged += 1;
+                        continue;
+                    }
                     let payload = match ProtectedBodyPayload::open(&open_key, envelope) {
                         Ok(p) => p,
                         Err(_) => {
@@ -1233,6 +1330,17 @@ impl Replica {
                         outcome.unchanged += 1;
                         continue;
                     }
+                    // Fast-forward (fresh body, opaque upgrade, or a payload
+                    // descending our chain): the incoming envelope CONTAINS
+                    // our state, so its head REPLACES the set. A concurrent
+                    // collaborative payload does not — it joins the set.
+                    let fast_forward = was_opaque
+                        || match (&payload.payload, current_chain) {
+                            (_, None) => true,
+                            (_, Some(chain)) if chain == payload.base_frontier => true,
+                            (BodyExport::Atomic(_), Some(_)) => true,
+                            (BodyExport::Collaborative(_), Some(_)) => false,
+                        };
                     let chain = match &payload.payload {
                         BodyExport::Atomic(_) => payload.resulting_frontier,
                         BodyExport::Collaborative(_) => match current_chain {
@@ -1254,15 +1362,18 @@ impl Replica {
                                 mutation_model: *model,
                             },
                             chain,
-                            tx: units[*unit].0.id(),
-                            descriptor_hash: descriptor_hash(descriptor),
-                            tx_commitment: [0u8; 32], // filled at persist
-                            protected: None,
-                            transaction: None,
-                            protected_len: envelope.len() as u64,
-                            tx_len: units[*unit].0.encode().len() as u64,
+                            heads: vec![BodyHead {
+                                tx: units[*unit].0.id(),
+                                descriptor_hash: descriptor_hash(descriptor),
+                                tx_commitment: staged_commitment,
+                                protected: None,
+                                transaction: None,
+                                protected_len: envelope.len() as u64,
+                                tx_len: units[*unit].0.encode().len() as u64,
+                            }],
                             interpreted: true,
                         },
+                        merge_append: !fast_forward,
                     });
                 }
                 _ => {
@@ -1270,10 +1381,11 @@ impl Replica {
                     // for an unavailable World/schema or a missing key epoch.
                     // Retain byte-identically; never call a World, never
                     // decrypt, never import into the engine.
-                    let already = self
-                        .raw_material
-                        .get(&key)
-                        .is_some_and(|(bytes, _)| bytes.as_slice() == *envelope);
+                    let already = self.raw_material.get(&key).is_some_and(|entries| {
+                        entries
+                            .iter()
+                            .any(|(_, bytes, _)| bytes.as_slice() == *envelope)
+                    });
                     if already {
                         outcome.unchanged += 1;
                         continue;
@@ -1300,15 +1412,21 @@ impl Replica {
                                 mutation_model: model_tag,
                             },
                             chain,
-                            tx: units[*unit].0.id(),
-                            descriptor_hash: descriptor_hash(descriptor),
-                            tx_commitment: [0u8; 32],
-                            protected: None,
-                            transaction: None,
-                            protected_len: envelope.len() as u64,
-                            tx_len: units[*unit].0.encode().len() as u64,
+                            heads: vec![BodyHead {
+                                tx: units[*unit].0.id(),
+                                descriptor_hash: descriptor_hash(descriptor),
+                                tx_commitment: tx_commitment(&units[*unit].0.encode()),
+                                protected: None,
+                                transaction: None,
+                                protected_len: envelope.len() as u64,
+                                tx_len: units[*unit].0.encode().len() as u64,
+                            }],
                             interpreted: false,
                         },
+                        // Opaque material is retained byte-identically per
+                        // author: a distinct envelope for a Body we already
+                        // hold joins the set rather than replacing it.
+                        merge_append: self.bodies.contains_key(&key),
                     });
                 }
             }
@@ -1319,37 +1437,43 @@ impl Replica {
         }
 
         // ---- Phase 4: quota projection over the COMPLETE resulting state. --
-        // The final record per key wins (successive same-Body writes within
-        // the bundle supersede each other in the ledger).
-        let mut final_keys: BTreeMap<BodyKey, usize> = BTreeMap::new();
-        for (i, change) in planned.iter().enumerate() {
-            final_keys.insert(change.key.clone(), i);
-        }
+        // Every planned change adds its envelope; a REPLACING change (fast
+        // forward) additionally reclaims the old head set, once per key. An
+        // appending change (concurrent merge head) reclaims nothing — its
+        // material joins the set. The projection is conservative: it never
+        // under-counts the resulting ledger.
         {
             let (mut projected_bytes, mut projected_bodies) = self.usage();
             let mut opaque_delta: BTreeMap<WorldId, (u64, u64)> = BTreeMap::new();
             let mut counted_tx: BTreeSet<usize> = BTreeSet::new();
-            for (key, i) in &final_keys {
-                let change = &planned[*i];
+            let mut seen_key: BTreeSet<BodyKey> = BTreeSet::new();
+            for change in &planned {
                 if change.envelope.len() as u64 > self.quota.max_body_bytes {
                     return Err(ReplicaCommitError::QuotaExceeded);
                 }
-                let old = self.bodies.get(key);
+                let old = self.bodies.get(&change.key);
                 projected_bytes = projected_bytes.saturating_add(change.envelope.len() as u64);
-                match old {
-                    Some(old_record) => {
-                        projected_bytes = projected_bytes.saturating_sub(old_record.protected_len);
+                let first_for_key = seen_key.insert(change.key.clone());
+                if first_for_key {
+                    match old {
+                        Some(old_record) if !change.merge_append => {
+                            projected_bytes =
+                                projected_bytes.saturating_sub(old_record.protected_total());
+                        }
+                        Some(_) => {}
+                        None => projected_bodies += 1,
                     }
-                    None => projected_bodies += 1,
                 }
                 if counted_tx.insert(change.unit) {
                     projected_bytes =
                         projected_bytes.saturating_add(units[change.unit].0.encode().len() as u64);
                 }
                 if !change.record.interpreted {
-                    let entry = opaque_delta.entry(key.world.clone()).or_insert((0, 0));
+                    let entry = opaque_delta
+                        .entry(change.key.world.clone())
+                        .or_insert((0, 0));
                     entry.0 = entry.0.saturating_add(change.envelope.len() as u64);
-                    if old.is_none() {
+                    if old.is_none() && first_for_key {
                         entry.1 += 1;
                     }
                 }
@@ -1377,7 +1501,14 @@ impl Replica {
         // ---- Phase 5: engine application, in unit order. ---------------------
         // Per-unit causal evidence drives the frontier advance, matching the
         // sequential single-transaction semantics exactly.
-        let mut changed: Vec<(BodyKey, Vec<u8>, BodyRecord, usize)> = Vec::new();
+        struct AcceptedChange {
+            key: BodyKey,
+            envelope: Vec<u8>,
+            record: BodyRecord,
+            unit: usize,
+            merge_append: bool,
+        }
+        let mut changed: Vec<AcceptedChange> = Vec::new();
         let mut unit_causal: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
         for change in planned {
             match &change.payload {
@@ -1395,7 +1526,13 @@ impl Replica {
                                 .entry(change.unit)
                                 .or_default()
                                 .extend_from_slice(receipt.causal().as_bytes());
-                            changed.push((change.key, change.envelope, change.record, change.unit));
+                            changed.push(AcceptedChange {
+                                key: change.key,
+                                envelope: change.envelope,
+                                record: change.record,
+                                unit: change.unit,
+                                merge_append: change.merge_append,
+                            });
                         }
                         Err(FabricError::TypeConflict) => {
                             outcome.rejected += 1;
@@ -1409,7 +1546,13 @@ impl Replica {
                 None => {
                     outcome.unsupported_retained += 1;
                     unit_causal.entry(change.unit).or_default();
-                    changed.push((change.key, change.envelope, change.record, change.unit));
+                    changed.push(AcceptedChange {
+                        key: change.key,
+                        envelope: change.envelope,
+                        record: change.record,
+                        unit: change.unit,
+                        merge_append: change.merge_append,
+                    });
                 }
             }
         }
@@ -1418,7 +1561,7 @@ impl Replica {
             outcome.current = previous;
             return Ok(outcome);
         }
-        outcome.scopes = changed.iter().map(|(k, _, _, _)| k.clone()).collect();
+        outcome.scopes = changed.iter().map(|c| c.key.clone()).collect();
         outcome.scopes.sort();
         outcome.scopes.dedup();
 
@@ -1426,7 +1569,7 @@ impl Replica {
         // order, from that unit's transaction id + engine causal evidence.
         let mut next_frontier = previous;
         for (idx, causal_tail) in &unit_causal {
-            let touched = changed.iter().any(|(_, _, _, unit)| unit == idx);
+            let touched = changed.iter().any(|c| &c.unit == idx);
             if !touched {
                 continue;
             }
@@ -1436,26 +1579,71 @@ impl Replica {
             next_frontier = advance(next_frontier, &causal);
         }
 
-        // ---- Phase 6: ONE durable commit for the complete bundle. -----------
-        // The final record per key wins; each final record references its own
-        // unit's transaction record.
-        let mut final_changes: BTreeMap<BodyKey, (Vec<u8>, BodyRecord, usize)> = BTreeMap::new();
-        for (key, envelope, record, unit) in changed {
-            final_changes.insert(key, (envelope, record, unit));
+        // ---- Phase 6: fold accepted changes into final head sets, then ONE
+        // durable commit for the complete bundle. A fast-forward change
+        // REPLACES a Body's head set (its envelope contains the prior state);
+        // a concurrent merge head JOINS it — the union of head envelopes is
+        // the merged state every restart and every downstream Contact must be
+        // able to reproduce.
+        let mut final_records: BTreeMap<BodyKey, BodyRecord> = BTreeMap::new();
+        // Every accepted (envelope, transaction) pair, per head — all of it
+        // must land durable (or in raw material) for re-serving.
+        let mut staged_material: Vec<(BodyKey, [u8; 32], Vec<u8>, usize)> = Vec::new();
+        for change in changed {
+            let staged_head = change.record.head().clone();
+            staged_material.push((
+                change.key.clone(),
+                staged_head.tx,
+                change.envelope.clone(),
+                change.unit,
+            ));
+            let base = final_records
+                .remove(&change.key)
+                .or_else(|| self.bodies.get(&change.key).cloned());
+            let folded = match (base, change.merge_append) {
+                (Some(mut existing), true) => {
+                    if !existing.has_commitment(&staged_head.tx_commitment) {
+                        existing.heads.push(staged_head);
+                    }
+                    existing.chain = change.record.chain;
+                    existing.interpreted = change.record.interpreted;
+                    existing
+                }
+                _ => change.record,
+            };
+            final_records.insert(change.key, folded);
         }
-        if self.durable.is_some() {
-            self.persist_bundle(ctx, units, &final_changes, next_frontier)?;
-        }
-        for (key, (envelope, record, unit)) in final_changes {
-            if !record.interpreted {
-                self.raw_material
-                    .insert(key.clone(), (envelope, units[unit].0.encode()));
+        let persisted: Option<BTreeMap<BodyKey, BodyRecord>> = if self.durable.is_some() {
+            Some(self.persist_bundle(
+                ctx,
+                units,
+                &staged_material,
+                &final_records,
+                next_frontier,
+            )?)
+        } else {
+            None
+        };
+        for (key, record) in final_records {
+            let record = persisted
+                .as_ref()
+                .and_then(|f| f.get(&key).cloned())
+                .unwrap_or(record);
+            if !record.interpreted || persisted.is_none() {
+                // Opaque material is always re-served from memory; a
+                // NON-durable replica keeps interpreted material in memory
+                // too — it has no object store to re-read from, and a Body it
+                // now advertises must stay exportable. Retention is per head.
+                let entries = self.raw_material.entry(key.clone()).or_default();
+                for (skey, tx_id, envelope, unit) in &staged_material {
+                    if skey == &key && !entries.iter().any(|(t, _, _)| t == tx_id) {
+                        entries.push((*tx_id, envelope.clone(), units[*unit].0.encode()));
+                    }
+                }
+                // Drop retained entries for heads the fold replaced.
+                entries.retain(|(t, _, _)| record.heads.iter().any(|h| &h.tx == t));
             } else {
                 self.raw_material.remove(&key);
-            }
-            let mut record = record;
-            if record.tx_commitment == [0u8; 32] {
-                record.tx_commitment = tx_commitment(&units[unit].0.encode());
             }
             self.bodies.insert(key, record);
         }
@@ -1464,31 +1652,36 @@ impl Replica {
         Ok(outcome)
     }
 
-    /// The bundle's one durable write: every final record's envelope, every
+    /// The bundle's one durable write: every staged head's envelope, every
     /// referenced signed transaction record, and the replacement Manifest over
     /// the complete post-bundle Body set — a single journal commit.
     fn persist_bundle(
         &mut self,
         ctx: &CommitContext<'_>,
         units: &[IncorporationUnit],
-        final_changes: &BTreeMap<BodyKey, (Vec<u8>, BodyRecord, usize)>,
+        staged_material: &[(BodyKey, [u8; 32], Vec<u8>, usize)],
+        final_records: &BTreeMap<BodyKey, BodyRecord>,
         next_frontier: ReplicaFrontier,
-    ) -> Result<(), ReplicaCommitError> {
-        // Fill object refs into a working copy of the final records.
-        let mut new_records: BTreeMap<BodyKey, BodyRecord> = BTreeMap::new();
+    ) -> Result<BTreeMap<BodyKey, BodyRecord>, ReplicaCommitError> {
+        // Fill object refs into a working copy of the final records: each
+        // staged head gets refs to the objects written below; heads carried
+        // over from the prior record keep the refs they already have.
+        let mut new_records: BTreeMap<BodyKey, BodyRecord> = final_records.clone();
         let mut tx_bytes_by_unit: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
-        for (key, (envelope, record, unit)) in final_changes {
+        for (key, tx_id, envelope, unit) in staged_material {
             let tx_bytes = tx_bytes_by_unit
                 .entry(*unit)
                 .or_insert_with(|| units[*unit].0.encode())
                 .clone();
-            let mut record = record.clone();
-            record.protected = Some(object_ref(envelope));
-            record.transaction = Some(object_ref(&tx_bytes));
-            record.tx_commitment = tx_commitment(&tx_bytes);
-            record.protected_len = envelope.len() as u64;
-            record.tx_len = tx_bytes.len() as u64;
-            new_records.insert(key.clone(), record);
+            if let Some(record) = new_records.get_mut(key) {
+                if let Some(head) = record.heads.iter_mut().find(|h| &h.tx == tx_id) {
+                    head.protected = Some(object_ref(envelope));
+                    head.transaction = Some(object_ref(&tx_bytes));
+                    head.tx_commitment = tx_commitment(&tx_bytes);
+                    head.protected_len = envelope.len() as u64;
+                    head.tx_len = tx_bytes.len() as u64;
+                }
+            }
         }
 
         // The post-commit body index: current records overlaid with the new.
@@ -1499,14 +1692,23 @@ impl Replica {
 
         // Manifest pages over the full Body set.
         let space = ctx.space;
+        // One entry per constituent head: a multi-writer Body is advertised
+        // as the exact set of author-signed heads whose union is its state.
         let entries: Vec<ManifestEntry> = bodies
             .iter()
-            .map(|(key, r)| ManifestEntry {
-                key: key.clone(),
-                descriptor_hash: r.descriptor_hash,
-                transaction_commitment: r.tx_commitment,
+            .flat_map(|(key, r)| {
+                r.heads.iter().map(move |h| ManifestEntry {
+                    key: key.clone(),
+                    descriptor_hash: h.descriptor_hash,
+                    transaction_commitment: h.tx_commitment,
+                })
             })
             .collect();
+        let mut entries = entries;
+        entries.sort_by(|a, b| {
+            (&a.key, &a.transaction_commitment).cmp(&(&b.key, &b.transaction_commitment))
+        });
+        let entries = entries;
         let mut pages: Vec<ManifestPage> = Vec::new();
         for (i, chunk) in entries.chunks(MAX_ENTRIES_PER_PAGE).enumerate() {
             pages.push(
@@ -1549,7 +1751,7 @@ impl Replica {
         for tx_bytes in tx_bytes_by_unit.values() {
             push_obj(tx_bytes, &mut new_objects, &mut seen);
         }
-        for (envelope, _, _) in final_changes.values() {
+        for (_, _, envelope, _) in staged_material {
             push_obj(envelope, &mut new_objects, &mut seen);
         }
         push_obj(&root_bytes, &mut new_objects, &mut seen);
@@ -1559,14 +1761,16 @@ impl Replica {
 
         // Keep: every carried object the post-commit index references.
         for record in bodies.values() {
-            if let Some(r) = record.protected {
-                if !seen.contains(&r.hash) {
-                    keep.push(r);
+            for head in &record.heads {
+                if let Some(r) = head.protected {
+                    if !seen.contains(&r.hash) {
+                        keep.push(r);
+                    }
                 }
-            }
-            if let Some(r) = record.transaction {
-                if !seen.contains(&r.hash) {
-                    keep.push(r);
+                if let Some(r) = head.transaction {
+                    if !seen.contains(&r.hash) {
+                        keep.push(r);
+                    }
                 }
             }
         }
@@ -1598,7 +1802,12 @@ impl Replica {
                 return Err(ReplicaCommitError::Durability(e.to_string()));
             }
         }
-        Ok(())
+        // The caller's in-memory index must adopt THESE records — the ones
+        // carrying the object refs just persisted — or the replica cannot
+        // re-serve incorporated material until a reopen reloads the meta
+        // (a served manifest would name Bodies its own export skips, which a
+        // receiving peer correctly rejects whole as illegitimate).
+        Ok(new_records)
     }
 
     /// Validate a completed Contact's staged material into a **sealed**
@@ -1696,11 +1905,12 @@ impl Replica {
             .root()
             .verify_pages(&pages)
             .map_err(|e| illegit(format!("manifest pages: {e}")))?;
-        let entries: BTreeMap<BodyKey, &ManifestEntry> = pages
-            .iter()
-            .flat_map(|p| p.entries.iter())
-            .map(|e| (e.key.clone(), e))
-            .collect();
+        // A multi-writer Body is advertised as several heads under one key:
+        // the entry index is a multimap grouped by key.
+        let mut entries: BTreeMap<BodyKey, Vec<&ManifestEntry>> = BTreeMap::new();
+        for e in pages.iter().flat_map(|p| p.entries.iter()) {
+            entries.entry(e.key.clone()).or_default().push(e);
+        }
         // 5. Every provided transaction verifies with historical standing,
         //    bound to the root's Space.
         for (tx, _) in &transactions {
@@ -1728,12 +1938,14 @@ impl Replica {
                     "payload does not match the signed commitment".into(),
                 ));
             }
-            let Some(entry) = entries.get(key) else {
+            let Some(key_entries) = entries.get(key) else {
                 return Err(illegit("payload outside the advertised manifest".into()));
             };
-            if entry.descriptor_hash != descriptor_hash(descriptor)
-                || entry.transaction_commitment != tx_commitment(tx_bytes)
-            {
+            let bound = key_entries.iter().any(|entry| {
+                entry.descriptor_hash == descriptor_hash(descriptor)
+                    && entry.transaction_commitment == tx_commitment(tx_bytes)
+            });
+            if !bound {
                 return Err(illegit(
                     "manifest entry does not bind this descriptor/transaction".into(),
                 ));
@@ -1749,21 +1961,32 @@ impl Replica {
         //    byte-identical local record or from the transferred material.
         //    A root naming material that is neither held nor transferred is
         //    rejected whole; no subset is adopted under it.
-        let received: BTreeSet<&BodyKey> = staged.bodies.iter().map(|(_, key, _)| key).collect();
-        for (key, entry) in &entries {
-            if received.contains(key) {
-                continue;
+        // Received heads are identified by (key, transaction commitment): the
+        // transferred payload's transaction bytes are in `transactions`.
+        let mut received: BTreeSet<(&BodyKey, [u8; 32])> = BTreeSet::new();
+        for (tx_id, key, _) in &staged.bodies {
+            if let Some((_, tx_bytes)) = transactions.iter().find(|(t, _)| &t.id() == tx_id) {
+                received.insert((key, tx_commitment(tx_bytes)));
             }
-            let local_matches = self.bodies.get(key).is_some_and(|record| {
-                record.descriptor_hash == entry.descriptor_hash
-                    && record.tx_commitment == entry.transaction_commitment
-            });
-            if !local_matches {
-                return Err(illegit(format!(
-                    "manifest names material neither held nor transferred: {}/{}",
-                    key.world.as_str(),
-                    key.body
-                )));
+        }
+        for (key, key_entries) in &entries {
+            for entry in key_entries {
+                if received.contains(&(key, entry.transaction_commitment)) {
+                    continue;
+                }
+                let local_matches = self.bodies.get(key).is_some_and(|record| {
+                    record.heads.iter().any(|h| {
+                        h.descriptor_hash == entry.descriptor_hash
+                            && h.tx_commitment == entry.transaction_commitment
+                    })
+                });
+                if !local_matches {
+                    return Err(illegit(format!(
+                        "manifest names material neither held nor transferred: {}/{}",
+                        key.world.as_str(),
+                        key.body
+                    )));
+                }
             }
         }
         Ok(crate::convergence::ValidatedContactBundle {
@@ -1793,15 +2016,23 @@ impl Replica {
         &self,
         ctx: &CommitContext<'_>,
     ) -> Result<(Vec<u8>, Vec<Vec<u8>>), ReplicaCommitError> {
+        // One entry per constituent head (see `persist_bundle`).
         let entries: Vec<ManifestEntry> = self
             .bodies
             .iter()
-            .map(|(key, r)| ManifestEntry {
-                key: key.clone(),
-                descriptor_hash: r.descriptor_hash,
-                transaction_commitment: r.tx_commitment,
+            .flat_map(|(key, r)| {
+                r.heads.iter().map(move |h| ManifestEntry {
+                    key: key.clone(),
+                    descriptor_hash: h.descriptor_hash,
+                    transaction_commitment: h.tx_commitment,
+                })
             })
             .collect();
+        let mut entries = entries;
+        entries.sort_by(|a, b| {
+            (&a.key, &a.transaction_commitment).cmp(&(&b.key, &b.transaction_commitment))
+        });
+        let entries = entries;
         let mut pages: Vec<ManifestPage> = Vec::new();
         for (i, chunk) in entries.chunks(MAX_ENTRIES_PER_PAGE).enumerate() {
             pages.push(
@@ -1828,28 +2059,49 @@ impl Replica {
         type Grouped = BTreeMap<[u8; 32], (BodyTransaction, Vec<(BodyKey, Vec<u8>)>)>;
         let mut by_tx: Grouped = BTreeMap::new();
         for (key, record) in &self.bodies {
-            let (envelope, tx_bytes) = match (&self.durable, self.raw_material.get(key)) {
-                (_, Some((envelope, tx_bytes))) => (envelope.clone(), tx_bytes.clone()),
-                (Some(store), None) => {
-                    let (Some(protected_ref), Some(tx_ref)) =
-                        (record.protected, record.transaction)
-                    else {
-                        continue;
-                    };
-                    let envelope = store
-                        .read_object(&protected_ref)
-                        .map_err(|e| ReplicaCommitError::Integrity(e.to_string()))?;
-                    let tx_bytes = store
-                        .read_object(&tx_ref)
-                        .map_err(|e| ReplicaCommitError::Integrity(e.to_string()))?;
-                    (envelope, tx_bytes)
-                }
-                (None, None) => continue,
-            };
-            let tx = BodyTransaction::decode_canonical(&tx_bytes)
-                .map_err(|e| ReplicaCommitError::Integrity(e.to_string()))?;
-            let entry = by_tx.entry(record.tx).or_insert_with(|| (tx, Vec::new()));
-            entry.1.push((key.clone(), envelope));
+            // A Body the manifest advertises MUST be fully exportable — every
+            // constituent head, from the retained in-memory material or the
+            // durable object store. A gap here would let this replica serve a
+            // root that names material it cannot supply, which every peer
+            // correctly rejects whole.
+            for head in &record.heads {
+                let raw = self
+                    .raw_material
+                    .get(key)
+                    .and_then(|entries| entries.iter().find(|(t, _, _)| t == &head.tx));
+                let (envelope, tx_bytes) = match (raw, &self.durable) {
+                    (Some((_, envelope, tx_bytes)), _) => (envelope.clone(), tx_bytes.clone()),
+                    (None, Some(store)) => {
+                        let (Some(protected_ref), Some(tx_ref)) =
+                            (head.protected, head.transaction)
+                        else {
+                            return Err(ReplicaCommitError::Integrity(format!(
+                                "unexportable head (no refs, no raw material): {}/{}",
+                                key.world.as_str(),
+                                key.body
+                            )));
+                        };
+                        let envelope = store
+                            .read_object(&protected_ref)
+                            .map_err(|e| ReplicaCommitError::Integrity(e.to_string()))?;
+                        let tx_bytes = store
+                            .read_object(&tx_ref)
+                            .map_err(|e| ReplicaCommitError::Integrity(e.to_string()))?;
+                        (envelope, tx_bytes)
+                    }
+                    (None, None) => {
+                        return Err(ReplicaCommitError::Integrity(format!(
+                            "unexportable head (no store, no raw material): {}/{}",
+                            key.world.as_str(),
+                            key.body
+                        )));
+                    }
+                };
+                let tx = BodyTransaction::decode_canonical(&tx_bytes)
+                    .map_err(|e| ReplicaCommitError::Integrity(e.to_string()))?;
+                let entry = by_tx.entry(head.tx).or_insert_with(|| (tx, Vec::new()));
+                entry.1.push((key.clone(), envelope));
+            }
         }
         Ok(by_tx.into_values().collect())
     }
@@ -1918,13 +2170,15 @@ impl Replica {
                             },
                         ),
                         chain: advance_chain(base, &seed),
-                        tx,
-                        descriptor_hash: [0u8; 32],
-                        tx_commitment: [0u8; 32],
-                        protected: None,
-                        transaction: None,
-                        protected_len: 0,
-                        tx_len: 0,
+                        heads: vec![BodyHead {
+                            tx,
+                            descriptor_hash: [0u8; 32],
+                            tx_commitment: [0u8; 32],
+                            protected: None,
+                            transaction: None,
+                            protected_len: 0,
+                            tx_len: 0,
+                        }],
                         interpreted: true,
                     };
                     self.bodies.insert(key, record);
@@ -1979,11 +2233,13 @@ impl Replica {
             None => (self.bodies.clone().into_iter().collect(), None, Vec::new()),
         };
         for (_, record) in &bodies {
-            if let Some(r) = record.protected {
-                keep.push(r);
-            }
-            if let Some(r) = record.transaction {
-                keep.push(r);
+            for head in &record.heads {
+                if let Some(r) = head.protected {
+                    keep.push(r);
+                }
+                if let Some(r) = head.transaction {
+                    keep.push(r);
+                }
             }
         }
         if let Some(r) = manifest_root {
@@ -2040,17 +2296,19 @@ impl Replica {
         let tx_ref = object_ref(&tx_bytes);
         let commitment = tx_commitment(&tx_bytes);
 
-        // Fill object refs + descriptor hashes into the new records.
+        // Fill object refs + descriptor hashes into the new records. A local
+        // commit's sealed envelope is the full merged state: one head.
         for (key, envelope, _) in sealed {
             if let Some(Some(record)) = new_records.get_mut(key) {
-                record.protected = Some(object_ref(envelope));
-                record.transaction = Some(tx_ref);
-                record.tx_commitment = commitment;
-                record.protected_len = envelope.len() as u64;
-                record.tx_len = tx_bytes.len() as u64;
-                if record.descriptor_hash == [0u8; 32] {
+                let head = record.head_mut();
+                head.protected = Some(object_ref(envelope));
+                head.transaction = Some(tx_ref);
+                head.tx_commitment = commitment;
+                head.protected_len = envelope.len() as u64;
+                head.tx_len = tx_bytes.len() as u64;
+                if head.descriptor_hash == [0u8; 32] {
                     if let Some(d) = tx.core.descriptors.iter().find(|d| &d.key() == key) {
-                        record.descriptor_hash = descriptor_hash(d);
+                        head.descriptor_hash = descriptor_hash(d);
                     }
                 }
             }
@@ -2071,14 +2329,22 @@ impl Replica {
 
         // Manifest pages over the full Body set.
         let space = ctx.space;
+        // One entry per constituent head (see `persist_bundle`).
         let entries: Vec<ManifestEntry> = bodies
             .iter()
-            .map(|(key, r)| ManifestEntry {
-                key: key.clone(),
-                descriptor_hash: r.descriptor_hash,
-                transaction_commitment: r.tx_commitment,
+            .flat_map(|(key, r)| {
+                r.heads.iter().map(move |h| ManifestEntry {
+                    key: key.clone(),
+                    descriptor_hash: h.descriptor_hash,
+                    transaction_commitment: h.tx_commitment,
+                })
             })
             .collect();
+        let mut entries = entries;
+        entries.sort_by(|a, b| {
+            (&a.key, &a.transaction_commitment).cmp(&(&b.key, &b.transaction_commitment))
+        });
+        let entries = entries;
         let mut pages: Vec<ManifestPage> = Vec::new();
         for (i, chunk) in entries.chunks(MAX_ENTRIES_PER_PAGE).enumerate() {
             pages.push(
@@ -2136,14 +2402,16 @@ impl Replica {
 
         // Keep: every carried object the post-commit index references.
         for record in bodies.values() {
-            if let Some(r) = record.protected {
-                if !seen.contains(&r.hash) {
-                    keep.push(r);
+            for head in &record.heads {
+                if let Some(r) = head.protected {
+                    if !seen.contains(&r.hash) {
+                        keep.push(r);
+                    }
                 }
-            }
-            if let Some(r) = record.transaction {
-                if !seen.contains(&r.hash) {
-                    keep.push(r);
+                if let Some(r) = head.transaction {
+                    if !seen.contains(&r.hash) {
+                        keep.push(r);
+                    }
                 }
             }
         }
