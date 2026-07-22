@@ -410,7 +410,7 @@ fn a_world_panic_is_contained_and_does_not_end_the_station() {
             payload: b"x".to_vec(),
         },
     );
-    assert_eq!(r, Err(WorldError::WorldImplementationFailed));
+    assert_eq!(r, Err(WorldError::WorldPanicked));
     // The Station survives the panic and can still go dormant cleanly.
     assert!(station.go_dormant().is_ok());
 }

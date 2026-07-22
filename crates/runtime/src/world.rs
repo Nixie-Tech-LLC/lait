@@ -10,7 +10,7 @@
 //! World callbacks are trusted, cooperative, in-process Rust code — not a
 //! sandbox. The API supplies no clock, RNG, environment, thread, file, or
 //! network handle; implementations promise deterministic synchronous bounded CPU
-//! work. Runtime contains an unwind-safe panic as `WorldImplementationFailed`
+//! work. Runtime contains an unwind-safe panic as `WorldPanicked`
 //! without ending the Station.
 
 use mechanics::ids::{ActorId, DeviceId, StationId};

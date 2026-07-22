@@ -124,7 +124,7 @@ pub enum WorldError {
     ResetRequired,
     /// The World callback panicked. Runtime contains the unwind as this typed
     /// error without ending the Station or discarding the Replica.
-    WorldImplementationFailed,
+    WorldPanicked,
     /// The World's durable state violates its own structural invariants (e.g.
     /// a missing, misplaced, duplicated or mis-bound singleton Body after
     /// completed initialization). Never repaired, selected among, or silently

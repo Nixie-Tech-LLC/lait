@@ -13,7 +13,7 @@
 //! schema+version (a query may also read a declared readable predecessor); and
 //! the principal's standing is **re-resolved through the mechanics
 //! [`AuthorityView`](crate::world::AuthorityView)** for this request. A panic in
-//! the callback is caught as [`WorldError::WorldImplementationFailed`] and never
+//! the callback is caught as [`WorldError::WorldPanicked`] and never
 //! ends the Station.
 //!
 //! After the World stages its effect, the Session **contains** it — every staged
@@ -705,7 +705,7 @@ impl Session {
                 let mut ctx = WorldContext::with_reads(principal, &reader, parent_root);
                 world.submit(&mut ctx, intent)
             }))
-            .unwrap_or(Err(WorldError::WorldImplementationFailed))?
+            .unwrap_or(Err(WorldError::WorldPanicked))?
         };
         // Contain the staged effect inside this World's namespace and each
         // Body's exact schema binding, resolving the bindings the commit is
@@ -841,7 +841,7 @@ impl Session {
                 let ctx = WorldContext::with_reads(principal, &reader, snapshot_root);
                 world.query(&ctx, query)
             }))
-            .unwrap_or(Err(WorldError::WorldImplementationFailed))?
+            .unwrap_or(Err(WorldError::WorldPanicked))?
         };
         // The query's read demand is mandatory and evaluated at the pinned
         // authority frontier — even publicly visible data requires an explicit

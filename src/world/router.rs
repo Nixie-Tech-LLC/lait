@@ -277,9 +277,7 @@ impl<'a> IssueRouter<'a> {
             WorldError::LimitExceeded => Response::err("request exceeds a limit"),
             WorldError::AuthorityChanged => Response::err("membership changed — retry"),
             WorldError::StationDormant => Response::err("the space is shutting down"),
-            WorldError::Persistence | WorldError::WorldImplementationFailed => {
-                Response::err("internal error")
-            }
+            WorldError::Persistence | WorldError::WorldPanicked => Response::err("internal error"),
             WorldError::ResetRequired => Response::err("state reset — re-query"),
             WorldError::WorldStateCorrupt => Response::err(
                 "the space's issue catalog is corrupt (missing, duplicated, or mis-bound) — \

@@ -356,7 +356,7 @@ impl ErrorDto {
             E::StationDormant => "station-dormant",
             E::Persistence => "persistence",
             E::ResetRequired => "reset-required",
-            E::WorldImplementationFailed => "world-implementation-failed",
+            E::WorldPanicked => "world-panicked",
             E::WorldStateCorrupt => "world-state-corrupt",
             E::ContractViolation => "contract-violation",
         }
