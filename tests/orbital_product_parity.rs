@@ -225,22 +225,16 @@ fn setup(root: &std::path::Path) -> (Runtime, Station) {
 
 fn seed_space(driver: &mut Driver) -> (String, String, String) {
     let ts = driver.ts();
-    driver
-        .submit(&IssueIntent::SpaceInit {
-            name: "Parity Space".into(),
-            ts,
-        })
-        .unwrap();
     let project = ProjectId::mint(&SystemUlidSource).as_str().to_string();
-    let ts = driver.ts();
     driver
-        .submit(&IssueIntent::ProjectNew {
-            id: project.clone(),
-            name: "Engineering".into(),
-            key: "eng".into(),
-            device: my_device().as_str().to_string(),
+        .submit(&lait::world::contract::initialize_tracker_intent(
+            "Parity Space",
             ts,
-        })
+            &project,
+            "Engineering",
+            "eng",
+            my_device().as_str(),
+        ))
         .unwrap();
     let doc = DocId::mint(&SystemUlidSource).as_str().to_string();
     let ts = driver.ts();

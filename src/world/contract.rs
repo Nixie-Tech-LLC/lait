@@ -84,6 +84,93 @@ pub fn founder_capabilities() -> Vec<(PolicyCapability, PolicyResource)> {
         .collect()
 }
 
+// ---- Capability registry v1 (plan 04) -------------------------------------
+//
+// The registry is part of the implementation descriptor's policy-table
+// commitment, NOT editable Catalog state; changing an entry requires a new
+// implementation id, and entries are never repurposed in place.
+
+/// The Space-scoped capability ids, sorted.
+pub const SPACE_CAPABILITIES: [&str; 8] = [
+    "catalog.label.configure",
+    "catalog.workflow.configure",
+    "policy.assign",
+    "policy.configure",
+    "project.create",
+    "space.admin",
+    "space.contributor",
+    "space.issue.read",
+];
+
+/// The Project-scoped capability ids, sorted. `workflow.transition.<id>` is a
+/// qualified family validated by grammar, not enumerated here.
+pub const PROJECT_CAPABILITIES: [&str; 14] = [
+    "comment.create",
+    "issue.assign",
+    "issue.create",
+    "issue.delete",
+    "issue.edit",
+    "issue.label",
+    "issue.link",
+    "issue.move_in",
+    "issue.move_out",
+    "issue.parent",
+    "issue.restore",
+    "project.configure",
+    "project.delete",
+    "workflow.transition",
+];
+
+/// The canonical exhaustive registry bytes: one line per entry,
+/// `scope	id	delegable`, sorted. The `workflow.transition` row stands for
+/// the qualified `workflow.transition.<TransitionId>` family.
+pub fn capability_registry_bytes() -> Vec<u8> {
+    let mut out = String::new();
+    for id in SPACE_CAPABILITIES {
+        out.push_str("space	");
+        out.push_str(id);
+        out.push_str(
+            "	delegable
+",
+        );
+    }
+    for id in PROJECT_CAPABILITIES {
+        out.push_str("project	");
+        out.push_str(id);
+        out.push_str(
+            "	delegable
+",
+        );
+    }
+    out.into_bytes()
+}
+
+/// The policy-table commitment (plan 01): BLAKE3 derive-key, context
+/// `lait.world-policy-table.v1`, over the exhaustive registry bytes. This is
+/// the commitment the implementation descriptor embeds.
+pub fn capability_registry_commitment() -> [u8; 32] {
+    blake3::derive_key("lait.world-policy-table.v1", &capability_registry_bytes())
+}
+
+/// Whether `name` is a registered Space-scoped capability.
+pub fn is_space_capability(name: &str) -> bool {
+    SPACE_CAPABILITIES.contains(&name)
+}
+
+/// Whether `name` is a registered Project-scoped capability (including the
+/// qualified `workflow.transition.<TransitionId>` family).
+pub fn is_project_capability(name: &str) -> bool {
+    if PROJECT_CAPABILITIES.contains(&name) {
+        return true;
+    }
+    name.strip_prefix("workflow.transition.").is_some_and(|t| {
+        !t.is_empty()
+            && t.len() <= 64
+            && t.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
+    })
+}
+
 pub fn issue_schema() -> SchemaId {
     SchemaId::parse(ISSUE_SCHEMA).expect("issue schema id")
 }
@@ -100,11 +187,22 @@ pub fn catalog_encoding() -> EncodingId {
     EncodingId::parse(CATALOG_ENCODING).expect("catalog encoding id")
 }
 
-/// The one catalog Body per Space.
-pub fn catalog_body_id() -> BodyId {
-    let digest = blake3::hash(b"lait/catalog-body/1");
+/// The ONE deterministic catalog Body per Space: the first 16 bytes of the
+/// BLAKE3 derive-key digest, context `lait.issues.catalog.v1`, over the
+/// canonical `(SpaceId, WorldId)` bytes (each length-prefixed big-endian).
+/// Joiners adopt this Body through Manifest synchronization; nobody ever
+/// creates it locally except the founder's one `InitializeTracker`.
+pub fn catalog_body_id(space: &mechanics::ids::SpaceId) -> BodyId {
+    let space_bytes = space.as_str().as_bytes();
+    let world_bytes = PRODUCT_WORLD.as_bytes();
+    let mut input = Vec::with_capacity(4 + space_bytes.len() + world_bytes.len());
+    input.extend_from_slice(&(space_bytes.len() as u16).to_be_bytes());
+    input.extend_from_slice(space_bytes);
+    input.extend_from_slice(&(world_bytes.len() as u16).to_be_bytes());
+    input.extend_from_slice(world_bytes);
+    let digest = blake3::derive_key("lait.issues.catalog.v1", &input);
     let mut raw = [0u8; 16];
-    raw.copy_from_slice(&digest.as_bytes()[..16]);
+    raw.copy_from_slice(&digest[..16]);
     BodyId::from_bytes(raw)
 }
 
@@ -118,8 +216,8 @@ pub fn issue_body_id(doc: &str) -> BodyId {
     BodyId::from_bytes(raw)
 }
 
-pub fn catalog_key() -> BodyKey {
-    BodyKey::new(world_id(), catalog_body_id())
+pub fn catalog_key(space: &mechanics::ids::SpaceId) -> BodyKey {
+    BodyKey::new(world_id(), catalog_body_id(space))
 }
 
 pub fn issue_key(doc: &str) -> BodyKey {
@@ -163,9 +261,30 @@ pub enum WorkAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum IssueIntent {
-    /// Seed the catalog Body at Space formation: display name + the default
-    /// workflow. Idempotent by content.
-    SpaceInit { name: String, ts: u64 },
+    /// The ONE founder-only, crash-resumable formation intent: it atomically
+    /// creates the deterministic Catalog with the captured display name,
+    /// initialization timestamp, initial project, the built-in role
+    /// definitions, the capability-registry commitment, and the default
+    /// workflow revision. The composition root persists the complete signed
+    /// action before submission and replays the exact bytes after a crash;
+    /// the World is a deterministic pure validator/stager (no clock, no id
+    /// generator). Joiners adopt the Catalog through Manifest synchronization
+    /// and never synthesize it locally.
+    InitializeTracker {
+        name: String,
+        ts: u64,
+        project_id: String,
+        project_name: String,
+        project_key: String,
+        device: String,
+        /// `(role_id, revision_id hex, definition digest hex)` for the three
+        /// built-ins — validated against the golden compiled-in definitions.
+        built_in_roles: Vec<(String, String, String)>,
+        /// Hex of [`capability_registry_commitment`].
+        capability_registry_commitment: String,
+        /// Hex of the initial project's default workflow revision id.
+        default_workflow_commitment: String,
+    },
     IssueNew {
         doc: String,
         project: String,
@@ -258,6 +377,42 @@ pub enum IssueIntent {
         device: String,
         ts: u64,
     },
+}
+
+/// Build the canonical `InitializeTracker` intent from captured formation
+/// facts; the golden role/registry/workflow commitments come from this
+/// build's compiled-in definitions. The composition root captures the inputs
+/// ONCE and persists the signed action before submission.
+pub fn initialize_tracker_intent(
+    name: &str,
+    ts: u64,
+    project_id: &str,
+    project_name: &str,
+    project_key: &str,
+    device: &str,
+) -> IssueIntent {
+    let mut built_in_roles = Vec::new();
+    for id in crate::world::roles::BUILT_IN_ROLE_IDS {
+        let rev = crate::world::roles::built_in(id).expect("built-in role");
+        built_in_roles.push((
+            id.to_string(),
+            data_encoding::HEXLOWER.encode(&rev.revision_id),
+            data_encoding::HEXLOWER.encode(&rev.body.definition_digest()),
+        ));
+    }
+    IssueIntent::InitializeTracker {
+        name: name.to_string(),
+        ts,
+        project_id: project_id.to_string(),
+        project_name: project_name.to_string(),
+        project_key: project_key.to_string(),
+        device: device.to_string(),
+        built_in_roles,
+        capability_registry_commitment: data_encoding::HEXLOWER
+            .encode(&capability_registry_commitment()),
+        default_workflow_commitment: crate::world::workflow::default_workflow_revision(project_id)
+            .revision_id,
+    }
 }
 
 impl IssueIntent {

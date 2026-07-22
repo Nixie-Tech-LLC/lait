@@ -129,7 +129,9 @@ fn the_orbital_daemon_serves_the_issue_surface_over_the_control_socket() {
         &home,
         Request::IssueNew {
             title: "Served over the socket".into(),
-            project: None,
+            // Formation seeded the default project, so the space has two —
+            // pick the explicit one.
+            project: Some("eng".into()),
             project_hint: None,
             assignees: vec![],
             priority: Some("high".into()),
@@ -198,7 +200,7 @@ fn the_orbital_daemon_serves_the_issue_surface_over_the_control_socket() {
         &client_rt,
         &home,
         Request::Board {
-            project: None,
+            project: Some("eng".into()),
             project_hint: None,
         },
     );

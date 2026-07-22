@@ -98,13 +98,27 @@ impl IssuesWorld {
 }
 
 /// A staged transaction under construction.
-#[derive(Default)]
 struct Staging {
+    /// The Space the transaction commits in — the deterministic Catalog's
+    /// identity input.
+    space: mechanics::ids::SpaceId,
     ops: Vec<(BodyKey, BodyOp)>,
     scopes: Vec<BodyKey>,
     declarations: Vec<BodyDeclaration>,
     /// The canonical demand this mutation requires (defaults to contributor).
     demand: Option<Vec<u8>>,
+}
+
+impl Staging {
+    fn for_space(space: mechanics::ids::SpaceId) -> Self {
+        Self {
+            space,
+            ops: Vec::new(),
+            scopes: Vec::new(),
+            declarations: Vec::new(),
+            demand: None,
+        }
+    }
 }
 
 impl Staging {
@@ -122,7 +136,7 @@ impl Staging {
     }
 
     fn declare_catalog(&mut self) {
-        let key = catalog_key();
+        let key = catalog_key(&self.space);
         if !self.declarations.iter().any(|d| d.key == key) {
             self.declarations.push(BodyDeclaration {
                 key: key.clone(),
@@ -142,7 +156,7 @@ impl Staging {
 
     fn catalog(&mut self, op: BodyOp) {
         self.declare_catalog();
-        self.ops.push((catalog_key(), op));
+        self.ops.push((catalog_key(&self.space), op));
     }
 
     /// Set the demand this mutation requires (an admin-only intent overrides
@@ -198,10 +212,32 @@ fn unchanged_effect(doc: Option<String>) -> WorldEffect {
     }
 }
 
-/// Load the catalog state from the committed snapshot.
-fn catalog_state(ctx: &WorldContext<'_>) -> CatalogState {
-    let view = ctx.read_collaborative(&catalog_key());
-    CatalogState::from_view(view.as_ref())
+/// The committed Catalog view with singleton-integrity enforcement: exactly
+/// the ONE deterministic Catalog key for this Space, or nothing (not yet
+/// initialized/adopted). Any other catalog-schema Body — wrong key, a
+/// duplicate semantic Catalog, an unrelated Catalog-shaped Body — is typed
+/// [`WorldError::WorldStateCorrupt`]; the World never selects among, merges,
+/// repairs, or silently recreates Catalogs.
+fn checked_catalog_view(
+    ctx: &WorldContext<'_>,
+) -> Result<Option<replica::CollaborativeView>, WorldError> {
+    let expected = catalog_key(&ctx.principal().space);
+    let catalogs = ctx.bodies_with_schema(&contract::world_id(), &contract::catalog_schema());
+    match catalogs.as_slice() {
+        [] => Ok(None),
+        [one] if one == &expected => match ctx.read_collaborative(&expected) {
+            Some(view) => Ok(Some(view)),
+            // Bound as a catalog but unreadable under the collaborative
+            // model: a wrong-model/encoding Body, not a missing one.
+            None => Err(WorldError::WorldStateCorrupt),
+        },
+        _ => Err(WorldError::WorldStateCorrupt),
+    }
+}
+
+/// Load the catalog state from the committed snapshot (integrity-checked).
+fn catalog_state(ctx: &WorldContext<'_>) -> Result<CatalogState, WorldError> {
+    Ok(CatalogState::from_view(checked_catalog_view(ctx)?.as_ref()))
 }
 
 fn issue_state(ctx: &WorldContext<'_>, doc: &str) -> Option<IssueState> {
@@ -224,6 +260,40 @@ fn push_event(staging: &mut Staging, ctx: &WorldContext<'_>, doc: &str, event: &
             value: serde_json::to_vec(event).expect("event json"),
         },
     );
+}
+
+/// Resolve the deterministic transition gate `from -> to` for a project: the
+/// demand template stored on the selected transition of the project's current
+/// workflow revision, plus the receipt-bound transition evidence. A missing
+/// revision on an existing project is corrupt catalog state; an edge the
+/// workflow does not define is an invalid transition — never inferred.
+fn transition_gate(
+    catalog: &CatalogState,
+    project: &str,
+    from: &str,
+    to: &str,
+) -> Result<(Vec<u8>, crate::world::workflow::WorkflowTransitionEvidence), WorldError> {
+    let revision = catalog
+        .workflow_revisions
+        .get(project)
+        .ok_or(WorldError::WorldStateCorrupt)?;
+    let transition = revision
+        .body
+        .transition_for(from, to)
+        .ok_or(WorldError::InvalidRequest)?;
+    let demand = transition.demand_template.resolve(project);
+    let bytes = demand
+        .encode_canonical()
+        .map_err(|_| WorldError::ContractViolation)?;
+    let digest = demand.digest().map_err(|_| WorldError::ContractViolation)?;
+    let evidence = crate::world::workflow::WorkflowTransitionEvidence {
+        transition_id: transition.transition_id.clone(),
+        workflow_revision_id: revision.revision_id.clone(),
+        source_state: from.to_string(),
+        destination_state: to.to_string(),
+        resolved_demand_digest: data_encoding::HEXLOWER.encode(&digest),
+    };
+    Ok((bytes, evidence))
 }
 
 fn event(kind: &str, device: &str, ts: u64) -> IssueEvent {
@@ -396,24 +466,115 @@ impl World for IssuesWorld {
             return Err(WorldError::Denied);
         }
         let intent = IssueIntent::from_json(&intent.payload).ok_or(WorldError::InvalidRequest)?;
-        let catalog = catalog_state(ctx);
-        let mut staging = Staging::default();
+        let catalog = catalog_state(ctx)?;
+        let mut staging = Staging::for_space(ctx.principal().space.clone());
         match intent {
-            IssueIntent::SpaceInit { name, ts: _ } => {
-                // Idempotent: a seeded catalog stays untouched.
-                let already = ctx
-                    .read_collaborative(&catalog_key())
-                    .is_some_and(|v| v.lists.get("workflow").is_some_and(|l| !l.is_empty()));
-                if already {
-                    return Ok(unchanged_effect(None));
+            IssueIntent::InitializeTracker {
+                name,
+                ts,
+                project_id,
+                project_name,
+                project_key,
+                device: _,
+                built_in_roles,
+                capability_registry_commitment,
+                default_workflow_commitment,
+            } => {
+                // A deterministic pure validator/stager: every captured value
+                // arrives in the intent (the composition root persisted the
+                // signed bytes); the World calls no clock and mints no id.
+                let project_key = project_key.trim().to_ascii_uppercase();
+                if project_name.trim().is_empty()
+                    || project_key.is_empty()
+                    || project_key.len() > 8
+                    || !project_key.bytes().all(|b| b.is_ascii_alphabetic())
+                    || project_id.is_empty()
+                    || ts == 0
+                {
+                    return Err(WorldError::InvalidRequest);
                 }
+                // The golden commitments must match this implementation's
+                // compiled-in definitions exactly.
+                let registry_hex =
+                    data_encoding::HEXLOWER.encode(&contract::capability_registry_commitment());
+                if capability_registry_commitment != registry_hex {
+                    return Err(WorldError::InvalidRequest);
+                }
+                let workflow_revision =
+                    crate::world::workflow::default_workflow_revision(&project_id);
+                if default_workflow_commitment != workflow_revision.revision_id {
+                    return Err(WorldError::InvalidRequest);
+                }
+                let mut goldens: Vec<(String, String, String)> = Vec::new();
+                for id in crate::world::roles::BUILT_IN_ROLE_IDS {
+                    let rev = crate::world::roles::built_in(id).expect("built-in role");
+                    goldens.push((
+                        id.to_string(),
+                        data_encoding::HEXLOWER.encode(&rev.revision_id),
+                        data_encoding::HEXLOWER.encode(&rev.body.definition_digest()),
+                    ));
+                }
+                if built_in_roles != goldens {
+                    return Err(WorldError::InvalidRequest);
+                }
+                // The deterministic Catalog must not exist yet: joiners adopt
+                // it through Manifest synchronization and never create it, and
+                // a second initialization never merges into the first. An
+                // exact replay is answered by the request receipt before the
+                // World runs; a content-identical re-run is a no-op.
+                if let Some(view) = checked_catalog_view(ctx)? {
+                    let initialized = view.lists.get("workflow").is_some_and(|l| !l.is_empty());
+                    if initialized {
+                        return Ok(unchanged_effect(None));
+                    }
+                    return Err(WorldError::Conflict);
+                }
+                // ---- one atomic Catalog transaction: display name, legacy
+                // workflow states, the workflow revision, the initial project,
+                // the built-in role definitions, and the registry commitment.
                 staging.catalog(reg("name", name.into_bytes()));
+                staging.catalog(reg("initialized_at", ts.to_string().into_bytes()));
+                staging.catalog(reg(
+                    "capability_registry",
+                    registry_hex.clone().into_bytes(),
+                ));
                 for (i, state) in contract::default_workflow().into_iter().enumerate() {
                     staging.catalog(BodyOp::ListInsert {
                         path: "workflow".into(),
                         index: i as u64,
                         value: serde_json::to_vec(&state).expect("workflow json"),
                     });
+                }
+                staging.catalog(map_set(
+                    "workflow_revisions",
+                    project_id.clone(),
+                    serde_json::to_vec(&workflow_revision).expect("workflow revision json"),
+                ));
+                staging.catalog(map_set(
+                    "projects",
+                    project_id.clone(),
+                    serde_json::to_vec(&serde_json::json!({
+                        "name": project_name.trim(),
+                        "key": project_key,
+                        "color": "blue",
+                    }))
+                    .expect("project json"),
+                ));
+                for id in crate::world::roles::BUILT_IN_ROLE_IDS {
+                    let rev = crate::world::roles::built_in(id).expect("built-in role");
+                    staging.catalog(map_set(
+                        "roles",
+                        id,
+                        serde_json::to_vec(&serde_json::json!({
+                            "revision_id": data_encoding::HEXLOWER.encode(&rev.revision_id),
+                            "predecessor_ids": [],
+                            "body": serde_json::from_slice::<serde_json::Value>(
+                                &rev.body.canonical_json()
+                            )
+                            .expect("role body json"),
+                        }))
+                        .expect("role json"),
+                    ));
                 }
                 // Tracker initialization is a founder-composition admin action.
                 staging.require(contract::demand_admin());
@@ -539,7 +700,18 @@ impl World for IssuesWorld {
                     });
                     staging.issue(&key, reg("title", title.as_bytes().to_vec()));
                 }
+                let mut transition_evidence = None;
                 if let Some(status) = &status {
+                    if *status != issue.status {
+                        // The deterministic transition gate: the demand
+                        // template stored on the workflow's selected edge, and
+                        // the evidence the receipt binds through the demand,
+                        // intent and operations digests.
+                        let (demand, evidence) =
+                            transition_gate(&catalog, &issue.project, &issue.status, status)?;
+                        staging.require(demand);
+                        transition_evidence = Some(evidence);
+                    }
                     changes.push(EventChange {
                         f: "status".into(),
                         from: Some(issue.status.clone()),
@@ -587,6 +759,11 @@ impl World for IssuesWorld {
                 }
                 let mut ev = event("edited", &device, ts);
                 ev.c = changes;
+                if let Some(evidence) = &transition_evidence {
+                    // The transition evidence rides the durable history event,
+                    // inside the operations digest the receipt binds.
+                    ev.x = serde_json::to_string(evidence).expect("transition evidence json");
+                }
                 push_event(&mut staging, ctx, &doc, &ev);
                 Ok(staging.into_effect(Some(doc)))
             }
@@ -875,7 +1052,14 @@ impl World for IssuesWorld {
                     .clone();
                 let key = issue_key(&doc);
                 let mut changes = Vec::new();
+                let mut transition_evidence = None;
                 if issue.status != target.id {
+                    // The category target's resulting edge must exist in the
+                    // project's workflow revision and authorize.
+                    let (demand, evidence) =
+                        transition_gate(&catalog, &issue.project, &issue.status, &target.id)?;
+                    staging.require(demand);
+                    transition_evidence = Some(evidence);
                     changes.push(EventChange {
                         f: "status".into(),
                         from: Some(issue.status.clone()),
@@ -929,6 +1113,9 @@ impl World for IssuesWorld {
                 }
                 let mut ev = event(kind, &device, ts);
                 ev.c = changes;
+                if let Some(evidence) = &transition_evidence {
+                    ev.x = serde_json::to_string(evidence).expect("transition evidence json");
+                }
                 push_event(&mut staging, ctx, &doc, &ev);
                 Ok(staging.into_effect(Some(doc)))
             }
@@ -952,13 +1139,22 @@ impl World for IssuesWorld {
                 }
                 staging.catalog(map_set(
                     "projects",
-                    id,
+                    id.clone(),
                     serde_json::to_vec(&serde_json::json!({
                         "name": name.trim(),
                         "key": key,
                         "color": "blue",
                     }))
                     .expect("project json"),
+                ));
+                // Every project carries a workflow revision from birth: the
+                // deterministic default (free movement, every edge an explicit
+                // replaceable gate).
+                let revision = crate::world::workflow::default_workflow_revision(&id);
+                staging.catalog(map_set(
+                    "workflow_revisions",
+                    id,
+                    serde_json::to_vec(&revision).expect("workflow revision json"),
                 ));
                 Ok(staging.into_effect(None))
             }
@@ -999,7 +1195,7 @@ impl World for IssuesWorld {
         query: WorldQuery,
     ) -> Result<WorldProjection, WorldError> {
         let query = IssueQuery::from_json(&query.payload).ok_or(WorldError::InvalidRequest)?;
-        let catalog = catalog_state(ctx);
+        let catalog = catalog_state(ctx)?;
         let aliases = derive_aliases(&catalog);
         let projection = |bytes: Vec<u8>| WorldProjection {
             schema: contract::issue_schema(),

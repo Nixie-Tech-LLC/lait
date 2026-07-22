@@ -281,6 +281,10 @@ impl<'a> IssueRouter<'a> {
                 Response::err("internal error")
             }
             WorldError::ResetRequired => Response::err("state reset — re-query"),
+            WorldError::WorldStateCorrupt => Response::err(
+                "the space's issue catalog is corrupt (missing, duplicated, or mis-bound) — \
+                 this store needs operator attention; nothing was changed",
+            ),
         }
     }
 

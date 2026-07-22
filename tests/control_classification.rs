@@ -1,112 +1,18 @@
-//! M0.1 — exhaustive terminal-owner classification of every control request.
-//!
-//! Every `control::Request` variant is mapped to exactly one **terminal
-//! owner** — the single orbital plane that serves it once the migration is
-//! complete. The `match` in [`terminal_owner`] is exhaustive, so adding a
-//! variant without a terminal owner fails the build; a daemon catch-all is
-//! forbidden by construction because there is no catch-all class.
-//!
-//! Owners (plan 01, "External architecture"):
-//! - **Session** — product intent/query through `IssueRouter` → Session;
-//! - **Mechanics** — membership/ceremony/custody/admission through the active
-//!   Orbit/Station's mechanics;
-//! - **Station** — connect/neighbor/Contact operations;
-//! - **Observation** — status/subscription projections;
-//! - **Lifecycle** — Runtime/Orbit/Station/daemon process concerns and
-//!   node-local configuration adapters.
+//! Exhaustive terminal-owner classification of every control request — driven
+//! by the PRODUCTION classifier (`control::classify`), the same function the
+//! daemon dispatches from. There is no test-only ownership table: the daemon,
+//! this gate, and the generated routing table all consume one source, and the
+//! classifier's exhaustive match makes an unclassified new variant a build
+//! failure, never a runtime catch-all.
 
-use lait::control::Request;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Owner {
-    Session,
-    Mechanics,
-    Station,
-    Observation,
-    Lifecycle,
-}
-
-/// The exhaustive terminal-owner table. Compile-enforced: a new `Request`
-/// variant without an arm here is a build failure, not a runtime catch-all.
-fn terminal_owner(r: &Request) -> Owner {
-    use Owner::*;
-    match r {
-        // ---- Session: product intents, queries, projections ----
-        Request::IssueNew { .. }
-        | Request::IssueEdit { .. }
-        | Request::IssueMove { .. }
-        | Request::Assign { .. }
-        | Request::Label { .. }
-        | Request::Comment { .. }
-        | Request::IssueDelete { .. }
-        | Request::IssueRestore { .. }
-        | Request::IssueLink { .. }
-        | Request::IssueUnlink { .. }
-        | Request::IssueParent { .. }
-        | Request::IssueGraph { .. }
-        | Request::IssueStart { .. }
-        | Request::IssueDone { .. }
-        | Request::IssueStop { .. }
-        | Request::IssueView { .. }
-        | Request::List { .. }
-        | Request::Board { .. }
-        | Request::History { .. }
-        | Request::ProjectNew { .. }
-        | Request::ProjectList
-        | Request::LabelNew { .. }
-        | Request::LabelList
-        | Request::Activity { .. }
-        | Request::Inbox { .. } => Session,
-
-        // ---- Mechanics: membership, admission, ceremonies, custody, devices ----
-        Request::MemberAdd { .. }
-        | Request::MemberRemove { .. }
-        | Request::Members
-        | Request::MemberLog
-        | Request::AgentAdd { .. }
-        | Request::KeyRotate
-        | Request::InviteRevoke { .. }
-        | Request::DeviceInvite
-        | Request::DeviceAdd { .. }
-        | Request::DeviceRevoke { .. }
-        | Request::DeviceList
-        | Request::SpaceRecover
-        | Request::SpaceElevate { .. }
-        | Request::SpaceRecoverApprove { .. }
-        | Request::SpaceElevateApprove { .. }
-        | Request::SpaceReshare { .. }
-        | Request::SpaceCustodyExport { .. }
-        | Request::SpaceCustodyImport { .. }
-        | Request::Recover
-        | Request::Invite { .. }
-        | Request::Join { .. }
-        | Request::Id => Mechanics,
-
-        // ---- Station: connect/neighbor/Contact ----
-        Request::Connect { .. } | Request::Who => Station,
-
-        // ---- Observation: status + subscription projections ----
-        Request::Status | Request::Subscribe { .. } => Observation,
-
-        // ---- Lifecycle/deployment: daemon process + node-local config ----
-        Request::Diagnose { .. }
-        | Request::SeedAdd { .. }
-        | Request::SeedList
-        | Request::SeedRemove { .. }
-        | Request::Log { .. }
-        | Request::ConfigReload
-        | Request::Stop
-        | Request::Hello { .. }
-        | Request::MemberAlias { .. } => Lifecycle,
-    }
-}
+use lait::control::{classify, representative_requests, routing_rows, Request, RequestOwner};
 
 #[test]
 fn every_request_variant_has_a_terminal_owner() {
-    // Exhaustiveness is compile-enforced by `terminal_owner`'s match. Assert
-    // the intended mapping for one representative per owner.
+    // Exhaustiveness is compile-enforced by `classify`'s match. Assert the
+    // intended mapping for representatives of every owner.
     assert_eq!(
-        terminal_owner(&Request::IssueNew {
+        classify(&Request::IssueNew {
             title: "t".into(),
             project: None,
             project_hint: None,
@@ -115,14 +21,66 @@ fn every_request_variant_has_a_terminal_owner() {
             labels: vec![],
             body: None,
         }),
-        Owner::Session
+        RequestOwner::Session
     );
-    assert_eq!(terminal_owner(&Request::Members), Owner::Mechanics);
-    assert_eq!(terminal_owner(&Request::DeviceList), Owner::Mechanics);
+    assert_eq!(classify(&Request::Members), RequestOwner::Mechanics);
+    assert_eq!(classify(&Request::DeviceList), RequestOwner::Mechanics);
     assert_eq!(
-        terminal_owner(&Request::Connect { ticket: "x".into() }),
-        Owner::Station
+        classify(&Request::SpaceReshare {
+            participants: vec![],
+            k: 0
+        }),
+        RequestOwner::Mechanics
     );
-    assert_eq!(terminal_owner(&Request::Status), Owner::Observation);
-    assert_eq!(terminal_owner(&Request::Stop), Owner::Lifecycle);
+    assert_eq!(
+        classify(&Request::Connect { ticket: "x".into() }),
+        RequestOwner::Station
+    );
+    assert_eq!(classify(&Request::Status), RequestOwner::Observation);
+    assert_eq!(
+        classify(&Request::Inbox { clear: false }),
+        RequestOwner::Observation
+    );
+    assert_eq!(classify(&Request::Stop), RequestOwner::Lifecycle);
+}
+
+#[test]
+fn the_representative_set_covers_every_wire_command_exactly_once() {
+    // Every representative must serialize to a distinct wire tag; a duplicate
+    // or missing representative would leave a hole in the generated table.
+    let mut tags: Vec<String> = representative_requests()
+        .iter()
+        .map(|r| {
+            serde_json::to_value(r).unwrap()["cmd"]
+                .as_str()
+                .expect("every request serializes with a cmd tag")
+                .to_string()
+        })
+        .collect();
+    let count = tags.len();
+    tags.sort();
+    tags.dedup();
+    assert_eq!(tags.len(), count, "duplicate representative");
+}
+
+/// Regenerate `docs/plans/generated/request-routing.tsv` from the SAME
+/// production classifier the daemon dispatches from. The file is local (the
+/// plans directory is gitignored); the gate is that generation succeeds and
+/// every row carries a real owner.
+#[test]
+fn the_generated_routing_table_comes_from_the_production_classifier() {
+    let rows = routing_rows();
+    assert!(!rows.is_empty());
+    let mut out = String::from("request\tterminal_owner\n");
+    for (tag, owner) in &rows {
+        assert!(!tag.is_empty(), "an untagged request cannot be routed");
+        out.push_str(tag);
+        out.push('\t');
+        out.push_str(owner);
+        out.push('\n');
+    }
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/plans/generated");
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::write(dir.join("request-routing.tsv"), out);
+    }
 }

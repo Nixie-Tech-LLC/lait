@@ -316,6 +316,7 @@ impl ErrorDto {
             E::Persistence => "persistence",
             E::ResetRequired => "reset-required",
             E::WorldImplementationFailed => "world-implementation-failed",
+            E::WorldStateCorrupt => "world-state-corrupt",
             E::ContractViolation => "contract-violation",
         }
     }

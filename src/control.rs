@@ -458,6 +458,288 @@ fn default_true() -> bool {
     true
 }
 
+/// The terminal owner of a control request — the single orbital plane that
+/// serves it (plan 01, "External architecture"):
+///
+/// - **Session** — product intent/query through `IssueRouter` -> Session;
+/// - **Mechanics** — membership/admission/ceremony/custody/device work through
+///   the active Orbit/Station's mechanics;
+/// - **Station** — connect/neighbor/Contact operations;
+/// - **Observation** — status and subscription projections;
+/// - **Lifecycle** — Runtime/Orbit/Station/daemon process concerns and
+///   node-local configuration adapters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestOwner {
+    Session,
+    Mechanics,
+    Station,
+    Observation,
+    Lifecycle,
+}
+
+impl RequestOwner {
+    /// The stable lowercase label (the generated routing table's column).
+    pub fn label(&self) -> &'static str {
+        match self {
+            RequestOwner::Session => "session",
+            RequestOwner::Mechanics => "mechanics",
+            RequestOwner::Station => "station",
+            RequestOwner::Observation => "observation",
+            RequestOwner::Lifecycle => "lifecycle",
+        }
+    }
+}
+
+/// The PRODUCTION exhaustive request classifier. The daemon dispatches from
+/// this value; the classification test and the generated routing table call
+/// this same function. The match is exhaustive with no wildcard arm, so
+/// adding a `Request` variant fails compilation until its terminal owner is
+/// explicit.
+pub fn classify(req: &Request) -> RequestOwner {
+    use RequestOwner::*;
+    match req {
+        // ---- Session: product intents, queries, projections ----
+        Request::IssueNew { .. }
+        | Request::IssueEdit { .. }
+        | Request::IssueMove { .. }
+        | Request::Assign { .. }
+        | Request::Label { .. }
+        | Request::Comment { .. }
+        | Request::IssueDelete { .. }
+        | Request::IssueRestore { .. }
+        | Request::IssueLink { .. }
+        | Request::IssueUnlink { .. }
+        | Request::IssueParent { .. }
+        | Request::IssueGraph { .. }
+        | Request::IssueStart { .. }
+        | Request::IssueDone { .. }
+        | Request::IssueStop { .. }
+        | Request::IssueView { .. }
+        | Request::List { .. }
+        | Request::Board { .. }
+        | Request::History { .. }
+        | Request::ProjectNew { .. }
+        | Request::ProjectList
+        | Request::LabelNew { .. }
+        | Request::LabelList
+        | Request::Activity { .. } => Session,
+
+        // ---- Mechanics: membership, admission, ceremonies, custody, devices ----
+        Request::MemberAdd { .. }
+        | Request::MemberRemove { .. }
+        | Request::Members
+        | Request::MemberLog
+        | Request::AgentAdd { .. }
+        | Request::KeyRotate
+        | Request::InviteRevoke { .. }
+        | Request::DeviceInvite
+        | Request::DeviceAdd { .. }
+        | Request::DeviceRevoke { .. }
+        | Request::DeviceList
+        | Request::SpaceRecover
+        | Request::SpaceElevate { .. }
+        | Request::SpaceRecoverApprove { .. }
+        | Request::SpaceElevateApprove { .. }
+        | Request::SpaceReshare { .. }
+        | Request::SpaceCustodyExport { .. }
+        | Request::SpaceCustodyImport { .. }
+        | Request::Recover
+        | Request::Invite { .. }
+        | Request::Join { .. }
+        | Request::Id => Mechanics,
+
+        // ---- Station: connect/neighbor/Contact ----
+        Request::Connect { .. } | Request::Who => Station,
+
+        // ---- Observation: status, subscription, and locally derived
+        // projection surfaces (the inbox rebuilds from query after reset and
+        // is never a second source of truth) ----
+        Request::Status | Request::Subscribe { .. } | Request::Inbox { .. } => Observation,
+
+        // ---- Lifecycle/deployment: daemon process + node-local config ----
+        Request::Diagnose { .. }
+        | Request::SeedAdd { .. }
+        | Request::SeedList
+        | Request::SeedRemove { .. }
+        | Request::Log { .. }
+        | Request::ConfigReload
+        | Request::Stop
+        | Request::Hello { .. }
+        | Request::MemberAlias { .. } => Lifecycle,
+    }
+}
+
+/// One representative instance per `Request` variant — the enumeration the
+/// generated routing table and classification tests iterate. Kept beside
+/// [`classify`] so both evolve together; the classifier's exhaustive match is
+/// the compile-time guard for new variants.
+pub fn representative_requests() -> Vec<Request> {
+    let s = String::new;
+    vec![
+        Request::IssueNew {
+            title: s(),
+            project: None,
+            project_hint: None,
+            assignees: vec![],
+            priority: None,
+            labels: vec![],
+            body: None,
+        },
+        Request::IssueEdit {
+            reff: s(),
+            title: None,
+            status: None,
+            priority: None,
+            description: None,
+        },
+        Request::IssueMove {
+            reff: s(),
+            project: None,
+            pos: None,
+        },
+        Request::Assign {
+            reff: s(),
+            who: vec![],
+            add: true,
+        },
+        Request::Label {
+            reff: s(),
+            add: vec![],
+            remove: vec![],
+        },
+        Request::Comment {
+            reff: s(),
+            body: s(),
+        },
+        Request::IssueDelete { reff: s() },
+        Request::IssueRestore { reff: s() },
+        Request::IssueLink {
+            reff: s(),
+            kind: s(),
+            target: s(),
+        },
+        Request::IssueUnlink {
+            reff: s(),
+            kind: s(),
+            target: s(),
+        },
+        Request::IssueParent {
+            reff: s(),
+            parent: None,
+        },
+        Request::IssueGraph { reff: s() },
+        Request::IssueStart { reff: s() },
+        Request::IssueDone { reff: s() },
+        Request::IssueStop { reff: s() },
+        Request::IssueView { reff: s() },
+        Request::List {
+            project: None,
+            filter: Filter::default(),
+        },
+        Request::Board {
+            project: None,
+            project_hint: None,
+        },
+        Request::History { reff: s() },
+        Request::ProjectNew {
+            name: s(),
+            key: s(),
+        },
+        Request::ProjectList,
+        Request::LabelNew {
+            name: s(),
+            color: None,
+        },
+        Request::LabelList,
+        Request::Activity { since: 0 },
+        Request::Inbox { clear: false },
+        Request::MemberAdd {
+            who: s(),
+            admin: false,
+            as_name: None,
+        },
+        Request::MemberRemove { who: s() },
+        Request::AgentAdd { key: s() },
+        Request::KeyRotate,
+        Request::InviteRevoke { invite: s() },
+        Request::DeviceInvite,
+        Request::DeviceAdd { consent: s() },
+        Request::DeviceRevoke { device: s() },
+        Request::DeviceList,
+        Request::SpaceRecover,
+        Request::SpaceElevate {
+            cofounders: vec![],
+            k: 0,
+        },
+        Request::SpaceRecoverApprove {
+            session: s(),
+            expect: vec![],
+        },
+        Request::SpaceElevateApprove {
+            session: s(),
+            proposal: s(),
+        },
+        Request::SpaceReshare {
+            participants: vec![],
+            k: 0,
+        },
+        Request::SpaceCustodyExport {
+            path: s(),
+            passphrase: s(),
+        },
+        Request::SpaceCustodyImport {
+            path: s(),
+            passphrase: s(),
+            force: false,
+        },
+        Request::Recover,
+        Request::Members,
+        Request::MemberLog,
+        Request::MemberAlias {
+            who: s(),
+            name: s(),
+        },
+        Request::Subscribe { since: 0 },
+        Request::Status,
+        Request::Diagnose {
+            expected_space: None,
+        },
+        Request::Id,
+        Request::Invite {
+            role: None,
+            reusable: false,
+            ttl_hours: None,
+        },
+        Request::Join { ticket: s() },
+        Request::Connect { ticket: s() },
+        Request::SeedAdd { arg: s() },
+        Request::SeedList,
+        Request::SeedRemove { who: s() },
+        Request::Log { since: 0 },
+        Request::Who,
+        Request::ConfigReload,
+        Request::Stop,
+        Request::Hello {
+            protocol_version: 0,
+        },
+    ]
+}
+
+/// The generated routing rows: `(wire command tag, owner label)` per variant,
+/// derived from [`representative_requests`] and [`classify`].
+pub fn routing_rows() -> Vec<(String, &'static str)> {
+    representative_requests()
+        .iter()
+        .map(|req| {
+            let tag = serde_json::to_value(req)
+                .ok()
+                .and_then(|v| v.get("cmd").and_then(|c| c.as_str()).map(String::from))
+                .unwrap_or_default();
+            (tag, classify(req).label())
+        })
+        .collect()
+}
+
 /// A response from the daemon. A snapshot at a version — there is
 /// **no CAS token**. Internally tagged by `kind` (not `status`, which
 /// would collide with `IssueView.status` when the `Issue` variant is flattened).
@@ -666,6 +948,11 @@ pub struct StatusInfo {
     pub space: Option<String>,
     pub issues: usize,
     pub projects: usize,
+    /// Whether the issue/project counts below are UNAVAILABLE (undocked or a
+    /// failed projection query). `true` means the zeros are not data — never
+    /// read them as an empty space.
+    #[serde(default)]
+    pub counts_unavailable: bool,
     /// This node's standing in the space ACL: `admin` | `member` | `pending`.
     /// `pending` means we joined from an invite but an admin hasn't approved us
     /// yet, so we cannot decrypt the board. Lets `status` tell a joiner

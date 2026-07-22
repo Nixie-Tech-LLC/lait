@@ -160,30 +160,20 @@ fn form_invite_join_autoapprove_and_e2ee_convergence() {
     let (_rt_f, station_f) = activate(&root_f, FOUNDER_SEED, &mech_f, &coords, t_founder);
     let session_f = dock(&station_f, &FOUNDER_SEED);
     // Seed product state under real keys.
-    submit(
-        &session_f,
-        &FOUNDER_SEED,
-        &IssueIntent::SpaceInit {
-            name: "Joined Space".into(),
-            ts: 1,
-        },
-    )
-    .unwrap();
     let project = lait::ids::ProjectId::mint(&lait::ids::SystemUlidSource)
         .as_str()
         .to_string();
     submit(
         &session_f,
         &FOUNDER_SEED,
-        &IssueIntent::ProjectNew {
-            id: project.clone(),
-            name: "Core".into(),
-            key: "core".into(),
-            device: mechanics::crypto::device_from_seed(&FOUNDER_SEED)
-                .as_str()
-                .to_string(),
-            ts: 2,
-        },
+        &lait::world::contract::initialize_tracker_intent(
+            "Joined Space",
+            1,
+            &project,
+            "Core",
+            "core",
+            mechanics::crypto::device_from_seed(&FOUNDER_SEED).as_str(),
+        ),
     )
     .unwrap();
     let doc = lait::ids::DocId::mint(&lait::ids::SystemUlidSource)

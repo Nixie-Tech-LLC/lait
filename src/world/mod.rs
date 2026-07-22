@@ -8,6 +8,7 @@ pub mod issues;
 pub mod roles;
 pub mod router;
 pub mod views;
+pub mod workflow;
 
 pub use contract::{IssueEffect, IssueIntent, IssueQuery, PRODUCT_WORLD};
 pub use issues::IssuesWorld;

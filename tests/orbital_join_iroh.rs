@@ -201,30 +201,18 @@ fn coordinates_only_two_endpoint_bootstrap_over_real_iroh() {
         vec![],
     );
     let session_f = dock(&station_f, &FOUNDER_SEED);
+    // One InitializeTracker seeds the catalog AND the initial project.
     submit(
         &session_f,
         &FOUNDER_SEED,
-        &IssueIntent::SpaceInit {
-            name: "Iroh Space".into(),
-            ts: 1,
-        },
-    )
-    .unwrap();
-    // The founder creates a project so the joiner has somewhere to file.
-    submit(
-        &session_f,
-        &FOUNDER_SEED,
-        &IssueIntent::ProjectNew {
-            id: lait::ids::ProjectId::mint(&lait::ids::SystemUlidSource)
-                .as_str()
-                .to_string(),
-            name: "Main".into(),
-            key: "MAIN".into(),
-            device: mechanics::crypto::device_from_seed(&FOUNDER_SEED)
-                .as_str()
-                .to_string(),
-            ts: 2,
-        },
+        &lait::world::contract::initialize_tracker_intent(
+            "Iroh Space",
+            1,
+            lait::ids::ProjectId::mint(&lait::ids::SystemUlidSource).as_str(),
+            "Main",
+            "MAIN",
+            mechanics::crypto::device_from_seed(&FOUNDER_SEED).as_str(),
+        ),
     )
     .unwrap();
 

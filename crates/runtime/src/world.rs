@@ -17,7 +17,7 @@ use mechanics::acl::Grant;
 use mechanics::ids::{ActorId, DeviceId, StationId};
 use replica::body::BodyOp;
 use replica::frontier::AuthorityFrontier;
-use replica::ids::{BodyKey, WorldId};
+use replica::ids::{BodyKey, SchemaId, WorldId};
 use replica::BodySchema;
 use serde::{Deserialize, Serialize};
 
@@ -49,6 +49,9 @@ pub struct PrincipalFacts {
     pub actor: ActorId,
     pub device: DeviceId,
     pub station: StationId,
+    /// The Space this principal is docked in — with the WorldId, the input to
+    /// deterministic per-Space identities (e.g. the Issues Catalog BodyId).
+    pub space: mechanics::ids::SpaceId,
     pub standing: Standing,
     pub authority_frontier: AuthorityFrontier,
 }
@@ -330,6 +333,10 @@ pub trait BodyReader {
     /// The committed collaborative view of a Body, if the key holds one. List
     /// elements carry the stable ids `ListRemove`/`ListMove` take.
     fn read_collaborative_body(&self, key: &BodyKey) -> Option<replica::CollaborativeView>;
+    /// Every interpreted Body of `world` bound to `schema` — the
+    /// singleton-integrity seam (a World validating that exactly its one
+    /// deterministic instance of a schema exists).
+    fn bodies_with_schema(&self, world: &WorldId, schema: &SchemaId) -> Vec<BodyKey>;
 }
 
 /// The bounded capability handed to World callbacks. It exposes the principal
@@ -340,6 +347,9 @@ pub trait BodyReader {
 pub struct WorldContext<'a> {
     principal: &'a PrincipalFacts,
     reads: Option<&'a dyn BodyReader>,
+    /// The committed Manifest root this callback is pinned to (the parent of a
+    /// submitted transaction; the snapshot root of a query).
+    manifest_root: [u8; 32],
 }
 
 impl<'a> WorldContext<'a> {
@@ -349,15 +359,35 @@ impl<'a> WorldContext<'a> {
         Self {
             principal,
             reads: None,
+            manifest_root: [0u8; 32],
         }
     }
 
-    /// Construct a context with committed-snapshot read access (for a query).
-    pub fn with_reads(principal: &'a PrincipalFacts, reads: &'a dyn BodyReader) -> Self {
+    /// Construct a context with committed-snapshot read access, pinned to the
+    /// snapshot's Manifest root.
+    pub fn with_reads(
+        principal: &'a PrincipalFacts,
+        reads: &'a dyn BodyReader,
+        manifest_root: [u8; 32],
+    ) -> Self {
         Self {
             principal,
             reads: Some(reads),
+            manifest_root,
         }
+    }
+
+    /// The committed Manifest root this callback is pinned to.
+    pub fn manifest_root(&self) -> [u8; 32] {
+        self.manifest_root
+    }
+
+    /// Every interpreted Body of `world` bound to `schema` in the committed
+    /// snapshot (empty without read access).
+    pub fn bodies_with_schema(&self, world: &WorldId, schema: &SchemaId) -> Vec<BodyKey> {
+        self.reads
+            .map(|r| r.bodies_with_schema(world, schema))
+            .unwrap_or_default()
     }
 
     /// The derived facts for the docked principal. A World authorizes against

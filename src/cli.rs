@@ -1420,8 +1420,14 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
                 };
                 println!("you:       {}", paint(out.color, code, &s.membership));
             }
-            println!("issues:    {}", s.issues);
-            println!("projects:  {}", s.projects);
+            if s.counts_unavailable {
+                // Never render an unavailable projection as an empty space.
+                println!("issues:    (unavailable)");
+                println!("projects:  (unavailable)");
+            } else {
+                println!("issues:    {}", s.issues);
+                println!("projects:  {}", s.projects);
+            }
             println!("online:    {} peer(s)", s.online_peers);
             // Directional nudges so neither side of a join stalls silently.
             if s.membership == "pending" {

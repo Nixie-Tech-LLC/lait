@@ -125,7 +125,8 @@ fn two_orbital_daemons_join_admit_and_converge_over_the_socket() {
         &founder_home,
         Request::IssueNew {
             title: "Secret plan".into(),
-            project: None,
+            // Formation seeded the default project too — pick the explicit one.
+            project: Some("core".into()),
             project_hint: None,
             assignees: vec![],
             priority: Some("high".into()),

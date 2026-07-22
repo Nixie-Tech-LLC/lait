@@ -591,6 +591,7 @@ impl Station {
             actor: resolution.actor,
             device: identity.device().clone(),
             station,
+            space: self.space_id().clone(),
             standing: resolution.standing,
             authority_frontier: resolution.authority_frontier,
         };

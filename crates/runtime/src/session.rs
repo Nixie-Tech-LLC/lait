@@ -368,6 +368,13 @@ impl crate::world::BodyReader for ReplicaReader<'_> {
     fn read_collaborative_body(&self, key: &BodyKey) -> Option<replica::CollaborativeView> {
         self.0.read_collaborative(key)
     }
+    fn bodies_with_schema(&self, world: &WorldId, schema: &SchemaId) -> Vec<BodyKey> {
+        self.0
+            .body_keys()
+            .into_iter()
+            .filter(|k| &k.world == world && self.0.binding(k).is_some_and(|b| &b.schema == schema))
+            .collect()
+    }
 }
 
 /// A local caller's handle to a hosted World.
@@ -453,6 +460,7 @@ impl Session {
             actor: resolution.actor,
             device: self.principal.device.clone(),
             station: self.principal.station.clone(),
+            space: self.space.clone(),
             standing: resolution.standing,
             authority_frontier: resolution.authority_frontier,
         })
@@ -689,9 +697,10 @@ impl Session {
         }
         let effect: WorldEffect = {
             let reader = ReplicaReader(&inner.replica);
+            let parent_root = inner.replica.manifest_root();
             let principal = &principal;
             std::panic::catch_unwind(AssertUnwindSafe(|| {
-                let mut ctx = WorldContext::with_reads(principal, &reader);
+                let mut ctx = WorldContext::with_reads(principal, &reader, parent_root);
                 world.submit(&mut ctx, intent)
             }))
             .unwrap_or(Err(WorldError::WorldImplementationFailed))?
@@ -823,10 +832,11 @@ impl Session {
             return Err(WorldError::StationDormant);
         }
         let reader = ReplicaReader(&inner.replica);
+        let snapshot_root = inner.replica.manifest_root();
         let mut projection = {
             let principal = &principal;
             std::panic::catch_unwind(AssertUnwindSafe(|| {
-                let ctx = WorldContext::with_reads(principal, &reader);
+                let ctx = WorldContext::with_reads(principal, &reader, snapshot_root);
                 world.query(&ctx, query)
             }))
             .unwrap_or(Err(WorldError::WorldImplementationFailed))?

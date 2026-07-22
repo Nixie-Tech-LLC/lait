@@ -51,6 +51,22 @@ pub struct CatalogState {
     pub parents: BTreeMap<String, String>,
     /// project id -> ordered `(stable element id, doc id)` board entries.
     pub boards: BTreeMap<String, Vec<(String, String)>>,
+    /// project id -> current workflow revision (the deterministic transition
+    /// gates; seeded by `InitializeTracker`/`ProjectNew`, replaced by
+    /// `workflow set`).
+    pub workflow_revisions: BTreeMap<String, crate::world::workflow::WorkflowRevision>,
+    /// role id -> stored role revision (built-ins + custom roles).
+    pub roles: BTreeMap<String, StoredRoleRevision>,
+}
+
+/// A role revision as stored in the catalog `roles` map: hex revision id,
+/// predecessors, and the canonical body.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredRoleRevision {
+    pub revision_id: String,
+    #[serde(default)]
+    pub predecessor_ids: Vec<String>,
+    pub body: crate::world::roles::RoleBody,
 }
 
 fn reg_str(view: &CollaborativeView, path: &str) -> Option<String> {
@@ -98,6 +114,17 @@ impl CatalogState {
         }
         if state.workflow.is_empty() {
             state.workflow = default_workflow_states();
+        }
+        for (project, raw) in map_str(view, "workflow_revisions") {
+            if let Ok(rev) = serde_json::from_str::<crate::world::workflow::WorkflowRevision>(&raw)
+            {
+                state.workflow_revisions.insert(project, rev);
+            }
+        }
+        for (id, raw) in map_str(view, "roles") {
+            if let Ok(rev) = serde_json::from_str::<StoredRoleRevision>(&raw) {
+                state.roles.insert(id, rev);
+            }
         }
         for (project, raw) in map_str(view, "aliases") {
             if let Ok(n) = raw.parse() {

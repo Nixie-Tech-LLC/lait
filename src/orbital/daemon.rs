@@ -242,38 +242,25 @@ impl OrbitalDaemon {
         }
     }
 
-    /// Route one control request to its plane.
+    /// Route one control request to its terminal owner — the value the
+    /// PRODUCTION classifier returns. Tests and the generated routing table
+    /// consume the same `control::classify`; there is no second table and no
+    /// wildcard terminal owner.
     fn dispatch(&self, req: Request) -> Response {
-        if IssueRouter::handles(&req) {
-            return self.route_issue(req);
+        use crate::control::{classify, RequestOwner};
+        match classify(&req) {
+            RequestOwner::Session => self.route_issue(req),
+            RequestOwner::Mechanics => self.dispatch_mechanics(req),
+            RequestOwner::Station => self.dispatch_station(req),
+            RequestOwner::Observation => self.dispatch_observation(req),
+            RequestOwner::Lifecycle => self.dispatch_lifecycle(req),
         }
+    }
+
+    /// Membership, admission, device, key, ceremony and custody requests —
+    /// served by [`OrbitalMechanics`] over the mechanics primitives.
+    fn dispatch_mechanics(&self, req: Request) -> Response {
         match req {
-            // ---- protocol handshake ----
-            // The first frame a client sends: answer with our control-protocol
-            // version so the probe classifies us as a live, compatible daemon
-            // (not a pre-handshake legacy node).
-            Request::Hello { .. } => Response::Hello {
-                protocol_version: crate::control::CONTROL_PROTOCOL_VERSION,
-            },
-
-            // ---- transport / status ----
-            Request::Status => self.status(),
-            Request::Id => Response::Ok {
-                message: Some(crate::crypto::device_from_seed(&self.device_seed).to_string()),
-            },
-            Request::Who => Response::Who { peers: vec![] },
-            Request::Invite {
-                role,
-                reusable,
-                ttl_hours,
-            } => self.invite(role.as_deref(), reusable, ttl_hours),
-            Request::Connect { ticket } | Request::Join { ticket } => self.connect(&ticket),
-            Request::ConfigReload => Response::Ok { message: None },
-            Request::Stop => Response::Ok {
-                message: Some("stopping".into()),
-            },
-
-            // ---- membership plane (over the signed ACL DAG) ----
             Request::Members => self.members(),
             Request::MemberAdd { who, admin, .. } => match self.mechanics.member_add(&who, admin) {
                 Ok(()) => Response::Ok {
@@ -290,8 +277,6 @@ impl OrbitalDaemon {
             Request::MemberLog => Response::MemberLog {
                 entries: self.mechanics.member_log(),
             },
-
-            // ---- multi-device (lait/actor/1 device management) ----
             Request::DeviceInvite => match self.mechanics.device_invite() {
                 Ok((actor, space)) => Response::Text {
                     text: format!("{actor} {space}"),
@@ -324,8 +309,6 @@ impl OrbitalDaemon {
                 },
                 Err(e) => Response::err(format!("{e}")),
             },
-
-            // ---- admin control plane ----
             Request::KeyRotate => match self.mechanics.key_rotate() {
                 Ok(gen) => Response::Ok {
                     message: Some(format!("rotated the space key to generation {gen}")),
@@ -350,32 +333,15 @@ impl OrbitalDaemon {
                 },
                 Err(e) => Response::err(format!("{e}")),
             },
-            Request::MemberAlias { who, name } => self.set_alias(&who, &name),
-
-            // ---- daemon lifecycle (node-local reads/config) ----
-            // The orbital daemon has no legacy in-memory event ring — live
-            // clients observe the Station's doorbell stream (`Subscribe`)
-            // instead — so the polling log is empty by construction.
-            Request::Log { since } => Response::Events {
-                events: vec![],
-                last: since,
+            Request::Id => Response::Ok {
+                message: Some(crate::crypto::device_from_seed(&self.device_seed).to_string()),
             },
-            Request::Inbox { clear } => {
-                let (entries, unread) = crate::inbox::list(&self.home);
-                if clear {
-                    crate::inbox::mark_read(&self.home, now_secs());
-                }
-                Response::Inbox { entries, unread }
-            }
-            Request::Diagnose { expected_space } => self.diagnose(expected_space),
-            Request::SeedAdd { arg } => self.seed_add(arg.trim()),
-            Request::SeedList => self.seed_list(),
-            Request::SeedRemove { who } => self.seed_remove(who.trim()),
-
-            // ---- product activity feed (Session) ----
-            Request::Activity { .. } => self.route_issue(req),
-
-            // ---- membership ceremonies (over mechanics FROST primitives) ----
+            Request::Invite {
+                role,
+                reusable,
+                ttl_hours,
+            } => self.invite(role.as_deref(), reusable, ttl_hours),
+            Request::Join { ticket } => self.connect(&ticket),
             Request::SpaceRecover => self.space_recover(),
             Request::SpaceRecoverApprove { session, expect } => {
                 self.space_recover_approve(session, expect)
@@ -393,27 +359,77 @@ impl OrbitalDaemon {
                 passphrase,
                 force,
             } => self.space_custody_import(path, passphrase, force),
-
-            // Every control request has an explicit terminal owner above; the
-            // only variants that reach here are the product issue-family that
-            // `IssueRouter::handles` claims at the top of `dispatch`, so route
-            // them to the World Session (which returns its own typed error if
-            // it does not recognize one) — never a catch-all refusal.
-            other => self.route_issue(other),
+            // The production classifier routed this here; any other variant
+            // reaching this arm is a routing invariant violation, not a
+            // servable request.
+            other => unreachable!("misclassified mechanics request: {other:?}"),
         }
     }
 
-    /// Best-effort (issues, projects) counts from the docked Session's catalog
-    /// snapshot. `(0, 0)` when undocked (un-admitted) or the query is unavailable.
-    fn counts(&self) -> (usize, usize) {
+    /// Connect/neighbor/Contact requests — served by the Station.
+    fn dispatch_station(&self, req: Request) -> Response {
+        match req {
+            Request::Connect { ticket } => self.connect(&ticket),
+            Request::Who => Response::Who { peers: vec![] },
+            other => unreachable!("misclassified station request: {other:?}"),
+        }
+    }
+
+    /// Status, subscription, and locally derived projection surfaces.
+    fn dispatch_observation(&self, req: Request) -> Response {
+        match req {
+            Request::Status => self.status(),
+            Request::Inbox { clear } => {
+                let (entries, unread) = crate::inbox::list(&self.home);
+                if clear {
+                    crate::inbox::mark_read(&self.home, now_secs());
+                }
+                Response::Inbox { entries, unread }
+            }
+            // Subscribe is handled by the streaming connection path before
+            // dispatch; a one-shot Subscribe cannot be answered on this plane.
+            Request::Subscribe { .. } => Response::err("subscribe is a streaming request"),
+            other => unreachable!("misclassified observation request: {other:?}"),
+        }
+    }
+
+    /// Daemon lifecycle and node-local configuration adapters.
+    fn dispatch_lifecycle(&self, req: Request) -> Response {
+        match req {
+            Request::Hello { .. } => Response::Hello {
+                protocol_version: crate::control::CONTROL_PROTOCOL_VERSION,
+            },
+            Request::ConfigReload => Response::Ok { message: None },
+            Request::Stop => Response::Ok {
+                message: Some("stopping".into()),
+            },
+            // The orbital daemon has no legacy in-memory event ring — live
+            // clients observe the Station's doorbell stream (`Subscribe`)
+            // instead — so the polling log is empty by construction.
+            Request::Log { since } => Response::Events {
+                events: vec![],
+                last: since,
+            },
+            Request::Diagnose { expected_space } => self.diagnose(expected_space),
+            Request::SeedAdd { arg } => self.seed_add(arg.trim()),
+            Request::SeedList => self.seed_list(),
+            Request::SeedRemove { who } => self.seed_remove(who.trim()),
+            Request::MemberAlias { who, name } => self.set_alias(&who, &name),
+            other => unreachable!("misclassified lifecycle request: {other:?}"),
+        }
+    }
+
+    /// The (issues, projects) counts from the docked Session's catalog
+    /// snapshot — `None` when the projection is UNAVAILABLE (undocked, or a
+    /// query failed). Status reports the truth; it never converts an
+    /// unavailable projection into false zeros.
+    fn counts(&self) -> Option<(usize, usize)> {
         use crate::world::contract::{self, IssueQuery};
         if !self.ensure_session() {
-            return (0, 0);
+            return None;
         }
         let guard = self.session.lock().expect("session lock");
-        let Some(session) = guard.as_ref() else {
-            return (0, 0);
-        };
+        let session = guard.as_ref()?;
         let query = |q: IssueQuery| -> Option<serde_json::Value> {
             let bytes = session
                 .query(runtime::WorldQuery {
@@ -425,14 +441,12 @@ impl OrbitalDaemon {
                 .bytes;
             serde_json::from_slice(&bytes).ok()
         };
-        let projects = query(IssueQuery::Snapshot)
-            .and_then(|v| {
-                v.get("catalog")?
-                    .get("projects")?
-                    .as_object()
-                    .map(|m| m.len())
-            })
-            .unwrap_or(0);
+        let projects = query(IssueQuery::Snapshot).and_then(|v| {
+            v.get("catalog")?
+                .get("projects")?
+                .as_object()
+                .map(|m| m.len())
+        })?;
         let issues = query(IssueQuery::List {
             project: None,
             label: None,
@@ -441,19 +455,20 @@ impl OrbitalDaemon {
             all: true,
             me: None,
         })
-        .and_then(|v| v.as_array().map(|a| a.len()))
-        .unwrap_or(0);
-        (issues, projects)
+        .and_then(|v| v.as_array().map(|a| a.len()))?;
+        Some((issues, projects))
     }
 
     fn status(&self) -> Response {
-        let (issues, projects) = self.counts();
+        let counts = self.counts();
+        let (issues, projects) = counts.unwrap_or((0, 0));
         Response::Status(Box::new(StatusInfo {
             id: crate::crypto::device_from_seed(&self.device_seed).to_string(),
             nick: String::new(),
             name: String::new(),
             online_peers: self.station.neighbors().len(),
             space: Some(self.station.space_id().as_str().to_string()),
+            counts_unavailable: counts.is_none(),
             issues,
             projects,
             membership: if self.mechanics.am_i_member() {
@@ -526,7 +541,7 @@ impl OrbitalDaemon {
     /// onboarding gate list (`docs/UI.md`). Pure over the snapshot the daemon
     /// already computes — the same core the legacy node used.
     fn diagnose(&self, expected_space: Option<String>) -> Response {
-        let (issues, projects) = self.counts();
+        let (issues, projects) = self.counts().unwrap_or((0, 0));
         let space = self.station.space_id().as_str().to_string();
         let membership = if self.mechanics.am_i_member() {
             "member"

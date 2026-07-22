@@ -108,6 +108,15 @@ impl PolicyResource {
         }
     }
 
+    /// A one-segment project-scoped resource of a World. The segment is the
+    /// World's opaque project identifier; matching stays byte-exact.
+    pub fn project(world: &str, project: &str) -> Self {
+        Self {
+            world: world.to_string(),
+            segments: vec![project.to_string()],
+        }
+    }
+
     pub fn validate(&self) -> Result<(), DemandError> {
         if !valid_name(&self.world) {
             return Err(DemandError::BadIdentifier(format!(
@@ -337,7 +346,7 @@ impl AuthorizationDemand {
                 }
                 let mut segments = Vec::with_capacity(count);
                 for _ in 0..count {
-                    segments.push(read_str(bytes, &mut pos)?);
+                    segments.push(read_segment(bytes, &mut pos)?);
                 }
                 *leaves += 1;
                 if *leaves > MAX_REQUIRE_LEAVES {
@@ -576,6 +585,28 @@ impl WorldAssignmentEvidence {
 fn push_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(&(s.len() as u16).to_be_bytes());
     out.extend_from_slice(s.as_bytes());
+}
+
+/// Read one resource segment: exact opaque UTF-8 bytes (1..=64, not `*`) —
+/// the plan-01 segment rule, NOT the identifier grammar (a World's opaque
+/// project ids may carry any UTF-8).
+fn read_segment(bytes: &[u8], pos: &mut usize) -> Result<String, DemandError> {
+    if bytes.len() < *pos + 2 {
+        return Err(DemandError::BadEncoding("truncated".into()));
+    }
+    let len = u16::from_be_bytes([bytes[*pos], bytes[*pos + 1]]) as usize;
+    *pos += 2;
+    if bytes.len() < *pos + len {
+        return Err(DemandError::BadEncoding("truncated string".into()));
+    }
+    let s = std::str::from_utf8(&bytes[*pos..*pos + len])
+        .map_err(|_| DemandError::BadEncoding("non-UTF-8".into()))?
+        .to_string();
+    *pos += len;
+    if s.is_empty() || s.len() > MAX_SEGMENT_BYTES || s == "*" {
+        return Err(DemandError::BadResource(format!("segment `{s}`")));
+    }
+    Ok(s)
 }
 
 fn read_str(bytes: &[u8], pos: &mut usize) -> Result<String, DemandError> {

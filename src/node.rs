@@ -1677,6 +1677,7 @@ impl Node {
                     space,
                     issues,
                     projects,
+                    counts_unavailable: false,
                     membership,
                     degraded_recovery,
                     recovery,

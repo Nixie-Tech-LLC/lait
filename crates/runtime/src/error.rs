@@ -125,6 +125,11 @@ pub enum WorldError {
     /// The World callback panicked. Runtime contains the unwind as this typed
     /// error without ending the Station or discarding the Replica.
     WorldImplementationFailed,
+    /// The World's durable state violates its own structural invariants (e.g.
+    /// a missing, misplaced, duplicated or mis-bound singleton Body after
+    /// completed initialization). Never repaired, selected among, or silently
+    /// recreated — surfaced for explicit operator action.
+    WorldStateCorrupt,
     /// The World's staged effect violated its containment contract: an operation
     /// or scope outside its own namespace, an operation kind its registered
     /// mutation models do not allow, or the transaction op-count bound.
