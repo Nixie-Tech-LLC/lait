@@ -105,22 +105,27 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       # --locked pins the committed Cargo.lock, so the portable dependency set
       # (interprocess, fs2, and the `ring` TLS backend) can't drift under CI.
+      # --workspace is load-bearing on every cargo invocation in this job: the
+      # root package plus six concept crates form the workspace, and a bare
+      # `cargo test`/`nextest run` covers ONLY the root package (218 of 706
+      # tests at the time this comment was written) — silently skipping every
+      # mechanics/fabric/replica/runtime/comms/journal suite.
       - name: Build
-        run: cargo build --locked --all-targets
+        run: cargo build --workspace --locked --all-targets --all-features
 
       # nextest parallelizes across test binaries (the `Build` step above already
       # compiled `--all-targets`, so examples/bins are covered there).
       - name: Test
-        run: cargo nextest run --locked
+        run: cargo nextest run --workspace --locked --all-features
 
       # nextest does not run doctests; run them explicitly so documented examples
       # (and the DTO/parity doc examples) can't rot.
       - name: Doctests
-        run: cargo test --locked --doc
+        run: cargo test --workspace --locked --doc --all-features
 
       # Portability guard: the control channel + single-instance lock MUST stay
       # cross-platform. Fail if a unix-only primitive is named outside an
@@ -220,17 +225,17 @@ jobs:
           - job: orbital-boundaries
             filter: "binary(orbital_boundaries)"
           - job: orbital-clean-break
-            filter: "binary(orbital_clean_break) + binary(semantic_type_names)"
+            filter: "binary(orbital_clean_break) + binary(semantic_type_names) + binary(mixed_root_guard)"
           - job: orbital-authority
             filter: "binary(authority_history) + binary(authority_checkpoint) + binary(world_policy) + binary(ceremony_frontier_isolation)"
           - job: orbital-formats
             filter: "binary(dto_schema) + binary(coordinates_fixtures) + binary(contact_fixtures) + binary(beacon_presence_fixtures) + binary(manifest_fixtures) + binary(transaction_marker_fixtures) + binary(canonical_ids) + binary(canonical_store) + binary(algebra_fixtures)"
           - job: orbital-faults
-            filter: "binary(journal_faults) + binary(journal_child_crash) + binary(manifest_atomicity) + binary(orbital_catalog)"
+            filter: "binary(journal_faults) + binary(journal_child_crash) + binary(manifest_atomicity) + binary(orbital_catalog) + binary(concurrent_heads)"
           - job: orbital-contact-real
             filter: "binary(contact_iroh) + binary(contact_mem)"
           - job: orbital-bootstrap-real
-            filter: "binary(orbital_join_iroh) + binary(orbital_admission)"
+            filter: "binary(orbital_join_iroh) + binary(orbital_admission) + binary(orbital_concurrent_catalog)"
           - job: orbital-ceremonies
             filter: "binary(orbital_ceremonies) + binary(mechanics_sparse_ceremony)"
           - job: orbital-independent-world
@@ -249,8 +254,17 @@ jobs:
         uses: taiki-e/install-action@e658debeddbabf20b2b866d9235eb08a2375b1ad
         with:
           tool: nextest
+      # --workspace is load-bearing: without it cargo builds only the root
+      # package, so filters naming crate-level binaries (runtime::dto_schema,
+      # mechanics::ceremony_frontier_isolation, …) silently select nothing —
+      # nextest's no-tests failure (exit 4) is what catches that, and partial
+      # matches would be worse: a gate that runs SOME of its binaries reads as
+      # green while skipping the rest. The list step makes the selection
+      # visible in the log before anything runs.
+      - name: List selected tests
+        run: cargo nextest list --workspace --locked --all-features -E '${{ matrix.filter }}'
       - name: Run gate
-        run: cargo nextest run --locked --all-features -E '${{ matrix.filter }}'
+        run: cargo nextest run --workspace --locked --all-features -E '${{ matrix.filter }}'
       # The formats gate additionally replays the committed schema examples
       # through a NON-Rust JSON Schema 2020-12 validator, so the external
       # contract is proven language-neutral, not merely serde-consistent.
@@ -304,7 +318,7 @@ jobs:
       - name: Check on MSRV
         env:
           RUSTUP_TOOLCHAIN: "1.91.0"
-        run: cargo check --locked --all-targets
+        run: cargo check --workspace --locked --all-targets --all-features
 
   # Supply-chain gate: advisories + licenses + bans + sources (deny.toml). The
   # bans list forbids the aws-lc-* backends so the portable `ring` backend can't

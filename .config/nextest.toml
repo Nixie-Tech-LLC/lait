@@ -55,6 +55,18 @@ slow-timeout = { period = "30s", terminate-after = 3 }
 filter = 'binary(ceremony_frontier_isolation) + binary(mechanics_sparse_ceremony)'
 slow-timeout = { period = "60s", terminate-after = 5 }
 
+# The smoke-scale performance gate builds a ~500-request corpus through the
+# real daemon and restarts it twice. Measured evidence: ~27 s wall on a warm
+# 12-core Windows dev box (dev profile); GitHub's 2-core windows-latest runner
+# with the whole suite saturating both cores ran past the default 90 s cap.
+# 5 × 120 s keeps a real wedge (a daemon that never answers Status) surfacing
+# within 10 minutes while giving the slowest supported runner ~20× the
+# measured single-machine time. The FULL corpus never runs under nextest —
+# the orbital-perf workflow invokes this binary directly with its own budget.
+[[profile.default.overrides]]
+filter = 'binary(issues_reference_perf)'
+slow-timeout = { period = "120s", terminate-after = 5 }
+
 [[profile.default.overrides]]
 filter = '''
     binary(orbital_join_iroh)
