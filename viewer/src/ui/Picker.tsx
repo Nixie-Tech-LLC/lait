@@ -49,7 +49,7 @@ const trigger = cva("flex items-center gap-1.5 text-sm", {
   variants: {
     variant: {
       pill: "border-line hover:bg-hover data-[state=open]:bg-hover rounded-full border px-2 py-1",
-      bare: "hover:bg-hover data-[state=open]:bg-hover -mx-1 min-w-0 rounded px-1 py-0.5 text-left",
+      bare: "hover:bg-hover data-[state=open]:bg-hover -mx-1 min-h-6 min-w-0 rounded px-1 py-0.5 text-left",
     },
   },
   defaultVariants: { variant: "pill" },

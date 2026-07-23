@@ -178,7 +178,7 @@ export function Inbox({
                   event.stopPropagation();
                   setReadState(e, !isUnread(e, i));
                 }}
-                className="text-mute hover:text-fg shrink-0 rounded px-1 text-xs"
+                className="text-mute hover:text-fg min-h-6 shrink-0 rounded px-1 text-xs"
                 aria-label={`${isUnread(e, i) ? "Mark read" : "Mark unread on this device"}: ${e.title}`}
               >
                 {isUnread(e, i) ? "Mark read" : "Mark unread"}

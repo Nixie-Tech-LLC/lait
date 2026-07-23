@@ -5,6 +5,7 @@ import { cmdkFilter } from "../core/fuzzy";
 import { formatBinding } from "../core/keys";
 import { registry, type Ctx } from "../core/registry";
 import { Kbd } from "./primitives";
+import { useReturnFocus } from "./useReturnFocus";
 
 /**
  * The command palette — a **projection** of the registry, not a menu.
@@ -25,6 +26,7 @@ import { Kbd } from "./primitives";
  * cheerfully shows every command for every query.
  */
 export function Palette({ ctx, onClose }: { ctx: Ctx; onClose: () => void }) {
+  useReturnFocus();
   const results = useMemo(() => {
     // `overlay: true` would hide every command gated on `!overlay` — but those are
     // exactly the ones you opened the palette to run. Rank against the world as it

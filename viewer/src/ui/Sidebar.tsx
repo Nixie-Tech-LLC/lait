@@ -104,7 +104,7 @@ export function Sidebar({
         title="Projects"
         action={
           !agent ? (
-            <IconButton label="New project" onClick={onCreateProject} className="size-5">
+            <IconButton label="New project" onClick={onCreateProject}>
               <Plus className="size-3" />
             </IconButton>
           ) : null

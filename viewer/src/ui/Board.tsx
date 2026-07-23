@@ -198,8 +198,8 @@ function Column({
         </DropdownMenu.Root>
       </header>
       <ul
-        role="listbox"
         aria-label={`${col.state.name} issues`}
+        data-board-collection
         className={[
           "flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto rounded p-1 transition-colors",
           // The whole column lights up as a target, because the drop is a *status*
@@ -314,7 +314,12 @@ function Card({
   const el = useRef<HTMLLIElement>(null);
   // Selection moves by keyboard, so it has to drag the viewport with it.
   useEffect(() => {
-    if (selected) el.current?.scrollIntoView({ block: "nearest" });
+    if (selected) {
+      el.current?.scrollIntoView({ block: "nearest" });
+      if (document.activeElement?.closest("[data-board-collection]")) {
+        el.current?.focus({ preventScroll: true });
+      }
+    }
   }, [selected]);
 
   return (
@@ -323,7 +328,16 @@ function Card({
       <li
         ref={el}
         draggable={draggable}
-        onClick={() => onSelect(row.reff)}
+        onClick={(event) => {
+          event.currentTarget.focus({ preventScroll: true });
+          onSelect(row.reff);
+        }}
+        onKeyDown={(event) => {
+          if (event.target === event.currentTarget && event.key === "Enter") {
+            event.preventDefault();
+            onSelect(row.reff);
+          }
+        }}
         onDragStart={(e) => {
           // Firefox ignores a drag whose dataTransfer carries nothing.
           e.dataTransfer.setData("text/plain", row.reff);
@@ -340,8 +354,8 @@ function Card({
           const below = e.clientY > box.top + box.height / 2;
           onOver({ at: below ? "after" : "before", reff: row.reff });
         }}
-        aria-selected={selected}
-        role="option"
+        aria-current={selected ? "true" : undefined}
+        tabIndex={selected ? 0 : -1}
         className={[
           "bg-raised group/card cursor-default rounded border p-2 transition-[border-color,box-shadow,opacity] duration-150",
           selected

@@ -9,6 +9,7 @@ import type { ProjectDto, Row, WorkflowState } from "../types";
 import { catalogColor } from "./colors";
 import { PriorityIcon, StatusIcon } from "./icons";
 import { Kbd } from "./primitives";
+import { useReturnFocus } from "./useReturnFocus";
 
 export function rememberIssue(spaceId: string, reff: string): void {
   rememberRecentIssue(spaceId, reff);
@@ -31,6 +32,7 @@ export function IssueSearch({
   onOpen: (row: Row) => void;
   onClose: () => void;
 }) {
+  useReturnFocus();
   const [available, setAvailable] = useState(rows);
   const [query, setQuery] = useState("");
   useEffect(() => {

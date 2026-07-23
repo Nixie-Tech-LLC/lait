@@ -198,7 +198,7 @@ function Group({
           onClick={() => setCollapsed((value) => !value)}
           aria-label={`${collapsed ? "Expand" : "Collapse"} ${title}`}
           aria-expanded={!collapsed}
-          className="text-mute hover:text-fg -ml-2 flex size-5 items-center justify-center rounded"
+          className="text-mute hover:text-fg -ml-2 flex size-6 items-center justify-center rounded"
         >
           <ChevronRight className={`size-3 transition-transform ${collapsed ? "" : "rotate-90"}`} />
         </button>
@@ -216,7 +216,7 @@ function Group({
           </IconButton>
         )}
       </header>
-      {!collapsed && <ul role="listbox" aria-label={`${title} issues`}>
+      {!collapsed && <ul aria-label={`${title} issues`} data-issue-collection>
         {rows.map((row) => (
           <IssueRow
             key={row.reff}
@@ -269,7 +269,12 @@ function IssueRow({
   // Selection moves by keyboard, so it must drag the viewport with it — a
   // selected row below the fold is indistinguishable from a dropped keypress.
   useEffect(() => {
-    if (selected) el.current?.scrollIntoView({ block: "nearest" });
+    if (selected) {
+      el.current?.scrollIntoView({ block: "nearest" });
+      if (document.activeElement?.closest("[data-issue-collection]")) {
+        el.current?.focus({ preventScroll: true });
+      }
+    }
   }, [selected]);
 
   return (
@@ -283,25 +288,36 @@ function IssueRow({
         row.provisional && "opacity-60",
         row.tombstone && "opacity-60",
       ])}
-      onClick={() => onSelect(row.reff)}
+      onClick={(event) => {
+        event.currentTarget.focus({ preventScroll: true });
+        onSelect(row.reff);
+      }}
       onDoubleClick={() => onOpen(row.reff)}
-      aria-selected={selected}
-      role="option"
+      onKeyDown={(event) => {
+        if (event.target === event.currentTarget && event.key === "Enter") {
+          event.preventDefault();
+          onOpen(row.reff);
+        }
+      }}
+      aria-current={selected ? "true" : undefined}
+      tabIndex={selected ? 0 : -1}
     >
       {!readOnly && (
-        <input
-          type="checkbox"
-          checked={checked}
-          onChange={() => onToggleCheck(row.reff)}
-          onClick={(e) => e.stopPropagation()}
-          aria-label={`Select ${row.key_alias ?? row.reff}`}
-          // Hidden until hover — or until a bulk selection is underway, when
-          // every row's box shows so the remaining targets are hittable.
+        <span
           className={clsxish([
-            "shrink-0",
-            !anyChecked && "opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100",
+            "flex size-6 shrink-0 items-center justify-center",
+            !anyChecked && "opacity-0 transition-opacity group-hover/row:opacity-100 focus-within:opacity-100",
           ])}
-        />
+        >
+          <input
+            type="checkbox"
+            checked={checked}
+            onChange={() => onToggleCheck(row.reff)}
+            onClick={(e) => e.stopPropagation()}
+            aria-label={`Select ${row.key_alias ?? row.reff}`}
+            className="size-4"
+          />
+        </span>
       )}
       <PriorityIcon priority={row.priority} />
       {/* Fixed width + tabular numerals: the ids form a straight edge to scan. */}

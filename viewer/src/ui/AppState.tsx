@@ -166,7 +166,7 @@ export function TrustPopover({
     <Popover.Root>
       <Popover.Trigger
         className={cn(
-          "hover:bg-hover flex h-6 shrink-0 items-center gap-1.5 whitespace-nowrap rounded px-2 text-xs",
+          "hover:bg-hover flex h-6 min-w-6 shrink-0 items-center gap-1.5 whitespace-nowrap rounded px-2 text-xs",
           healthy ? "text-dim" : "text-warn",
         )}
         aria-label="Local and peer status"

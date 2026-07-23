@@ -28,9 +28,14 @@
 
   --color-fg: light-dark(#17171a, #e9e9ec);
   --color-dim: light-dark(#5c5c66, #a0a0aa);
-  --color-mute: light-dark(#8b8b95, #6e6e78);
+  /* Muted copy still appears at the dense 11–12px scale throughout the viewer,
+     so it must clear normal-text contrast rather than relying on "secondary"
+     styling as an exemption. */
+  --color-mute: light-dark(#72727d, #858590);
 
-  --color-accent: light-dark(#2f6bff, #5b8cff);
+  /* The dark-theme blue is intentionally deeper than the light-theme value:
+     white labels remain AA while focus rings still clear non-text contrast. */
+  --color-accent: light-dark(#2f6bff, #416fe0);
   --color-accent-fg: #ffffff;
   --color-danger: light-dark(#d1242f, #f0616d);
   --color-ok: light-dark(#1a7f37, #3fb950);

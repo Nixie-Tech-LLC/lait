@@ -1100,7 +1100,7 @@ export function App() {
         <span className="absolute inset-y-0 -left-[3px] w-[7px]" />
       </Separator>
 
-      <Panel id="main" className="flex min-w-0 flex-col">
+      <Panel id="main" role="main" className="flex min-w-0 flex-col">
         {/*
           Chrome recedes. Linear's header is a breadcrumb and a few ghost icons —
           no bordered CTA competing with the content, no permanently-lit status
@@ -1633,7 +1633,11 @@ export function App() {
         </div>
       )}
       {toast && (
-        <div className="border-line-strong bg-raised shadow-overlay fixed bottom-4 left-1/2 -translate-x-1/2 rounded border px-3 py-1.5 text-sm">
+        <div
+          className="border-line-strong bg-raised shadow-overlay fixed bottom-4 left-1/2 -translate-x-1/2 rounded border px-3 py-1.5 text-sm"
+          role="status"
+          aria-live="polite"
+        >
           {toast}
         </div>
       )}
