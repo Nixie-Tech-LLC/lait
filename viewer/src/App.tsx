@@ -210,6 +210,27 @@ export function App() {
     saveLastRoute(route);
   }, [routeSpace, project, view, selection, focusedDetail, filter]);
 
+  // Settings is a page state, not a panel: its own left rail owns the hierarchy,
+  // so the workspace sidebar steps aside while it's open and returns as you left
+  // it on the way out. Only touches the desktop rail; the mobile drawer is modal
+  // and already dismissed on navigation.
+  const sidebarBeforeSettings = useRef<boolean | null>(null);
+  useEffect(() => {
+    const panel = sidebar.current;
+    if (!panel || window.matchMedia("(max-width: 960px)").matches) return;
+    if (view === "settings") {
+      if (sidebarBeforeSettings.current === null) {
+        sidebarBeforeSettings.current = panel.isCollapsed();
+      }
+      if (!panel.isCollapsed()) panel.collapse();
+    } else if (sidebarBeforeSettings.current !== null) {
+      if (!sidebarBeforeSettings.current && panel.isCollapsed()) panel.expand();
+      sidebarBeforeSettings.current = null;
+    }
+    // `sidebar` is a stable ref; `view` is the trigger.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view]);
+
   const space = spaces.find((s) => s.id === current) ?? null;
   const readOnly = space ? isReadOnly(space) : false;
   const missingProject =
@@ -1349,6 +1370,7 @@ export function App() {
               readOnly={readOnly}
               revision={revision}
               onError={setError}
+              onExit={() => api.goto("list")}
             />
           ) : view === "projects" ? (
             <Projects

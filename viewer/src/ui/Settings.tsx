@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Hash, Palette, SlidersHorizontal, Tag, Trash2 } from "lucide-react";
+import { ArrowLeft, Hash, Palette, SlidersHorizontal, Tag, Trash2 } from "lucide-react";
 
 import { rpc } from "../api";
 import type { LabelDto, ProjectDto } from "../types";
@@ -30,6 +30,7 @@ export function Settings({
   readOnly,
   revision,
   onError,
+  onExit,
 }: {
   spaceId: string;
   spaceName: string;
@@ -39,6 +40,9 @@ export function Settings({
   /** Bumped by the doorbell; re-reads the panels that fetch. */
   revision: number;
   onError: (message: string) => void;
+  /** Leave settings and return to the app — the workspace sidebar is collapsed
+   *  while this page is open, so this is the way back. */
+  onExit: () => void;
 }) {
   const [tab, setTab] = useState<Tab>("general");
   const tabs: { id: Tab; label: string; icon: React.ReactNode }[] = [
@@ -49,7 +53,10 @@ export function Settings({
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <SurfaceHeader className="px-3">
+      <SurfaceHeader className="gap-2 px-3">
+        <IconButton label="Back to app" onClick={onExit}>
+          <ArrowLeft className="size-4" />
+        </IconButton>
         <h1 className="text-sm font-semibold">Settings</h1>
       </SurfaceHeader>
       <div className="flex min-h-0 flex-1">
