@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   CheckCircle2,
   CloudOff,
+  Copy,
   Database,
   HardDrive,
   LoaderCircle,
@@ -10,6 +11,7 @@ import {
   SearchX,
   ShieldCheck,
   Users,
+  X,
 } from "lucide-react";
 
 import type { SpaceRow, StatusInfo } from "../types";
@@ -77,19 +79,60 @@ function StateIcon({ kind }: { kind: ApplicationStateKind }) {
   return <Database className="size-5" />;
 }
 
-export function InlineError({ message, onRetry }: { message: string; onRetry?: () => void }) {
+export function InlineError({
+  title,
+  message,
+  retryLabel = "Retry",
+  onRetry,
+  onCopy,
+  onDismiss,
+}: {
+  title?: string;
+  message: string;
+  retryLabel?: string;
+  onRetry?: () => void;
+  onCopy?: () => void;
+  onDismiss?: () => void;
+}) {
   return (
     <div className="border-danger/25 bg-danger/5 text-danger flex items-center gap-2 border-b px-3 py-2 text-sm" role="alert">
       <AlertTriangle className="size-3.5 shrink-0" />
-      <span className="min-w-0 flex-1">{message}</span>
+      <span className="min-w-0 flex-1">
+        {title && <strong className="mr-1">{title}.</strong>}
+        {message}
+      </span>
       {onRetry && (
         <Button variant="ghost" onClick={onRetry} className="text-danger">
           <RefreshCw className="size-3" />
-          Retry
+          {retryLabel}
+        </Button>
+      )}
+      {onCopy && (
+        <Button variant="ghost" onClick={onCopy} className="text-danger">
+          <Copy className="size-3" />
+          Copy details
+        </Button>
+      )}
+      {onDismiss && (
+        <Button variant="ghost" onClick={onDismiss} className="text-danger" aria-label="Dismiss error">
+          <X className="size-3" />
         </Button>
       )}
     </div>
   );
+}
+
+export function recoveryForError(message: string): {
+  title: string;
+  retryLabel: string;
+} {
+  if (/connect|daemon|network|fetch|offline/i.test(message)) {
+    return { title: "Local service unavailable", retryLabel: "Reconnect" };
+  }
+  if (/permission|unauthori|read.?only|refused/i.test(message)) {
+    return { title: "Change not allowed", retryLabel: "Refresh" };
+  }
+  return { title: "Something didn’t finish", retryLabel: "Retry" };
 }
 
 /**

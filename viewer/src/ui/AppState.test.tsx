@@ -2,7 +2,13 @@ import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { ApplicationState, LoadingState, trustSummary } from "./AppState";
+import {
+  ApplicationState,
+  InlineError,
+  LoadingState,
+  recoveryForError,
+  trustSummary,
+} from "./AppState";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
   .IS_REACT_ACT_ENVIRONMENT = true;
@@ -39,6 +45,43 @@ describe("application state vocabulary", () => {
   it("gives retry states an explicit recoverable identity", () => {
     render(<ApplicationState kind="retry" title="Connection interrupted" action={<button>Try again</button>} />);
     expect(host!.querySelector('[data-application-state="retry"] button')?.textContent).toBe("Try again");
+  });
+
+  it("offers contextual recovery, diagnostics, and dismissal", () => {
+    let retried = 0;
+    let copied = 0;
+    let dismissed = 0;
+    render(
+      <InlineError
+        title="Local service unavailable"
+        message="Network request failed"
+        retryLabel="Reconnect"
+        onRetry={() => retried++}
+        onCopy={() => copied++}
+        onDismiss={() => dismissed++}
+      />,
+    );
+
+    const buttons = [...host!.querySelectorAll("button")];
+    act(() => buttons.find((button) => button.textContent?.includes("Reconnect"))?.click());
+    act(() => buttons.find((button) => button.textContent?.includes("Copy details"))?.click());
+    act(() => buttons.find((button) => button.getAttribute("aria-label") === "Dismiss error")?.click());
+    expect([retried, copied, dismissed]).toEqual([1, 1, 1]);
+  });
+
+  it("classifies connection and authorization recovery into useful actions", () => {
+    expect(recoveryForError("Failed to fetch daemon status")).toEqual({
+      title: "Local service unavailable",
+      retryLabel: "Reconnect",
+    });
+    expect(recoveryForError("Unauthorized: space is read-only")).toEqual({
+      title: "Change not allowed",
+      retryLabel: "Refresh",
+    });
+    expect(recoveryForError("Unexpected projection failure")).toEqual({
+      title: "Something didn’t finish",
+      retryLabel: "Retry",
+    });
   });
 
   function render(node: React.ReactNode) {

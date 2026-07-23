@@ -12,6 +12,7 @@ import {
 import { ConfirmRequired, LaitError, rpc, spaces as fetchSpaces } from "./api";
 import { useDoorbell } from "./doorbell";
 import { coalesce } from "./core/coalesce";
+import { runBounded, type BulkProgress } from "./core/bulk";
 import { groupRows, loadDisplay, saveDisplay, type DisplayState } from "./core/display";
 import {
   contribute,
@@ -34,7 +35,7 @@ import { neighbourState, workTarget } from "./core/workflow";
 import { loadFavoriteProjects, loadRecentIssues, toggleFavoriteProject } from "./core/personalNav";
 import { loadSavedViews, type SavedView } from "./core/savedViews";
 import { Activity } from "./ui/Activity";
-import { EmptyState, InlineError, TrustPopover } from "./ui/AppState";
+import { EmptyState, InlineError, recoveryForError, TrustPopover } from "./ui/AppState";
 import { Board } from "./ui/Board";
 import { BulkBar } from "./ui/BulkBar";
 import { DisplayOptions } from "./ui/DisplayOptions";
@@ -53,7 +54,7 @@ import { catalogColor } from "./ui/colors";
 import * as ask from "./ui/dialogs";
 import { DialogHost } from "./ui/dialogs";
 import { Combobox } from "./ui/Picker";
-import { IconButton, TooltipProvider } from "./ui/primitives";
+import { Button, IconButton, TooltipProvider } from "./ui/primitives";
 import { Sidebar } from "./ui/Sidebar";
 import { SavedViews } from "./ui/SavedViews";
 import {
@@ -126,7 +127,8 @@ export function App() {
   /** Bulk-selection checks, by canonical ref. Distinct from `selection`: the
    *  focus is one row, the checks are a set, and `x` is the bridge. */
   const [checked, setChecked] = useState<ReadonlySet<string>>(new Set());
-  const [bulkProgress, setBulkProgress] = useState<{ done: number; total: number; failed?: string } | null>(null);
+  const [bulkProgress, setBulkProgress] = useState<BulkProgress | null>(null);
+  const bulkOperation = useRef<((reff: string) => Promise<unknown>) | null>(null);
   const [labels, setLabels] = useState<LabelDto[]>([]);
   const [members, setMembers] = useState<MemberDto[]>([]);
   const [projects, setProjects] = useState<ProjectDto[]>([]);
@@ -614,29 +616,60 @@ export function App() {
   }, []);
 
   /**
-   * One request per checked issue, in check order, sequentially.
-   *
-   * Sequential on purpose: each write is its own commit and its own doorbell,
-   * and a parallel burst of N mutations against one daemon buys nothing but
-   * interleaved activity rows. The first refusal stops the run and shows why —
-   * continuing past an error would leave "which of my 12 landed?" unanswerable.
+   * One request per checked issue with a small concurrency ceiling. Independent
+   * refusals do not stop the run, and the itemized result targets retry precisely.
    */
-  const bulk = useCallback(async (fn: (reff: string) => Promise<unknown>) => {
-    const targets = rowsRef.current.filter((r) => checkedRef.current.has(r.reff));
-    setBulkProgress({ done: 0, total: targets.length });
-    for (const [index, row] of targets.entries()) {
-      try {
-        await fn(row.reff);
-        setBulkProgress({ done: index + 1, total: targets.length });
-      } catch (e) {
-        const message = e instanceof LaitError ? e.message : String(e);
-        setBulkProgress({ done: index, total: targets.length, failed: row.reff });
-        setError(`Bulk action stopped at ${row.key_alias ?? row.reff} after ${index} of ${targets.length}: ${message}`);
-        return;
+  const bulk = useCallback(
+    async (
+      fn: (reff: string) => Promise<unknown>,
+      retryRefs?: readonly string[],
+    ) => {
+      const requested = retryRefs
+        ? new Set(retryRefs)
+        : checkedRef.current;
+      const targets = rowsRef.current.filter((row) => requested.has(row.reff));
+      if (!targets.length) return null;
+      bulkOperation.current = fn;
+      setBulkProgress({
+        done: 0,
+        total: targets.length,
+        pending: true,
+        successes: [],
+        failures: [],
+      });
+      const result = await runBounded(
+        targets,
+        (row) => fn(row.reff),
+        3,
+        (done, total) =>
+          setBulkProgress((currentProgress) => ({
+            done,
+            total,
+            pending: true,
+            successes: currentProgress?.successes ?? [],
+            failures: currentProgress?.failures ?? [],
+          })),
+      );
+      const failures = result.failures.map(({ item, message }) => ({
+        reff: item.reff,
+        label: item.key_alias ?? item.reff,
+        message,
+      }));
+      const finalProgress: BulkProgress = {
+        done: targets.length,
+        total: targets.length,
+        pending: false,
+        successes: result.successes.map((row) => row.reff),
+        failures,
+      };
+      setBulkProgress(finalProgress);
+      if (!failures.length) {
+        window.setTimeout(() => setBulkProgress(null), 1600);
       }
-    }
-    window.setTimeout(() => setBulkProgress(null), 1600);
-  }, []);
+      return finalProgress;
+    },
+    [],
+  );
 
   const api: AppApi = useMemo(
     () => ({
@@ -1180,7 +1213,19 @@ export function App() {
           </span>
         </header>
 
-        {error && <InlineError message={error} onRetry={api.refresh} />}
+        {error && (
+          <InlineError
+            {...recoveryForError(error)}
+            message={error}
+            onRetry={api.refresh}
+            onDismiss={() => setError(null)}
+            onCopy={() =>
+              void navigator.clipboard.writeText(
+                [`Viewer error`, error, window.location.href].join("\n"),
+              )
+            }
+          />
+        )}
 
         {filterOpen && (view === "list" || view === "board") && (
           <FilterBar
@@ -1214,8 +1259,18 @@ export function App() {
             />
           ) : missingProject ? (
             <EmptyState
+              kind="unavailable"
               title="Project not found in this local space"
               body={`${project} is not available in the current replica. Choose another project from the sidebar or wait for catalog data to arrive.`}
+              action={
+                projects[0] ? (
+                  <Button onClick={() => api.pickProject(projects[0]!.key)}>
+                    Choose {projects[0].name}
+                  </Button>
+                ) : (
+                  <Button onClick={api.refresh}>Refresh projects</Button>
+                )
+              }
             />
           ) : view === "inbox" ? (
             <Inbox
@@ -1285,7 +1340,12 @@ export function App() {
               filtered={isActive(filter)}
             />
           ) : (
-            <EmptyState kind="unavailable" title="This view is unavailable" body="The local projection could not be loaded." />
+            <EmptyState
+              kind="unavailable"
+              title="This view is unavailable"
+              body="The local projection could not be loaded."
+              action={<Button onClick={api.refresh}>Retry loading</Button>}
+            />
           )}
         </div>
       </Panel>
@@ -1365,8 +1425,10 @@ export function App() {
             />
             ) : (
               <EmptyState
+                kind="unavailable"
                 title="Issue not found in this local project"
                 body={`${selection} is not present in the current local projection. It may belong to another project, still be arriving, or not exist on this replica.`}
+                action={<Button onClick={() => api.select(null)}>Clear selection</Button>}
               />
             )}
           </Panel>
@@ -1482,10 +1544,17 @@ export function App() {
                 danger: true,
               });
               if (!ok) return;
-              await bulk((reff) => rpc(current, { cmd: "issue_delete", reff }, { confirm: true }));
-              setChecked(new Set());
+              const result = await bulk((reff) =>
+                rpc(current, { cmd: "issue_delete", reff }, { confirm: true }),
+              );
+              if (!result?.failures.length) setChecked(new Set());
             })()
           }
+          onRetryFailures={() => {
+            const operation = bulkOperation.current;
+            if (!operation || !bulkProgress?.failures.length) return;
+            void bulk(operation, bulkProgress.failures.map((failure) => failure.reff));
+          }}
           onClear={() => setChecked(new Set())}
         />
       )}
