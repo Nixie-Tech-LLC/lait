@@ -1,7 +1,15 @@
-import { useCallback, useEffect, useState } from "react";
-import { AtSign, CheckCheck, Inbox as InboxIcon, MessageSquare, RotateCcw, SignalHigh } from "lucide-react";
+import * as Popover from "@radix-ui/react-popover";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { AtSign, CheckCheck, Inbox as InboxIcon, MessageSquare, RotateCcw, Settings2, SignalHigh, Timer } from "lucide-react";
 
 import { rpc } from "../api";
+import {
+  defaultInboxPreferences,
+  inboxEntryKey,
+  type InboxKind,
+  type InboxPreferences,
+  visibleInboxEntries,
+} from "../core/inbox";
 import type { InboxEntry } from "../types";
 import { ApplicationState, EmptyState, LoadingState } from "./AppState";
 import { Button } from "./primitives";
@@ -35,6 +43,9 @@ export function Inbox({
   const [unread, setUnread] = useState(0);
   const [error, setError] = useState("");
   const [overrides, setOverrides] = useState(() => loadOverrides(spaceId));
+  const [preferences, setPreferences] = useState(() => loadPreferences(spaceId));
+  const [activeKey, setActiveKey] = useState(() => loadContext(spaceId).active);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
   const load = useCallback(
     async (clear: boolean) => {
@@ -71,6 +82,18 @@ export function Inbox({
     void load(false);
   }, [load, revision]);
 
+  useEffect(() => {
+    const scroll = scrollRef.current;
+    if (!scroll) return;
+    const context = loadContext(spaceId);
+    scroll.scrollTop = context.scroll;
+    if (context.active) {
+      requestAnimationFrame(() =>
+        scroll.querySelector<HTMLElement>(`[data-inbox-key="${CSS.escape(context.active)}"]`)?.focus(),
+      );
+    }
+  }, [spaceId, entries]);
+
   if (!entries) {
     if (error) {
       return (
@@ -91,13 +114,35 @@ export function Inbox({
   }
   const read = new Set(overrides.read);
   const forcedUnread = new Set(overrides.unread);
-  const keyOf = (entry: InboxEntry) => `${entry.doc_id}:${entry.ts}:${entry.kind}`;
+  const keyOf = inboxEntryKey;
   const isUnread = (entry: InboxEntry, index: number) =>
     forcedUnread.has(keyOf(entry)) || (index < unread && !read.has(keyOf(entry)));
   const unreadCount = entries.filter(isUnread).length;
-  const groups = (["assigned", "comment", "status"] as const)
-    .map((kind) => ({ kind, entries: entries.map((entry, index) => ({ entry, index })).filter(({ entry }) => entry.kind === kind) }))
-    .filter((group) => group.entries.length > 0);
+  const now = Date.now();
+  const visible = visibleInboxEntries(entries, preferences, now);
+  const indexed = visible.map((entry) => ({ entry, index: entries.indexOf(entry) }));
+  const groups = preferences.grouping === "cause"
+    ? (["assigned", "comment", "status"] as const)
+      .map((kind) => ({ kind, entries: indexed.filter(({ entry }) => entry.kind === kind) }))
+      .filter((group) => group.entries.length > 0)
+    : [{ kind: "chronological" as const, entries: indexed }];
+  const snoozedCount = entries.filter((entry) => (preferences.snoozed[keyOf(entry)] ?? 0) > now).length;
+  const savePreferences = (next: InboxPreferences) => {
+    setPreferences(next);
+    persistPreferences(spaceId, next);
+  };
+  const snooze = (entry: InboxEntry) => {
+    savePreferences({
+      ...preferences,
+      snoozed: { ...preferences.snoozed, [keyOf(entry)]: Date.now() + 60 * 60 * 1000 },
+    });
+  };
+  const openEntry = (entry: InboxEntry) => {
+    const key = keyOf(entry);
+    setActiveKey(key);
+    saveContext(spaceId, { active: key, scroll: scrollRef.current?.scrollTop ?? 0 });
+    onOpen(entry.reff);
+  };
   const setReadState = (entry: InboxEntry, nextUnread: boolean) => {
     const key = keyOf(entry);
     const next = {
@@ -129,6 +174,38 @@ export function Inbox({
             Mark {unreadCount === 1 ? "notification" : `all ${unreadCount} notifications`} read
           </button>
         )}
+        <Popover.Root>
+          <Popover.Trigger asChild>
+            <button className="text-mute hover:bg-hover hover:text-fg ml-auto flex min-h-7 items-center gap-1.5 rounded px-2 text-sm" aria-label="Inbox preferences">
+              <Settings2 className="size-3.5" /> Preferences
+            </button>
+          </Popover.Trigger>
+          <Popover.Portal>
+            <Popover.Content align="end" sideOffset={6} className="bg-overlay border-line-strong z-50 w-64 rounded-lg border p-3 shadow-xl outline-none">
+              <h2 className="mb-1 text-sm font-medium">Inbox preferences</h2>
+              <p className="text-mute mb-3 text-xs">Local controls for what is shown on this device. The daemon still delivers the complete feed.</p>
+              {(["assigned", "comment", "status"] as InboxKind[]).map((kind) => (
+                <label key={kind} className="hover:bg-hover flex min-h-8 items-center gap-2 rounded px-1.5 text-sm">
+                  <input type="checkbox" checked={preferences.kinds[kind]} onChange={(event) => savePreferences({
+                    ...preferences,
+                    kinds: { ...preferences.kinds, [kind]: event.target.checked },
+                  })} />
+                  {causeLabel(kind)}
+                </label>
+              ))}
+              <div className="bg-line my-2 h-px" />
+              <label className="text-mute block text-xs" htmlFor="inbox-grouping">Group notifications</label>
+              <select id="inbox-grouping" value={preferences.grouping} onChange={(event) => savePreferences({
+                ...preferences,
+                grouping: event.target.value as InboxPreferences["grouping"],
+              })} className="bg-raised border-line mt-1 h-8 w-full rounded border px-2 text-sm">
+                <option value="cause">By cause</option>
+                <option value="chronological">Chronologically</option>
+              </select>
+              {snoozedCount > 0 && <button onClick={() => savePreferences({ ...preferences, snoozed: {} })} className="text-accent mt-3 text-xs">Restore {snoozedCount} snoozed</button>}
+            </Popover.Content>
+          </Popover.Portal>
+        </Popover.Root>
       </div>
 
       {entries.length === 0 ? (
@@ -137,8 +214,10 @@ export function Inbox({
           title="You’re all caught up"
           body="Nothing in this local space is currently addressed to you."
         />
+      ) : visible.length === 0 ? (
+        <EmptyState icon={<InboxIcon className="size-5" />} title="No notifications match" body="Adjust local preferences or restore snoozed notifications." />
       ) : (
-        <div className="min-h-0 flex-1 overflow-y-auto">
+        <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
           {groups.map((group) => (
             <section key={group.kind} aria-labelledby={`inbox-${group.kind}`}>
               <h2 id={`inbox-${group.kind}`} className="bg-raised/95 border-line text-mute sticky top-0 z-10 border-b px-4 py-1.5 text-2xs font-semibold uppercase">
@@ -148,9 +227,28 @@ export function Inbox({
               {group.entries.map(({ entry: e, index: i }) => (
             <li
               key={`${e.doc_id}-${e.ts}-${i}`}
-              onClick={() => onOpen(e.reff)}
+              data-inbox-key={keyOf(e)}
+              tabIndex={activeKey === keyOf(e) || (!activeKey && i === indexed[0]?.index) ? 0 : -1}
+              aria-current={activeKey === keyOf(e) ? "true" : undefined}
+              onFocus={() => setActiveKey(keyOf(e))}
+              onClick={() => openEntry(e)}
+              onKeyDown={(event) => {
+                const rows = [...(scrollRef.current?.querySelectorAll<HTMLElement>("[data-inbox-key]") ?? [])];
+                const position = rows.indexOf(event.currentTarget);
+                if (event.key === "ArrowDown" || event.key.toLowerCase() === "j") {
+                  event.preventDefault(); event.stopPropagation(); rows[Math.min(rows.length - 1, position + 1)]?.focus();
+                } else if (event.key === "ArrowUp" || event.key.toLowerCase() === "k") {
+                  event.preventDefault(); event.stopPropagation(); rows[Math.max(0, position - 1)]?.focus();
+                } else if (event.key === "Enter") {
+                  event.preventDefault(); event.stopPropagation(); openEntry(e);
+                } else if (event.key.toLowerCase() === "m") {
+                  event.preventDefault(); event.stopPropagation(); setReadState(e, !isUnread(e, i));
+                } else if (event.key.toLowerCase() === "s") {
+                  event.preventDefault(); event.stopPropagation(); snooze(e);
+                }
+              }}
               className={[
-                "border-line/60 hover:bg-hover flex cursor-default items-start gap-3 border-b px-4 py-2",
+                "border-line/60 hover:bg-hover focus-visible:bg-hover focus-visible:ring-accent/60 group flex cursor-default items-start gap-3 border-b px-4 py-2 outline-none focus-visible:ring-1 focus-visible:ring-inset",
                 // `unread` counts entries past the watermark, and they are the
                 // newest — so the first N are the unread ones.
                 isUnread(e, i) ? "bg-accent/5" : "",
@@ -183,6 +281,9 @@ export function Inbox({
               >
                 {isUnread(e, i) ? "Mark read" : "Mark unread"}
               </button>
+              <button onClick={(event) => { event.stopPropagation(); snooze(e); }} className="text-mute hover:text-fg min-h-6 shrink-0 rounded px-1 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100" aria-label={`Snooze for one hour: ${e.title}`} title="Snooze 1 hour (S)">
+                <Timer className="size-3.5" />
+              </button>
             </li>
               ))}
               </ul>
@@ -195,7 +296,31 @@ export function Inbox({
 }
 
 function causeLabel(kind: string): string {
-  return { assigned: "Assignments", comment: "Comments and mentions", status: "Status changes" }[kind] ?? "Other";
+  return { assigned: "Assignments", comment: "Comments and mentions", status: "Status changes", chronological: "Latest" }[kind] ?? "Other";
+}
+
+const preferencesKey = (spaceId: string) => `lait.inbox-preferences:${spaceId}`;
+function loadPreferences(spaceId: string): InboxPreferences {
+  try {
+    const saved = JSON.parse(localStorage.getItem(preferencesKey(spaceId)) ?? "null") as Partial<InboxPreferences> | null;
+    const defaults = defaultInboxPreferences();
+    return saved ? { ...defaults, ...saved, kinds: { ...defaults.kinds, ...saved.kinds }, snoozed: saved.snoozed ?? {} } : defaults;
+  } catch {
+    return defaultInboxPreferences();
+  }
+}
+function persistPreferences(spaceId: string, value: InboxPreferences): void {
+  try { localStorage.setItem(preferencesKey(spaceId), JSON.stringify(value)); } catch { /* memory remains authoritative */ }
+}
+
+interface InboxContext { active: string; scroll: number }
+const contextKey = (spaceId: string) => `lait.inbox-context:${spaceId}`;
+function loadContext(spaceId: string): InboxContext {
+  try { return JSON.parse(sessionStorage.getItem(contextKey(spaceId)) ?? '{"active":"","scroll":0}'); }
+  catch { return { active: "", scroll: 0 }; }
+}
+function saveContext(spaceId: string, value: InboxContext): void {
+  try { sessionStorage.setItem(contextKey(spaceId), JSON.stringify(value)); } catch { /* restoration is best effort */ }
 }
 
 interface ReadOverrides { read: string[]; unread: string[] }

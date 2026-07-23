@@ -3,6 +3,7 @@ import { Activity as ActivityIcon, AlertTriangle } from "lucide-react";
 
 import { rpc } from "../api";
 import { describeChanges, describeEvent, type NameResolver } from "../core/activity";
+import { groupActivity } from "../core/inbox";
 import { boundedTail, indexBy } from "../core/performance";
 import type { ActivityEvent, MemberDto } from "../types";
 import { EmptyState, LoadingState } from "./AppState";
@@ -95,16 +96,28 @@ export function Activity({
         </li>
       )}
       {/* Newest first: the feed answers "what just happened", not "what happened". */}
-      {[...boundedTail(events, visibleCount)].reverse().map((e) => (
+      {groupActivity([...boundedTail(events, visibleCount)].reverse()).map((group) => {
+        const e = group.events[0]!;
+        return (
         <li
-          key={e.seq}
+          key={`${e.seq}-${group.events.length}`}
           onClick={() => onOpen(e.reff)}
-          className="border-line/60 hover:bg-hover flex cursor-default items-baseline gap-3 border-b px-4 py-2"
+          onKeyDown={(event) => {
+            if (event.key === "Enter") onOpen(e.reff);
+          }}
+          tabIndex={0}
+          className="border-line/60 hover:bg-hover focus-visible:bg-hover focus-visible:ring-accent/60 flex cursor-default items-start gap-3 border-b px-4 py-2.5 outline-none focus-visible:ring-1 focus-visible:ring-inset"
         >
           <span className="text-mute w-20 shrink-0 truncate font-mono text-xs tabular-nums">
             {e.reff}
           </span>
-          <Line event={e} resolveName={resolveName} />
+          <span className="min-w-0 flex-1">
+            {group.events.map((event, index) => (
+              <span key={event.seq} className={index ? "mt-1 block" : "block"}>
+                <Line event={event} resolveName={resolveName} />
+              </span>
+            ))}
+          </span>
           {/* A concurrent overwrite is worth flagging but never worth blocking on
               (A§9): last-writer-wins already resolved it; you just get told. */}
           {e.collision && (
@@ -113,9 +126,12 @@ export function Activity({
               aria-label="Concurrent overwrite detected"
             />
           )}
-          <time className="text-mute shrink-0 text-xs">{when(e.ts)}</time>
+          <span className="flex shrink-0 items-center gap-2">
+            {group.events.length > 1 && <span className="bg-raised text-mute rounded px-1.5 text-2xs">{group.events.length} changes</span>}
+            <time className="text-mute text-xs">{when(e.ts)}</time>
+          </span>
         </li>
-      ))}
+      )})}
     </ul>
   );
 }
@@ -124,13 +140,15 @@ function Line({ event, resolveName }: { event: ActivityEvent; resolveName: NameR
   const { actor, phrase } = describeEvent(event, resolveName);
   const changes = describeChanges(event);
   return (
-    <span className="min-w-0 flex-1">
+    <span>
       {/* No name when we have no honest one — see core/activity.ts. */}
       {actor && <span className="font-medium">{actor} </span>}
       <span className="text-dim">{phrase}</span>
       {/* `created` and `commented` are the two kinds that carry words of their
           own; everything else is phrased above. */}
-      {event.text && <span className="text-mute ml-2 text-xs">{event.text}</span>}
+      {(event.kind === "created" || event.kind === "commented") && event.text && (
+        <span className="text-mute ml-2 text-xs">{event.text}</span>
+      )}
       {changes && <span className="text-mute ml-2 text-xs">{changes}</span>}
     </span>
   );
