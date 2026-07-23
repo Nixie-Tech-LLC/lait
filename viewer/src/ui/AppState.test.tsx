@@ -6,6 +6,7 @@ import {
   ApplicationState,
   InlineError,
   LoadingState,
+  recoveryDiagnostics,
   recoveryForError,
   trustSummary,
 } from "./AppState";
@@ -103,5 +104,29 @@ describe("local trust summary", () => {
 
   it("reports reachability without claiming convergence", () => {
     expect(trustSummary("live", true, 2, false)).toBe("2 peers");
+  });
+
+  it("produces copyable recovery detail without inventing repair success", () => {
+    expect(recoveryDiagnostics({
+      id: "local",
+      nick: "me",
+      name: "Viewer",
+      online_peers: 0,
+      space: "ws_viewer",
+      issues: 89,
+      projects: 13,
+      membership: "admin",
+      recovery: {
+        scheme: "Single",
+        k: 1,
+        n: 1,
+        local_custody: { state: "unreadable", detail: { kind: "undecryptable", detail: "wrong key" } },
+      },
+      degraded_recovery: [{
+        transcript: "transcript-1",
+        reason: { kind: "undecryptable", detail: "wrong key" },
+        is_current_authority: true,
+      }],
+    })).toContain("Failure: undecryptable: wrong key");
   });
 });

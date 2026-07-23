@@ -1,4 +1,5 @@
 import * as Popover from "@radix-ui/react-popover";
+import { useState } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -154,8 +155,10 @@ export function TrustPopover({
   localReady: boolean;
   latestChange?: string;
 }) {
+  const [diagnosticsCopied, setDiagnosticsCopied] = useState(false);
   const peers = status?.online_peers ?? 0;
-  const degraded = (status?.degraded_recovery?.length ?? 0) > 0;
+  const recoveryFailures = status?.degraded_recovery ?? [];
+  const degraded = recoveryFailures.length > 0;
   const healthy = liveness === "live" && localReady && !degraded && status?.membership !== "pending";
   const agent = space?.identity.kind === "agent" ? space.identity.name : null;
 
@@ -197,6 +200,13 @@ export function TrustPopover({
               neutral={peers === 0}
             />
             <Fact
+              icon={<Users />}
+              label="Last peer contact"
+              value="Not reported"
+              ok={false}
+              neutral
+            />
+            <Fact
               icon={<Database />}
               label="Latest change"
               value={latestChange || "No change pending"}
@@ -209,7 +219,55 @@ export function TrustPopover({
               value={degraded ? "Needs attention" : recoveryLabel(status)}
               ok={!degraded}
             />
+            <Fact
+              icon={<ShieldCheck />}
+              label="Peer convergence"
+              value="Not reported"
+              ok={false}
+              neutral
+            />
           </dl>
+          {degraded && (
+            <section className="border-warn/30 bg-warn/5 mt-3 rounded-md border p-2.5" aria-label="Recovery required">
+              <div className="flex items-start gap-2">
+                <AlertTriangle className="text-warn mt-0.5 size-3.5 shrink-0" />
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-medium">Recovery material needs attention</p>
+                  <p className="text-dim mt-0.5 text-xs leading-4">
+                    Local issue data remains readable. Do not remove or replace recovery files until you have inspected the diagnosis and verified a backup.
+                  </p>
+                </div>
+              </div>
+              <ul className="border-line mt-2 space-y-1 border-t pt-2 text-xs">
+                {recoveryFailures.map((failure) => (
+                  <li key={failure.transcript} className="grid grid-cols-[1fr_auto] gap-2">
+                    <span className="min-w-0 truncate font-mono" title={failure.transcript}>
+                      {failure.transcript}
+                    </span>
+                    <span className="text-warn">
+                      {failure.reason.kind === "undecryptable" ? "Unreadable" : "I/O failure"}
+                      {failure.is_current_authority ? " · current authority" : ""}
+                    </span>
+                    <span className="text-dim col-span-2 break-words">{failure.reason.detail}</span>
+                  </li>
+                ))}
+              </ul>
+              <div className="mt-2 flex items-center gap-2">
+                <Button
+                  variant="ghost"
+                  onClick={() => {
+                    void navigator.clipboard.writeText(recoveryDiagnostics(status));
+                    setDiagnosticsCopied(true);
+                    window.setTimeout(() => setDiagnosticsCopied(false), 1600);
+                  }}
+                >
+                  <Copy className="size-3" />
+                  {diagnosticsCopied ? "Copied" : "Copy diagnosis"}
+                </Button>
+                <span className="text-mute text-xs">Run `lait doctor` before repair.</span>
+              </div>
+            </section>
+          )}
           {peers === 0 && localReady && (
             <p className="bg-bg border-line text-dim mt-3 rounded border p-2 text-xs">
               Ready locally. Changes will share when a peer connects.
@@ -227,6 +285,23 @@ export function TrustPopover({
       </Popover.Portal>
     </Popover.Root>
   );
+}
+
+export function recoveryDiagnostics(status: StatusInfo | null): string {
+  if (!status) return "Lait recovery diagnosis\nStatus unavailable";
+  const failures = status.degraded_recovery ?? [];
+  return [
+    "Lait recovery diagnosis",
+    `Space: ${status.name} (${status.space ?? "unavailable"})`,
+    `Membership: ${status.membership}`,
+    `Recovery: ${recoveryLabel(status)}`,
+    `Scheme: ${status.recovery?.scheme ?? "not reported"}`,
+    ...failures.flatMap((failure) => [
+      `Transcript: ${failure.transcript}`,
+      `Failure: ${failure.reason.kind}: ${failure.reason.detail}`,
+      `Current authority: ${failure.is_current_authority === true ? "yes" : "no"}`,
+    ]),
+  ].join("\n");
 }
 
 export function trustSummary(
