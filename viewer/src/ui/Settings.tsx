@@ -36,6 +36,7 @@ type Tab = "general" | "labels" | "workflow" | "access";
 export function Settings({
   spaceId,
   spaceName,
+  spaceDescription,
   labels,
   projects,
   readOnly,
@@ -45,6 +46,7 @@ export function Settings({
 }: {
   spaceId: string;
   spaceName: string;
+  spaceDescription: string;
   labels: LabelDto[];
   projects: ProjectDto[];
   readOnly: boolean;
@@ -113,6 +115,7 @@ export function Settings({
               <GeneralPanel
                 spaceId={spaceId}
                 spaceName={spaceName}
+                spaceDescription={spaceDescription}
                 readOnly={readOnly}
                 onError={onError}
               />
@@ -155,22 +158,28 @@ function Section({ title, hint, children }: { title: string; hint?: string; chil
   );
 }
 
-/** General — the space's mutable display label, and its immutable identity. */
+/** General — the space's mutable display label, description, and immutable identity. */
 function GeneralPanel({
   spaceId,
   spaceName,
+  spaceDescription,
   readOnly,
   onError,
 }: {
   spaceId: string;
   spaceName: string;
+  spaceDescription: string;
   readOnly: boolean;
   onError: (message: string) => void;
 }) {
   const [name, setName] = useState(spaceName);
+  const [description, setDescription] = useState(spaceDescription);
   const [saving, setSaving] = useState(false);
+  const [savingDesc, setSavingDesc] = useState(false);
   useEffect(() => setName(spaceName), [spaceName]);
+  useEffect(() => setDescription(spaceDescription), [spaceDescription]);
   const dirty = name.trim() !== spaceName && name.trim() !== "";
+  const descDirty = description !== spaceDescription;
 
   const save = async () => {
     setSaving(true);
@@ -180,6 +189,17 @@ function GeneralPanel({
       onError(e instanceof Error ? e.message : String(e));
     } finally {
       setSaving(false);
+    }
+  };
+
+  const saveDescription = async () => {
+    setSavingDesc(true);
+    try {
+      await rpc(spaceId, { cmd: "space_describe", description: description.trim() });
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSavingDesc(false);
     }
   };
 
@@ -197,6 +217,24 @@ function GeneralPanel({
           <Button variant="primary" size="md" disabled={!dirty || readOnly} loading={saving} onClick={() => void save()}>
             Update
           </Button>
+        </div>
+      </Section>
+      <Section title="Description" hint="A short overview of what this space is for. Shared with everyone in the space.">
+        <div className="flex max-w-lg flex-col items-start gap-2">
+          <textarea
+            value={description}
+            disabled={readOnly}
+            rows={3}
+            placeholder="What is this space for? Goals, scope, links…"
+            onChange={(e) => setDescription(e.target.value)}
+            className="border-line focus:border-line-strong placeholder:text-mute w-full resize-y rounded border bg-transparent px-2 py-1.5 text-sm outline-none disabled:opacity-50"
+            aria-label="Space description"
+          />
+          {!readOnly && (
+            <Button variant="primary" size="md" disabled={!descDirty} loading={savingDesc} onClick={() => void saveDescription()}>
+              Save description
+            </Button>
+          )}
         </div>
       </Section>
       <Section title="Identity" hint="The seed id — derived at founding from keys, not the name. It cannot be changed.">

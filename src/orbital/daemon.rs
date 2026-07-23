@@ -500,7 +500,7 @@ impl OrbitalDaemon {
     /// snapshot — `None` when the projection is UNAVAILABLE (undocked, or a
     /// query failed). Status reports the truth; it never converts an
     /// unavailable projection into false zeros.
-    fn counts(&self) -> Option<(usize, usize, String)> {
+    fn counts(&self) -> Option<(usize, usize, String, String)> {
         use crate::world::contract::{self, IssueQuery};
         if !self.ensure_session() {
             return None;
@@ -528,6 +528,11 @@ impl OrbitalDaemon {
             .and_then(|n| n.as_str())
             .unwrap_or("")
             .to_string();
+        let description = catalog
+            .get("description")
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_string();
         let issues = query(IssueQuery::List {
             project: None,
             label: None,
@@ -537,16 +542,20 @@ impl OrbitalDaemon {
             me: None,
         })
         .and_then(|v| v.as_array().map(|a| a.len()))?;
-        Some((issues, projects, name))
+        Some((issues, projects, name, description))
     }
 
     fn status(&self) -> Response {
         let counts = self.counts();
-        let (issues, projects, name) = counts.clone().unwrap_or((0, 0, String::new()));
+        let (issues, projects, name, description) =
+            counts
+                .clone()
+                .unwrap_or((0, 0, String::new(), String::new()));
         Response::Status(Box::new(StatusInfo {
             id: crate::crypto::device_from_seed(&self.device_seed).to_string(),
             nick: String::new(),
             name,
+            description,
             online_peers: self.station.neighbors().len(),
             space: Some(self.station.space_id().as_str().to_string()),
             counts_unavailable: counts.is_none(),
@@ -622,7 +631,9 @@ impl OrbitalDaemon {
     /// onboarding gate list (`docs/UI.md`). Pure over the snapshot the daemon
     /// already computes — the same core the legacy node used.
     fn diagnose(&self, expected_space: Option<String>) -> Response {
-        let (issues, projects, _name) = self.counts().unwrap_or((0, 0, String::new()));
+        let (issues, projects, _name, _description) =
+            self.counts()
+                .unwrap_or((0, 0, String::new(), String::new()));
         let space = self.station.space_id().as_str().to_string();
         let membership = if self.mechanics.am_i_member() {
             "member"

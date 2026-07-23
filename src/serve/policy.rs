@@ -75,6 +75,7 @@ pub fn is_read(req: &Request) -> bool {
         | Request::LabelEdit { .. }
         | Request::LabelDelete { .. }
         | Request::SpaceRename { .. }
+        | Request::SpaceDescribe { .. }
         // …the ACL, every op of which is signed by whoever's daemon runs it…
         | Request::MemberAdd { .. }
         | Request::MemberRemove { .. }

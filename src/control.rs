@@ -338,6 +338,10 @@ pub enum Request {
     SpaceRename {
         name: String,
     },
+    /// Set (or clear, empty) the space's overview description (SCOPE-2).
+    SpaceDescribe {
+        description: String,
+    },
     Activity {
         #[serde(default)]
         since: u64,
@@ -684,6 +688,7 @@ pub fn classify(req: &Request) -> RequestOwner {
         | Request::LabelEdit { .. }
         | Request::LabelDelete { .. }
         | Request::SpaceRename { .. }
+        | Request::SpaceDescribe { .. }
         | Request::Activity { .. }
         | Request::RoleList
         | Request::RoleShow { .. }
@@ -861,6 +866,7 @@ pub fn representative_requests() -> Vec<Request> {
         },
         Request::LabelDelete { label: s() },
         Request::SpaceRename { name: s() },
+        Request::SpaceDescribe { description: s() },
         Request::Activity { since: 0 },
         Request::RoleList,
         Request::RoleShow { role: s() },
@@ -1201,6 +1207,10 @@ pub struct StatusInfo {
     /// The space display name (synced catalog value; empty on a joiner
     /// whose catalog hasn't arrived yet).
     pub name: String,
+    /// The space overview description (synced catalog value; empty when unset).
+    /// Additive so pre-SCOPE-2 clients decode the status unchanged.
+    #[serde(default)]
+    pub description: String,
     pub online_peers: usize,
     pub space: Option<String>,
     pub issues: usize,

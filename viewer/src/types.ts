@@ -330,6 +330,8 @@ export interface StatusInfo {
   nick: string;
   /** Space display name. (Was `room` in the pre-v0.4.2 shape.) */
   name: string;
+  /** Space overview description (SCOPE-2; empty when unset). */
+  description?: string;
   online_peers: number;
   space: string | null;
   issues: number;
@@ -505,6 +507,7 @@ export type Request =
   | { cmd: "label_edit"; label: string; name?: string | null; color?: string | null }
   | { cmd: "label_delete"; label: string }
   | { cmd: "space_rename"; name: string }
+  | { cmd: "space_describe"; description: string }
   | { cmd: "activity"; since?: number }
   | { cmd: "inbox"; clear?: boolean }
   | { cmd: "member_add"; who: string; admin?: boolean; as_name?: string | null }

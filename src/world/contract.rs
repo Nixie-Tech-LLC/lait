@@ -542,6 +542,14 @@ pub enum IssueIntent {
         device: String,
         ts: u64,
     },
+    /// Set (or clear, with an empty string) the space's overview description — a
+    /// plain LWW `RegisterSet` on the catalog `description`, beside `name`
+    /// (SCOPE-2). `demand_admin`-gated like the rename.
+    SpaceDescribe {
+        description: String,
+        device: String,
+        ts: u64,
+    },
     /// Create a custom role definition (a grow-only Catalog revision with no
     /// predecessor). The daemon mints `role_id` (`role_<ULID>`); the World
     /// validates the registry membership of every capability for the declared

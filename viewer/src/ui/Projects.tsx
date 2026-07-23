@@ -25,6 +25,7 @@ export function Projects({
   members,
   revision,
   readOnly,
+  spaceDescription,
   onOpen,
   onError,
 }: {
@@ -33,6 +34,7 @@ export function Projects({
   members: MemberDto[];
   revision: number;
   readOnly: boolean;
+  spaceDescription?: string;
   onOpen: (key: string) => void;
   onError: (message: string) => void;
 }) {
@@ -134,9 +136,13 @@ export function Projects({
       <div className="mx-auto max-w-5xl">
         <div className="mb-5">
           <h2 className="text-lg font-semibold">Projects</h2>
-          <p className="text-dim mt-1 text-sm">
-            {projects.length} {projects.length === 1 ? "project" : "projects"} in this local space
-          </p>
+          {spaceDescription ? (
+            <p className="text-dim mt-1 max-w-2xl text-sm whitespace-pre-line">{spaceDescription}</p>
+          ) : (
+            <p className="text-dim mt-1 text-sm">
+              {projects.length} {projects.length === 1 ? "project" : "projects"} in this local space
+            </p>
+          )}
         </div>
         <ul className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
           {[...health]

@@ -74,6 +74,9 @@ pub struct LabelMeta {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogState {
     pub name: String,
+    /// The space's overview/description — a plain catalog register beside `name`
+    /// (SCOPE-2). Additive: a space that predates it decodes as empty.
+    pub description: String,
     pub projects: BTreeMap<String, ProjectMeta>,
     pub labels: BTreeMap<String, LabelMeta>,
     pub workflow: Vec<WorkflowState>,
@@ -133,6 +136,7 @@ impl CatalogState {
         };
         let mut state = Self {
             name: reg_str(view, "name").unwrap_or_default(),
+            description: reg_str(view, "description").unwrap_or_default(),
             ..Self::default()
         };
         for (id, raw) in map_str(view, "projects") {

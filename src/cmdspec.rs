@@ -1768,6 +1768,16 @@ pub fn specs() -> Vec<Spec> {
                 })
             },
         ),
+        Spec::req(
+            "describe",
+            "Set this space's overview description (empty string clears it). Admin only.",
+            vec![A::pos("description", "The space overview text (or \"\" to clear).")],
+            |m| {
+                Ok(Request::SpaceDescribe {
+                    description: req_str(m, "description"),
+                })
+            },
+        ),
         Spec {
             subs: vec![Spec::req(
                 "revoke",

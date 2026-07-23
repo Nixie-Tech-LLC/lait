@@ -1419,6 +1419,7 @@ export function App() {
             <Settings
               spaceId={current}
               spaceName={space?.name ?? ""}
+              spaceDescription={statusInfo?.description ?? ""}
               labels={labels}
               projects={projects}
               readOnly={readOnly}
@@ -1433,6 +1434,7 @@ export function App() {
               members={members}
               revision={revision}
               readOnly={readOnly}
+              spaceDescription={statusInfo?.description ?? ""}
               onOpen={(key) => {
                 api.pickProject(key);
                 api.goto("list");

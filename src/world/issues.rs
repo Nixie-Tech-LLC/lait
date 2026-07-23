@@ -1655,6 +1655,20 @@ impl World for IssuesWorld {
                 staging.catalog(reg("name", name.to_string().into_bytes()));
                 Ok(staging.into_effect(None))
             }
+            IssueIntent::SpaceDescribe {
+                description,
+                device: _,
+                ts: _,
+            } => {
+                staging.require(contract::demand_admin());
+                // Empty clears; no trim so intentional leading/trailing prose is
+                // preserved. LWW on the catalog `description` register.
+                if catalog.description == description {
+                    return Ok(staging.into_effect(None));
+                }
+                staging.catalog(reg("description", description.into_bytes()));
+                Ok(staging.into_effect(None))
+            }
             IssueIntent::RoleCreate {
                 role_id,
                 scope_project,

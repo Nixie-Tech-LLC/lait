@@ -329,6 +329,7 @@ impl<'a> IssueRouter<'a> {
                 | Request::LabelEdit { .. }
                 | Request::LabelDelete { .. }
                 | Request::SpaceRename { .. }
+                | Request::SpaceDescribe { .. }
                 | Request::Activity { .. }
                 | Request::RoleList
                 | Request::RoleShow { .. }
@@ -846,6 +847,15 @@ impl<'a> IssueRouter<'a> {
                 })
                 .map_err(Self::effect_err)?;
                 Ok((Response::Ref { reff: name }, true))
+            }
+            Request::SpaceDescribe { description } => {
+                self.submit(&IssueIntent::SpaceDescribe {
+                    description,
+                    device: facts.device.clone(),
+                    ts: facts.now,
+                })
+                .map_err(Self::effect_err)?;
+                Ok((Response::Ok { message: None }, true))
             }
             Request::RoleList => {
                 let roles: serde_json::Value =
