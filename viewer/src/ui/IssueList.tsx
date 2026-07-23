@@ -69,6 +69,27 @@ export function IssueList({
     () => indexBy(states, (state) => state.id),
     [states],
   );
+  const checkAnchor = useRef<string | null>(null);
+  const orderedRows = useMemo(
+    () => deletedMode ? deleted : groups.flatMap((group) => visible(group)),
+    [deletedMode, deleted, groups],
+  );
+  const checkRow = (reff: string, range: boolean) => {
+    const anchor = checkAnchor.current;
+    if (range && anchor) {
+      const from = orderedRows.findIndex((row) => row.reff === anchor);
+      const to = orderedRows.findIndex((row) => row.reff === reff);
+      if (from >= 0 && to >= 0) {
+        const desired = !checked.has(reff);
+        for (const row of orderedRows.slice(Math.min(from, to), Math.max(from, to) + 1)) {
+          if (checked.has(row.reff) !== desired) onToggleCheck(row.reff);
+        }
+        return;
+      }
+    }
+    checkAnchor.current = reff;
+    onToggleCheck(reff);
+  };
   const total = deletedMode
     ? deleted.length
     : groups.reduce((n, g) => n + visible(g).length, 0);
@@ -90,7 +111,7 @@ export function IssueList({
             checked={checked}
             optimistic={optimistic}
             onSelect={onSelect}
-            onToggleCheck={onToggleCheck}
+            onToggleCheck={checkRow}
             onOpen={onOpen}
             onCreate={onCreate}
             readOnly={readOnly}
@@ -115,7 +136,7 @@ export function IssueList({
                   anyChecked={checked.size > 0}
                   pending={optimistic.has(row.doc_id)}
                   onSelect={onSelect}
-                  onToggleCheck={onToggleCheck}
+                  onToggleCheck={checkRow}
                   onOpen={onOpen}
                   readOnly={readOnly}
                 />
@@ -176,7 +197,7 @@ function Group({
   checked: ReadonlySet<string>;
   optimistic: ReadonlySet<string>;
   onSelect: (reff: string) => void;
-  onToggleCheck: (reff: string) => void;
+  onToggleCheck: (reff: string, range: boolean) => void;
   onOpen: (reff: string) => void;
   onCreate: (status: string) => void;
   readOnly: boolean;
@@ -265,7 +286,7 @@ function IssueRow({
   anyChecked: boolean;
   pending: boolean;
   onSelect: (reff: string) => void;
-  onToggleCheck: (reff: string) => void;
+  onToggleCheck: (reff: string, range: boolean) => void;
   onOpen: (reff: string) => void;
   readOnly: boolean;
 }) {
@@ -288,6 +309,7 @@ function IssueRow({
       className={clsxish([
         "border-line/60 group/row flex h-8 cursor-default items-center gap-3 border-b px-4",
         selected ? "bg-active" : "hover:bg-hover",
+        checked && !selected && "bg-accent/5 shadow-[inset_2px_0_var(--color-accent)]",
         // A row whose body hasn't synced yet is real but not yet trustworthy;
         // say so quietly rather than rendering it as settled (UI.md §3.3).
         row.provisional && "opacity-60",
@@ -305,6 +327,7 @@ function IssueRow({
         }
       }}
       aria-current={selected ? "true" : undefined}
+      data-bulk-selected={checked || undefined}
       tabIndex={selected ? 0 : -1}
     >
       {!readOnly && (
@@ -317,7 +340,10 @@ function IssueRow({
           <input
             type="checkbox"
             checked={checked}
-            onChange={() => onToggleCheck(row.reff)}
+            onChange={(event) => onToggleCheck(
+              row.reff,
+              (event.nativeEvent as MouseEvent).shiftKey,
+            )}
             onClick={(e) => e.stopPropagation()}
             aria-label={`Select ${row.key_alias ?? row.reff}`}
             className="size-4"
@@ -400,7 +426,7 @@ function IssueRow({
               Copy link
             </RowMenuItem>
             {!readOnly && (
-              <RowMenuItem onSelect={() => onToggleCheck(row.reff)}>
+              <RowMenuItem onSelect={() => onToggleCheck(row.reff, false)}>
                 <CheckSquare className="size-3.5" />
                 {checked ? "Remove from selection" : "Add to selection"}
               </RowMenuItem>

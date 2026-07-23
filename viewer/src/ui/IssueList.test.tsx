@@ -1,4 +1,5 @@
 import { act } from "react";
+import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -35,6 +36,53 @@ describe("IssueList semantics", () => {
     expect(onOpen).toHaveBeenCalledWith(current.reff);
   });
 
+  it("extends bulk selection across a shift-clicked range", () => {
+    const toggled = vi.fn();
+    const rows = [row("LIST-1"), row("LIST-2"), row("LIST-3")];
+    const state: WorkflowState = { id: "backlog", name: "Backlog", category: "backlog", color: "gray" };
+    function Harness() {
+      const [checked, setChecked] = useState<ReadonlySet<string>>(new Set());
+      return (
+        <IssueList
+          groups={[{ key: "backlog", kind: "status", label: "Backlog", rows, state }]}
+          deleted={[]}
+          deletedMode={false}
+          states={[state]}
+          members={[]}
+          selection={rows[0]!.reff}
+          checked={checked}
+          optimistic={new Set()}
+          onSelect={() => undefined}
+          onToggleCheck={(reff) => {
+            toggled(reff);
+            setChecked((current) => {
+              const next = new Set(current);
+              if (!next.delete(reff)) next.add(reff);
+              return next;
+            });
+          }}
+          onOpen={() => undefined}
+          onCreate={() => undefined}
+          readOnly={false}
+          filtered={false}
+        />
+      );
+    }
+    host = document.createElement("div");
+    document.body.append(host);
+    root = createRoot(host);
+    act(() => root?.render(
+      <TooltipProvider>
+        <Harness />
+      </TooltipProvider>,
+    ));
+
+    const checks = [...host.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')];
+    act(() => checks[0]!.click());
+    act(() => checks[2]!.dispatchEvent(new MouseEvent("click", { bubbles: true, shiftKey: true })));
+    expect(toggled.mock.calls.map(([reff]) => reff)).toEqual(rows.map((item) => item.reff));
+  });
+
   function render(current: Row, onOpen: (reff: string) => void) {
     const state: WorkflowState = { id: "backlog", name: "Backlog", category: "backlog", color: "gray" };
     const groups: RowGroup[] = [{ key: "backlog", kind: "status", label: "Backlog", rows: [current], state }];
@@ -66,8 +114,8 @@ describe("IssueList semantics", () => {
 
 function row(key: string): Row {
   return {
-    reff: "iss_list1",
-    doc_id: "iss_list1",
+    reff: `iss_${key.toLowerCase()}`,
+    doc_id: `iss_${key.toLowerCase()}`,
     project_id: "prj_list",
     key_alias: key,
     title: "Tune list density",
