@@ -112,6 +112,8 @@ fn new_issue(rt: &tokio::runtime::Runtime, home: &Path, title: &str) -> Response
         rt,
         home,
         Request::IssueNew {
+            due: None,
+            estimate: None,
             title: title.into(),
             project: Some("ENG".into()),
             project_hint: None,

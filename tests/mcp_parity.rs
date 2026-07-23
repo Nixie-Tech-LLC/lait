@@ -64,6 +64,8 @@ fn response_dtos_round_trip() {
         color: "blue".into(),
     };
     let row = Row {
+        due_date: None,
+        estimate: None,
         reff: "iss_3f9ab2c".into(),
         doc_id: doc_id.clone(),
         project_id: project.id.clone(),
@@ -104,6 +106,8 @@ fn response_dtos_round_trip() {
             }],
         })),
         Response::Issue(Box::new(IssueView {
+            due_date: None,
+            estimate: None,
             schema_version: SCHEMA_VERSION,
             reff: "iss_3f9ab2c".into(),
             doc_id: doc_id.clone(),
@@ -162,6 +166,8 @@ fn response_dtos_round_trip() {
 fn issue_response_status_field_survives_the_kind_tag() {
     let ulid = SystemUlidSource;
     let resp = Response::Issue(Box::new(IssueView {
+        due_date: None,
+        estimate: None,
         schema_version: SCHEMA_VERSION,
         reff: "iss_x".into(),
         doc_id: DocId::mint(&ulid),

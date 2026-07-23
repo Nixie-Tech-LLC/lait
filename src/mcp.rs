@@ -132,6 +132,12 @@ pub struct IssueNewArgs {
     /// Optional body/description.
     #[serde(default)]
     pub body: Option<String>,
+    /// Due date: `YYYY-MM-DD` (UTC) or unix seconds.
+    #[serde(default)]
+    pub due: Option<String>,
+    /// Estimate points.
+    #[serde(default)]
+    pub estimate: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -159,6 +165,12 @@ pub struct IssueEditArgs {
     /// Replace the whole description buffer.
     #[serde(default)]
     pub description: Option<String>,
+    /// Due date: `YYYY-MM-DD` (UTC), unix seconds, or `none` to clear.
+    #[serde(default)]
+    pub due: Option<String>,
+    /// Estimate points, or `none` to clear.
+    #[serde(default)]
+    pub estimate: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -195,6 +207,20 @@ pub struct LabelArgs {
 pub struct CommentArgs {
     pub reff: String,
     pub body: String,
+    /// Reply to a comment (its `cmt_…` id from the issue view).
+    #[serde(default)]
+    pub reply_to: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReactArgs {
+    pub reff: String,
+    /// The target comment's id (`cmt_…`, from the issue view).
+    pub comment: String,
+    pub emoji: String,
+    /// Remove the reaction instead of adding it.
+    #[serde(default)]
+    pub remove: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -447,6 +473,8 @@ impl LaitMcp {
             priority: a.priority,
             labels: a.labels,
             body: a.body,
+            due: a.due,
+            estimate: a.estimate,
         })
         .await
     }
@@ -506,6 +534,8 @@ impl LaitMcp {
             status: a.status,
             priority: a.priority,
             description: a.description,
+            due: a.due,
+            estimate: a.estimate,
         })
         .await
     }
@@ -557,6 +587,24 @@ impl LaitMcp {
         self.run(Request::Comment {
             reff: a.reff,
             body: a.body,
+            reply_to: a.reply_to,
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Toggle an emoji reaction on a comment (comment ids come from the \
+                       issue view). Writes no history event."
+    )]
+    async fn react(
+        &self,
+        Parameters(a): Parameters<ReactArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::React {
+            reff: a.reff,
+            comment: a.comment,
+            emoji: a.emoji,
+            on: !a.remove,
         })
         .await
     }

@@ -36,7 +36,7 @@ import { PriorityIcon, StatusIcon } from "./icons";
 import { Markdown } from "./Markdown";
 import { Combobox, type Option } from "./Picker";
 import { Button, IconButton } from "./primitives";
-import { short, when } from "./time";
+import { dueLabel, dueToInput, dueTone, short, when } from "./time";
 
 /**
  * The issue detail — co-visible beside the list, not an overlay.
@@ -405,6 +405,39 @@ export function IssueDetail({
             />
           </Prop>
 
+          <Prop label="Due date">
+            <DueDate
+              value={issue.due_date ?? null}
+              readOnly={readOnly}
+              onChange={(due) =>
+                void send(() => rpc(spaceId, { cmd: "issue_edit", reff, due }))
+              }
+            />
+          </Prop>
+
+          <Prop label="Estimate">
+            <Combobox
+              variant="bare"
+              label="Estimate"
+              disabled={readOnly}
+              value={
+                issue.estimate != null
+                  ? { id: String(issue.estimate), label: `${issue.estimate} pt` }
+                  : null
+              }
+              placeholder="None"
+              // Fibonacci-ish, Linear's default scale; "None" clears. The
+              // engine stores a bare number — the scale is a team convention.
+              options={[
+                { id: "none", label: "None" },
+                ...[1, 2, 3, 5, 8, 13].map((n) => ({ id: String(n), label: `${n} pt` })),
+              ]}
+              onPick={(id) =>
+                void send(() => rpc(spaceId, { cmd: "issue_edit", reff, estimate: id }))
+              }
+            />
+          </Prop>
+
           <Prop label="Project">
             <Combobox
               variant="bare"
@@ -454,7 +487,19 @@ export function IssueDetail({
           />
         )}
 
-        <Timeline events={events} comments={issue.comments} memberOf={memberOf} />
+        <Timeline
+          events={events}
+          comments={issue.comments}
+          memberOf={memberOf}
+          readOnly={readOnly}
+          meKey={members.find((m) => m.me)?.key ?? null}
+          onReact={(comment, emoji, on) =>
+            void send(() => rpc(spaceId, { cmd: "react", reff, comment, emoji, on }))
+          }
+          onReply={(replyTo, body) =>
+            void send(() => rpc(spaceId, { cmd: "comment", reff, body, reply_to: replyTo }))
+          }
+        />
 
         {!readOnly && (
           <textarea
@@ -485,6 +530,56 @@ export function IssueDetail({
         </footer>
       </div>
     </aside>
+  );
+}
+
+/**
+ * The due-date control: a native date input wearing the property-row style.
+ *
+ * The platform's picker beats anything hand-rolled here, and the input's value
+ * IS the wire format (`YYYY-MM-DD`, UTC — the engine stores UTC midnight).
+ * Clearing goes through the same request with `"none"`.
+ */
+function DueDate({
+  value,
+  readOnly,
+  onChange,
+}: {
+  value: number | null;
+  readOnly: boolean;
+  onChange: (due: string) => void;
+}) {
+  const tone =
+    value !== null ? { overdue: "text-danger", soon: "text-warn", later: "" }[dueTone(value)] : "";
+  if (readOnly) {
+    return (
+      <span className={`text-dim px-1 py-0.5 ${tone}`}>
+        {value !== null ? dueLabel(value) : "None"}
+      </span>
+    );
+  }
+  return (
+    <span className="flex items-center gap-1">
+      <input
+        type="date"
+        value={value !== null ? dueToInput(value) : ""}
+        onChange={(e) => onChange(e.target.value || "none")}
+        onKeyDown={(e) => e.stopPropagation()}
+        aria-label="Due date"
+        className={`hover:bg-hover -mx-1 rounded px-1 py-0.5 text-sm outline-none ${tone} ${
+          value === null ? "text-mute" : ""
+        }`}
+      />
+      {value !== null && (
+        <IconButton
+          label="Clear due date"
+          onClick={() => onChange("none")}
+          className="opacity-0 group-hover/prop:opacity-100 focus-visible:opacity-100"
+        >
+          <X className="size-3" />
+        </IconButton>
+      )}
+    </span>
   );
 }
 
@@ -909,17 +1004,30 @@ function Timeline({
   events,
   comments,
   memberOf,
+  readOnly,
+  meKey,
+  onReact,
+  onReply,
 }: {
   events: ActivityEvent[];
   comments: CommentDto[];
   memberOf: (key: string) => MemberDto | undefined;
+  readOnly: boolean;
+  /** My member key — how "did I already react" is answered. */
+  meKey: string | null;
+  onReact: (comment: string, emoji: string, on: boolean) => void;
+  onReply: (replyTo: string, body: string) => void;
 }) {
   // The naming policy lives here, where the member list is: a key becomes an alias,
   // "you", or a short prefix. `describeEvent` only decides *whether* there is a name.
   const resolveName: NameResolver = (key) => nameOf(key, memberOf(key));
   const entries = useMemo<Entry[]>(() => {
     const out: Entry[] = [
-      ...comments.map((c, i) => ({ at: c.ts, order: i, kind: "comment" as const, comment: c })),
+      // Roots only: a reply renders nested under its parent, not as its own
+      // timeline entry — the thread reads as one exchange.
+      ...comments
+        .filter((c) => !c.parent)
+        .map((c, i) => ({ at: c.ts, order: i, kind: "comment" as const, comment: c })),
       ...events
         .filter((e) => e.kind !== "commented")
         .map((e) => ({ at: e.ts, order: e.seq, kind: "event" as const, event: e })),
@@ -929,6 +1037,9 @@ function Timeline({
     // the same `ts`, and without it they shuffle on every render.
     return out.sort((a, b) => a.at - b.at || a.order - b.order);
   }, [events, comments]);
+
+  const repliesOf = (c: CommentDto): CommentDto[] =>
+    c.id ? comments.filter((r) => r.parent === c.id) : [];
 
   return (
     <section className="flex flex-col gap-3">
@@ -952,7 +1063,12 @@ function Timeline({
           <Comment
             key={`c${entry.order}`}
             comment={entry.comment}
-            member={memberOf(entry.comment.author)}
+            replies={repliesOf(entry.comment)}
+            memberOf={memberOf}
+            readOnly={readOnly}
+            meKey={meKey}
+            onReact={onReact}
+            onReply={onReply}
           />
         ) : (
           <Event key={`e${entry.order}`} event={entry.event} resolveName={resolveName} />
@@ -962,7 +1078,34 @@ function Timeline({
   );
 }
 
-function Comment({ comment: c, member }: { comment: CommentDto; member: MemberDto | undefined }) {
+/** The fixed reaction palette — Linear's set, no free-typing an emoji here
+ *  (the engine accepts any single emoji; the CLI can send exotic ones). */
+const REACTION_EMOJIS = ["👍", "❤️", "🎉", "😄", "🚀", "👀"] as const;
+
+function Comment({
+  comment: c,
+  replies,
+  memberOf,
+  readOnly,
+  meKey,
+  onReact,
+  onReply,
+}: {
+  comment: CommentDto;
+  replies: CommentDto[];
+  memberOf: (key: string) => MemberDto | undefined;
+  readOnly: boolean;
+  meKey: string | null;
+  onReact: (comment: string, emoji: string, on: boolean) => void;
+  onReply: (replyTo: string, body: string) => void;
+}) {
+  const member = memberOf(c.author);
+  const [picking, setPicking] = useState(false);
+  const [replying, setReplying] = useState<string | null>(null);
+  // Pre-identity comments (no id) cannot anchor reactions or replies — the
+  // affordances simply don't exist for them, rather than existing and failing.
+  const canAct = !readOnly && !!c.id;
+
   return (
     <article className="flex gap-2">
       <Avatar
@@ -974,16 +1117,115 @@ function Comment({ comment: c, member }: { comment: CommentDto; member: MemberDt
         className="mt-0.5"
       />
       <div className="min-w-0 flex-1">
-        <div className="flex items-baseline gap-2">
-          <span className="font-medium">
-            {member ? nameOf(c.author, member) : (c.author_nick ?? short(c.author))}
-          </span>
-          {/* Unix SECONDS — `tsToDate` is the only place that's converted. */}
-          <time className="text-mute text-xs" dateTime={tsToDate(c.ts).toISOString()}>
-            {when(c.ts)}
-          </time>
+        <div className="group/comment">
+          <div className="flex items-baseline gap-2">
+            <span className="font-medium">
+              {member ? nameOf(c.author, member) : (c.author_nick ?? short(c.author))}
+            </span>
+            {/* Unix SECONDS — `tsToDate` is the only place that's converted. */}
+            <time className="text-mute text-xs" dateTime={tsToDate(c.ts).toISOString()}>
+              {when(c.ts)}
+            </time>
+          </div>
+          <Markdown text={c.body} />
+
+          {(canAct || (c.reactions?.length ?? 0) > 0) && (
+            <div className="mt-1 flex flex-wrap items-center gap-1">
+              {(c.reactions ?? []).map((r) => {
+                const mine = meKey !== null && r.actors.includes(meKey);
+                return (
+                  <button
+                    key={r.emoji}
+                    disabled={!canAct}
+                    onClick={() => c.id && onReact(c.id, r.emoji, !mine)}
+                    title={r.actors.map((a) => nameOf(a, memberOf(a))).join(", ")}
+                    aria-pressed={mine}
+                    className={`flex items-center gap-1 rounded-full border px-1.5 py-px text-xs ${
+                      mine
+                        ? "border-accent bg-accent/10"
+                        : "border-line hover:border-line-strong"
+                    }`}
+                  >
+                    {r.emoji}
+                    <span className="tabular-nums">{r.actors.length}</span>
+                  </button>
+                );
+              })}
+              {canAct &&
+                (picking ? (
+                  REACTION_EMOJIS.map((emoji) => (
+                    <button
+                      key={emoji}
+                      onClick={() => {
+                        setPicking(false);
+                        if (c.id) onReact(c.id, emoji, true);
+                      }}
+                      aria-label={`React ${emoji}`}
+                      className="hover:bg-hover rounded px-1 text-sm"
+                    >
+                      {emoji}
+                    </button>
+                  ))
+                ) : (
+                  <>
+                    <button
+                      onClick={() => setPicking(true)}
+                      aria-label="Add reaction"
+                      className="text-mute hover:text-fg rounded-full px-1 text-xs opacity-0 transition-opacity group-hover/comment:opacity-100 focus-visible:opacity-100"
+                    >
+                      +😊
+                    </button>
+                    {/* Replies to a reply re-anchor to the root: one level. */}
+                    {!c.parent && (
+                      <button
+                        onClick={() => setReplying("")}
+                        className="text-mute hover:text-fg text-xs opacity-0 transition-opacity group-hover/comment:opacity-100 focus-visible:opacity-100"
+                      >
+                        Reply
+                      </button>
+                    )}
+                  </>
+                ))}
+            </div>
+          )}
         </div>
-        <Markdown text={c.body} />
+
+        {(replies.length > 0 || replying !== null) && (
+          <div className="border-line mt-2 flex flex-col gap-2 border-l pl-3">
+            {replies.map((r, i) => (
+              <Comment
+                key={r.id ?? `r${i}`}
+                comment={r}
+                replies={[]}
+                memberOf={memberOf}
+                readOnly={readOnly}
+                meKey={meKey}
+                onReact={onReact}
+                onReply={onReply}
+              />
+            ))}
+            {replying !== null && (
+              <textarea
+                autoFocus
+                value={replying}
+                placeholder="Reply…  (⌘/Ctrl + Enter)"
+                onChange={(e) => setReplying(e.target.value)}
+                onKeyDown={(e) => {
+                  e.stopPropagation();
+                  if (e.key === "Escape") setReplying(null);
+                  if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && replying.trim() && c.id) {
+                    e.preventDefault();
+                    onReply(c.id, replying.trim());
+                    setReplying(null);
+                  }
+                }}
+                rows={2}
+                aria-label="Reply"
+                className="border-line focus-within:border-line-strong placeholder:text-mute resize-y rounded border bg-transparent p-2 text-sm outline-none"
+              />
+            )}
+          </div>
+        )}
       </div>
     </article>
   );

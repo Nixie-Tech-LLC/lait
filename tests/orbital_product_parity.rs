@@ -238,6 +238,8 @@ fn seed_space(driver: &mut Driver) -> (String, String, String) {
     let ts = driver.ts();
     driver
         .submit(&IssueIntent::IssueNew {
+            duedate: None,
+            estimate: None,
             doc: doc.clone(),
             project: project.clone(),
             title: "First issue".into(),
@@ -283,6 +285,8 @@ fn the_full_issue_surface_round_trips_with_legacy_shapes() {
     let ts = driver.ts();
     driver
         .submit(&IssueIntent::IssueNew {
+            duedate: None,
+            estimate: None,
             doc: doc2.clone(),
             project: project.clone(),
             title: "Second issue".into(),
@@ -377,6 +381,8 @@ fn the_full_issue_surface_round_trips_with_legacy_shapes() {
     let ts = driver.ts();
     driver
         .submit(&IssueIntent::Comment {
+            id: None,
+            parent: None,
             doc: doc.clone(),
             body: "a comment".into(),
             actor: my_actor().as_str().to_string(),
@@ -564,6 +570,8 @@ fn a_denied_or_invalid_request_commits_and_publishes_nothing() {
     let ts = driver.ts();
     assert_eq!(
         driver.submit(&IssueIntent::IssueNew {
+            duedate: None,
+            estimate: None,
             doc: DocId::mint(&SystemUlidSource).as_str().to_string(),
             project: "prj_00000000000000000000000000".into(),
             title: "x".into(),
@@ -581,6 +589,8 @@ fn a_denied_or_invalid_request_commits_and_publishes_nothing() {
     let ts = driver.ts();
     assert_eq!(
         driver.submit(&IssueIntent::IssueEdit {
+            duedate: None,
+            estimate: None,
             doc: doc.clone(),
             title: None,
             status: Some("nonexistent".into()),
@@ -665,6 +675,8 @@ fn two_stations_converge_product_issues_over_the_contact_plane() {
     let ts = driver_b.ts();
     driver_b
         .submit(&IssueIntent::Comment {
+            id: None,
+            parent: None,
             doc: doc.clone(),
             body: "from b".into(),
             actor: my_actor().as_str().to_string(),
@@ -700,4 +712,202 @@ fn two_stations_converge_product_issues_over_the_contact_plane() {
     let _ = std::fs::remove_dir_all(&root_b);
     let _ = BTreeMap::<String, String>::new();
     let _ = StatusCategory::Done;
+}
+
+#[test]
+fn due_dates_estimates_and_comment_reactions_round_trip() {
+    let root = temp_root("enriched");
+    let (_rt, station) = setup(&root);
+    let mut driver = Driver::dock(&station);
+    let (_project, doc, _alias) = seed_space(&mut driver);
+
+    // ---- due date + estimate: set, project, change, clear ----
+    let ts = driver.ts();
+    driver
+        .submit(&IssueIntent::IssueEdit {
+            doc: doc.clone(),
+            title: None,
+            status: None,
+            priority: None,
+            description: None,
+            duedate: Some(Some(1_800_000_000)),
+            estimate: Some(Some(5)),
+            device: my_device().as_str().to_string(),
+            ts,
+        })
+        .unwrap();
+    let view: IssueView = driver.query(&IssueQuery::View {
+        doc: doc.clone(),
+        me: None,
+    });
+    assert_eq!(view.due_date, Some(1_800_000_000));
+    assert_eq!(view.estimate, Some(5));
+    let rows: Vec<Row> = driver.query(&IssueQuery::List {
+        project: None,
+        label: None,
+        status: None,
+        mine: None,
+        all: true,
+        me: None,
+    });
+    let row = rows.iter().find(|r| r.doc_id.as_str() == doc).unwrap();
+    assert_eq!(row.due_date, Some(1_800_000_000));
+    assert_eq!(row.estimate, Some(5));
+
+    // Clearing goes back to absent — the register is removed, not zeroed.
+    let ts = driver.ts();
+    driver
+        .submit(&IssueIntent::IssueEdit {
+            doc: doc.clone(),
+            title: None,
+            status: None,
+            priority: None,
+            description: None,
+            duedate: Some(None),
+            estimate: Some(None),
+            device: my_device().as_str().to_string(),
+            ts,
+        })
+        .unwrap();
+    let view: IssueView = driver.query(&IssueQuery::View {
+        doc: doc.clone(),
+        me: None,
+    });
+    assert_eq!(view.due_date, None);
+    assert_eq!(view.estimate, None);
+    // A due date of 0 is a typo, not an epoch-midnight deadline.
+    let ts = driver.ts();
+    let refused = driver.submit(&IssueIntent::IssueEdit {
+        doc: doc.clone(),
+        title: None,
+        status: None,
+        priority: None,
+        description: None,
+        duedate: Some(Some(0)),
+        estimate: None,
+        device: my_device().as_str().to_string(),
+        ts,
+    });
+    assert!(matches!(refused, Err(WorldError::InvalidRequest)));
+
+    // ---- comment identity, replies, reactions ----
+    let cid = lait::ids::mint_comment_id(&SystemUlidSource);
+    let ts = driver.ts();
+    driver
+        .submit(&IssueIntent::Comment {
+            doc: doc.clone(),
+            body: "root comment".into(),
+            id: Some(cid.clone()),
+            parent: None,
+            actor: my_actor().as_str().to_string(),
+            device: my_device().as_str().to_string(),
+            ts,
+        })
+        .unwrap();
+    // A duplicate id would fuse two comments' reactions — refused.
+    let ts = driver.ts();
+    let refused = driver.submit(&IssueIntent::Comment {
+        doc: doc.clone(),
+        body: "same id".into(),
+        id: Some(cid.clone()),
+        parent: None,
+        actor: my_actor().as_str().to_string(),
+        device: my_device().as_str().to_string(),
+        ts,
+    });
+    assert!(matches!(refused, Err(WorldError::InvalidRequest)));
+
+    let reply = lait::ids::mint_comment_id(&SystemUlidSource);
+    let ts = driver.ts();
+    driver
+        .submit(&IssueIntent::Comment {
+            doc: doc.clone(),
+            body: "a reply".into(),
+            id: Some(reply.clone()),
+            parent: Some(cid.clone()),
+            actor: my_actor().as_str().to_string(),
+            device: my_device().as_str().to_string(),
+            ts,
+        })
+        .unwrap();
+    // One level only: replying to the reply is refused, not laddered.
+    let ts = driver.ts();
+    let refused = driver.submit(&IssueIntent::Comment {
+        doc: doc.clone(),
+        body: "reply to reply".into(),
+        id: Some(lait::ids::mint_comment_id(&SystemUlidSource)),
+        parent: Some(reply.clone()),
+        actor: my_actor().as_str().to_string(),
+        device: my_device().as_str().to_string(),
+        ts,
+    });
+    assert!(matches!(refused, Err(WorldError::InvalidRequest)));
+
+    let ts = driver.ts();
+    driver
+        .submit(&IssueIntent::React {
+            doc: doc.clone(),
+            comment: cid.clone(),
+            emoji: "👍".into(),
+            actor: my_actor().as_str().to_string(),
+            on: true,
+            device: my_device().as_str().to_string(),
+            ts,
+        })
+        .unwrap();
+    let view: IssueView = driver.query(&IssueQuery::View {
+        doc: doc.clone(),
+        me: None,
+    });
+    let root_comment = view
+        .comments
+        .iter()
+        .find(|c| c.id.as_deref() == Some(cid.as_str()))
+        .unwrap();
+    assert_eq!(root_comment.reactions.len(), 1);
+    assert_eq!(root_comment.reactions[0].emoji, "👍");
+    assert_eq!(root_comment.reactions[0].actors, vec![my_actor()]);
+    let reply_comment = view
+        .comments
+        .iter()
+        .find(|c| c.id.as_deref() == Some(reply.as_str()))
+        .unwrap();
+    assert_eq!(reply_comment.parent.as_deref(), Some(cid.as_str()));
+
+    // Un-react removes the pair; the set converges to empty.
+    let ts = driver.ts();
+    driver
+        .submit(&IssueIntent::React {
+            doc: doc.clone(),
+            comment: cid.clone(),
+            emoji: "👍".into(),
+            actor: my_actor().as_str().to_string(),
+            on: false,
+            device: my_device().as_str().to_string(),
+            ts,
+        })
+        .unwrap();
+    let view: IssueView = driver.query(&IssueQuery::View {
+        doc: doc.clone(),
+        me: None,
+    });
+    let root_comment = view
+        .comments
+        .iter()
+        .find(|c| c.id.as_deref() == Some(cid.as_str()))
+        .unwrap();
+    assert!(root_comment.reactions.is_empty());
+
+    // Reacting to a comment that does not exist is refused.
+    let ts = driver.ts();
+    let refused = driver.submit(&IssueIntent::React {
+        doc: doc.clone(),
+        comment: lait::ids::mint_comment_id(&SystemUlidSource),
+        emoji: "🎉".into(),
+        actor: my_actor().as_str().to_string(),
+        on: true,
+        device: my_device().as_str().to_string(),
+        ts,
+    });
+    assert!(matches!(refused, Err(WorldError::InvalidRequest)));
 }

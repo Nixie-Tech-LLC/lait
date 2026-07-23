@@ -56,6 +56,7 @@ pub fn is_read(req: &Request) -> bool {
         | Request::Assign { .. }
         | Request::Label { .. }
         | Request::Comment { .. }
+        | Request::React { .. }
         | Request::IssueDelete { .. }
         | Request::IssueRestore { .. }
         | Request::IssueLink { .. }
@@ -101,6 +102,8 @@ pub fn is_read(req: &Request) -> bool {
         | Request::AccessGrant { .. }
         | Request::AccessRevoke { .. }
         | Request::WorkflowSet { .. }
+        // …implementation activation is a signed ACL write…
+        | Request::WorldUpgrade
         // …and node control.
         | Request::ConfigReload
         | Request::Stop => false,

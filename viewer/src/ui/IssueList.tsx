@@ -7,6 +7,7 @@ import { Avatar, AvatarStack, memberName, stackFor } from "./Avatar";
 import { catalogColor } from "./colors";
 import { PriorityIcon, StatusIcon } from "./icons";
 import { IconButton, Kbd } from "./primitives";
+import { dueLabel, dueTone } from "./time";
 
 /**
  * The default view: one flat, grouped list.
@@ -293,6 +294,24 @@ function IssueRow({
       </span>
       {row.tombstone && (
         <Trash2 className="text-mute size-3 shrink-0" aria-label="Deleted" />
+      )}
+      {row.estimate != null && (
+        <span className="text-mute shrink-0 text-2xs tabular-nums" title="Estimate">
+          {row.estimate}pt
+        </span>
+      )}
+      {row.due_date != null && (
+        <span
+          className={clsxish([
+            "shrink-0 text-2xs tabular-nums",
+            { overdue: "text-danger", soon: "text-warn", later: "text-mute" }[
+              dueTone(row.due_date)
+            ],
+          ])}
+          title="Due date"
+        >
+          {dueLabel(row.due_date)}
+        </span>
       )}
       {/* Unconfirmed: shown as truth because that is what makes a write feel
           instant, but never *claimed* as truth. */}

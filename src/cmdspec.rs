@@ -622,6 +622,8 @@ pub fn specs() -> Vec<Spec> {
                     .short('l')
                     .long("label"),
                 A::val("body", "Issue body/description.").short('b'),
+                A::val("due", "Due date (YYYY-MM-DD or unix seconds)."),
+                A::val("estimate", "Estimate points.").short('e'),
                 A::flag(
                     "start",
                     "Also start it: assign yourself, set it active, create+checkout its branch.",
@@ -636,6 +638,13 @@ pub fn specs() -> Vec<Spec> {
                     priority: opt_str(m, "priority"),
                     labels: multi(m, "labels"),
                     body: opt_str(m, "body"),
+                    due: opt_str(m, "due"),
+                    estimate: opt_str(m, "estimate")
+                        .map(|s| {
+                            s.parse::<u32>()
+                                .map_err(|_| anyhow!("--estimate takes a whole number of points"))
+                        })
+                        .transpose()?,
                 })
             },
         ),
@@ -725,6 +734,8 @@ pub fn specs() -> Vec<Spec> {
                 A::val("status", "New status."),
                 A::val("priority", "New priority."),
                 A::val("body", "Replace the description (whole body).").short('b'),
+                A::val("due", "Due date (YYYY-MM-DD, unix seconds, or `none` to clear)."),
+                A::val("estimate", "Estimate points, or `none` to clear.").short('e'),
             ],
             |m| {
                 Ok(Request::IssueEdit {
@@ -733,6 +744,8 @@ pub fn specs() -> Vec<Spec> {
                     status: opt_str(m, "status"),
                     priority: opt_str(m, "priority"),
                     description: opt_str(m, "body"),
+                    due: opt_str(m, "due"),
+                    estimate: opt_str(m, "estimate"),
                 })
             },
         ),
@@ -814,6 +827,8 @@ pub fn specs() -> Vec<Spec> {
             vec![
                 A::pos_opt("reff", "Issue ref (optional on a KEY-n branch when a body is given)."),
                 A::pos_opt("body", "Comment body (omit to read stdin)."),
+                A::val("reply_to", "Reply to a comment (its `cmt_…` id, from `show --json`).")
+                    .long("reply-to"),
             ],
             |m| {
                 // Grammar: `comment [ref] [body]`. With ONE positional, it's
@@ -844,8 +859,38 @@ pub fn specs() -> Vec<Spec> {
                         s.trim_end().to_string()
                     }
                 };
-                Ok(Request::Comment { reff, body })
+                Ok(Request::Comment {
+                    reff,
+                    body,
+                    reply_to: opt_str(m, "reply_to"),
+                })
             },
+        ),
+        Spec::req(
+            "react",
+            "Toggle an emoji reaction on a comment (its `cmt_…` id, from `show --json`).",
+            vec![
+                A::pos("reff", "Issue ref."),
+                A::pos("comment", "Comment id (`cmt_…`)."),
+                A::pos("emoji", "The emoji."),
+                A::flag("remove", "Remove your reaction instead of adding it."),
+            ],
+            |m| {
+                Ok(Request::React {
+                    reff: req_str(m, "reff"),
+                    comment: req_str(m, "comment"),
+                    emoji: req_str(m, "emoji"),
+                    on: !flag(m, "remove"),
+                })
+            },
+        ),
+        Spec::req(
+            "world-upgrade",
+            "Activate this build's reviewed IssuesWorld implementation for the space \
+             (admin; no-op when already active). Run after upgrading builds when the \
+             daemon warns about an implementation mismatch.",
+            vec![],
+            |_| Ok(Request::WorldUpgrade),
         ),
         Spec::req(
             "delete",

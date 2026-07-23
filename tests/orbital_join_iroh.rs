@@ -312,6 +312,8 @@ fn coordinates_only_two_endpoint_bootstrap_over_real_iroh() {
             labels: vec![],
             new_labels: vec![],
             body: Some("over real iroh".into()),
+            duedate: None,
+            estimate: None,
             actor: {
                 use runtime::AuthorityView;
                 mech_j

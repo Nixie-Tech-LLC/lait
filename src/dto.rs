@@ -345,6 +345,13 @@ pub struct Row {
     pub assignees: Vec<ActorId>,
     pub tombstone: bool,
     pub provisional: bool,
+    /// Due date, unix seconds. Additive with absent-when-none serialization so
+    /// pre-duedate consumers keep decoding the same bytes for undated rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_date: Option<u64>,
+    /// Estimate points (scale is the team's convention, not the schema's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<u32>,
 }
 
 /// A board column: an ordered slice of rows for one workflow state.
@@ -376,6 +383,23 @@ pub struct CommentDto {
     pub author_nick: Option<String>,
     pub ts: u64,
     pub body: String,
+    /// Canonical comment id (`cmt_…`). Absent on comments stored before
+    /// comment identity existed — those cannot anchor reactions or replies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The comment this one replies to (one level of nesting).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Emoji reactions, grouped: each emoji with the actors who reacted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reactions: Vec<ReactionDto>,
+}
+
+/// One emoji's reactions on one comment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReactionDto {
+    pub emoji: String,
+    pub actors: Vec<ActorId>,
 }
 
 /// The full issue projection — populated by lazily loading the issue doc
@@ -401,6 +425,11 @@ pub struct IssueView {
     pub comments: Vec<CommentDto>,
     pub created_by: ActorId,
     pub created_at: u64,
+    /// Due date, unix seconds (absent = none). Additive, like `Row.due_date`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_date: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<u32>,
     pub provisional: bool,
     /// Records under this issue that failed to project (see [`CorruptRecord`]).
     ///

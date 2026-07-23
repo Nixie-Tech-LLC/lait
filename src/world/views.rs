@@ -233,9 +233,16 @@ pub struct IssueState {
     pub created_by: Option<ActorId>,
     pub created_at: u64,
     pub description: String,
+    /// Unix seconds; absent register = no due date.
+    pub duedate: Option<u64>,
+    pub estimate: Option<u32>,
     pub assignees: Vec<ActorId>,
     pub labels: Vec<String>,
     pub comments: Vec<StoredComment>,
+    /// comment id -> sorted `(emoji, actor)` pairs, parsed from the
+    /// `reactions/<comment id>` sets. Malformed values are dropped, not
+    /// surfaced — a reaction is not worth a corrupt-record row.
+    pub reactions: BTreeMap<String, Vec<(String, String)>>,
     pub events: Vec<IssueEvent>,
 }
 
@@ -279,6 +286,20 @@ impl IssueState {
                     .collect()
             })
             .unwrap_or_default();
+        let mut reactions: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        for (path, values) in &view.sets {
+            let Some(comment) = path.strip_prefix("reactions/") else {
+                continue;
+            };
+            let mut pairs: Vec<(String, String)> = values
+                .iter()
+                .filter_map(|v| super::contract::parse_reaction_value(v))
+                .collect();
+            pairs.sort();
+            if !pairs.is_empty() {
+                reactions.insert(comment.to_string(), pairs);
+            }
+        }
         Self {
             project: reg_str(view, "projectid").unwrap_or_default(),
             title: reg_str(view, "title").unwrap_or_default(),
@@ -290,9 +311,12 @@ impl IssueState {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
             description: view.texts.get("description").cloned().unwrap_or_default(),
+            duedate: reg_str(view, "duedate").and_then(|s| s.parse().ok()),
+            estimate: reg_str(view, "estimate").and_then(|s| s.parse().ok()),
             assignees,
             labels,
             comments,
+            reactions,
             events,
         }
     }
@@ -423,13 +447,15 @@ pub fn project_row(
     issue: Option<&IssueState>,
     me: Option<&ActorId>,
 ) -> Row {
-    let (title, status, priority, assignees, project) = match issue {
+    let (title, status, priority, assignees, project, due_date, estimate) = match issue {
         Some(i) => (
             i.title.clone(),
             i.status.clone(),
             i.priority,
             i.assignees.clone(),
             i.project.clone(),
+            i.duedate,
+            i.estimate,
         ),
         None => (
             String::new(),
@@ -437,6 +463,8 @@ pub fn project_row(
             Priority::None,
             Vec::new(),
             String::new(),
+            None,
+            None,
         ),
     };
     Row {
@@ -455,6 +483,8 @@ pub fn project_row(
         assignees,
         tombstone: catalog.tombstones.contains(doc),
         provisional: issue.is_none(),
+        due_date,
+        estimate,
     }
 }
 
@@ -507,6 +537,14 @@ pub fn issue_view(
                     author_nick: None,
                     ts: c.t,
                     body: c.b.clone(),
+                    id: c.id.clone(),
+                    parent: c.parent.clone(),
+                    reactions: c
+                        .id
+                        .as_deref()
+                        .and_then(|id| issue.reactions.get(id))
+                        .map(|pairs| group_reactions(pairs))
+                        .unwrap_or_default(),
                 })
             })
             .collect(),
@@ -515,9 +553,31 @@ pub fn issue_view(
             .clone()
             .unwrap_or_else(|| ActorId::from_incept_hash(&"0".repeat(64))),
         created_at: issue.created_at,
+        due_date: issue.duedate,
+        estimate: issue.estimate,
         provisional: false,
         corrupt_records: Vec::new(),
     }
+}
+
+/// Group one comment's `(emoji, actor)` pairs into per-emoji actor lists,
+/// first-appearance emoji order (the pairs arrive sorted, so this is
+/// deterministic across replicas).
+fn group_reactions(pairs: &[(String, String)]) -> Vec<crate::dto::ReactionDto> {
+    let mut out: Vec<crate::dto::ReactionDto> = Vec::new();
+    for (emoji, actor) in pairs {
+        let Some(actor) = ActorId::parse(actor) else {
+            continue;
+        };
+        match out.iter_mut().find(|r| &r.emoji == emoji) {
+            Some(r) => r.actors.push(actor),
+            None => out.push(crate::dto::ReactionDto {
+                emoji: emoji.clone(),
+                actors: vec![actor],
+            }),
+        }
+    }
+    out
 }
 
 pub fn project_dto(id: &str, meta: &ProjectMeta) -> Option<ProjectDto> {

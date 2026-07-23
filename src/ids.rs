@@ -29,6 +29,19 @@ mechanics::prefixed_id!(
     /// Label id — key in the Catalog's `labels` register.
     LabelId, "lbl_"
 );
+mechanics::prefixed_id!(
+    /// Comment id — element identity inside an issue's `comments` list.
+    ///
+    /// Stored and wired **lowercased** (`mint_comment_id`), because the id
+    /// doubles as a Body path segment (`reactions/<id>`) and the frozen path
+    /// grammar admits only `[a-z0-9_]`.
+    CommentId, "cmt_"
+);
+
+/// Mint a canonical (lowercase) comment id.
+pub fn mint_comment_id(clock: &dyn UlidSource) -> String {
+    CommentId::mint(clock).as_str().to_ascii_lowercase()
+}
 
 #[cfg(test)]
 mod tests {

@@ -116,6 +116,8 @@ fn concurrent_issue_creation_converges_across_daemons() {
         &rt,
         &founder_home,
         Request::IssueNew {
+            due: None,
+            estimate: None,
             title: "founder issue".into(),
             project: None,
             project_hint: None,
@@ -228,6 +230,8 @@ fn concurrent_issue_creation_converges_across_daemons() {
             &rt,
             &founder_home,
             Request::IssueNew {
+                due: None,
+                estimate: None,
                 title: format!("founder concurrent {i}"),
                 project: None,
                 project_hint: None,
@@ -242,6 +246,8 @@ fn concurrent_issue_creation_converges_across_daemons() {
             &rt,
             &joiner_home,
             Request::IssueNew {
+                due: None,
+                estimate: None,
                 title: format!("joiner concurrent {i}"),
                 project: None,
                 project_hint: None,

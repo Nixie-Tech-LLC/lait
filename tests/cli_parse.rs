@@ -101,6 +101,8 @@ fn new_collects_repeated_short_flags() {
             "details",
         ],
         Request::IssueNew {
+            due: None,
+            estimate: None,
             title: "Fix login".into(),
             project: Some("ENG".into()),
             project_hint: None,
@@ -145,6 +147,7 @@ fn comment_with_inline_body() {
     parses_to(
         &["lait", "comment", "ENG-1", "looks good"],
         Request::Comment {
+            reply_to: None,
             reff: "ENG-1".into(),
             body: "looks good".into(),
         },
@@ -218,6 +221,8 @@ fn explicit_project_pins_the_hint_to_none() {
     parses_to(
         &["lait", "new", "t", "-p", "ENG"],
         Request::IssueNew {
+            due: None,
+            estimate: None,
             title: "t".into(),
             project: Some("ENG".into()),
             project_hint: None,
@@ -375,6 +380,7 @@ fn comment_single_arg_is_the_body_with_explicit_ref_still_working() {
     parses_to(
         &["lait", "comment", "ENG-1", "found it"],
         Request::Comment {
+            reply_to: None,
             reff: "ENG-1".into(),
             body: "found it".into(),
         },
@@ -383,7 +389,7 @@ fn comment_single_arg_is_the_body_with_explicit_ref_still_working() {
     // Off a KEY-n branch that inference fails with a teaching error (this test
     // runs on arbitrary branches, so pin only the failure shape).
     match parse_to_request(&["lait", "comment", "just a body, no ref"]) {
-        Ok(Request::Comment { reff, body }) => {
+        Ok(Request::Comment { reff, body, .. }) => {
             // On a KEY-n branch the inference kicks in — body must be intact.
             assert_eq!(body, "just a body, no ref");
             assert!(reff.contains('-'), "inferred ref is a KEY-n: {reff}");

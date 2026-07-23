@@ -2117,6 +2117,8 @@ mod tests {
                 project: None,
                 project_hint: None,
                 body: None,
+                due: None,
+                estimate: None,
                 assignees: vec![],
                 priority: None,
                 labels: vec![],

@@ -302,6 +302,8 @@ fn role_access_and_workflow_authoring_round_trip_over_the_daemon() {
         &rt,
         &home,
         Request::IssueNew {
+            due: None,
+            estimate: None,
             title: "Gated".into(),
             project: Some(project_id.clone()),
             project_hint: None,
@@ -320,6 +322,8 @@ fn role_access_and_workflow_authoring_round_trip_over_the_daemon() {
         &rt,
         &home,
         Request::IssueEdit {
+            due: None,
+            estimate: None,
             reff: reff.clone(),
             title: None,
             status: Some("done".into()),
@@ -334,6 +338,8 @@ fn role_access_and_workflow_authoring_round_trip_over_the_daemon() {
         &rt,
         &home,
         Request::IssueEdit {
+            due: None,
+            estimate: None,
             reff: reff.clone(),
             title: None,
             status: Some("in_progress".into()),
@@ -381,6 +387,8 @@ fn role_access_and_workflow_authoring_round_trip_over_the_daemon() {
         &rt,
         &home,
         Request::IssueEdit {
+            due: None,
+            estimate: None,
             reff: reff.clone(),
             title: None,
             status: Some("in_progress".into()),
@@ -422,6 +430,8 @@ fn role_access_and_workflow_authoring_round_trip_over_the_daemon() {
         &rt,
         &home,
         Request::IssueEdit {
+            due: None,
+            estimate: None,
             reff: reff.clone(),
             title: None,
             status: Some("backlog".into()),
@@ -436,6 +446,8 @@ fn role_access_and_workflow_authoring_round_trip_over_the_daemon() {
         &rt,
         &home,
         Request::IssueEdit {
+            due: None,
+            estimate: None,
             reff,
             title: None,
             status: Some("in_progress".into()),

@@ -124,6 +124,8 @@ fn two_orbital_daemons_join_admit_and_converge_over_the_socket() {
         &client,
         &founder_home,
         Request::IssueNew {
+            due: None,
+            estimate: None,
             title: "Secret plan".into(),
             // Formation seeded the default project too — pick the explicit one.
             project: Some("core".into()),
@@ -236,6 +238,7 @@ fn two_orbital_daemons_join_admit_and_converge_over_the_socket() {
         &client,
         &joiner_home,
         Request::Comment {
+            reply_to: None,
             reff: "CORE-1".into(),
             body: "joined over the socket".into(),
         },

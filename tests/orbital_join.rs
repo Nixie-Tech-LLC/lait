@@ -191,6 +191,8 @@ fn form_invite_join_autoapprove_and_e2ee_convergence() {
         &session_f,
         &FOUNDER_SEED,
         &IssueIntent::IssueNew {
+            duedate: None,
+            estimate: None,
             doc: doc.clone(),
             project: project.clone(),
             title: "Secret plan".into(),
@@ -302,6 +304,8 @@ fn form_invite_join_autoapprove_and_e2ee_convergence() {
         &session_j,
         &JOINER_SEED,
         &IssueIntent::Comment {
+            id: None,
+            parent: None,
             doc: doc.clone(),
             body: "joined and commenting".into(),
             actor: joiner_actor.as_str().to_string(),

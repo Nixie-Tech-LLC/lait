@@ -190,23 +190,35 @@ struct Staging {
     ops: Vec<(BodyKey, BodyOp)>,
     scopes: Vec<BodyKey>,
     declarations: Vec<BodyDeclaration>,
+    /// Whether a catalog op must carry the creation declaration — true exactly
+    /// when the committed snapshot holds no Catalog yet (first-ever write).
+    declare_catalog_on_use: bool,
     /// The canonical demand this mutation requires (defaults to contributor).
     demand: Option<Vec<u8>>,
 }
 
 impl Staging {
-    fn for_space(space: mechanics::ids::SpaceId) -> Self {
+    fn for_space(space: mechanics::ids::SpaceId, declare_catalog_on_use: bool) -> Self {
         Self {
             space,
             ops: Vec::new(),
             scopes: Vec::new(),
             declarations: Vec::new(),
+            declare_catalog_on_use,
             demand: None,
         }
     }
 }
 
 impl Staging {
+    /// Declarations ride ONLY the transaction that may create a Body.
+    ///
+    /// A Body's `(schema, version)` binding is immutable once recorded, and a
+    /// later declaration must equal it exactly — so declaring the compiled-in
+    /// version on every write would turn the first schema-version bump into a
+    /// `ContractViolation` against every pre-existing Body. An existing Body
+    /// resolves its own binding without any declaration; only creation needs
+    /// one, so only creation carries one.
     fn declare_issue(&mut self, key: &BodyKey) {
         if !self.declarations.iter().any(|d| &d.key == key) {
             self.declarations.push(BodyDeclaration {
@@ -215,11 +227,12 @@ impl Staging {
                 schema_version: contract::ISSUE_SCHEMA_VERSION,
             });
         }
-        if !self.scopes.contains(key) {
-            self.scopes.push(key.clone());
-        }
     }
 
+    /// See [`Self::declare_issue`] — attached exactly when this transaction
+    /// may bring the Catalog into being (`declare_catalog_on_use`). Joiners
+    /// adopt the Catalog through Manifest synchronization and never
+    /// re-declare it.
     fn declare_catalog(&mut self) {
         let key = catalog_key(&self.space);
         if !self.declarations.iter().any(|d| d.key == key) {
@@ -229,19 +242,27 @@ impl Staging {
                 schema_version: contract::CATALOG_SCHEMA_VERSION,
             });
         }
-        if !self.scopes.contains(&key) {
-            self.scopes.push(key);
-        }
     }
 
     fn issue(&mut self, key: &BodyKey, op: BodyOp) {
-        self.declare_issue(key);
+        if matches!(op, BodyOp::Create) {
+            self.declare_issue(key);
+        }
+        if !self.scopes.contains(key) {
+            self.scopes.push(key.clone());
+        }
         self.ops.push((key.clone(), op));
     }
 
     fn catalog(&mut self, op: BodyOp) {
-        self.declare_catalog();
-        self.ops.push((catalog_key(&self.space), op));
+        if self.declare_catalog_on_use {
+            self.declare_catalog();
+        }
+        let key = catalog_key(&self.space);
+        if !self.scopes.contains(&key) {
+            self.scopes.push(key.clone());
+        }
+        self.ops.push((key, op));
     }
 
     /// Set the demand this mutation requires (an admin-only intent overrides
@@ -620,8 +641,10 @@ impl World for IssuesWorld {
         intent: WorldIntent,
     ) -> Result<WorldEffect, WorldError> {
         let intent = IssueIntent::from_json(&intent.payload).ok_or(WorldError::InvalidRequest)?;
-        let catalog = catalog_state(ctx)?;
-        let mut staging = Staging::for_space(ctx.principal().space.clone());
+        let catalog_view = checked_catalog_view(ctx)?;
+        let catalog = CatalogState::from_view(catalog_view.as_ref());
+        let mut staging = Staging::for_space(ctx.principal().space.clone(), catalog_view.is_none());
+        drop(catalog_view);
         match intent {
             IssueIntent::InitializeTracker {
                 name,
@@ -743,6 +766,8 @@ impl World for IssuesWorld {
                 labels,
                 new_labels,
                 body,
+                duedate,
+                estimate,
                 actor,
                 device,
                 ts,
@@ -761,6 +786,9 @@ impl World for IssuesWorld {
                         return Err(WorldError::InvalidRequest);
                     }
                 }
+                if duedate == Some(0) || estimate.is_some_and(|e| e > contract::MAX_ESTIMATE) {
+                    return Err(WorldError::InvalidRequest);
+                }
                 let key = issue_key(&doc);
                 staging.issue(&key, BodyOp::Create);
                 staging.issue(&key, reg("projectid", project.as_bytes().to_vec()));
@@ -769,6 +797,12 @@ impl World for IssuesWorld {
                 staging.issue(&key, reg("priority", priority.as_bytes().to_vec()));
                 staging.issue(&key, reg("createdby", actor.as_bytes().to_vec()));
                 staging.issue(&key, reg("createdat", ts.to_string().into_bytes()));
+                if let Some(due) = duedate {
+                    staging.issue(&key, reg("duedate", due.to_string().into_bytes()));
+                }
+                if let Some(points) = estimate {
+                    staging.issue(&key, reg("estimate", points.to_string().into_bytes()));
+                }
                 if let Some(body) = body.filter(|b| !b.is_empty()) {
                     staging.issue(
                         &key,
@@ -823,6 +857,8 @@ impl World for IssuesWorld {
                 status,
                 priority,
                 description,
+                duedate,
+                estimate,
                 device,
                 ts,
             } => {
@@ -831,6 +867,15 @@ impl World for IssuesWorld {
                     && status.is_none()
                     && priority.is_none()
                     && description.is_none()
+                    && duedate.is_none()
+                    && estimate.is_none()
+                {
+                    return Err(WorldError::InvalidRequest);
+                }
+                if duedate == Some(Some(0))
+                    || estimate
+                        .flatten()
+                        .is_some_and(|e| e > contract::MAX_ESTIMATE)
                 {
                     return Err(WorldError::InvalidRequest);
                 }
@@ -906,6 +951,45 @@ impl World for IssuesWorld {
                             from: None,
                             to: None,
                         });
+                    }
+                }
+                if let Some(duedate) = duedate {
+                    if duedate != issue.duedate {
+                        changes.push(EventChange {
+                            f: "duedate".into(),
+                            from: issue.duedate.map(|d| d.to_string()),
+                            to: duedate.map(|d| d.to_string()),
+                        });
+                        match duedate {
+                            Some(due) => {
+                                staging.issue(&key, reg("duedate", due.to_string().into_bytes()))
+                            }
+                            None => staging.issue(
+                                &key,
+                                BodyOp::RegisterClear {
+                                    path: "duedate".into(),
+                                },
+                            ),
+                        }
+                    }
+                }
+                if let Some(estimate) = estimate {
+                    if estimate != issue.estimate {
+                        changes.push(EventChange {
+                            f: "estimate".into(),
+                            from: issue.estimate.map(|e| e.to_string()),
+                            to: estimate.map(|e| e.to_string()),
+                        });
+                        match estimate {
+                            Some(points) => staging
+                                .issue(&key, reg("estimate", points.to_string().into_bytes())),
+                            None => staging.issue(
+                                &key,
+                                BodyOp::RegisterClear {
+                                    path: "estimate".into(),
+                                },
+                            ),
+                        }
                     }
                 }
                 if staging.ops.is_empty() {
@@ -1066,6 +1150,8 @@ impl World for IssuesWorld {
             IssueIntent::Comment {
                 doc,
                 body,
+                id,
+                parent,
                 actor,
                 device,
                 ts,
@@ -1074,6 +1160,29 @@ impl World for IssuesWorld {
                     return Err(WorldError::InvalidRequest);
                 }
                 let issue = issue_state(ctx, &doc).ok_or(WorldError::InvalidRequest)?;
+                if let Some(id) = &id {
+                    // The daemon mints; the World re-validates — including
+                    // uniqueness, because a duplicated id would fuse two
+                    // comments' reactions and replies.
+                    if !contract::is_comment_id(id)
+                        || issue.comments.iter().any(|c| c.id.as_deref() == Some(id))
+                    {
+                        return Err(WorldError::InvalidRequest);
+                    }
+                }
+                if let Some(parent) = &parent {
+                    // A reply needs an addressable target: an existing comment
+                    // that carries an id (pre-identity comments cannot anchor
+                    // threads) and is itself a root — one level, no ladders.
+                    let target = issue
+                        .comments
+                        .iter()
+                        .find(|c| c.id.as_deref() == Some(parent.as_str()))
+                        .ok_or(WorldError::InvalidRequest)?;
+                    if id.is_none() || target.parent.is_some() {
+                        return Err(WorldError::InvalidRequest);
+                    }
+                }
                 let key = issue_key(&doc);
                 staging.issue(
                     &key,
@@ -1084,6 +1193,8 @@ impl World for IssuesWorld {
                             a: actor,
                             t: ts,
                             b: body.clone(),
+                            id,
+                            parent,
                         })
                         .expect("comment json"),
                     },
@@ -1091,6 +1202,43 @@ impl World for IssuesWorld {
                 let mut ev = event("commented", &device, ts);
                 ev.x = body;
                 push_event(&mut staging, ctx, &doc, &ev);
+                Ok(staging.into_effect(Some(doc)))
+            }
+            IssueIntent::React {
+                doc,
+                comment,
+                emoji,
+                actor,
+                on,
+                device: _,
+                ts: _,
+            } => {
+                if ActorId::parse(&actor).is_none()
+                    || !contract::is_comment_id(&comment)
+                    || !contract::is_reaction_emoji(&emoji)
+                {
+                    return Err(WorldError::InvalidRequest);
+                }
+                let issue = issue_state(ctx, &doc).ok_or(WorldError::InvalidRequest)?;
+                if !issue
+                    .comments
+                    .iter()
+                    .any(|c| c.id.as_deref() == Some(comment.as_str()))
+                {
+                    return Err(WorldError::InvalidRequest);
+                }
+                let value = contract::reaction_value(&emoji, &actor);
+                let path = contract::reaction_path(&comment);
+                staging.issue(
+                    &issue_key(&doc),
+                    if on {
+                        BodyOp::SetAdd { path, value }
+                    } else {
+                        BodyOp::SetRemove { path, value }
+                    },
+                );
+                // No history event, deliberately — see the intent's contract
+                // note: a reaction is a social signal, not a change of record.
                 Ok(staging.into_effect(Some(doc)))
             }
             IssueIntent::SetTombstone {
@@ -1866,6 +2014,8 @@ fn provisional_view(
         comments: vec![],
         created_by: ActorId::from_incept_hash(&"0".repeat(64)),
         created_at: 0,
+        due_date: None,
+        estimate: None,
         provisional: true,
         corrupt_records: vec![],
     }

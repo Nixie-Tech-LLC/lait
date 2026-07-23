@@ -141,6 +141,12 @@ pub enum Request {
         labels: Vec<String>,
         #[serde(default)]
         body: Option<String>,
+        /// Due date: unix seconds or `YYYY-MM-DD` (UTC midnight).
+        #[serde(default)]
+        due: Option<String>,
+        /// Estimate points.
+        #[serde(default)]
+        estimate: Option<u32>,
     },
     IssueEdit {
         reff: String,
@@ -154,6 +160,13 @@ pub enum Request {
         /// no `LoroText` cursor; the daemon applies it as a text update).
         #[serde(default)]
         description: Option<String>,
+        /// Due date: unix seconds, `YYYY-MM-DD` (UTC midnight), or `none` to
+        /// clear. Absent = untouched.
+        #[serde(default)]
+        due: Option<String>,
+        /// Estimate points, or `none` to clear. Absent = untouched.
+        #[serde(default)]
+        estimate: Option<String>,
     },
     IssueMove {
         reff: String,
@@ -178,6 +191,21 @@ pub enum Request {
     Comment {
         reff: String,
         body: String,
+        /// The comment id being replied to (from `IssueView.comments[].id`),
+        /// when this comment is a reply. One level of nesting.
+        #[serde(default)]
+        reply_to: Option<String>,
+    },
+    /// Toggle an emoji reaction on a comment. Writes no history event — a
+    /// reaction is a social signal, not a change of record.
+    React {
+        reff: String,
+        /// The target comment's id (`IssueView.comments[].id`).
+        comment: String,
+        emoji: String,
+        /// `true` (default) adds the reaction; `false` removes it.
+        #[serde(default = "default_true")]
+        on: bool,
     },
     IssueDelete {
         reff: String,
@@ -431,6 +459,11 @@ pub enum Request {
     AccessRevoke {
         grant_id: String,
     },
+    /// Activate this build's reviewed IssuesWorld implementation for the
+    /// Space (admin-authored ACL action; idempotent when already active).
+    /// The activation is what receipts pin — a build whose descriptor differs
+    /// from the active one should run this before writing.
+    WorldUpgrade,
     /// A project's workflow revision head(s).
     WorkflowShow {
         project: String,
@@ -574,6 +607,7 @@ pub fn classify(req: &Request) -> RequestOwner {
         | Request::Assign { .. }
         | Request::Label { .. }
         | Request::Comment { .. }
+        | Request::React { .. }
         | Request::IssueDelete { .. }
         | Request::IssueRestore { .. }
         | Request::IssueLink { .. }
@@ -627,6 +661,7 @@ pub fn classify(req: &Request) -> RequestOwner {
         | Request::AccessList { .. }
         | Request::AccessGrant { .. }
         | Request::AccessRevoke { .. }
+        | Request::WorldUpgrade
         | Request::Id => Mechanics,
 
         // ---- Station: connect/neighbor/Contact ----
@@ -665,6 +700,8 @@ pub fn representative_requests() -> Vec<Request> {
             priority: None,
             labels: vec![],
             body: None,
+            due: None,
+            estimate: None,
         },
         Request::IssueEdit {
             reff: s(),
@@ -672,6 +709,8 @@ pub fn representative_requests() -> Vec<Request> {
             status: None,
             priority: None,
             description: None,
+            due: None,
+            estimate: None,
         },
         Request::IssueMove {
             reff: s(),
@@ -691,6 +730,13 @@ pub fn representative_requests() -> Vec<Request> {
         Request::Comment {
             reff: s(),
             body: s(),
+            reply_to: None,
+        },
+        Request::React {
+            reff: s(),
+            comment: s(),
+            emoji: s(),
+            on: true,
         },
         Request::IssueDelete { reff: s() },
         Request::IssueRestore { reff: s() },
@@ -764,6 +810,7 @@ pub fn representative_requests() -> Vec<Request> {
             project: None,
         },
         Request::AccessRevoke { grant_id: s() },
+        Request::WorldUpgrade,
         Request::WorkflowShow { project: s() },
         Request::WorkflowValidate { body_json: s() },
         Request::WorkflowSet {

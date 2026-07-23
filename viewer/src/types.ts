@@ -77,6 +77,10 @@ export interface Row {
   assignees: string[];
   tombstone: boolean;
   provisional: boolean;
+  /** Due date, unix seconds. Absent = none. */
+  due_date?: number | null;
+  /** Estimate points (the scale is the team's convention). */
+  estimate?: number | null;
 }
 
 export interface BoardColumn {
@@ -96,6 +100,18 @@ export interface CommentDto {
   /** Unix seconds. */
   ts: number;
   body: string;
+  /** Canonical comment id (`cmt_…`). Absent on comments stored before comment
+   *  identity existed — those cannot anchor reactions or replies. */
+  id?: string | null;
+  /** The comment this one replies to (one level of nesting). */
+  parent?: string | null;
+  /** Emoji reactions, grouped per emoji with the actors who reacted. */
+  reactions?: ReactionDto[];
+}
+
+export interface ReactionDto {
+  emoji: string;
+  actors: string[];
 }
 
 export interface IssueView {
@@ -117,6 +133,9 @@ export interface IssueView {
   created_by: string;
   /** Unix seconds. */
   created_at: number;
+  /** Due date, unix seconds. Absent = none. */
+  due_date?: number | null;
+  estimate?: number | null;
   provisional: boolean;
 }
 
@@ -353,12 +372,16 @@ export interface Filter {
  * have no browser surface yet — add them here when they grow one.
  */
 export type Request =
-  | { cmd: "issue_new"; title: string; project?: string | null; project_hint?: string | null; assignees?: string[]; priority?: Priority | null; labels?: string[]; body?: string | null }
-  | { cmd: "issue_edit"; reff: string; title?: string | null; status?: string | null; priority?: string | null; description?: string | null }
+  | { cmd: "issue_new"; title: string; project?: string | null; project_hint?: string | null; assignees?: string[]; priority?: Priority | null; labels?: string[]; body?: string | null; due?: string | null; estimate?: number | null }
+  /** `due`: `YYYY-MM-DD` (UTC), unix seconds, or `"none"` to clear; `estimate`:
+   *  a number as a string, or `"none"` to clear. Absent = untouched. */
+  | { cmd: "issue_edit"; reff: string; title?: string | null; status?: string | null; priority?: string | null; description?: string | null; due?: string | null; estimate?: string | null }
   | { cmd: "issue_move"; reff: string; project?: string | null; pos?: BoardPos | null }
   | { cmd: "assign"; reff: string; who: string[]; add?: boolean }
   | { cmd: "label"; reff: string; add?: string[]; remove?: string[] }
-  | { cmd: "comment"; reff: string; body: string }
+  | { cmd: "comment"; reff: string; body: string; reply_to?: string | null }
+  /** Toggle an emoji reaction on a comment. Writes no history event. */
+  | { cmd: "react"; reff: string; comment: string; emoji: string; on?: boolean }
   | { cmd: "issue_delete"; reff: string }
   /** Clears the tombstone. Restore wins over a concurrent delete. */
   | { cmd: "issue_restore"; reff: string }

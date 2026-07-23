@@ -27,6 +27,12 @@ pub const VIEW_SCHEMA_VERSION: u32 = 3;
 pub const LINK_KINDS: [&str; 3] = ["blocks", "relates", "duplicates"];
 /// The default status a fresh issue carries.
 pub const DEFAULT_STATUS: &str = "backlog";
+/// The longest reaction emoji accepted, in UTF-8 bytes (a ZWJ family sequence
+/// fits; a paragraph does not).
+pub const MAX_REACTION_EMOJI_BYTES: usize = 32;
+/// The largest accepted estimate. Every scale humans use tops out far below
+/// this; the cap exists so a typo cannot become a permanent register.
+pub const MAX_ESTIMATE: u32 = 1000;
 
 pub fn world_id() -> WorldId {
     WorldId::parse(PRODUCT_WORLD).expect("product world id")
@@ -240,6 +246,51 @@ pub fn board_path(project: &str) -> String {
     format!("board/{}", project.to_ascii_lowercase())
 }
 
+/// The reactions set path for one comment. Comment ids are canonically
+/// lowercase (`cmt_` + lowercased ULID) precisely so they are path-legal —
+/// the frozen path grammar admits only `[a-z0-9_]`.
+pub fn reaction_path(comment_id: &str) -> String {
+    format!("reactions/{comment_id}")
+}
+
+/// Whether `s` is a canonical comment id: `cmt_` + a 26-character lowercased
+/// ULID in the kernel's base32 alphabet (`0-9` then `a-v`, the lowercase of
+/// [`mechanics::ids`]' encoder). The daemon mints and lowercases; the World
+/// re-validates because ids arrive inside the intent.
+pub fn is_comment_id(s: &str) -> bool {
+    s.strip_prefix("cmt_").is_some_and(|ulid| {
+        ulid.len() == 26
+            && ulid
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'v').contains(&b))
+    })
+}
+
+/// One reaction as stored in a comment's reactions set: `emoji \t actor`.
+/// A set (not a map) so two actors reacting concurrently never clobber, and
+/// add-wins semantics keep a reaction that raced its own removal.
+pub fn reaction_value(emoji: &str, actor: &str) -> Vec<u8> {
+    format!("{emoji}\t{actor}").into_bytes()
+}
+
+/// Parse a stored reaction value back into `(emoji, actor)`.
+pub fn parse_reaction_value(raw: &[u8]) -> Option<(String, String)> {
+    let s = std::str::from_utf8(raw).ok()?;
+    let (emoji, actor) = s.split_once('\t')?;
+    if emoji.is_empty() || actor.is_empty() {
+        return None;
+    }
+    Some((emoji.to_string(), actor.to_string()))
+}
+
+/// Whether `emoji` is acceptable as a reaction: non-empty, bounded, and free
+/// of the control/whitespace bytes the storage encoding reserves.
+pub fn is_reaction_emoji(emoji: &str) -> bool {
+    !emoji.is_empty()
+        && emoji.len() <= MAX_REACTION_EMOJI_BYTES
+        && !emoji.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
 /// A board position, resolved to DocIds by the daemon before submit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "at", rename_all = "snake_case")]
@@ -256,6 +307,16 @@ pub struct NewLabel {
     pub id: String,
     pub name: String,
     pub color: String,
+}
+
+/// Deserialize a present field (including an explicit `null`) as the OUTER
+/// `Some` of a double option — absent stays `None` via `#[serde(default)]`.
+fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Deserialize::deserialize(de).map(Some)
 }
 
 /// The work-state actions.
@@ -305,6 +366,10 @@ pub enum IssueIntent {
         labels: Vec<String>,
         new_labels: Vec<NewLabel>,
         body: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duedate: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        estimate: Option<u32>,
         actor: String,
         device: String,
         ts: u64,
@@ -315,6 +380,23 @@ pub enum IssueIntent {
         status: Option<String>,
         priority: Option<String>,
         description: Option<String>,
+        /// Double-option: absent = untouched, `Some(None)` (JSON `null`) =
+        /// clear, `Some(Some(ts))` = set (unix seconds). The custom
+        /// deserializer is what keeps `null` distinct from absent — serde's
+        /// default reads both as the outer `None`.
+        #[serde(
+            default,
+            deserialize_with = "double_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        duedate: Option<Option<u64>>,
+        /// Same shape as `duedate`; points on whatever scale the team reads.
+        #[serde(
+            default,
+            deserialize_with = "double_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        estimate: Option<Option<u32>>,
         device: String,
         ts: u64,
     },
@@ -343,7 +425,29 @@ pub enum IssueIntent {
     Comment {
         doc: String,
         body: String,
+        /// Daemon-minted canonical comment id. Optional for wire compatibility
+        /// with pre-identity intents; a comment stored without one cannot
+        /// anchor reactions or replies.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        /// The id of the comment being replied to, when this is a reply.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<String>,
         actor: String,
+        device: String,
+        ts: u64,
+    },
+    /// Toggle one actor's emoji reaction on one comment. Deliberately writes
+    /// **no history event**: a reaction is a social signal, not a change of
+    /// record, and history rows for every 👍 would bury the changes that are.
+    React {
+        doc: String,
+        /// The target comment's canonical id.
+        comment: String,
+        emoji: String,
+        actor: String,
+        /// `true` adds, `false` removes.
+        on: bool,
         device: String,
         ts: u64,
     },
@@ -603,11 +707,24 @@ pub struct EventChange {
 }
 
 /// A stored comment list element.
+///
+/// `id`/`parent` arrived after v0.6 comments shipped, so both are optional
+/// with absent-means-absent serialization: pre-existing comments keep their
+/// exact stored bytes, and older builds deserialize enriched comments
+/// unchanged (serde ignores unknown fields). A comment without an `id`
+/// predates identity and simply cannot anchor reactions or replies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredComment {
     pub a: String,
     pub t: u64,
     pub b: String,
+    /// Canonical comment id (`cmt_…`, lowercase — see [`is_comment_id`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The comment this one replies to (one level; a reply to a reply names
+    /// the same root).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
 }
 
 /// The default workflow, exactly the legacy seed.

@@ -177,6 +177,34 @@ impl OrbitalDaemon {
             .dock(&crate::world::contract::world_id(), &identity)
             .ok();
 
+        // The implementation self-check. Receipts pin whichever implementation
+        // id is ACTIVE in the ledger — not this build's — so a build whose
+        // descriptor has moved on would silently attest an implementation it
+        // is not. Say so at open; `lait world-upgrade` (admin) activates this
+        // build's id.
+        {
+            use runtime::AuthorityView;
+            let device = crate::crypto::device_from_seed(&device_seed);
+            if let Some(principal) = mechanics.resolve(&device) {
+                let ours = crate::orbital::issues_implementation_id();
+                let active = mechanics.active_implementation(
+                    &crate::world::contract::world_id(),
+                    &principal.authority_frontier,
+                );
+                if active != Some(ours) {
+                    tracing::warn!(
+                        "this build's IssuesWorld implementation ({}) is not the space's \
+                         active one ({}) — writes will attest the active implementation; \
+                         an admin should run `lait world-upgrade`",
+                        data_encoding::HEXLOWER.encode(&ours[..8]),
+                        active
+                            .map(|a| data_encoding::HEXLOWER.encode(&a[..8]))
+                            .unwrap_or_else(|| "none".into()),
+                    );
+                }
+            }
+        }
+
         Ok(Self {
             mechanics,
             station,
@@ -333,6 +361,22 @@ impl OrbitalDaemon {
                 },
                 Err(e) => Response::err(format!("{e}")),
             },
+            Request::WorldUpgrade => {
+                let ours = crate::orbital::issues_implementation_id();
+                match self
+                    .mechanics
+                    .activate_implementation(crate::world::contract::PRODUCT_WORLD, ours)
+                {
+                    Ok(()) => Response::Ok {
+                        message: Some(format!(
+                            "implementation {} is active for {} (no-op if it already was)",
+                            data_encoding::HEXLOWER.encode(&ours[..8]),
+                            crate::world::contract::PRODUCT_WORLD,
+                        )),
+                    },
+                    Err(e) => Response::err(format!("{e}")),
+                }
+            }
             Request::Id => Response::Ok {
                 message: Some(crate::crypto::device_from_seed(&self.device_seed).to_string()),
             },

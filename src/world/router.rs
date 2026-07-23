@@ -297,6 +297,7 @@ impl<'a> IssueRouter<'a> {
                 | Request::Assign { .. }
                 | Request::Label { .. }
                 | Request::Comment { .. }
+                | Request::React { .. }
                 | Request::IssueDelete { .. }
                 | Request::IssueRestore { .. }
                 | Request::IssueLink { .. }
@@ -347,8 +348,14 @@ impl<'a> IssueRouter<'a> {
                 priority,
                 labels,
                 body,
+                due,
+                estimate,
             } => {
                 let project = self.choose_project(&snapshot, project.as_deref(), facts)?;
+                let duedate = match due.as_deref() {
+                    None | Some("none") => None,
+                    Some(text) => Some(parse_due(text).ok_or_else(bad_due)?),
+                };
                 let resolved_assignees: Vec<String> = assignees.to_vec();
                 let mut label_ids = Vec::new();
                 let mut new_labels = Vec::new();
@@ -373,6 +380,8 @@ impl<'a> IssueRouter<'a> {
                         labels: label_ids,
                         new_labels,
                         body,
+                        duedate,
+                        estimate,
                         actor: facts.actor.clone(),
                         device: facts.device.clone(),
                         ts: facts.now,
@@ -390,14 +399,32 @@ impl<'a> IssueRouter<'a> {
                 status,
                 priority,
                 description,
+                due,
+                estimate,
             } => {
                 let doc = self.resolve(&snapshot, &reff)?;
+                // `none` clears; absent leaves the field untouched — the
+                // double-option the intent carries.
+                let duedate = match due.as_deref() {
+                    None => None,
+                    Some("none") => Some(None),
+                    Some(text) => Some(Some(parse_due(text).ok_or_else(bad_due)?)),
+                };
+                let estimate = match estimate.as_deref() {
+                    None => None,
+                    Some("none") => Some(None),
+                    Some(text) => Some(Some(text.parse::<u32>().map_err(|_| {
+                        Response::err("estimate must be a whole number of points, or `none`")
+                    })?)),
+                };
                 self.submit(&IssueIntent::IssueEdit {
                     doc: doc.clone(),
                     title,
                     status,
                     priority,
                     description,
+                    duedate,
+                    estimate,
                     device: facts.device.clone(),
                     ts: facts.now,
                 })
@@ -469,12 +496,39 @@ impl<'a> IssueRouter<'a> {
                 .map_err(Self::effect_err)?;
                 Ok((self.ref_response(&doc), true))
             }
-            Request::Comment { reff, body } => {
+            Request::Comment {
+                reff,
+                body,
+                reply_to,
+            } => {
                 let doc = self.resolve(&snapshot, &reff)?;
                 self.submit(&IssueIntent::Comment {
                     doc: doc.clone(),
                     body,
+                    // The adapter mints the id (lowercase — it doubles as a
+                    // Body path segment); the World re-validates it.
+                    id: Some(crate::ids::mint_comment_id(self.clock)),
+                    parent: reply_to,
                     actor: facts.actor.clone(),
+                    device: facts.device.clone(),
+                    ts: facts.now,
+                })
+                .map_err(Self::effect_err)?;
+                Ok((self.ref_response(&doc), true))
+            }
+            Request::React {
+                reff,
+                comment,
+                emoji,
+                on,
+            } => {
+                let doc = self.resolve(&snapshot, &reff)?;
+                self.submit(&IssueIntent::React {
+                    doc: doc.clone(),
+                    comment,
+                    emoji,
+                    actor: facts.actor.clone(),
+                    on,
                     device: facts.device.clone(),
                     ts: facts.now,
                 })
@@ -910,4 +964,51 @@ impl<'a> IssueRouter<'a> {
 /// A shared clock for the router in production.
 pub fn system_clock() -> SystemUlidSource {
     SystemUlidSource
+}
+
+fn bad_due() -> Response {
+    Response::err("due must be unix seconds, YYYY-MM-DD, or `none`")
+}
+
+/// Parse a due-date argument: raw unix seconds, or `YYYY-MM-DD` as UTC
+/// midnight. Timezone policy is deliberately the simplest honest one — a due
+/// *date* names a day, and UTC midnight is the one reading every replica
+/// derives identically; clients localize for display.
+fn parse_due(text: &str) -> Option<u64> {
+    let text = text.trim();
+    if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
+        return text.parse().ok();
+    }
+    let mut parts = text.splitn(3, '-');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    let d: u32 = parts.next()?.parse().ok()?;
+    if !(1970..=9999).contains(&y) || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    // Howard Hinnant's days-from-civil: civil date -> days since 1970-01-01.
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = (y - era * 400) as u64;
+    let mp = ((m + 9) % 12) as u64;
+    let doy = (153 * mp + 2) / 5 + (d as u64) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe as i64 - 719_468;
+    u64::try_from(days).ok().map(|d| d * 86_400)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_due;
+
+    #[test]
+    fn due_dates_parse_as_utc_midnight_and_unix_passthrough() {
+        assert_eq!(parse_due("1970-01-01"), Some(0));
+        // A known epoch day: 2026-07-22 = 20 656 days after the epoch.
+        assert_eq!(parse_due("2026-07-22"), Some(20_656 * 86_400));
+        assert_eq!(parse_due("1753142400"), Some(1_753_142_400));
+        assert_eq!(parse_due("2026-13-01"), None, "month out of range");
+        assert_eq!(parse_due("07-22"), None, "not a date");
+        assert_eq!(parse_due(""), None);
+    }
 }
