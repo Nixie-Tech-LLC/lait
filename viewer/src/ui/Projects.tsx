@@ -2,9 +2,10 @@ import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, ArrowRight, FolderKanban } from "lucide-react";
 
 import { rpc } from "../api";
-import type { BoardView, ProjectDto } from "../types";
+import type { BoardView, MemberDto, ProjectDto } from "../types";
 import { ApplicationState, LoadingState } from "./AppState";
 import { catalogColor } from "./colors";
+import { ProjectOverview } from "./ProjectOverview";
 
 type ProjectHealth = {
   project: ProjectDto;
@@ -21,15 +22,22 @@ type ProjectHealth = {
 export function Projects({
   spaceId,
   projects,
+  members,
   revision,
+  readOnly,
   onOpen,
+  onError,
 }: {
   spaceId: string;
   projects: ProjectDto[];
+  members: MemberDto[];
   revision: number;
+  readOnly: boolean;
   onOpen: (key: string) => void;
+  onError: (message: string) => void;
 }) {
   const [boards, setBoards] = useState<Map<string, BoardView> | null>(null);
+  const [selected, setSelected] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -68,6 +76,28 @@ export function Projects({
   }, [boards, projects]);
 
   if (!boards) return <LoadingState title="Loading projects" body="Reading local project projections." />;
+
+  const openProject = selected ? health.find((h) => h.project.key === selected) : null;
+  if (openProject) {
+    return (
+      <ProjectOverview
+        spaceId={spaceId}
+        project={openProject.project}
+        members={members}
+        counts={{
+          backlog: openProject.backlog,
+          active: openProject.active,
+          done: openProject.done,
+          total: openProject.total,
+        }}
+        readOnly={readOnly}
+        onOpenIssues={() => onOpen(openProject.project.key)}
+        onBack={() => setSelected(null)}
+        onError={onError}
+      />
+    );
+  }
+
   if (projects.length === 0) {
     return (
       <ApplicationState
@@ -92,7 +122,7 @@ export function Projects({
           {health.map(({ project, total, backlog, active, done, unavailable }) => (
             <li key={project.id}>
               <button
-                onClick={() => onOpen(project.key)}
+                onClick={() => setSelected(project.key)}
                 className="border-line bg-raised hover:border-line-strong hover:bg-hover group flex min-h-32 w-full flex-col rounded-lg border p-4 text-left transition-colors"
               >
                 <span className="flex w-full items-center gap-2">

@@ -1014,17 +1014,25 @@ pub fn specs() -> Vec<Spec> {
                 .alias(&["new"]),
                 Spec::req(
                     "edit",
-                    "Rename and/or recolor a project: `projects edit ENG --name Engineering --color blue`. The KEY is immutable.",
+                    "Edit a project's overview: name/color/description/lead/dates. `projects edit ENG --name Engineering --target 2026-09-01`. The KEY is immutable.",
                     vec![
                         A::pos("project", "Project KEY or prj_ id."),
                         A::val("name", "New name."),
                         A::val("color", "New color (hex/name)."),
+                        A::val("description", "Overview markdown."),
+                        A::val("lead", "Lead actor key (or `none` to clear)."),
+                        A::val("start", "Start date YYYY-MM-DD (or `none`)."),
+                        A::val("target", "Target date YYYY-MM-DD (or `none`)."),
                     ],
                     |m| {
                         Ok(Request::ProjectEdit {
                             project: req_str(m, "project"),
                             name: opt_str(m, "name"),
                             color: opt_str(m, "color"),
+                            description: opt_str(m, "description"),
+                            lead: opt_str(m, "lead"),
+                            start: opt_str(m, "start"),
+                            target: opt_str(m, "target"),
                         })
                     },
                 ),

@@ -51,6 +51,13 @@ export interface ProjectDto {
   name: string;
   key: string;
   color: string;
+  /** Overview markdown (absent/empty = none). */
+  description?: string;
+  /** Lead actor key (absent/empty = none). */
+  lead?: string;
+  /** Planned window, unix seconds. */
+  start_date?: number | null;
+  target_date?: number | null;
 }
 
 export interface LabelDto {
@@ -445,7 +452,16 @@ export type Request =
   | { cmd: "issue_graph"; reff: string }
   | { cmd: "project_new"; name: string; key: string; color?: string | null }
   | { cmd: "project_list" }
-  | { cmd: "project_edit"; project: string; name?: string | null; color?: string | null }
+  | {
+      cmd: "project_edit";
+      project: string;
+      name?: string | null;
+      color?: string | null;
+      description?: string | null;
+      lead?: string | null;
+      start?: string | null;
+      target?: string | null;
+    }
   | { cmd: "label_new"; name: string; color?: string | null }
   | { cmd: "label_list" }
   | { cmd: "label_edit"; label: string; name?: string | null; color?: string | null }

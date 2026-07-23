@@ -62,6 +62,10 @@ fn response_dtos_round_trip() {
         name: "Engineering".into(),
         key: "ENG".into(),
         color: "blue".into(),
+        description: String::new(),
+        lead: String::new(),
+        start_date: None,
+        target_date: None,
     };
     let row = Row {
         due_date: None,

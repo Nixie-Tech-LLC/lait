@@ -308,6 +308,16 @@ pub struct ProjectDto {
     pub name: String,
     pub key: String,
     pub color: String,
+    /// Overview markdown (additive; empty when unset).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Lead actor key (empty = none).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lead: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_date: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_date: Option<u64>,
 }
 
 /// A label registry entry.

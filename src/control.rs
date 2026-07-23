@@ -288,6 +288,16 @@ pub enum Request {
         name: Option<String>,
         #[serde(default)]
         color: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        /// Lead actor key, or "" / "none" to clear.
+        #[serde(default)]
+        lead: Option<String>,
+        /// `YYYY-MM-DD`, or "none" to clear. Absent leaves it untouched.
+        #[serde(default)]
+        start: Option<String>,
+        #[serde(default)]
+        target: Option<String>,
     },
     LabelNew {
         name: String,
@@ -807,6 +817,10 @@ pub fn representative_requests() -> Vec<Request> {
             project: s(),
             name: None,
             color: None,
+            description: None,
+            lead: None,
+            start: None,
+            target: None,
         },
         Request::LabelNew {
             name: s(),

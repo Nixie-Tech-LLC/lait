@@ -1495,6 +1495,10 @@ impl World for IssuesWorld {
                 id,
                 name,
                 color,
+                description,
+                lead,
+                start_date,
+                target_date,
                 device: _,
                 ts: _,
             } => {
@@ -1516,19 +1520,28 @@ impl World for IssuesWorld {
                 if let Some(color) = color {
                     meta.color = color;
                 }
+                if let Some(description) = description {
+                    meta.description = description;
+                }
+                if let Some(lead) = lead {
+                    meta.lead = lead;
+                }
+                if let Some(start) = start_date {
+                    meta.start_date = start;
+                }
+                if let Some(target) = target_date {
+                    meta.target_date = target;
+                }
                 // Nothing changed: don't emit an op that would look like an edit.
                 if meta == *current {
                     return Ok(staging.into_effect(None));
                 }
+                // Serialize the whole record so an edit never drops a field the
+                // caller didn't touch.
                 staging.catalog(map_set(
                     "projects",
                     id.clone(),
-                    serde_json::to_vec(&serde_json::json!({
-                        "name": meta.name,
-                        "key": meta.key,
-                        "color": meta.color,
-                    }))
-                    .expect("project json"),
+                    serde_json::to_vec(&meta).expect("project json"),
                 ));
                 Ok(staging.into_effect(None))
             }

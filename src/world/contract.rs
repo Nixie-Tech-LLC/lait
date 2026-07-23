@@ -500,6 +500,11 @@ pub enum IssueIntent {
         id: String,
         name: Option<String>,
         color: Option<String>,
+        description: Option<String>,
+        lead: Option<String>,
+        /// Outer `None` leaves the date untouched; inner `None` clears it.
+        start_date: Option<Option<u64>>,
+        target_date: Option<Option<u64>>,
         device: String,
         ts: u64,
     },

@@ -715,14 +715,39 @@ impl<'a> IssueRouter<'a> {
                 project,
                 name,
                 color,
+                description,
+                lead,
+                start,
+                target,
             } => {
                 let id = snapshot.resolve_project(&project).ok_or_else(|| {
                     Response::not_found(format!("no project matches {project:?}"))
                 })?;
+                // `none`/`""` clears; absent leaves it untouched — the same
+                // double-option the issue due-date carries.
+                let parse_date = |v: Option<String>| -> Result<Option<Option<u64>>, Response> {
+                    match v.as_deref() {
+                        None => Ok(None),
+                        Some("none") | Some("") => Ok(Some(None)),
+                        Some(text) => Ok(Some(Some(parse_due(text).ok_or_else(bad_due)?))),
+                    }
+                };
+                let lead = lead.map(|l| {
+                    let l = l.trim();
+                    if l.eq_ignore_ascii_case("none") {
+                        String::new()
+                    } else {
+                        l.to_string()
+                    }
+                });
                 self.submit(&IssueIntent::ProjectEdit {
                     id,
                     name,
                     color,
+                    description,
+                    lead,
+                    start_date: parse_date(start)?,
+                    target_date: parse_date(target)?,
                     device: facts.device.clone(),
                     ts: facts.now,
                 })

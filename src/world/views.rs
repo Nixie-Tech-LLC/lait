@@ -25,6 +25,18 @@ pub struct ProjectMeta {
     pub name: String,
     pub key: String,
     pub color: String,
+    /// The overview document — freeform markdown. Additive: projects minted
+    /// before this field decode with an empty string.
+    #[serde(default)]
+    pub description: String,
+    /// The project lead's actor key (empty = none).
+    #[serde(default)]
+    pub lead: String,
+    /// Planned window, unix seconds (None = unset).
+    #[serde(default)]
+    pub start_date: Option<u64>,
+    #[serde(default)]
+    pub target_date: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -606,6 +618,10 @@ pub fn project_dto(id: &str, meta: &ProjectMeta) -> Option<ProjectDto> {
         name: meta.name.clone(),
         key: meta.key.clone(),
         color: meta.color.clone(),
+        description: meta.description.clone(),
+        lead: meta.lead.clone(),
+        start_date: meta.start_date,
+        target_date: meta.target_date,
     })
 }
 
@@ -781,6 +797,7 @@ mod tests {
                 name: "Board".into(),
                 key: "BOARD".into(),
                 color: "blue".into(),
+                ..Default::default()
             },
         );
         catalog.seqs.insert(doc.into(), 5);

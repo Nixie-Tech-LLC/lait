@@ -1376,11 +1376,14 @@ export function App() {
             <Projects
               spaceId={current}
               projects={projects}
+              members={members}
               revision={revision}
+              readOnly={readOnly}
               onOpen={(key) => {
                 api.pickProject(key);
                 api.goto("list");
               }}
+              onError={setError}
             />
           ) : view === "activity" ? (
             <Activity
