@@ -132,11 +132,11 @@ export function Sidebar({
           projects.map((project) => {
             const active = project.key === currentProject;
             return (
-              <div key={project.id} className="group/project mb-0.5 flex items-center">
+              <div key={project.id} className="group/project relative mb-0.5">
                 <button
                   onClick={() => onPickProject(project.key)}
                   className={cn(
-                    "flex h-7 min-w-0 flex-1 items-center gap-2 rounded px-2 text-left text-sm",
+                    "flex h-7 w-full min-w-0 items-center gap-2 rounded px-2 text-left text-sm",
                     active ? "bg-active text-fg" : "text-dim hover:bg-hover hover:text-fg",
                   )}
                 >
@@ -146,7 +146,10 @@ export function Sidebar({
                 </button>
                 <IconButton
                   label={favoriteProjects.includes(project.key) ? `Remove ${project.name} from favorites` : `Add ${project.name} to favorites`}
-                  className="size-6 opacity-0 group-hover/project:opacity-100 focus-visible:opacity-100"
+                  className={cn(
+                    "absolute top-0.5 right-0.5 size-6 opacity-0 group-hover/project:opacity-100 focus-visible:opacity-100",
+                    active ? "bg-active hover:bg-hover" : "bg-hover",
+                  )}
                   onClick={() => onToggleFavorite(project.key)}
                 >
                   {favoriteProjects.includes(project.key) ? <StarOff className="size-3" /> : <Star className="size-3" />}
