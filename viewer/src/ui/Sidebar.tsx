@@ -8,6 +8,7 @@ import {
   Folder,
   Inbox,
   LayoutGrid,
+  FolderKanban,
   Plus,
   Settings2,
   Star,
@@ -30,6 +31,8 @@ export function Sidebar({
   currentProject,
   view,
   unread,
+  memberCount,
+  membership,
   favoriteProjects,
   recentIssues,
   savedViews,
@@ -49,6 +52,8 @@ export function Sidebar({
   currentProject: string | null;
   view: View;
   unread: number;
+  memberCount?: number | undefined;
+  membership?: string | null | undefined;
   favoriteProjects: readonly string[];
   recentIssues: readonly string[];
   savedViews: readonly SavedView[];
@@ -67,7 +72,13 @@ export function Sidebar({
 
   return (
     <nav aria-label="Workspace" className="flex h-full min-h-0 flex-col p-2">
-      <SpaceSwitcher spaces={spaces} current={current} onPick={onPickSpace} />
+      <SpaceSwitcher
+        spaces={spaces}
+        current={current}
+        memberCount={memberCount}
+        membership={membership}
+        onPick={onPickSpace}
+      />
 
       {agent && (
         <div className="border-line bg-bg text-dim mx-1 mt-2 flex items-start gap-2 rounded border p-2 text-xs">
@@ -82,19 +93,23 @@ export function Sidebar({
         <NavItem icon={<Inbox />} label="Inbox" active={view === "inbox"} badge={unread} onClick={() => onGo("inbox")} />
         <NavItem icon={<CircleDot />} label="Issues" active={view === "list"} onClick={() => onGo("list")} />
         <NavItem icon={<LayoutGrid />} label="Board" active={view === "board"} onClick={() => onGo("board")} />
+        <NavItem icon={<FolderKanban />} label="Projects" active={view === "projects"} onClick={() => onGo("projects")} />
         <NavItem icon={<Activity />} label="Activity" active={view === "activity"} onClick={() => onGo("activity")} />
       </div>
 
       <Section title="Your workspace" />
       <div className="flex flex-col gap-px">
         <NavItem icon={<UserRound />} label="My issues" onClick={onMyIssues} />
+        {favoriteProjects.length > 0 && <MiniSection title="Favorites" />}
         {favoriteProjects.map((key) => {
           const favorite = projects.find((candidate) => candidate.key === key);
           return favorite ? <NavItem key={key} icon={<Star />} label={favorite.name} onClick={() => onPickProject(key)} compact /> : null;
         })}
+        {savedViews.length > 0 && <MiniSection title="Saved views" />}
         {savedViews.map((saved) => (
           <NavItem key={saved.id} icon={<Bookmark />} label={saved.name} onClick={() => onApplySavedView(saved)} compact />
         ))}
+        {recentIssues.length > 0 && <MiniSection title="Recent" />}
         {recentIssues.slice(0, 3).map((reff) => (
           <NavItem key={reff} icon={<Clock3 />} label={reff} onClick={() => onOpenRecent(reff)} compact />
         ))}
@@ -150,13 +165,36 @@ export function Sidebar({
   );
 }
 
-function SpaceSwitcher({ spaces, current, onPick }: { spaces: SpaceRow[]; current: string | null; onPick: (id: string) => void }) {
+function SpaceSwitcher({
+  spaces,
+  current,
+  memberCount,
+  membership,
+  onPick,
+}: {
+  spaces: SpaceRow[];
+  current: string | null;
+  memberCount?: number | undefined;
+  membership?: string | null | undefined;
+  onPick: (id: string) => void;
+}) {
   const selected = spaces.find((s) => s.id === current) ?? null;
   return (
     <details className="group relative">
-      <summary className="hover:bg-hover flex h-8 list-none items-center gap-2 rounded px-2 font-semibold [&::-webkit-details-marker]:hidden">
-        {selected?.identity.kind === "agent" ? <Bot className="text-mute size-4" /> : <Folder className="text-mute size-4" />}
-        <span className="min-w-0 flex-1 truncate">{selected?.name || selected?.space || "Choose a space"}</span>
+      <summary className="hover:bg-hover flex min-h-10 list-none items-center gap-2 rounded px-2 py-1 [&::-webkit-details-marker]:hidden">
+        <span className="bg-active flex size-7 shrink-0 items-center justify-center rounded-md">
+          {selected?.identity.kind === "agent" ? <Bot className="text-mute size-4" /> : <Folder className="text-mute size-4" />}
+        </span>
+        <span className="min-w-0 flex-1">
+          <strong className="block truncate text-sm">{selected?.name || selected?.space || "Choose a space"}</strong>
+          {selected && (
+            <span className="text-mute block truncate text-[10px] font-normal">
+              {selected.identity.kind === "agent"
+                ? `Agent-owned · read only`
+                : `${membership === "admin" ? "Admin" : membership === "pending" ? "Joining" : "Member"}${memberCount !== undefined ? ` · ${memberCount} ${memberCount === 1 ? "person" : "people"}` : ""}`}
+            </span>
+          )}
+        </span>
         {selected && <StatusDot status={selected.status} />}
         <ChevronDown className="text-mute size-3 transition-transform group-open:rotate-180" />
       </summary>
@@ -199,6 +237,10 @@ function Section({ title, action }: { title: string; action?: React.ReactNode })
       {action && <span className="ml-auto">{action}</span>}
     </div>
   );
+}
+
+function MiniSection({ title }: { title: string }) {
+  return <p className="text-mute mt-1 px-2 text-[9px] font-semibold tracking-[0.08em] uppercase">{title}</p>;
 }
 
 function NavItem({ icon, label, active, badge, compact, onClick }: { icon: React.ReactElement; label: string; active?: boolean; badge?: number; compact?: boolean; onClick: () => void }) {

@@ -56,6 +56,21 @@ describe("viewer routes", () => {
     ).toBe("/spaces/ws_1/inbox");
   });
 
+  it("round-trips the durable project portfolio destination", () => {
+    const href = formatRoute({
+      spaceId: "ws_1",
+      project: null,
+      view: "projects",
+      issue: null,
+    });
+    expect(href).toBe("/spaces/ws_1/projects");
+    expect(parseRoute(new URL(href, "http://lait.local"))).toMatchObject({
+      spaceId: "ws_1",
+      view: "projects",
+      issue: null,
+    });
+  });
+
   it("round-trips focused detail only when an issue can be displayed", () => {
     const focused = formatRoute({
       spaceId: "ws_1", project: "WEB", view: "list", issue: "iss_1", focused: true,

@@ -42,6 +42,7 @@ import { DisplayOptions } from "./ui/DisplayOptions";
 import { FilterBar } from "./ui/FilterBar";
 import { Inbox } from "./ui/Inbox";
 import { IssueSearch, rememberIssue } from "./ui/IssueSearch";
+import { Projects } from "./ui/Projects";
 import { Members } from "./ui/Members";
 import { IssueDetail } from "./ui/IssueDetail";
 import { IssueList } from "./ui/IssueList";
@@ -1080,6 +1081,8 @@ export function App() {
           currentProject={board?.project.key ?? project}
           view={view}
           unread={unread}
+          memberCount={members.length}
+          membership={statusInfo?.membership}
           favoriteProjects={favoriteProjects}
           recentIssues={recentIssues}
           savedViews={sidebarSavedViews}
@@ -1314,6 +1317,16 @@ export function App() {
               readOnly={readOnly}
               onError={setError}
             />
+          ) : view === "projects" ? (
+            <Projects
+              spaceId={current}
+              projects={projects}
+              revision={revision}
+              onOpen={(key) => {
+                api.pickProject(key);
+                api.goto("list");
+              }}
+            />
           ) : view === "activity" ? (
             <Activity
               spaceId={current}
@@ -1500,6 +1513,8 @@ export function App() {
               currentProject={board?.project.key ?? project}
               view={view}
               unread={unread}
+              memberCount={members.length}
+              membership={statusInfo?.membership}
               favoriteProjects={favoriteProjects}
               recentIssues={recentIssues}
               savedViews={sidebarSavedViews}
