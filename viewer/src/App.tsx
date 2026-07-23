@@ -148,6 +148,11 @@ export function App() {
   const [members, setMembers] = useState<MemberDto[]>([]);
   const [projects, setProjects] = useState<ProjectDto[]>([]);
   const [statusInfo, setStatusInfo] = useState<StatusInfo | null>(null);
+  /** Projects offered for navigation/creation. Archived ones are soft-hidden
+   *  here (the engine already keeps them out of the default board and all-project
+   *  lists) but stay in `projects` so the Projects page can list and restore them,
+   *  and a directly-opened archived board still renders. */
+  const liveProjects = useMemo(() => projects.filter((p) => !p.archived), [projects]);
   /** Which project's board is on screen. `null` = let the daemon's chain pick
    *  (branch key → `project.default` → the only project), same as a bare `lait board`. */
   const [project, setProject] = useState<string | null>(initialRoute.project);
@@ -1148,7 +1153,7 @@ export function App() {
         <Sidebar
           spaces={spaces}
           current={current}
-          projects={projects}
+          projects={liveProjects}
           currentProject={board?.project.key ?? project}
           view={view}
           unread={unread}
@@ -1196,7 +1201,7 @@ export function App() {
             never decoration — it was the one control the header was missing.
           */}
           <h1 className="ml-1 flex min-w-0 items-baseline gap-1.5">
-            {projects.length > 1 ? (
+            {liveProjects.length > 1 ? (
               <Combobox
                 variant="bare"
                 label="Project"
@@ -1210,7 +1215,14 @@ export function App() {
                       }
                     : null
                 }
-                options={projects.map((p) => ({
+                // Live projects, plus the current one if it happens to be archived
+                // (opened directly) so the switch still shows what you're viewing.
+                options={[
+                  ...liveProjects,
+                  ...(board && !liveProjects.some((p) => p.key === board.project.key)
+                    ? projects.filter((p) => p.key === board.project.key)
+                    : []),
+                ].map((p) => ({
                   id: p.key,
                   label: p.name,
                   swatch: catalogColor(p.color),
@@ -1493,7 +1505,7 @@ export function App() {
             />
           ) : view === "timeline" ? (
             <Timeline
-              projects={projects}
+              projects={liveProjects}
               onOpenProject={(key) => {
                 api.pickProject(key);
                 api.goto("list");
@@ -1623,7 +1635,7 @@ export function App() {
           spaceId={current}
           canonicalSpaceId={routeSpace}
           projectKey={board.project.key}
-          projects={projects}
+          projects={liveProjects}
           states={states}
           labels={labels}
           members={members}
@@ -1657,7 +1669,7 @@ export function App() {
             <Sidebar
               spaces={spaces}
               current={current}
-              projects={projects}
+              projects={liveProjects}
               currentProject={board?.project.key ?? project}
               view={view}
               unread={unread}
@@ -1710,7 +1722,7 @@ export function App() {
           states={states}
           labels={labels}
           members={members}
-          projects={projects}
+          projects={liveProjects}
           onStatus={(id) =>
             void bulk((reff) => rpc(current, { cmd: "issue_edit", reff, status: id }))
           }

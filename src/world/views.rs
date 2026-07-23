@@ -37,6 +37,11 @@ pub struct ProjectMeta {
     pub start_date: Option<u64>,
     #[serde(default)]
     pub target_date: Option<u64>,
+    /// Soft-hidden from pickers, default selection, and all-project lists — but
+    /// still resolvable by id/KEY (so a direct link opens it) with its aliases
+    /// intact. Additive: pre-archive projects decode as live. See CUSTOM-9.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -626,6 +631,7 @@ pub fn project_dto(id: &str, meta: &ProjectMeta) -> Option<ProjectDto> {
         lead: meta.lead.clone(),
         start_date: meta.start_date,
         target_date: meta.target_date,
+        archived: meta.archived,
     })
 }
 

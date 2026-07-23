@@ -298,6 +298,10 @@ pub enum Request {
         start: Option<String>,
         #[serde(default)]
         target: Option<String>,
+        /// Soft-hide toggle: `Some(true)` archives, `Some(false)` restores,
+        /// `None` leaves it untouched (CUSTOM-9).
+        #[serde(default)]
+        archived: Option<bool>,
     },
     LabelNew {
         name: String,
@@ -821,6 +825,7 @@ pub fn representative_requests() -> Vec<Request> {
             lead: None,
             start: None,
             target: None,
+            archived: None,
         },
         Request::LabelNew {
             name: s(),

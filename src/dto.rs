@@ -318,6 +318,11 @@ pub struct ProjectDto {
     pub start_date: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_date: Option<u64>,
+    /// Soft-hidden (archived). Additive; absent-when-false so pre-archive
+    /// consumers decode unchanged. Clients hide these from pickers and
+    /// all-project lists but can still open one directly.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
 }
 
 /// A label registry entry.

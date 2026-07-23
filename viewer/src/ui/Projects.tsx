@@ -139,15 +139,24 @@ export function Projects({
           </p>
         </div>
         <ul className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-          {health.map(({ project, total, backlog, active, done, unavailable }) => (
+          {[...health]
+            .sort((a, b) => Number(a.project.archived ?? false) - Number(b.project.archived ?? false))
+            .map(({ project, total, backlog, active, done, unavailable }) => (
             <li key={project.id}>
               <button
                 onClick={() => setSelected(project.key)}
-                className="border-line bg-raised hover:border-line-strong hover:bg-hover group flex min-h-32 w-full flex-col rounded-lg border p-4 text-left transition-colors"
+                className={`border-line bg-raised hover:border-line-strong hover:bg-hover group flex min-h-32 w-full flex-col rounded-lg border p-4 text-left transition-colors ${
+                  project.archived ? "opacity-60" : ""
+                }`}
               >
                 <span className="flex w-full items-center gap-2">
                   <span className="size-3 rounded-sm" style={{ background: catalogColor(project.color) }} />
                   <strong className="min-w-0 flex-1 truncate">{project.name}</strong>
+                  {project.archived && (
+                    <span className="border-line text-mute rounded-full border px-1.5 text-2xs">
+                      Archived
+                    </span>
+                  )}
                   <span className="text-mute font-mono text-xs">{project.key}</span>
                   <ArrowRight className="text-mute size-3.5 transition-transform group-hover:translate-x-0.5" />
                 </span>

@@ -1499,6 +1499,7 @@ impl World for IssuesWorld {
                 lead,
                 start_date,
                 target_date,
+                archived,
                 device: _,
                 ts: _,
             } => {
@@ -1531,6 +1532,9 @@ impl World for IssuesWorld {
                 }
                 if let Some(target) = target_date {
                     meta.target_date = target;
+                }
+                if let Some(archived) = archived {
+                    meta.archived = archived;
                 }
                 // Nothing changed: don't emit an op that would look like an edit.
                 if meta == *current {
@@ -1860,6 +1864,15 @@ impl World for IssuesWorld {
                         if &issue.project != project {
                             continue;
                         }
+                    } else if catalog
+                        .projects
+                        .get(&issue.project)
+                        .is_some_and(|m| m.archived)
+                    {
+                        // No explicit project: an archived project's issues stay
+                        // out of the all-project list (CUSTOM-9). Opening the
+                        // project by ref passes `project` and bypasses this.
+                        continue;
                     }
                     let tomb = catalog.tombstones.contains(doc);
                     let done = catalog.status_category(&issue.status) == StatusCategory::Done;

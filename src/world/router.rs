@@ -230,9 +230,17 @@ impl<'a> IssueRouter<'a> {
                 return Ok(id);
             }
         }
+        // Auto-selection skips archived projects: a soft-hidden project must not
+        // become the default board just because it is the only live-looking one
+        // (CUSTOM-9). Explicit refs above still resolve it.
         let projects = snapshot.projects();
-        if projects.len() == 1 {
-            return Ok(projects.keys().next().unwrap().clone());
+        let live: Vec<&String> = projects
+            .iter()
+            .filter(|(_, meta)| meta["archived"].as_bool() != Some(true))
+            .map(|(id, _)| id)
+            .collect();
+        if live.len() == 1 {
+            return Ok(live[0].clone());
         }
         Err(Response::err(
             "no project chosen and no single default — pass -p <project>",
@@ -719,6 +727,7 @@ impl<'a> IssueRouter<'a> {
                 lead,
                 start,
                 target,
+                archived,
             } => {
                 let id = snapshot.resolve_project(&project).ok_or_else(|| {
                     Response::not_found(format!("no project matches {project:?}"))
@@ -748,6 +757,7 @@ impl<'a> IssueRouter<'a> {
                     lead,
                     start_date: parse_date(start)?,
                     target_date: parse_date(target)?,
+                    archived,
                     device: facts.device.clone(),
                     ts: facts.now,
                 })

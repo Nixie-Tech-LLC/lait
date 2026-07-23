@@ -505,6 +505,8 @@ pub enum IssueIntent {
         /// Outer `None` leaves the date untouched; inner `None` clears it.
         start_date: Option<Option<u64>>,
         target_date: Option<Option<u64>>,
+        /// Soft-hide toggle: `None` leaves it, `Some(bool)` sets it (CUSTOM-9).
+        archived: Option<bool>,
         device: String,
         ts: u64,
     },

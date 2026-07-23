@@ -1,9 +1,13 @@
 import { useEffect, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
-import { X } from "lucide-react";
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+import { LayoutTemplate, Trash2, X } from "lucide-react";
 
 import { rpc } from "../api";
 import { clearDraft, loadDraft, saveDraft } from "../core/drafts";
+import { loadTemplates, removeTemplate, saveTemplate, type IssueTemplate } from "../core/templates";
+import * as ask from "./dialogs";
+import { MenuContent, MenuItem } from "./layout";
 import {
   PRIORITY_ORDER,
   type LabelDto,
@@ -77,6 +81,8 @@ export function NewIssue({
   const [busy, setBusy] = useState(false);
   const [again, setAgain] = useState(false);
   const [newLabel, setNewLabel] = useState<string | null>(null);
+  const [templates, setTemplates] = useState(() => loadTemplates(canonicalSpaceId));
+  const [templateMenu, setTemplateMenu] = useState(false);
   const [failure, setFailure] = useState("");
   const [recovered] = useState(() =>
     Boolean(
@@ -87,6 +93,40 @@ export function NewIssue({
 
   const state = states.find((s) => s.id === status) ?? null;
   const landsIn = states[0]?.id ?? "backlog";
+
+  const applyTemplate = (t: IssueTemplate) => {
+    if (t.title) setTitle(t.title);
+    if (t.body) setBody(t.body);
+    setPriority(t.priority);
+    if (t.status) setStatus(t.status);
+    setPicked(t.labels);
+    setAssignees(t.assignees);
+    setTemplateMenu(false);
+  };
+  const saveAsTemplate = async () => {
+    setTemplateMenu(false);
+    const name = await ask.prompt({
+      title: "Save as template",
+      body: "Stored on this device, for this space. Applies the current fields to a new issue.",
+      label: "Template name",
+      defaultValue: title.trim(),
+    });
+    if (!name?.trim()) return;
+    const id = `${Date.now().toString(36)}-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
+    setTemplates(
+      saveTemplate(canonicalSpaceId, {
+        id,
+        name: name.trim(),
+        title: title.trim(),
+        body: body.trim(),
+        priority,
+        status,
+        labels: picked,
+        assignees,
+      }),
+    );
+    onCreated(`Saved template “${name.trim()}”`);
+  };
 
   useEffect(
     () => saveDraft(canonicalSpaceId, draftSubject, "new-title", title),
@@ -164,8 +204,47 @@ export function NewIssue({
             </span>
             <span className="text-mute">›</span>
             <Dialog.Title className="text-dim text-sm">New issue</Dialog.Title>
+            <DropdownMenu.Root open={templateMenu} onOpenChange={setTemplateMenu}>
+              <DropdownMenu.Trigger asChild>
+                <IconButton label="Templates" className="ml-auto">
+                  <LayoutTemplate className="size-4" />
+                </IconButton>
+              </DropdownMenu.Trigger>
+              <DropdownMenu.Portal>
+                <MenuContent align="end" className="w-56">
+                  <DropdownMenu.Label className="text-mute px-2 py-1 text-2xs font-semibold uppercase">
+                    Templates
+                  </DropdownMenu.Label>
+                  {templates.length === 0 && (
+                    <p className="text-mute px-2 py-1 text-xs">None yet — fill the fields, then save.</p>
+                  )}
+                  {templates.map((t) => (
+                    <div key={t.id} className="hover:bg-hover flex items-center rounded">
+                      <button
+                        onClick={() => applyTemplate(t)}
+                        className="min-w-0 flex-1 truncate px-2 py-1.5 text-left text-sm"
+                      >
+                        {t.name}
+                      </button>
+                      <IconButton
+                        label={`Delete template ${t.name}`}
+                        className="mr-0.5"
+                        onClick={() => setTemplates(removeTemplate(canonicalSpaceId, t.id))}
+                      >
+                        <Trash2 className="size-3.5" />
+                      </IconButton>
+                    </div>
+                  ))}
+                  <DropdownMenu.Separator className="bg-line my-1 h-px" />
+                  <MenuItem onSelect={() => void saveAsTemplate()} disabled={!title.trim()}>
+                    <LayoutTemplate className="size-3.5" />
+                    Save current as template…
+                  </MenuItem>
+                </MenuContent>
+              </DropdownMenu.Portal>
+            </DropdownMenu.Root>
             <Dialog.Close asChild>
-              <IconButton label="Close" chord="Esc" className="ml-auto">
+              <IconButton label="Close" chord="Esc">
                 <X className="size-4" />
               </IconButton>
             </Dialog.Close>

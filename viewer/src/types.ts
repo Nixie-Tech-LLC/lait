@@ -58,6 +58,8 @@ export interface ProjectDto {
   /** Planned window, unix seconds. */
   start_date?: number | null;
   target_date?: number | null;
+  /** Soft-hidden from pickers and all-project lists (still openable directly). */
+  archived?: boolean;
 }
 
 export interface LabelDto {
@@ -480,6 +482,8 @@ export type Request =
       lead?: string | null;
       start?: string | null;
       target?: string | null;
+      /** Soft-hide toggle: true archives, false restores, absent leaves it. */
+      archived?: boolean | null;
     }
   | { cmd: "label_new"; name: string; color?: string | null }
   | { cmd: "label_list" }

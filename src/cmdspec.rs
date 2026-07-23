@@ -1023,6 +1023,8 @@ pub fn specs() -> Vec<Spec> {
                         A::val("lead", "Lead actor key (or `none` to clear)."),
                         A::val("start", "Start date YYYY-MM-DD (or `none`)."),
                         A::val("target", "Target date YYYY-MM-DD (or `none`)."),
+                        A::flag("archive", "Soft-hide this project from pickers and all-project lists."),
+                        A::flag("unarchive", "Restore a previously archived project."),
                     ],
                     |m| {
                         Ok(Request::ProjectEdit {
@@ -1033,6 +1035,13 @@ pub fn specs() -> Vec<Spec> {
                             lead: opt_str(m, "lead"),
                             start: opt_str(m, "start"),
                             target: opt_str(m, "target"),
+                            archived: if flag(m, "archive") {
+                                Some(true)
+                            } else if flag(m, "unarchive") {
+                                Some(false)
+                            } else {
+                                None
+                            },
                         })
                     },
                 ),

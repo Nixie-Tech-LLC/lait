@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ArrowLeft, ArrowRight } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowLeft, ArrowRight } from "lucide-react";
 
 import { rpc } from "../api";
 import type { MemberDto, ProjectDto } from "../types";
@@ -47,7 +47,7 @@ export function ProjectOverview({
   onBack: () => void;
   onError: (message: string) => void;
 }) {
-  const edit = async (patch: Record<string, string | null>) => {
+  const edit = async (patch: Record<string, string | boolean | null>) => {
     try {
       await rpc(spaceId, { cmd: "project_edit", project: project.key, ...patch });
     } catch (e) {
@@ -65,7 +65,29 @@ export function ProjectOverview({
           <ArrowLeft className="size-4" />
         </IconButton>
         <span className="text-mute font-mono text-xs">{project.key}</span>
-        <Button className="ml-auto" onClick={onOpenIssues}>
+        {project.archived && (
+          <span className="border-line text-mute rounded-full border px-2 py-px text-2xs">
+            Archived
+          </span>
+        )}
+        {!readOnly && (
+          <Button
+            variant="outline"
+            className="ml-auto"
+            onClick={() => void edit({ archived: !project.archived })}
+          >
+            {project.archived ? (
+              <>
+                <ArchiveRestore className="size-3.5" /> Restore
+              </>
+            ) : (
+              <>
+                <Archive className="size-3.5" /> Archive
+              </>
+            )}
+          </Button>
+        )}
+        <Button className={readOnly ? "ml-auto" : ""} onClick={onOpenIssues}>
           Open issues
           <ArrowRight className="size-3" />
         </Button>
