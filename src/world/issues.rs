@@ -1549,6 +1549,38 @@ impl World for IssuesWorld {
                 ));
                 Ok(staging.into_effect(None))
             }
+            IssueIntent::ProjectUpdatePost {
+                project_id,
+                id,
+                author,
+                body,
+                health,
+                device: _,
+                ts,
+            } => {
+                staging.require(contract::demand_space_any("project.configure"));
+                if !catalog.projects.contains_key(&project_id) {
+                    return Err(WorldError::InvalidRequest);
+                }
+                let body = body.trim();
+                if body.is_empty() {
+                    return Err(WorldError::InvalidRequest);
+                }
+                let update = crate::world::views::ProjectUpdate {
+                    id: id.clone(),
+                    project_id: project_id.clone(),
+                    author,
+                    ts,
+                    body: body.to_string(),
+                    health,
+                };
+                staging.catalog(map_set(
+                    "project_updates",
+                    format!("{project_id}/{id}"),
+                    serde_json::to_vec(&update).expect("project update json"),
+                ));
+                Ok(staging.into_effect(None))
+            }
             IssueIntent::LabelEdit {
                 id,
                 name,
@@ -2041,6 +2073,27 @@ impl World for IssuesWorld {
                 projects.sort_by(|a, b| a.key.cmp(&b.key));
                 Ok(projection(
                     serde_json::to_vec(&projects).expect("projects json"),
+                ))
+            }
+            IssueQuery::ProjectUpdates { project } => {
+                let mut updates: Vec<crate::dto::ProjectUpdateDto> = catalog
+                    .project_updates
+                    .get(&project)
+                    .into_iter()
+                    .flatten()
+                    .map(|u| crate::dto::ProjectUpdateDto {
+                        id: u.id.clone(),
+                        author: u.author.clone(),
+                        ts: u.ts,
+                        body: u.body.clone(),
+                        health: u.health.clone(),
+                    })
+                    .collect();
+                // Newest first; ids are ULIDs so id order is time order, a stable
+                // tiebreak when two updates share a second.
+                updates.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| b.id.cmp(&a.id)));
+                Ok(projection(
+                    serde_json::to_vec(&updates).expect("project updates json"),
                 ))
             }
             IssueQuery::Labels => {

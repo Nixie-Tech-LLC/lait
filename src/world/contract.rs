@@ -510,6 +510,18 @@ pub enum IssueIntent {
         device: String,
         ts: u64,
     },
+    /// Append an immutable status update to a project's feed (SCOPE-1). A
+    /// grow-only `project_updates` log entry keyed `<project>/<id>`;
+    /// `project.configure`-gated like the other project mutations.
+    ProjectUpdatePost {
+        project_id: String,
+        id: String,
+        author: String,
+        body: String,
+        health: String,
+        device: String,
+        ts: u64,
+    },
     /// Rename and/or recolor a label in place. Issues reference labels by id,
     /// so a rename re-points every use for free. `catalog.label.configure`-gated.
     LabelEdit {
@@ -661,6 +673,10 @@ pub enum IssueQuery {
         doc: String,
     },
     Projects,
+    /// A project's status-update feed, newest first (SCOPE-1).
+    ProjectUpdates {
+        project: String,
+    },
     Labels,
     /// Every role definition: built-ins plus custom heads (with conflict
     /// head lists).

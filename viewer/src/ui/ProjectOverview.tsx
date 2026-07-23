@@ -1,8 +1,8 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Archive, ArchiveRestore, ArrowLeft, ArrowRight } from "lucide-react";
 
 import { rpc } from "../api";
-import type { MemberDto, ProjectDto } from "../types";
+import type { MemberDto, ProjectDto, ProjectUpdateDto } from "../types";
 import { Avatar, memberName } from "./Avatar";
 import { catalogColor } from "./colors";
 import { ColorPicker } from "./ColorPicker";
@@ -11,7 +11,15 @@ import { Markdown } from "./Markdown";
 import { Combobox } from "./Picker";
 import { PropertyRow, SurfaceHeader } from "./layout";
 import { Button, IconButton, PopoverContent } from "./primitives";
+import { when } from "./time";
 import * as Popover from "@radix-ui/react-popover";
+
+/** The health signals a project update can carry — Linear's on-track palette. */
+const HEALTH: Record<string, { label: string; tone: string }> = {
+  on_track: { label: "On track", tone: "text-ok" },
+  at_risk: { label: "At risk", tone: "text-warn" },
+  off_track: { label: "Off track", tone: "text-danger" },
+};
 
 /** unix seconds -> YYYY-MM-DD (UTC), the wire format the engine + DatePicker share. */
 function toInput(secs: number | null | undefined): string | null {
@@ -139,6 +147,13 @@ export function ProjectOverview({
               value={project.description ?? ""}
               readOnly={readOnly}
               onSave={(description) => void edit({ description })}
+            />
+            <Updates
+              spaceId={spaceId}
+              projectKey={project.key}
+              members={members}
+              readOnly={readOnly}
+              onError={onError}
             />
           </div>
 
@@ -270,5 +285,129 @@ function Description({
       className="border-line focus:border-line-strong placeholder:text-mute w-full resize-y rounded border bg-transparent p-2 outline-none"
       aria-label="Project description"
     />
+  );
+}
+
+/**
+ * The project updates feed (SCOPE-1) — an append-only stream of status posts.
+ *
+ * Each update is an immutable record in the engine's grow-only `project_updates`
+ * log (a catalog map, not a per-project doc: an update is authored once, so a
+ * record is the honest shape and it needs no collaborative-text merge). This
+ * posts via `project_update_post` and reads via `project_updates`; the doorbell
+ * is not wired here, so it reloads after its own post.
+ */
+function Updates({
+  spaceId,
+  projectKey,
+  members,
+  readOnly,
+  onError,
+}: {
+  spaceId: string;
+  projectKey: string;
+  members: MemberDto[];
+  readOnly: boolean;
+  onError: (message: string) => void;
+}) {
+  const [updates, setUpdates] = useState<ProjectUpdateDto[] | null>(null);
+  const [draft, setDraft] = useState("");
+  const [health, setHealth] = useState("");
+  const [posting, setPosting] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const r = await rpc(spaceId, { cmd: "project_updates", project: projectKey });
+      if (r.kind === "updates") setUpdates(r.updates);
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    }
+  }, [spaceId, projectKey, onError]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const post = async () => {
+    const body = draft.trim();
+    if (!body) return;
+    setPosting(true);
+    try {
+      await rpc(spaceId, { cmd: "project_update_post", project: projectKey, body, health });
+      setDraft("");
+      setHealth("");
+      await load();
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPosting(false);
+    }
+  };
+
+  return (
+    <section className="mt-8">
+      <h2 className="text-mute mb-3 text-2xs font-semibold tracking-wider uppercase">Updates</h2>
+
+      {!readOnly && (
+        <div className="border-line mb-4 rounded border p-3">
+          <textarea
+            value={draft}
+            rows={2}
+            placeholder="Post a status update — what changed, what's next…"
+            onChange={(e) => setDraft(e.target.value)}
+            className="placeholder:text-mute w-full resize-y bg-transparent text-sm outline-none"
+            aria-label="New project update"
+          />
+          <div className="mt-2 flex items-center gap-2">
+            <Combobox
+              label="Health"
+              value={{ id: health, label: health ? (HEALTH[health]?.label ?? health) : "No health" }}
+              placeholder="Health"
+              options={[
+                { id: "", label: "No health" },
+                { id: "on_track", label: "On track" },
+                { id: "at_risk", label: "At risk" },
+                { id: "off_track", label: "Off track" },
+              ]}
+              onPick={setHealth}
+            />
+            <Button
+              variant="primary"
+              size="md"
+              className="ml-auto"
+              disabled={!draft.trim() || posting}
+              loading={posting}
+              onClick={() => void post()}
+            >
+              Post update
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {!updates && <p className="text-mute text-sm">Loading…</p>}
+      {updates && updates.length === 0 && (
+        <p className="text-mute text-sm">No updates yet.</p>
+      )}
+      <ol className="flex flex-col gap-4">
+        {updates?.map((u) => {
+          const author = members.find((m) => m.key === u.author);
+          const h = u.health ? HEALTH[u.health] : undefined;
+          return (
+            <li key={u.id} className="border-line border-l-2 pl-3">
+              <div className="mb-1 flex items-center gap-2 text-sm">
+                {author && <Avatar deviceKey={u.author} alias={author.alias} me={author.me} size="sm" />}
+                <span className="font-medium">{memberName(u.author, author)}</span>
+                {h && <span className={`text-2xs ${h.tone}`}>· {h.label}</span>}
+                <span className="text-mute ml-auto text-xs">{when(u.ts)}</span>
+              </div>
+              <div className="text-sm">
+                <Markdown text={u.body} />
+              </div>
+            </li>
+          );
+        })}
+      </ol>
+    </section>
   );
 }

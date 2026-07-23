@@ -303,6 +303,20 @@ pub enum Request {
         #[serde(default)]
         archived: Option<bool>,
     },
+    /// A project's status-update feed, newest first (SCOPE-1). Reply: `Updates`.
+    ProjectUpdates {
+        /// KEY or `prj_` id.
+        project: String,
+    },
+    /// Append an immutable status update to a project's feed (SCOPE-1).
+    ProjectUpdatePost {
+        /// KEY or `prj_` id.
+        project: String,
+        body: String,
+        /// `on_track` | `at_risk` | `off_track` | "" (none).
+        #[serde(default)]
+        health: Option<String>,
+    },
     LabelNew {
         name: String,
         #[serde(default)]
@@ -663,6 +677,8 @@ pub fn classify(req: &Request) -> RequestOwner {
         | Request::ProjectNew { .. }
         | Request::ProjectList
         | Request::ProjectEdit { .. }
+        | Request::ProjectUpdates { .. }
+        | Request::ProjectUpdatePost { .. }
         | Request::LabelNew { .. }
         | Request::LabelList
         | Request::LabelEdit { .. }
@@ -826,6 +842,12 @@ pub fn representative_requests() -> Vec<Request> {
             start: None,
             target: None,
             archived: None,
+        },
+        Request::ProjectUpdates { project: s() },
+        Request::ProjectUpdatePost {
+            project: s(),
+            body: s(),
+            health: None,
         },
         Request::LabelNew {
             name: s(),
@@ -1009,6 +1031,10 @@ pub enum Response {
     },
     Projects {
         projects: Vec<ProjectDto>,
+    },
+    /// A project's status-update feed (reply to [`Request::ProjectUpdates`]).
+    Updates {
+        updates: Vec<crate::dto::ProjectUpdateDto>,
     },
     Labels {
         labels: Vec<LabelDto>,

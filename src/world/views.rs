@@ -44,6 +44,26 @@ pub struct ProjectMeta {
     pub archived: bool,
 }
 
+/// One project status update — an immutable post in the project's updates feed
+/// (SCOPE-1). Stored as a grow-only catalog log (`project_updates` keyed
+/// `<project>/<id>`), mirroring how workflow revisions and roles are logged
+/// rather than introducing a per-project collaborative Body: an update is
+/// authored once and never edited, so a record is the honest shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectUpdate {
+    pub id: String,
+    pub project_id: String,
+    /// The authoring actor key.
+    pub author: String,
+    /// Post time, unix seconds.
+    pub ts: u64,
+    pub body: String,
+    /// `on_track` | `at_risk` | `off_track` | "" (none). A self-reported health
+    /// signal, free of any derived-metric coupling.
+    #[serde(default)]
+    pub health: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LabelMeta {
     pub name: String,
@@ -75,6 +95,8 @@ pub struct CatalogState {
     pub roles: BTreeMap<String, StoredRoleRevision>,
     /// role id -> grow-only custom-role revision log.
     pub role_revisions: BTreeMap<String, Vec<StoredRoleRevision>>,
+    /// project id -> grow-only status-update log (SCOPE-1 updates feed).
+    pub project_updates: BTreeMap<String, Vec<ProjectUpdate>>,
 }
 
 /// A role revision as stored in the catalog `roles` map: hex revision id,
@@ -145,6 +167,19 @@ impl CatalogState {
                     .entry(project.to_string())
                     .or_default()
                     .push(rev);
+            }
+        }
+        for (key, raw) in map_str(view, "project_updates") {
+            // Key: `<project>/<update id>` — grow-only log entries.
+            let Some((project, _id)) = key.rsplit_once('/') else {
+                continue;
+            };
+            if let Ok(update) = serde_json::from_str::<ProjectUpdate>(&raw) {
+                state
+                    .project_updates
+                    .entry(project.to_string())
+                    .or_default()
+                    .push(update);
             }
         }
         for (id, raw) in map_str(view, "roles") {

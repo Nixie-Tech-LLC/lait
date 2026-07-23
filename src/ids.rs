@@ -38,9 +38,20 @@ mechanics::prefixed_id!(
     CommentId, "cmt_"
 );
 
+mechanics::prefixed_id!(
+    /// Project-update id — element identity in the Catalog's `project_updates`
+    /// grow-only log (keyed `<project>/<update>`). Sortable by mint time.
+    UpdateId, "upd_"
+);
+
 /// Mint a canonical (lowercase) comment id.
 pub fn mint_comment_id(clock: &dyn UlidSource) -> String {
     CommentId::mint(clock).as_str().to_ascii_lowercase()
+}
+
+/// Mint a canonical (lowercase) project-update id.
+pub fn mint_update_id(clock: &dyn UlidSource) -> String {
+    UpdateId::mint(clock).as_str().to_ascii_lowercase()
 }
 
 #[cfg(test)]

@@ -1046,6 +1046,32 @@ pub fn specs() -> Vec<Spec> {
                     },
                 ),
                 Spec::req("ls", "List projects.", vec![], |_| Ok(Request::ProjectList)),
+                Spec::req(
+                    "update",
+                    "Post a status update to a project's feed: `projects update ENG \"Shipped the API\" --health on_track`.",
+                    vec![
+                        A::pos("project", "Project KEY or prj_ id."),
+                        A::pos("body", "The update text."),
+                        A::val("health", "on_track | at_risk | off_track."),
+                    ],
+                    |m| {
+                        Ok(Request::ProjectUpdatePost {
+                            project: req_str(m, "project"),
+                            body: req_str(m, "body"),
+                            health: opt_str(m, "health"),
+                        })
+                    },
+                ),
+                Spec::req(
+                    "updates",
+                    "Show a project's status-update feed (newest first).",
+                    vec![A::pos("project", "Project KEY or prj_ id.")],
+                    |m| {
+                        Ok(Request::ProjectUpdates {
+                            project: req_str(m, "project"),
+                        })
+                    },
+                ),
             ],
             ..Spec::req("projects", "Manage the project registry.", vec![], |_| {
                 Ok(Request::ProjectList)

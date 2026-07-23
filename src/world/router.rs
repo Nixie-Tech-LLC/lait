@@ -322,6 +322,8 @@ impl<'a> IssueRouter<'a> {
                 | Request::ProjectNew { .. }
                 | Request::ProjectList
                 | Request::ProjectEdit { .. }
+                | Request::ProjectUpdates { .. }
+                | Request::ProjectUpdatePost { .. }
                 | Request::LabelNew { .. }
                 | Request::LabelList
                 | Request::LabelEdit { .. }
@@ -758,6 +760,35 @@ impl<'a> IssueRouter<'a> {
                     start_date: parse_date(start)?,
                     target_date: parse_date(target)?,
                     archived,
+                    device: facts.device.clone(),
+                    ts: facts.now,
+                })
+                .map_err(Self::effect_err)?;
+                Ok((Response::Ref { reff: project }, true))
+            }
+            Request::ProjectUpdates { project } => {
+                let id = snapshot.resolve_project(&project).ok_or_else(|| {
+                    Response::not_found(format!("no project matches {project:?}"))
+                })?;
+                let updates: Vec<crate::dto::ProjectUpdateDto> = self
+                    .query(&IssueQuery::ProjectUpdates { project: id })
+                    .map_err(Self::effect_err)?;
+                Ok((Response::Updates { updates }, false))
+            }
+            Request::ProjectUpdatePost {
+                project,
+                body,
+                health,
+            } => {
+                let id = snapshot.resolve_project(&project).ok_or_else(|| {
+                    Response::not_found(format!("no project matches {project:?}"))
+                })?;
+                self.submit(&IssueIntent::ProjectUpdatePost {
+                    project_id: id,
+                    id: crate::ids::mint_update_id(self.clock),
+                    author: facts.actor.clone(),
+                    body,
+                    health: health.unwrap_or_default(),
                     device: facts.device.clone(),
                     ts: facts.now,
                 })

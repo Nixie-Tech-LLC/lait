@@ -325,6 +325,20 @@ pub struct ProjectDto {
     pub archived: bool,
 }
 
+/// One project status update, projected for the updates feed (SCOPE-1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectUpdateDto {
+    pub id: String,
+    /// The authoring actor key.
+    pub author: String,
+    /// Post time, unix seconds.
+    pub ts: u64,
+    pub body: String,
+    /// `on_track` | `at_risk` | `off_track` | "" (none).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub health: String,
+}
+
 /// A label registry entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LabelDto {

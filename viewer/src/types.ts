@@ -281,6 +281,18 @@ export interface AssignmentDto {
   resource: string[];
 }
 
+/** One project status update — `dto.rs` `ProjectUpdateDto` (SCOPE-1). */
+export interface ProjectUpdateDto {
+  id: string;
+  /** Authoring actor key. */
+  author: string;
+  /** Post time, unix seconds. */
+  ts: number;
+  body: string;
+  /** `on_track` | `at_risk` | `off_track` | "" (none). */
+  health?: string;
+}
+
 /** A pinned seed ("remote") — a bootstrap + backfill anchor, never trust. */
 export interface SeedDto {
   id: string;
@@ -485,6 +497,9 @@ export type Request =
       /** Soft-hide toggle: true archives, false restores, absent leaves it. */
       archived?: boolean | null;
     }
+  /** Reply is `updates` — the project's status feed, newest first. */
+  | { cmd: "project_updates"; project: string }
+  | { cmd: "project_update_post"; project: string; body: string; health?: string | null }
   | { cmd: "label_new"; name: string; color?: string | null }
   | { cmd: "label_list" }
   | { cmd: "label_edit"; label: string; name?: string | null; color?: string | null }
@@ -539,6 +554,7 @@ export type Response =
   | { kind: "activity"; events: ActivityEvent[]; last: number }
   | { kind: "inbox"; entries: InboxEntry[]; unread: number }
   | { kind: "projects"; projects: ProjectDto[] }
+  | { kind: "updates"; updates: ProjectUpdateDto[] }
   | { kind: "labels"; labels: LabelDto[] }
   | { kind: "members"; members: MemberDto[] }
   | { kind: "assignments"; rows: AssignmentDto[] }

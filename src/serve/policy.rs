@@ -42,6 +42,7 @@ pub fn is_read(req: &Request) -> bool {
         | Request::RoleList
         | Request::RoleShow { .. }
         | Request::AccessList { .. }
+        | Request::ProjectUpdates { .. }
         | Request::WorkflowShow { .. }
         | Request::WorkflowValidate { .. }
         | Request::Hello { .. } => true,
@@ -69,6 +70,7 @@ pub fn is_read(req: &Request) -> bool {
         // …the registries…
         | Request::ProjectNew { .. }
         | Request::ProjectEdit { .. }
+        | Request::ProjectUpdatePost { .. }
         | Request::LabelNew { .. }
         | Request::LabelEdit { .. }
         | Request::LabelDelete { .. }

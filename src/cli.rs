@@ -1317,6 +1317,21 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
             }
             0
         }
+        Response::Updates { updates } => {
+            if updates.is_empty() {
+                println!("(no updates yet — post one: `lait projects update KEY \"…\"`)");
+            }
+            for u in updates {
+                let health = if u.health.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", u.health.replace('_', " "))
+                };
+                println!("{}{health}  {}", u.ts, u.body);
+                let _ = &u.author;
+            }
+            0
+        }
         Response::Labels { labels } => {
             if labels.is_empty() {
                 println!("(no labels)");
