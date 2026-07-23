@@ -589,6 +589,7 @@ export function App() {
       try {
         await send();
         setMutationNotice(`${field} saved on this device`);
+        return true;
       } catch (e) {
         overlay.current.clearDoc(doc);
         setPredicted((n) => n + 1);
@@ -596,6 +597,7 @@ export function App() {
         if (!(e instanceof ConfirmRequired)) {
           setError(e instanceof LaitError ? e.message : String(e));
         }
+        return false;
       }
     },
     [],

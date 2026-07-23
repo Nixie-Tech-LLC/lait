@@ -1,6 +1,6 @@
 const PREFIX = "lait.draft";
 
-export type DraftKind = "new-title" | "new-body" | "description" | "comment";
+export type DraftKind = "new-title" | "new-body" | "title" | "description" | "comment";
 
 export function loadDraft(spaceId: string, subject: string, kind: DraftKind): string {
   try {

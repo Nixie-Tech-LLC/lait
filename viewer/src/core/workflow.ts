@@ -52,6 +52,15 @@ export function primaryWorkAction(category: StatusCategory): PrimaryWorkAction {
   return { action: "start", label: "Start", pendingLabel: "Starting…" };
 }
 
+/** The lifecycle verb that restores the state category a promoted action left. */
+export function inverseWorkAction(
+  action: keyof typeof WORK_CATEGORY,
+  previousCategory: StatusCategory,
+): keyof typeof WORK_CATEGORY {
+  if (action === "done" || action === "stop") return "start";
+  return previousCategory === "done" ? "done" : "stop";
+}
+
 /**
  * The status a work verb will land on, or `null` if this workflow has no state in
  * that category — in which case the daemon refuses with "this space's workflow has

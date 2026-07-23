@@ -77,7 +77,7 @@ export interface AppApi {
   select(reff: string | null): void;
   /** Show `value` for `(doc, field)` now, send the write, and let the doorbell
    *  retire the guess. See core/overlay.ts. */
-  predict(doc: string, field: Field, value: string, send: () => Promise<unknown>): Promise<void>;
+  predict(doc: string, field: Field, value: string, send: () => Promise<unknown>): Promise<boolean>;
   createIssue(): void;
   deleteIssue(reff: string): void;
   pickSpace(id: string): void;

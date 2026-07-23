@@ -9,16 +9,20 @@ import {
   ChevronRight,
   CircleDot,
   Copy,
+  CopyPlus,
   CornerDownRight,
   GitMerge,
   Info,
+  Link2,
   Maximize2,
   MoreHorizontal,
   Minimize2,
+  MoveRight,
   Play,
   RotateCcw,
   Plus,
   Trash2,
+  UserPlus,
   X,
 } from "lucide-react";
 
@@ -27,7 +31,7 @@ import { clearDraft, loadDraft, saveDraft } from "../core/drafts";
 import { describeChanges, describeEvent, type NameResolver } from "../core/activity";
 import type { Field as PredictField } from "../core/overlay";
 import type { IssueField } from "../core/registry";
-import { primaryWorkAction, workTarget } from "../core/workflow";
+import { inverseWorkAction, primaryWorkAction, workTarget } from "../core/workflow";
 import {
   type GraphView,
   type LinkDto,
@@ -49,6 +53,7 @@ import { PriorityIcon, StatusIcon } from "./icons";
 import { Markdown } from "./Markdown";
 import { Combobox, type Option } from "./Picker";
 import { Button, IconButton } from "./primitives";
+import * as ask from "./dialogs";
 import { dueLabel, dueToInput, dueTone, short, when } from "./time";
 
 /**
@@ -105,7 +110,7 @@ export function IssueDetail({
   onError: (m: string) => void;
   onDelete: (reff: string) => void;
   /** Predict `(doc, field)` locally, then send. The doorbell retires the guess. */
-  onPredict: (doc: string, field: PredictField, value: string, send: () => Promise<unknown>) => Promise<void>;
+  onPredict: (doc: string, field: PredictField, value: string, send: () => Promise<unknown>) => Promise<boolean>;
   /** Select another issue — following a graph edge (parent, sub-issue, blocker). */
   onNavigate: (reff: string) => void;
   onClose: () => void;
@@ -119,15 +124,34 @@ export function IssueDetail({
   const [issue, setIssue] = useState<IssueView | null>(null);
   const [events, setEvents] = useState<ActivityEvent[]>([]);
   const [graph, setGraph] = useState<GraphView | null>(null);
-  const [draft, setDraft] = useState("");
+  const [draft, setDraft] = useState(() => loadDraft(canonicalSpaceId, reff, "title"));
   const [comment, setComment] = useState(() => loadDraft(canonicalSpaceId, reff, "comment"));
+  const [commentPending, setCommentPending] = useState(false);
+  const [commentError, setCommentError] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [undoWork, setUndoWork] = useState<{
+    message: string;
+    action: "start" | "done" | "stop";
+  } | null>(null);
   const titleRef = useRef<HTMLTextAreaElement>(null);
+  const commentRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(
     () => saveDraft(canonicalSpaceId, reff, "comment", comment),
     [canonicalSpaceId, reff, comment],
   );
+
+  useEffect(() => {
+    if (!issue) return;
+    if (draft !== issue.title) saveDraft(canonicalSpaceId, reff, "title", draft);
+    else clearDraft(canonicalSpaceId, reff, "title");
+  }, [canonicalSpaceId, reff, draft, issue]);
+
+  useEffect(() => {
+    if (!undoWork) return;
+    const timeout = window.setTimeout(() => setUndoWork(null), 6000);
+    return () => window.clearTimeout(timeout);
+  }, [undoWork]);
 
   useEffect(() => {
     let alive = true;
@@ -146,7 +170,7 @@ export function IssueDetail({
         if (!alive) return;
         if (view.kind === "issue") {
           setIssue(view);
-          setDraft(view.title);
+          setDraft((current) => current || view.title);
         }
         setEvents(hist?.kind === "activity" ? hist.events : []);
         setGraph(gr?.kind === "graph" ? gr : null);
@@ -197,17 +221,31 @@ export function IssueDetail({
   const locked = readOnly || issue.provisional;
   const lifecycle = primaryWorkAction(state?.category ?? "backlog");
 
-  const runWorkAction = async (action: "start" | "done" | "stop") => {
+  const runWorkAction = async (
+    action: "start" | "done" | "stop",
+    recordUndo = true,
+  ) => {
     if (pendingAction) return;
     const target = workTarget(states, action);
+    const previousCategory = state?.category ?? "backlog";
     setPendingAction(action);
     try {
-      if (target) {
-        await onPredict(issue.doc_id, "status", target.id, () =>
+      const accepted = target
+        ? await onPredict(issue.doc_id, "status", target.id, () =>
           rpc(spaceId, { cmd: `issue_${action}`, reff }),
-        );
-      } else {
-        await rpc(spaceId, { cmd: `issue_${action}`, reff });
+        )
+        : await rpc(spaceId, { cmd: `issue_${action}`, reff }).then(() => true);
+      if (!accepted) return;
+      if (recordUndo) {
+        setUndoWork({
+          message:
+            action === "done"
+              ? "Issue completed"
+              : action === "stop"
+                ? "Work stopped"
+                : "Work started",
+          action: inverseWorkAction(action, previousCategory),
+        });
       }
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e));
@@ -218,8 +256,56 @@ export function IssueDetail({
 
   const saveTitle = () => {
     const next = draft.trim();
-    if (!next || next === issue.title) return setDraft(issue.title);
-    void edit({ title: next });
+    if (!next || next === issue.title) {
+      setDraft(issue.title);
+      clearDraft(canonicalSpaceId, reff, "title");
+      return;
+    }
+    void onPredict(issue.doc_id, "title", next, () =>
+      rpc(spaceId, { cmd: "issue_edit", reff, title: next }),
+    ).then((accepted) => {
+      if (accepted) clearDraft(canonicalSpaceId, reff, "title");
+    });
+  };
+
+  const submitComment = async () => {
+    const body = comment.trim();
+    if (!body || commentPending) return;
+    setCommentPending(true);
+    setCommentError(null);
+    try {
+      await rpc(spaceId, { cmd: "comment", reff, body });
+      setComment("");
+      clearDraft(canonicalSpaceId, reff, "comment");
+      commentRef.current?.focus();
+    } catch (error) {
+      setCommentError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setCommentPending(false);
+    }
+  };
+
+  const duplicateIssue = async () => {
+    if (pendingAction) return;
+    setPendingAction("duplicate");
+    try {
+      const result = await rpc(spaceId, {
+        cmd: "issue_new",
+        title: `${issue.title} (copy)`,
+        project: issue.project_id,
+        body: issue.description || null,
+        priority: issue.priority,
+        labels: issue.label_names,
+        assignees: issue.assignees,
+        due: issue.due_date != null ? dueToInput(issue.due_date) : null,
+        estimate: issue.estimate ?? null,
+      });
+      if (result.kind === "ref") onNavigate(result.reff);
+    } catch (error) {
+      onError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setPendingAction(null);
+    }
   };
 
   const pickerOpen = (f: IssueField) => openField === f;
@@ -280,6 +366,10 @@ export function IssueDetail({
             locked={locked}
             tombstone={tombstone}
             pending={pendingAction !== null}
+            onDuplicate={() => void duplicateIssue()}
+            onRelate={() => document.getElementById("issue-add-relation")?.click()}
+            onAssign={() => onOpenField("assignee")}
+            onMove={() => onOpenField("project")}
             onStop={() => void runWorkAction("stop")}
             onRestore={() => void send(() => rpc(spaceId, { cmd: "issue_restore", reff: issue.reff }))}
             onDelete={() => onDelete(issue.reff)}
@@ -291,6 +381,24 @@ export function IssueDetail({
       </header>
 
       <div className="issue-detail-body flex flex-col gap-4 p-4">
+        {undoWork && (
+          <div
+            className="border-line bg-raised text-dim flex items-center gap-3 rounded border px-3 py-2 text-sm shadow-sm"
+            role="status"
+          >
+            <span className="min-w-0 flex-1">{undoWork.message}</span>
+            <Button
+              variant="ghost"
+              onClick={() => {
+                const action = undoWork.action;
+                setUndoWork(null);
+                void runWorkAction(action, false);
+              }}
+            >
+              Undo
+            </Button>
+          </div>
+        )}
         {issue.provisional && (
           <div className="border-warn/30 bg-warn/5 text-dim flex gap-2 rounded border p-3 text-sm">
             <Info className="text-warn mt-0.5 size-3.5 shrink-0" />
@@ -330,6 +438,7 @@ export function IssueDetail({
             }
             if (e.key === "Escape") {
               setDraft(issue.title);
+              clearDraft(canonicalSpaceId, reff, "title");
               titleRef.current?.blur();
             }
           }}
@@ -602,27 +711,47 @@ export function IssueDetail({
         />
 
         {!locked && (
-          <textarea
-            value={comment}
-            placeholder="Leave a comment…  (⌘/Ctrl + Enter)"
-            onChange={(e) => setComment(e.target.value)}
-            onKeyDown={(e) => {
-              // The one chord that survives the typing guard, and the one people
-              // expect: submit without reaching for the mouse.
-              if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && comment.trim()) {
-                e.preventDefault();
-                const body = comment.trim();
-                setComment("");
-                clearDraft(canonicalSpaceId, reff, "comment");
-                void rpc(spaceId, { cmd: "comment", reff, body }).catch((err) =>
-                  onError(err instanceof Error ? err.message : String(err)),
-                );
-              }
-            }}
-            rows={2}
-            className="border-line focus-within:border-line-strong placeholder:text-mute resize-y rounded border bg-transparent p-2 outline-none"
-            aria-label="New comment"
-          />
+          <div className="border-line focus-within:border-line-strong rounded border bg-transparent">
+            <textarea
+              ref={commentRef}
+              value={comment}
+              placeholder="Leave a comment…"
+              onChange={(e) => setComment(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && comment.trim()) {
+                  e.preventDefault();
+                  void submitComment();
+                }
+              }}
+              rows={3}
+              className="placeholder:text-mute block w-full resize-y bg-transparent p-2 outline-none"
+              aria-label="New comment"
+              aria-describedby={commentError ? "comment-error" : undefined}
+            />
+            <div className="border-line flex items-center gap-2 border-t px-2 py-1.5">
+              {commentError ? (
+                <span
+                  id="comment-error"
+                  className="text-danger min-w-0 flex-1 truncate text-xs"
+                  role="alert"
+                >
+                  Comment not sent. Your draft is safe.
+                </span>
+              ) : (
+                <span className="text-mute min-w-0 flex-1 text-xs">
+                  Ctrl/⌘ Enter to send
+                </span>
+              )}
+              <Button
+                variant="primary"
+                disabled={!comment.trim() || commentPending}
+                aria-busy={commentPending}
+                onClick={() => void submitComment()}
+              >
+                {commentPending ? "Sending…" : commentError ? "Retry" : "Comment"}
+              </Button>
+            </div>
+          </div>
         )}
 
         <footer className="text-mute border-line mt-2 border-t pt-3 text-xs">
@@ -634,12 +763,29 @@ export function IssueDetail({
   );
 }
 
-function IssueOverflow({ issueRef, active, locked, tombstone, pending, onStop, onRestore, onDelete }: {
+function IssueOverflow({
+  issueRef,
+  active,
+  locked,
+  tombstone,
+  pending,
+  onDuplicate,
+  onRelate,
+  onAssign,
+  onMove,
+  onStop,
+  onRestore,
+  onDelete,
+}: {
   issueRef: string;
   active: boolean;
   locked: boolean;
   tombstone: boolean;
   pending: boolean;
+  onDuplicate: () => void;
+  onRelate: () => void;
+  onAssign: () => void;
+  onMove: () => void;
   onStop: () => void;
   onRestore: () => void;
   onDelete: () => void;
@@ -652,6 +798,14 @@ function IssueOverflow({ issueRef, active, locked, tombstone, pending, onStop, o
       <DropdownMenu.Portal>
         <DropdownMenu.Content align="end" sideOffset={4} className="ui-surface border-line-strong bg-raised shadow-overlay z-50 min-w-52 rounded-lg border p-1 text-sm">
           <MenuItem onSelect={() => void navigator.clipboard.writeText(issueRef)}><Copy className="size-3.5" /> Copy reference</MenuItem>
+          {!locked && !tombstone && (
+            <>
+              <MenuItem disabled={pending} onSelect={onDuplicate}><CopyPlus className="size-3.5" /> Duplicate issue</MenuItem>
+              <MenuItem disabled={pending} onSelect={onRelate}><Link2 className="size-3.5" /> Add relation</MenuItem>
+              <MenuItem disabled={pending} onSelect={onAssign}><UserPlus className="size-3.5" /> Assign issue</MenuItem>
+              <MenuItem disabled={pending} onSelect={onMove}><MoveRight className="size-3.5" /> Move to project</MenuItem>
+            </>
+          )}
           {active && !locked && <MenuItem disabled={pending} onSelect={onStop}><CircleDot className="size-3.5" /> Stop work</MenuItem>}
           {!locked && <DropdownMenu.Separator className="bg-line my-1 h-px" />}
           {!locked && (tombstone
@@ -831,8 +985,20 @@ function Relations({
     });
   };
 
+  const confirmRemove = (body: string, remove: () => Promise<unknown>) =>
+    void ask
+      .confirm({
+        title: "Remove relationship?",
+        body,
+        confirmText: "Remove",
+        danger: true,
+      })
+      .then((confirmed) => {
+        if (confirmed) return send(remove);
+      });
+
   const unlink = (l: LinkDto) =>
-    void send(() =>
+    confirmRemove(`Remove the ${l.kind} relationship with ${l.row.key_alias ?? l.row.reff}?`, () =>
       // `direction` says which end this issue is; the unlink must name the same
       // ordered pair the link did or `blocks`/`duplicates` would miss the edge.
       l.direction === "out"
@@ -877,7 +1043,9 @@ function Relations({
             {...(removable
               ? {
                   onRemove: () =>
-                    void send(() => rpc(spaceId, { cmd: "issue_parent", reff, parent: null })),
+                    confirmRemove("Detach this issue from its parent?", () =>
+                      rpc(spaceId, { cmd: "issue_parent", reff, parent: null }),
+                    ),
                 }
               : {})}
           />
@@ -896,7 +1064,7 @@ function Relations({
               {...(removable
                 ? {
                     onRemove: () =>
-                      void send(() =>
+                      confirmRemove(`Detach ${r.key_alias ?? r.reff} from this issue?`, () =>
                         rpc(spaceId, { cmd: "issue_parent", reff: r.reff, parent: null }),
                       ),
                   }
@@ -988,7 +1156,7 @@ function Relations({
           </div>
         ) : (
           <div className="flex items-center gap-1">
-            <Button onClick={() => setAdding(true)} className="w-fit">
+            <Button id="issue-add-relation" onClick={() => setAdding(true)} className="w-fit">
               <Plus className="size-3" />
               Add relation
             </Button>
