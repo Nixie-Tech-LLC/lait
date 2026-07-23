@@ -122,7 +122,8 @@ export function App() {
   const [filterOpen, setFilterOpen] = useState(false);
   const [focusToken, setFocusToken] = useState(0);
   /** Group / order / show-deleted. Loaded once; every change is persisted. */
-  const [display, setDisplay] = useState<DisplayState>(loadDisplay);
+  const initialDisplayScope = `${initialRoute.spaceId ?? "none"}/${initialRoute.project ?? "all"}/${initialRoute.view}`;
+  const [display, setDisplay] = useState<DisplayState>(() => loadDisplay(initialDisplayScope));
   const [displayOpen, setDisplayOpen] = useState(false);
   const [mobileNav, setMobileNav] = useState(false);
   const [personalNavRevision, setPersonalNavRevision] = useState(0);
@@ -246,10 +247,19 @@ export function App() {
     () => routeSpace && project ? loadSavedViews(routeSpace, project) : [],
     [routeSpace, project, personalNavRevision],
   );
+  const displayScope = `${routeSpace ?? "none"}/${project ?? "all"}/${view}`;
+  const displayScopeRef = useRef(initialDisplayScope);
 
-  // Persisted like the sidebar width: an arrangement chosen once should hold.
   useEffect(() => {
-    saveDisplay(display);
+    if (displayScopeRef.current === displayScope) return;
+    displayScopeRef.current = displayScope;
+    setDisplay(loadDisplay(displayScope));
+  }, [displayScope]);
+
+  // Persisted per canonical project and surface: list grouping must not silently
+  // rewrite the board's display contract, or another space's preference.
+  useEffect(() => {
+    saveDisplay(display, displayScopeRef.current);
   }, [display]);
 
   const loadSpacesRaw = useCallback(async () => {

@@ -1,5 +1,6 @@
 const FAVORITES = "lait.favorite-projects";
 const RECENTS = "lait.issue-recents";
+const SEARCHES = "lait.recent-searches";
 
 export function loadFavoriteProjects(spaceId: string): string[] {
   return read(FAVORITES)[spaceId] ?? [];
@@ -24,6 +25,21 @@ export function rememberRecentIssue(spaceId: string, reff: string): void {
 
 export function loadRecentIssues(spaceId: string): string[] {
   return read(RECENTS)[spaceId] ?? [];
+}
+
+export function rememberRecentSearch(spaceId: string, query: string): void {
+  const normalized = query.trim().replace(/\s+/g, " ");
+  if (!normalized) return;
+  const all = read(SEARCHES);
+  all[spaceId] = [
+    normalized,
+    ...(all[spaceId] ?? []).filter((item) => item.toLowerCase() !== normalized.toLowerCase()),
+  ].slice(0, 6);
+  write(SEARCHES, all);
+}
+
+export function loadRecentSearches(spaceId: string): string[] {
+  return read(SEARCHES)[spaceId] ?? [];
 }
 
 function read(key: string): Record<string, string[]> {

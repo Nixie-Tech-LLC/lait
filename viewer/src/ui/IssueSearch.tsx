@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import { rpc } from "../api";
 import { cmdkFilter } from "../core/fuzzy";
-import { loadRecentIssues, rememberRecentIssue } from "../core/personalNav";
+import { loadRecentIssues, loadRecentSearches, rememberRecentIssue, rememberRecentSearch } from "../core/personalNav";
 import { indexBy } from "../core/performance";
 import type { ProjectDto, Row, WorkflowState } from "../types";
 import { catalogColor } from "./colors";
@@ -72,6 +72,7 @@ export function IssueSearch({
       return row ? [row] : [];
     });
   }, [spaceId, available]);
+  const recentSearches = useMemo(() => loadRecentSearches(spaceId), [spaceId]);
   const results = useMemo(() => {
     const text = query.trim();
     if (!text) return available;
@@ -105,6 +106,7 @@ export function IssueSearch({
   const choose = (reff: string) => {
     const row = availableByRef.get(reff);
     if (!row) return;
+    if (query.trim()) rememberRecentSearch(spaceId, query);
     rememberIssue(spaceId, reff);
     onClose();
     onOpen(row);
@@ -142,7 +144,22 @@ export function IssueSearch({
               {recents.map((row) => <IssueResult key={`recent-${row.reff}`} row={row} recent projectById={projectById} stateById={stateById} onOpen={choose} />)}
             </Command.Group>
           )}
-          <Command.Group heading={query.trim() ? `${results.length} results` : "All issues"} className="[&_[cmdk-group-heading]]:text-mute [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-2xs [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase">
+          {!query.trim() && recentSearches.length > 0 && (
+            <Command.Group heading="Recent searches" className="[&_[cmdk-group-heading]]:text-mute [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-2xs [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase">
+              {recentSearches.map((search) => (
+                <Command.Item
+                  key={search}
+                  value={`recent-search:${search}`}
+                  onSelect={() => setQuery(search)}
+                  className="data-[selected=true]:bg-hover flex cursor-default items-center gap-3 rounded px-2 py-1.5"
+                >
+                  <Clock3 className="text-mute size-3.5" />
+                  <span className="truncate">{search}</span>
+                </Command.Item>
+              ))}
+            </Command.Group>
+          )}
+          <Command.Group heading={query.trim() ? `${results.length} results · sorted by relevance` : "All issues"} className="[&_[cmdk-group-heading]]:text-mute [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-2xs [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase">
             {results.map((row) => <IssueResult key={row.reff} row={row} projectById={projectById} stateById={stateById} onOpen={choose} />)}
           </Command.Group>
         </Command.List>

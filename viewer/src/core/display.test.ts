@@ -65,4 +65,14 @@ describe("groupRows", () => {
     const byTitle = groupRows(board(rows), { ...DEFAULT_DISPLAY, group: "none", order: "title" });
     expect(byTitle[0]!.rows.map((r) => r.reff)).toEqual(["b", "c", "a"]);
   });
+
+  it("keeps display arrangements independent by view and project", async () => {
+    localStorage.clear();
+    const { loadDisplay, saveDisplay } = await import("./display");
+    saveDisplay({ group: "priority", order: "title", deleted: false });
+    expect(loadDisplay("missing")).toMatchObject({ group: "priority", order: "title" });
+    saveDisplay({ group: "none", order: "board", deleted: true }, "ws/PRJ/list");
+    expect(loadDisplay("ws/PRJ/list")).toEqual({ group: "none", order: "board", deleted: true });
+    expect(loadDisplay("ws/PRJ/board")).toMatchObject({ group: "priority", order: "title" });
+  });
 });

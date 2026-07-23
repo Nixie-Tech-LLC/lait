@@ -28,12 +28,16 @@ export interface DisplayState {
 export const DEFAULT_DISPLAY: DisplayState = { group: "status", order: "board", deleted: false };
 
 const STORAGE_KEY = "lait.display";
+const SCOPED_STORAGE_KEY = "lait.display.scoped";
 
 /** Persisted per browser, like the sidebar width: an arrangement you chose once
  *  should survive a reload. Unknown values fall back rather than throw. */
-export function loadDisplay(): DisplayState {
+export function loadDisplay(scope?: string): DisplayState {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const scoped = scope
+      ? (JSON.parse(localStorage.getItem(SCOPED_STORAGE_KEY) ?? "{}") as Record<string, DisplayState>)[scope]
+      : undefined;
+    const raw = scoped ? JSON.stringify(scoped) : localStorage.getItem(STORAGE_KEY);
     if (!raw) return DEFAULT_DISPLAY;
     const parsed = JSON.parse(raw) as Partial<DisplayState>;
     return {
@@ -52,9 +56,15 @@ export function loadDisplay(): DisplayState {
   }
 }
 
-export function saveDisplay(d: DisplayState): void {
+export function saveDisplay(d: DisplayState, scope?: string): void {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(d));
+    if (!scope) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(d));
+      return;
+    }
+    const all = JSON.parse(localStorage.getItem(SCOPED_STORAGE_KEY) ?? "{}") as Record<string, DisplayState>;
+    all[scope] = d;
+    localStorage.setItem(SCOPED_STORAGE_KEY, JSON.stringify(all));
   } catch {
     // Storage may be full or blocked; the arrangement still applies this session.
   }
