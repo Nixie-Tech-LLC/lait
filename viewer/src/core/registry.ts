@@ -28,7 +28,7 @@ import type { Field } from "./overlay";
 
 /** The root surfaces. These are also the stable view segments in the viewer URL;
  *  see `route.ts` for the canonical, machine-independent route contract. */
-export type View = "list" | "board" | "projects" | "inbox" | "activity" | "members";
+export type View = "list" | "board" | "projects" | "inbox" | "activity" | "members" | "settings";
 
 /**
  * A field a picker can be opened on.

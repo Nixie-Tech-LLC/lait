@@ -5,6 +5,7 @@ import {
   ChevronDown,
   CircleDot,
   Clock3,
+  Cog,
   Folder,
   Inbox,
   LayoutGrid,
@@ -162,6 +163,7 @@ export function Sidebar({
 
       <div className="border-line mt-2 flex flex-col gap-px border-t pt-2">
         <NavItem icon={<Users />} label="Members" active={view === "members"} onClick={() => onGo("members")} />
+        <NavItem icon={<Cog />} label="Settings" active={view === "settings"} onClick={() => onGo("settings")} />
         <NavItem icon={<Settings2 />} label="Governance" onClick={onOpenGovernance} />
       </div>
     </nav>

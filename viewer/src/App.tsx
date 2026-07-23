@@ -45,6 +45,7 @@ import { IssueSearch, rememberIssue } from "./ui/IssueSearch";
 import { Projects } from "./ui/Projects";
 import { SurfaceHeader } from "./ui/layout";
 import { Members } from "./ui/Members";
+import { Settings } from "./ui/Settings";
 import { IssueDetail } from "./ui/IssueDetail";
 import { IssueList } from "./ui/IssueList";
 import { RolesDialog, WorkflowDialog } from "./ui/Governance";
@@ -1337,6 +1338,16 @@ export function App() {
               spaceId={current}
               revision={revision}
               readOnly={readOnly}
+              onError={setError}
+            />
+          ) : view === "settings" ? (
+            <Settings
+              spaceId={current}
+              spaceName={space?.name ?? ""}
+              labels={labels}
+              projects={projects}
+              readOnly={readOnly}
+              revision={revision}
               onError={setError}
             />
           ) : view === "projects" ? (

@@ -467,6 +467,7 @@ export type Request =
   | { cmd: "invite_revoke"; invite: string }
   /** Reply is `text` — the revision as pretty JSON (same shape the CLI prints). */
   | { cmd: "workflow_show"; project: string }
+  | { cmd: "workflow_set"; project: string; expect_heads: string[]; body_json: string }
   /** Reply is `text` — every role definition as pretty JSON. */
   | { cmd: "role_list" }
   | { cmd: "join"; ticket: string }
