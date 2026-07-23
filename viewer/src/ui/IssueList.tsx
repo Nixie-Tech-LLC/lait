@@ -4,9 +4,10 @@ import { ChevronRight, Plus, Trash2 } from "lucide-react";
 import type { RowGroup } from "../core/display";
 import type { MemberDto, Row, WorkflowState } from "../types";
 import { Avatar, AvatarStack, memberName, stackFor } from "./Avatar";
+import { ApplicationState } from "./AppState";
 import { catalogColor } from "./colors";
 import { PriorityIcon, StatusIcon } from "./icons";
-import { IconButton, Kbd } from "./primitives";
+import { Button, IconButton } from "./primitives";
 import { dueLabel, dueTone } from "./time";
 
 /**
@@ -112,13 +113,13 @@ export function IssueList({
           </section>
         )}
         {total === 0 && deleted.length === 0 && (
-          <p className="text-mute p-8 text-center">
-            {filtered ? (
-              "No issues match the current filters. Clear or adjust them to see more."
-            ) : (
-              <>Nothing here yet. Press <Kbd>c</Kbd> to file the first issue.</>
-            )}
-          </p>
+          <ApplicationState
+            kind={filtered ? "filtered-empty" : "empty"}
+            title={filtered ? "No matching issues" : "No issues yet"}
+            body={filtered ? "Clear or adjust the current filters to see more." : "Create the first issue in this project."}
+            action={!filtered && !readOnly && states[0] ? <Button variant="primary" onClick={() => onCreate(states[0]!.id)}><Plus className="size-3.5" /> New issue</Button> : undefined}
+            className="min-h-60"
+          />
         )}
       </div>
     </div>

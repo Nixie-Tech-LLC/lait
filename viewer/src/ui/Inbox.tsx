@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
-import { AtSign, CheckCheck, Inbox as InboxIcon, LoaderCircle, MessageSquare, SignalHigh } from "lucide-react";
+import { AtSign, CheckCheck, Inbox as InboxIcon, MessageSquare, SignalHigh } from "lucide-react";
 
 import { rpc } from "../api";
 import type { InboxEntry } from "../types";
-import { EmptyState } from "./AppState";
+import { EmptyState, LoadingState } from "./AppState";
 import { short, when } from "./time";
 
 /**
@@ -66,8 +66,7 @@ export function Inbox({
 
   if (!entries) {
     return (
-      <EmptyState
-        icon={<LoaderCircle className="size-5 animate-spin" />}
+      <LoadingState
         title="Loading inbox"
         body="Reading notifications from this local replica."
       />

@@ -569,14 +569,14 @@ export function App() {
     async (doc: string, field: Field, value: string, send: () => Promise<unknown>) => {
       overlay.current.set(doc, field, value);
       setPredicted((n) => n + 1);
-      setMutationNotice(`Updating ${field} locally`);
+      setMutationNotice(`Saving ${field} on this device…`);
       try {
         await send();
-        setMutationNotice(`${field} saved locally`);
+        setMutationNotice(`${field} saved on this device`);
       } catch (e) {
         overlay.current.clearDoc(doc);
         setPredicted((n) => n + 1);
-        setMutationNotice(`${field} was refused; authoritative local value restored`);
+        setMutationNotice(`${field} was refused · local value restored`);
         if (!(e instanceof ConfirmRequired)) {
           setError(e instanceof LaitError ? e.message : String(e));
         }
@@ -960,6 +960,12 @@ export function App() {
     return () => window.clearInterval(t);
   }, [loadBoard]);
 
+  useEffect(() => {
+    if (!mutationNotice || mutationNotice.startsWith("Saving")) return;
+    const timeout = window.setTimeout(() => setMutationNotice(""), 3200);
+    return () => window.clearTimeout(timeout);
+  }, [mutationNotice]);
+
   const run = (id: string) => void registry.get(id)?.run(ctx);
 
   return (
@@ -1067,6 +1073,7 @@ export function App() {
                   statusInfo.membership !== "pending" &&
                   statusInfo.counts_unavailable !== true)
               }
+              latestChange={mutationNotice}
             />
 
             <IconButton label="Search issues" chord="Q" onClick={() => run("search.issues")}>
@@ -1222,7 +1229,7 @@ export function App() {
               filtered={isActive(filter)}
             />
           ) : (
-            <EmptyState title="This view is unavailable" body="The local projection could not be loaded." />
+            <EmptyState kind="unavailable" title="This view is unavailable" body="The local projection could not be loaded." />
           )}
         </div>
       </Panel>
@@ -1442,7 +1449,15 @@ export function App() {
           {pending.join(" ")} …
         </div>
       )}
-      <p className="sr-only" aria-live="polite">{mutationNotice}</p>
+      {mutationNotice && (
+        <div
+          className="ui-surface border-line-strong bg-raised text-dim shadow-overlay fixed right-4 bottom-4 z-40 rounded border px-3 py-1.5 text-sm"
+          role="status"
+          aria-live="polite"
+        >
+          {mutationNotice}
+        </div>
+      )}
       {toast && (
         <div className="border-line-strong bg-raised shadow-overlay fixed bottom-4 left-1/2 -translate-x-1/2 rounded border px-3 py-1.5 text-sm">
           {toast}

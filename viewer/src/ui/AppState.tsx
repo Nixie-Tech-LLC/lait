@@ -5,7 +5,9 @@ import {
   CloudOff,
   Database,
   HardDrive,
+  LoaderCircle,
   RefreshCw,
+  SearchX,
   ShieldCheck,
   Users,
 } from "lucide-react";
@@ -13,29 +15,66 @@ import {
 import type { SpaceRow, StatusInfo } from "../types";
 import { Button, cn } from "./primitives";
 
-export function EmptyState({
+export type ApplicationStateKind =
+  | "loading"
+  | "empty"
+  | "filtered-empty"
+  | "unavailable"
+  | "error"
+  | "retry"
+  | "progress"
+  | "success";
+
+export function ApplicationState({
+  kind,
   icon,
   title,
   body,
   action,
   className,
 }: {
+  kind: ApplicationStateKind;
   icon?: React.ReactNode;
   title: string;
-  body?: string;
+  body?: React.ReactNode;
   action?: React.ReactNode;
   className?: string;
 }) {
   return (
-    <div className={cn("flex flex-1 items-center justify-center p-8", className)}>
+    <div
+      className={cn("flex flex-1 items-center justify-center p-8", className)}
+      data-application-state={kind}
+      role={kind === "error" || kind === "retry" ? "alert" : "status"}
+      aria-live={kind === "loading" || kind === "progress" ? "polite" : undefined}
+      aria-busy={kind === "loading" || kind === "progress" ? true : undefined}
+    >
       <div className="flex max-w-sm flex-col items-center text-center">
-        {icon && <span className="text-mute mb-3">{icon}</span>}
+        <span className={cn("text-mute mb-3", (kind === "error" || kind === "retry") && "text-danger")}>
+          {icon ?? <StateIcon kind={kind} />}
+        </span>
         <h2 className="text-base font-semibold">{title}</h2>
         {body && <p className="text-dim mt-1 text-sm leading-5">{body}</p>}
         {action && <div className="mt-4">{action}</div>}
       </div>
     </div>
   );
+}
+
+export function EmptyState(props: Omit<React.ComponentProps<typeof ApplicationState>, "kind"> & { kind?: Extract<ApplicationStateKind, "empty" | "filtered-empty" | "unavailable"> }) {
+  const { kind = "empty", ...rest } = props;
+  return <ApplicationState kind={kind} {...rest} />;
+}
+
+export function LoadingState(props: Omit<React.ComponentProps<typeof ApplicationState>, "kind">) {
+  return <ApplicationState kind="loading" {...props} />;
+}
+
+function StateIcon({ kind }: { kind: ApplicationStateKind }) {
+  if (kind === "loading" || kind === "progress") return <LoaderCircle className="size-5 animate-spin" />;
+  if (kind === "filtered-empty") return <SearchX className="size-5" />;
+  if (kind === "error" || kind === "retry" || kind === "unavailable") return <AlertTriangle className="size-5" />;
+  if (kind === "success") return <CheckCircle2 className="text-ok size-5" />;
+  return <Database className="size-5" />;
 }
 
 export function InlineError({ message, onRetry }: { message: string; onRetry?: () => void }) {
@@ -64,15 +103,17 @@ export function TrustPopover({
   status,
   space,
   localReady,
+  latestChange,
 }: {
   liveness: "connecting" | "live" | "retrying";
   status: StatusInfo | null;
   space: SpaceRow | null;
   localReady: boolean;
+  latestChange?: string;
 }) {
-  const healthy = liveness === "live" && localReady;
   const peers = status?.online_peers ?? 0;
   const degraded = (status?.degraded_recovery?.length ?? 0) > 0;
+  const healthy = liveness === "live" && localReady && !degraded && status?.membership !== "pending";
   const agent = space?.identity.kind === "agent" ? space.identity.name : null;
 
   return (
@@ -86,13 +127,7 @@ export function TrustPopover({
       >
         <span className={cn("size-1.5 rounded-full", healthy ? "bg-ok" : "bg-warn animate-pulse")} />
         <span className="max-[1200px]:hidden">
-          {liveness !== "live"
-            ? liveness
-            : localReady
-              ? peers > 0
-                ? `${peers} ${peers === 1 ? "peer" : "peers"}`
-                : "Ready locally"
-              : "Loading local data"}
+          {trustSummary(liveness, localReady, peers, degraded)}
         </span>
       </Popover.Trigger>
       <Popover.Portal>
@@ -109,7 +144,7 @@ export function TrustPopover({
             </div>
           </div>
           <dl className="flex flex-col gap-2 text-sm">
-            <Fact icon={<HardDrive />} label="Local service" value={liveness === "live" ? "Connected" : liveness} ok={liveness === "live"} />
+            <Fact icon={<HardDrive />} label="Local service" value={livenessLabel(liveness)} ok={liveness === "live"} />
             <Fact icon={<Database />} label="Local data" value={localReady ? "Ready" : "Loading or unavailable"} ok={localReady} />
             <Fact
               icon={peers ? <Users /> : <CloudOff />}
@@ -117,6 +152,13 @@ export function TrustPopover({
               value={peers ? `${peers} connected` : "No peers connected"}
               ok={peers > 0}
               neutral={peers === 0}
+            />
+            <Fact
+              icon={<Database />}
+              label="Latest change"
+              value={latestChange || "No change pending"}
+              ok={!latestChange || latestChange.includes("saved on this device")}
+              neutral={!latestChange || latestChange.startsWith("Saving")}
             />
             <Fact
               icon={<ShieldCheck />}
@@ -130,6 +172,9 @@ export function TrustPopover({
               Ready locally. Changes will share when a peer connects.
             </p>
           )}
+          <p className="text-mute mt-3 text-xs leading-4">
+            “Saved on this device” means the local daemon accepted the change. Peer count shows reachability only; this build does not report per-change peer acknowledgement or convergence.
+          </p>
           <div className="border-line text-mute mt-3 border-t pt-2 text-xs">
             Acting as {agent ? <strong className="text-fg">agent {agent}</strong> : <strong className="text-fg">your local actor</strong>}
             {status?.membership ? ` · ${status.membership}` : ""}
@@ -139,6 +184,22 @@ export function TrustPopover({
       </Popover.Portal>
     </Popover.Root>
   );
+}
+
+export function trustSummary(
+  liveness: "connecting" | "live" | "retrying",
+  localReady: boolean,
+  peers: number,
+  degraded: boolean,
+): string {
+  if (degraded) return "Recovery needs attention";
+  if (liveness !== "live") return localReady ? "Offline · local data safe" : livenessLabel(liveness);
+  if (!localReady) return "Loading local data";
+  return peers > 0 ? `${peers} ${peers === 1 ? "peer" : "peers"}` : "Ready locally";
+}
+
+function livenessLabel(liveness: "connecting" | "live" | "retrying"): string {
+  return { connecting: "Connecting", live: "Connected", retrying: "Reconnecting" }[liveness];
 }
 
 function Fact({

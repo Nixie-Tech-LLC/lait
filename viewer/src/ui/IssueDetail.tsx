@@ -43,6 +43,7 @@ import {
   type WorkflowState,
 } from "../types";
 import { Avatar, AvatarStack, memberName as nameOf } from "./Avatar";
+import { LoadingState } from "./AppState";
 import { catalogColor } from "./colors";
 import { PriorityIcon, StatusIcon } from "./icons";
 import { Markdown } from "./Markdown";
@@ -188,7 +189,7 @@ export function IssueDetail({
   );
 
   if (!issue) {
-    return <aside className="border-line text-mute border-l p-4 text-sm">Loading…</aside>;
+    return <aside className="border-line flex h-full border-l"><LoadingState title="Loading issue" body="Reading the local issue document." /></aside>;
   }
 
   const state = states.find((s) => s.id === issue.status);

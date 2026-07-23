@@ -1,10 +1,10 @@
 import { useEffect, useState } from "react";
-import { Activity as ActivityIcon, AlertTriangle, LoaderCircle } from "lucide-react";
+import { Activity as ActivityIcon, AlertTriangle } from "lucide-react";
 
 import { rpc } from "../api";
 import { describeChanges, describeEvent, type NameResolver } from "../core/activity";
 import type { ActivityEvent, MemberDto } from "../types";
-import { EmptyState } from "./AppState";
+import { EmptyState, LoadingState } from "./AppState";
 import { memberName } from "./Avatar";
 import { when } from "./time";
 
@@ -60,8 +60,7 @@ export function Activity({
 
   if (!events) {
     return (
-      <EmptyState
-        icon={<LoaderCircle className="size-5 animate-spin" />}
+      <LoadingState
         title="Loading activity"
         body="Reading the local session history."
       />
