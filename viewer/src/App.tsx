@@ -1300,7 +1300,6 @@ export function App() {
             <Inbox
               spaceId={current}
               revision={revision}
-              onError={setError}
               onCountChange={setUnread}
               onOpen={(reff) => {
                 api.goto("list");
