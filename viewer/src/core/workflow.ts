@@ -35,6 +35,23 @@ export const WORK_CATEGORY = {
   stop: "backlog",
 } as const satisfies Record<string, StatusCategory>;
 
+export interface PrimaryWorkAction {
+  action: keyof typeof WORK_CATEGORY;
+  label: string;
+  pendingLabel: string;
+}
+
+/** The single lifecycle action promoted in issue chrome for the current state. */
+export function primaryWorkAction(category: StatusCategory): PrimaryWorkAction {
+  if (category === "active") {
+    return { action: "done", label: "Complete", pendingLabel: "Completing…" };
+  }
+  if (category === "done") {
+    return { action: "start", label: "Reopen", pendingLabel: "Reopening…" };
+  }
+  return { action: "start", label: "Start", pendingLabel: "Starting…" };
+}
+
 /**
  * The status a work verb will land on, or `null` if this workflow has no state in
  * that category — in which case the daemon refuses with "this space's workflow has

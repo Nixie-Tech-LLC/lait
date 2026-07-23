@@ -11,7 +11,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { WorkflowState } from "../types";
-import { firstStateIn, neighbourState, workTarget } from "./workflow";
+import { firstStateIn, neighbourState, primaryWorkAction, workTarget } from "./workflow";
 
 const s = (id: string, category: WorkflowState["category"]): WorkflowState => ({
   id,
@@ -29,6 +29,11 @@ const DEFAULT: WorkflowState[] = [
 ];
 
 describe("work verb targets", () => {
+  it("promotes one clear lifecycle action for every status category", () => {
+    expect(primaryWorkAction("backlog")).toMatchObject({ action: "start", label: "Start" });
+    expect(primaryWorkAction("active")).toMatchObject({ action: "done", label: "Complete" });
+    expect(primaryWorkAction("done")).toMatchObject({ action: "start", label: "Reopen" });
+  });
   it("resolves the default workflow the way the daemon does", () => {
     expect(workTarget(DEFAULT, "start")?.id).toBe("in_progress");
     expect(workTarget(DEFAULT, "done")?.id).toBe("done");

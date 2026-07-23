@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import {
   AlertTriangle,
   ArchiveRestore,
   Ban,
+  Check,
   ChevronLeft,
   ChevronRight,
   CircleDot,
@@ -11,7 +13,10 @@ import {
   GitMerge,
   Info,
   Maximize2,
+  MoreHorizontal,
   Minimize2,
+  Play,
+  RotateCcw,
   Plus,
   Trash2,
   X,
@@ -22,6 +27,7 @@ import { clearDraft, loadDraft, saveDraft } from "../core/drafts";
 import { describeChanges, describeEvent, type NameResolver } from "../core/activity";
 import type { Field as PredictField } from "../core/overlay";
 import type { IssueField } from "../core/registry";
+import { primaryWorkAction, workTarget } from "../core/workflow";
 import {
   type GraphView,
   type LinkDto,
@@ -98,7 +104,7 @@ export function IssueDetail({
   onError: (m: string) => void;
   onDelete: (reff: string) => void;
   /** Predict `(doc, field)` locally, then send. The doorbell retires the guess. */
-  onPredict: (doc: string, field: PredictField, value: string, send: () => Promise<unknown>) => void;
+  onPredict: (doc: string, field: PredictField, value: string, send: () => Promise<unknown>) => Promise<void>;
   /** Select another issue — following a graph edge (parent, sub-issue, blocker). */
   onNavigate: (reff: string) => void;
   onClose: () => void;
@@ -114,6 +120,7 @@ export function IssueDetail({
   const [graph, setGraph] = useState<GraphView | null>(null);
   const [draft, setDraft] = useState("");
   const [comment, setComment] = useState(() => loadDraft(canonicalSpaceId, reff, "comment"));
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
   const titleRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(
@@ -187,6 +194,26 @@ export function IssueDetail({
   const state = states.find((s) => s.id === issue.status);
   const project = projects.find((p) => p.id === issue.project_id);
   const locked = readOnly || issue.provisional;
+  const lifecycle = primaryWorkAction(state?.category ?? "backlog");
+
+  const runWorkAction = async (action: "start" | "done" | "stop") => {
+    if (pendingAction) return;
+    const target = workTarget(states, action);
+    setPendingAction(action);
+    try {
+      if (target) {
+        await onPredict(issue.doc_id, "status", target.id, () =>
+          rpc(spaceId, { cmd: `issue_${action}`, reff }),
+        );
+      } else {
+        await rpc(spaceId, { cmd: `issue_${action}`, reff });
+      }
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPendingAction(null);
+    }
+  };
 
   const saveTitle = () => {
     const next = draft.trim();
@@ -226,30 +253,36 @@ export function IssueDetail({
           >
             <Copy className="size-3.5" />
           </IconButton>
+          {!locked && !tombstone && (
+            <Button
+              variant="primary"
+              disabled={pendingAction !== null}
+              aria-busy={pendingAction === lifecycle.action}
+              onClick={() => void runWorkAction(lifecycle.action)}
+            >
+              {lifecycle.action === "done" ? (
+                <Check className="size-3" />
+              ) : state?.category === "done" ? (
+                <RotateCcw className="size-3" />
+              ) : (
+                <Play className="size-3" />
+              )}
+              {pendingAction === lifecycle.action ? lifecycle.pendingLabel : lifecycle.label}
+            </Button>
+          )}
           <IconButton label={focused ? "Return to split view" : "Focus issue"} onClick={onToggleFocus}>
             {focused ? <Minimize2 className="size-3.5" /> : <Maximize2 className="size-3.5" />}
           </IconButton>
-        {!locked &&
-          (tombstone ? (
-            // Restore wins over a concurrent delete (engine rule), so this is
-            // safe to offer without a confirmation of its own.
-            <IconButton
-              label="Restore issue"
-              onClick={() =>
-                void send(() => rpc(spaceId, { cmd: "issue_restore", reff: issue.reff }))
-              }
-            >
-              <ArchiveRestore className="size-3.5" />
-            </IconButton>
-          ) : (
-            <IconButton
-              label="Delete issue"
-              variant="danger"
-              onClick={() => onDelete(issue.reff)}
-            >
-              <Trash2 className="size-3.5" />
-            </IconButton>
-          ))}
+          <IssueOverflow
+            issueRef={issue.key_alias ?? issue.reff}
+            active={state?.category === "active"}
+            locked={locked}
+            tombstone={tombstone}
+            pending={pendingAction !== null}
+            onStop={() => void runWorkAction("stop")}
+            onRestore={() => void send(() => rpc(spaceId, { cmd: "issue_restore", reff: issue.reff }))}
+            onDelete={() => onDelete(issue.reff)}
+          />
           <IconButton label="Close issue" chord="Esc" onClick={onClose}>
             <X className="size-3.5" />
           </IconButton>
@@ -598,6 +631,39 @@ export function IssueDetail({
       </div>
     </aside>
   );
+}
+
+function IssueOverflow({ issueRef, active, locked, tombstone, pending, onStop, onRestore, onDelete }: {
+  issueRef: string;
+  active: boolean;
+  locked: boolean;
+  tombstone: boolean;
+  pending: boolean;
+  onStop: () => void;
+  onRestore: () => void;
+  onDelete: () => void;
+}) {
+  return (
+    <DropdownMenu.Root>
+      <DropdownMenu.Trigger asChild>
+        <IconButton label="More issue actions"><MoreHorizontal className="size-3.5" /></IconButton>
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content align="end" sideOffset={4} className="ui-surface border-line-strong bg-raised shadow-overlay z-50 min-w-52 rounded-lg border p-1 text-sm">
+          <MenuItem onSelect={() => void navigator.clipboard.writeText(issueRef)}><Copy className="size-3.5" /> Copy reference</MenuItem>
+          {active && !locked && <MenuItem disabled={pending} onSelect={onStop}><CircleDot className="size-3.5" /> Stop work</MenuItem>}
+          {!locked && <DropdownMenu.Separator className="bg-line my-1 h-px" />}
+          {!locked && (tombstone
+            ? <MenuItem onSelect={onRestore}><ArchiveRestore className="size-3.5" /> Restore issue</MenuItem>
+            : <MenuItem danger onSelect={onDelete}><Trash2 className="size-3.5" /> Delete issue</MenuItem>)}
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
+  );
+}
+
+function MenuItem({ children, danger, ...props }: React.ComponentProps<typeof DropdownMenu.Item> & { danger?: boolean }) {
+  return <DropdownMenu.Item {...props} className={`flex h-7 cursor-default select-none items-center gap-2 rounded px-2 outline-none data-[highlighted]:bg-hover data-[disabled]:opacity-50 ${danger ? "text-danger" : "text-dim"}`}>{children}</DropdownMenu.Item>;
 }
 
 /**

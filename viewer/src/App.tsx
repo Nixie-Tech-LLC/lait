@@ -106,7 +106,7 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [detail, setDetail] = useState(true);
-  const [focusedDetail, setFocusedDetail] = useState(false);
+  const [focusedDetail, setFocusedDetail] = useState(Boolean(initialRoute.focused));
   const [view, setView] = useState<View>(initialRoute.view);
   const [unread, setUnread] = useState(0);
   /** The composer, and the column it was opened from (null = closed). */
@@ -175,6 +175,7 @@ export function App() {
     setSelection(route.issue);
     setFilter(route.filter ?? EMPTY_FILTER);
     setDetail(route.issue !== null);
+    setFocusedDetail(Boolean(route.focused));
   }, []);
 
   useEffect(() => {
@@ -187,12 +188,13 @@ export function App() {
   // resolve its initial project asynchronously. Replace keeps the address honest
   // without turning those automatic corrections into Back-button destinations.
   useEffect(() => {
-    const href = formatRoute({ spaceId: routeSpace, project, view, issue: selection, filter });
+    const route = { spaceId: routeSpace, project, view, issue: selection, focused: focusedDetail, filter };
+    const href = formatRoute(route);
     if (`${window.location.pathname}${window.location.search}` !== href) {
       window.history.replaceState(null, "", href);
     }
-    saveLastRoute({ spaceId: routeSpace, project, view, issue: selection, filter });
-  }, [routeSpace, project, view, selection, filter]);
+    saveLastRoute(route);
+  }, [routeSpace, project, view, selection, focusedDetail, filter]);
 
   const space = spaces.find((s) => s.id === current) ?? null;
   const readOnly = space ? isReadOnly(space) : false;
@@ -630,7 +632,7 @@ export function App() {
         window.history.pushState(
           null,
           "",
-          formatRoute({ spaceId: routeSpace, project, view: v, issue, filter }),
+          formatRoute({ spaceId: routeSpace, project, view: v, issue, focused: issue ? focusedDetail : false, filter }),
         );
         setView(v);
         if (!issue) setSelection(null);
@@ -663,11 +665,11 @@ export function App() {
         window.history.replaceState(
           null,
           "",
-          formatRoute({ spaceId: routeSpace, project, view, issue: reff, filter }),
+          formatRoute({ spaceId: routeSpace, project, view, issue: reff, focused: reff ? focusedDetail : false, filter }),
         );
         setSelection(reff);
       },
-      predict: (doc, field, value, send) => void predict(doc, field, value, send),
+      predict: (doc, field, value, send) => predict(doc, field, value, send),
       pickSpace: (id) => {
         const picked = spacesRef.current.find((space) => space.id === id);
         if (!picked) return;
@@ -1271,7 +1273,15 @@ export function App() {
                 setFocusedDetail(false);
               }}
               focused={focusedDetail}
-              onToggleFocus={() => setFocusedDetail((value) => !value)}
+              onToggleFocus={() => {
+                const next = !focusedDetail;
+                window.history.pushState(
+                  null,
+                  "",
+                  formatRoute({ spaceId: routeSpace, project, view, issue: selection, focused: next, filter }),
+                );
+                setFocusedDetail(next);
+              }}
               {...(rows.findIndex((row) => row.reff === selection) > 0
                 ? {
                     onPrevious: () =>

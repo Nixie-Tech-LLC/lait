@@ -15,6 +15,7 @@ export interface ViewerRoute {
   project: string | null;
   view: View;
   issue: string | null;
+  focused?: boolean;
   filter?: FilterState;
 }
 
@@ -51,12 +52,15 @@ export function parseRoute(location: Pick<Location, "pathname" | "search">): Vie
     label: clean(query.get("label")),
     status: query.getAll("status").filter(Boolean),
   };
+  const issue = view === "list" || view === "board" ? clean(query.get("issue")) : null;
+  const focused = issue !== null && query.get("focus") === "1";
 
   return {
     spaceId: parts[1],
     project: clean(query.get("project")),
     view,
-    issue: view === "list" || view === "board" ? clean(query.get("issue")) : null,
+    issue,
+    ...(focused ? { focused: true } : {}),
     ...(isActive(filter) ? { filter } : {}),
   };
 }
@@ -68,6 +72,7 @@ export function formatRoute(route: ViewerRoute): string {
   if (route.project) query.set("project", route.project);
   if (route.issue && (route.view === "list" || route.view === "board")) {
     query.set("issue", route.issue);
+    if (route.focused) query.set("focus", "1");
   }
   if (route.filter && isActive(route.filter)) {
     if (route.filter.text.trim()) query.set("q", route.filter.text.trim());
@@ -87,6 +92,7 @@ export function sameRoute(a: ViewerRoute, b: ViewerRoute): boolean {
     a.project === b.project &&
     a.view === b.view &&
     a.issue === b.issue &&
+    Boolean(a.focused) === Boolean(b.focused) &&
     JSON.stringify(a.filter ?? EMPTY_FILTER) === JSON.stringify(b.filter ?? EMPTY_FILTER)
   );
 }
