@@ -749,6 +749,14 @@ export function App() {
         setFilterOpen(true);
         setFocusToken((t) => t + 1);
       },
+      clearFilter: () => {
+        window.history.replaceState(
+          null,
+          "",
+          formatRoute({ spaceId: routeSpace, project, view, issue: selection, filter: EMPTY_FILTER }),
+        );
+        setFilter(EMPTY_FILTER);
+      },
       toggleSidebar: () => {
         if (window.matchMedia("(max-width: 960px)").matches) {
           setMobileNav((open) => !open);
@@ -793,10 +801,15 @@ export function App() {
         setSelection(null);
       },
       pickProject: (key) => {
-        const next = { spaceId: routeSpace, project: key, view, issue: null, filter };
+        // "My issues" is a destination, not a sticky scope: opening a specific
+        // project drops the `mine` authorization filter so its board doesn't come
+        // up mysteriously empty. Other facets (status/label/…) ride along as before.
+        const scoped = filter.mine ? { ...filter, mine: false } : filter;
+        const next = { spaceId: routeSpace, project: key, view, issue: null, filter: scoped };
         window.history.pushState(null, "", formatRoute(next));
         setProject(key);
         setSelection(null);
+        if (scoped !== filter) setFilter(scoped);
       },
 
       // A picker needs its subject visible: opening the assignee menu over a pane
@@ -1467,6 +1480,8 @@ export function App() {
               }}
               onCreate={(status) => setComposing({ status })}
               onDrop={dropCard}
+              filtered={isActive(filter)}
+              onClearFilter={() => api.clearFilter()}
               onReassign={(row, groupKey) => {
                 const id = currentRef.current;
                 if (!id) return;

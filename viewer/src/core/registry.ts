@@ -89,6 +89,8 @@ export interface AppApi {
   toggleDetail(): void;
   goto(view: View): void;
   openFilter(): void;
+  /** Reset every filter facet to the neutral state (show all). */
+  clearFilter(): void;
   toast(message: string): void;
   refresh(): void;
   select(reff: string | null): void;

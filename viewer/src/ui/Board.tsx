@@ -1,16 +1,17 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { MenuContent, MenuItem } from "./layout";
-import { CalendarClock, ChevronRight, ExternalLink, Flag, Gauge, Info, ListChecks, MoreHorizontal, Plus, Tags, UserPlus } from "lucide-react";
+import { CalendarClock, ChevronRight, ExternalLink, Flag, FilterX, Gauge, Info, ListChecks, MoreHorizontal, Plus, Tags, UserPlus } from "lucide-react";
 
 import { loadBoardScroll, saveBoardScroll } from "../core/boardState";
 import { groupRows, type DisplayState, type RowGroup } from "../core/display";
 import type { IssueField } from "../core/registry";
 import type { BoardColumn, BoardPos, BoardView, LabelDto, MemberDto, Row } from "../types";
 import { AvatarStack, memberName, stackFor } from "./Avatar";
+import { EmptyState } from "./AppState";
 import { catalogColor } from "./colors";
 import { PriorityIcon, StatusIcon } from "./icons";
-import { IconButton } from "./primitives";
+import { Button, IconButton } from "./primitives";
 import { dueLabel, dueTone } from "./time";
 
 const DUE_TONE = { overdue: "text-danger", soon: "text-warn", later: "text-mute" } as const;
@@ -46,6 +47,8 @@ export function Board({
   onReassign,
   onEdit,
   readOnly,
+  filtered,
+  onClearFilter,
 }: {
   board: BoardView;
   /** How the board is grouped. `status` = workflow columns (the default and the
@@ -67,7 +70,32 @@ export function Board({
   onReassign: (row: Row, groupKey: string) => void;
   onEdit: (reff: string, field: Extract<IssueField, "priority" | "assignee" | "label">) => void;
   readOnly: boolean;
+  /** A filter is narrowing this board (`mine`, status, label, …). */
+  filtered: boolean;
+  /** Reset that filter — offered on the empty state so a board emptied by a
+   *  leftover filter (e.g. "My issues") is never a silent blank. */
+  onClearFilter: () => void;
 }) {
+  // A board with rows in the space but none after filtering must say so, exactly
+  // as the list does — an empty grid of columns reads as "no issues", when the
+  // truth is "a filter is hiding them" (the classic leftover-`mine` trap).
+  const anyRows = board.columns.some((col) => col.rows.some((row) => !row.tombstone));
+  if (!anyRows && filtered) {
+    return (
+      <EmptyState
+        kind="filtered-empty"
+        title="No matching issues"
+        body="Every issue in this project is hidden by the current filter."
+        action={
+          <Button variant="primary" onClick={onClearFilter}>
+            <FilterX className="size-3.5" /> Clear filter
+          </Button>
+        }
+        className="min-h-60"
+      />
+    );
+  }
+
   if (display.group === "assignee" || display.group === "priority") {
     return (
       <GroupedBoard
