@@ -230,7 +230,7 @@ export function App() {
       view === "board" && shown
         ? shown.columns.flatMap((c) => c.rows.filter((r) => !r.tombstone))
         : groups.flatMap((g) => g.rows.filter((r) => !r.tombstone));
-    return display.deleted ? [...live, ...deletedRows] : live;
+    return display.deleted ? deletedRows : live;
   }, [view, shown, groups, display.deleted, deletedRows]);
   const favoriteProjects = useMemo(
     () => routeSpace ? loadFavoriteProjects(routeSpace) : [],
@@ -478,8 +478,13 @@ export function App() {
     // Keep an explicit unknown ref so the detail surface can say it is missing.
     // Redirecting it to the first row would rewrite a broken/shared link into a
     // different issue and make the failure invisible.
-    setSelection((selected) => selected ?? rows[0]?.reff ?? null);
-  }, [board, view, rows]);
+    setSelection((selected) => {
+      if (display.deleted) {
+        return selected && rows.some((row) => row.reff === selected) ? selected : null;
+      }
+      return selected ?? rows[0]?.reff ?? null;
+    });
+  }, [board, view, rows, display.deleted]);
 
   // Checks on rows that left the view are stale writes waiting to happen: a
   // bulk action must only ever touch what the user can currently see checked.
@@ -1187,7 +1192,14 @@ export function App() {
                   view={view}
                   open={displayOpen}
                   onOpenChange={setDisplayOpen}
-                  onChange={setDisplay}
+                  onChange={(nextDisplay) => {
+                    if (nextDisplay.deleted !== display.deleted) {
+                      api.select(null);
+                      setDetail(false);
+                    }
+                    setDisplay(nextDisplay);
+                    if (nextDisplay.deleted && view === "board") api.goto("list");
+                  }}
                 />
                 {routeSpace && board && (
                   <SavedViews
@@ -1197,6 +1209,10 @@ export function App() {
                     display={display}
                     onApply={(saved) => {
                       setFilter(saved.filter);
+                      if (saved.display.deleted !== display.deleted) {
+                        api.select(null);
+                        setDetail(false);
+                      }
                       setDisplay(saved.display);
                     }}
                     onChange={() => setPersonalNavRevision((revision) => revision + 1)}
@@ -1319,8 +1335,9 @@ export function App() {
             />
           ) : shown && view === "list" ? (
             <IssueList
-              groups={groups}
+              groups={display.deleted ? [] : groups}
               deleted={display.deleted ? deletedRows : []}
+              deletedMode={display.deleted}
               states={states}
               members={members}
               selection={selection}

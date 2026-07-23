@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronRight, Plus, Trash2 } from "lucide-react";
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+import { CheckSquare, ChevronRight, Copy, ExternalLink, MoreHorizontal, Plus, Trash2 } from "lucide-react";
 
 import type { RowGroup } from "../core/display";
 import type { MemberDto, Row, WorkflowState } from "../types";
@@ -26,6 +27,7 @@ import { dueLabel, dueTone } from "./time";
 export function IssueList({
   groups,
   deleted,
+  deletedMode,
   states,
   members,
   selection,
@@ -43,6 +45,8 @@ export function IssueList({
    *  group. Separate from `groups` because a deleted issue is *not on the
    *  board* (deletion removes it from `boards[P]`); empty = trash hidden. */
   deleted: Row[];
+  /** Deleted rows are a recovery destination, never an appendix to live work. */
+  deletedMode: boolean;
   /** Board-ordered workflow, for a row's status glyph under non-status grouping. */
   states: WorkflowState[];
   /** The ACL, for resolving assignee keys to faces. */
@@ -60,15 +64,17 @@ export function IssueList({
   filtered: boolean;
 }) {
   const visible = (g: RowGroup) => g.rows.filter((r) => !r.tombstone);
-  const total = groups.reduce((n, g) => n + visible(g).length, 0);
+  const total = deletedMode
+    ? deleted.length
+    : groups.reduce((n, g) => n + visible(g).length, 0);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="text-mute border-line border-b px-4 py-2 text-sm">
-        {total} {total === 1 ? "issue" : "issues"}
+        {total} {deletedMode ? "deleted " : ""}{total === 1 ? "issue" : "issues"}
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto">
-        {groups.map((group) => (
+        {!deletedMode && groups.map((group) => (
           <Group
             key={group.key}
             group={group}
@@ -112,12 +118,12 @@ export function IssueList({
             </ul>
           </section>
         )}
-        {total === 0 && deleted.length === 0 && (
+        {total === 0 && (
           <ApplicationState
-            kind={filtered ? "filtered-empty" : "empty"}
-            title={filtered ? "No matching issues" : "No issues yet"}
-            body={filtered ? "Clear or adjust the current filters to see more." : "Create the first issue in this project."}
-            action={!filtered && !readOnly && states[0] ? <Button variant="primary" onClick={() => onCreate(states[0]!.id)}><Plus className="size-3.5" /> New issue</Button> : undefined}
+            kind={deletedMode ? "empty" : filtered ? "filtered-empty" : "empty"}
+            title={deletedMode ? "No deleted issues" : filtered ? "No matching issues" : "No issues yet"}
+            body={deletedMode ? "Deleted issues will appear here so they can be inspected or restored." : filtered ? "Clear or adjust the current filters to see more." : "Create the first issue in this project."}
+            action={!deletedMode && !filtered && !readOnly && states[0] ? <Button variant="primary" onClick={() => onCreate(states[0]!.id)}><Plus className="size-3.5" /> New issue</Button> : undefined}
             className="min-h-60"
           />
         )}
@@ -341,7 +347,64 @@ function IssueRow({
       {/* Faces, not `assignee_summary` — that string is the terminal's projection
           ("you +1"), and this row has a fixed 32px rhythm to keep. */}
       <AvatarStack members={stackFor(row.assignees, members)} className="w-14 justify-end" />
+      <DropdownMenu.Root>
+        <DropdownMenu.Trigger asChild>
+          <IconButton
+            label={`Actions for ${row.key_alias ?? row.reff}`}
+            onClick={(event) => event.stopPropagation()}
+            className="opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100"
+          >
+            <MoreHorizontal className="size-3.5" />
+          </IconButton>
+        </DropdownMenu.Trigger>
+        <DropdownMenu.Portal>
+          <DropdownMenu.Content
+            align="end"
+            sideOffset={4}
+            className="border-line-strong bg-raised shadow-overlay z-50 min-w-48 rounded-lg border p-1"
+          >
+            <RowMenuItem onSelect={() => onOpen(row.reff)}>
+              <ExternalLink className="size-3.5" />
+              Open focused
+            </RowMenuItem>
+            <RowMenuItem
+              onSelect={() => {
+                const url = new URL(window.location.href);
+                url.searchParams.set("issue", row.reff);
+                url.searchParams.set("focus", "1");
+                void navigator.clipboard.writeText(url.toString());
+              }}
+            >
+              <Copy className="size-3.5" />
+              Copy link
+            </RowMenuItem>
+            {!readOnly && (
+              <RowMenuItem onSelect={() => onToggleCheck(row.reff)}>
+                <CheckSquare className="size-3.5" />
+                {checked ? "Remove from selection" : "Add to selection"}
+              </RowMenuItem>
+            )}
+          </DropdownMenu.Content>
+        </DropdownMenu.Portal>
+      </DropdownMenu.Root>
     </li>
+  );
+}
+
+function RowMenuItem({
+  children,
+  onSelect,
+}: {
+  children: React.ReactNode;
+  onSelect: () => void;
+}) {
+  return (
+    <DropdownMenu.Item
+      onSelect={onSelect}
+      className="data-[highlighted]:bg-hover flex cursor-default items-center gap-2 rounded px-2 py-1.5 text-sm outline-none"
+    >
+      {children}
+    </DropdownMenu.Item>
   );
 }
 

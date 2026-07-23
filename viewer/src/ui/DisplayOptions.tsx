@@ -12,8 +12,8 @@ import { Button, IconButton } from "./primitives";
  * popover would be the one overlay the registry couldn't reach.
  *
  * Grouping applies to the list (the board's columns *are* the status grouping);
- * ordering and the deleted toggle apply to both. Saying that here, on the
- * control, beats letting someone discover it by switching views.
+ * ordering applies to both. Deleted issues are a dedicated list recovery mode;
+ * choosing it from the board moves to that destination.
  */
 export function DisplayOptions({
   display,
@@ -81,14 +81,14 @@ export function DisplayOptions({
             ))}
           </Axis>
 
-          <Axis label="Deleted issues">
+          <Axis label="Issue mode">
             <Choice
-              label="Hidden"
+              label="Active"
               active={!display.deleted}
               onClick={() => onChange({ ...display, deleted: false })}
             />
             <Choice
-              label="Shown"
+              label="Deleted"
               active={display.deleted}
               onClick={() => onChange({ ...display, deleted: true })}
             />
