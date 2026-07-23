@@ -18,6 +18,7 @@ import { memberName } from "./Avatar";
 import * as ask from "./dialogs";
 import { Combobox } from "./Picker";
 import { Button, IconButton } from "./primitives";
+import { EmptyState, InlineError, LoadingState } from "./AppState";
 
 /**
  * Members and the invite link. Admission needs no controls here: accepting an
@@ -38,10 +39,11 @@ export function Members({
   readOnly: boolean;
   onError: (m: string) => void;
 }) {
-  const [members, setMembers] = useState<MemberDto[]>([]);
+  const [members, setMembers] = useState<MemberDto[] | null>(null);
   const [log, setLog] = useState<MemberLogEntry[]>([]);
+  const [logError, setLogError] = useState("");
   const [ticket, setTicket] = useState<string | null>(null);
-  const [, setBusy] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -58,6 +60,7 @@ export function Members({
       // The audit log is a nicety, not load-bearing for the roster; a failure just
       // hides the section rather than breaking the page.
       setLog([]);
+      setLogError("The access log is temporarily unavailable. The member roster is still current.");
     }
   }, [spaceId, onError]);
 
@@ -65,7 +68,7 @@ export function Members({
     void load();
   }, [load, revision]);
 
-  const isAdmin = members.some((m) => m.me && m.role === "admin");
+  const isAdmin = members?.some((m) => m.me && m.role === "admin") ?? false;
 
   const act = async (id: string, fn: () => Promise<unknown>) => {
     setBusy(id);
@@ -83,6 +86,10 @@ export function Members({
     }
   };
 
+  if (!members) {
+    return <LoadingState title="Loading members" body="Verifying this space’s signed access graph." />;
+  }
+
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto flex max-w-2xl flex-col gap-6 p-6">
@@ -90,7 +97,10 @@ export function Members({
           <h2 className="text-mute mb-2 text-2xs font-semibold tracking-wider uppercase">
             Members · {members.length}
           </h2>
-          <ul className="border-line divide-line divide-y rounded border">
+          <p className="text-dim mb-3 text-sm">People and agents with verified access to this encrypted space. Names are private labels on this device.</p>
+          {members.length === 0 ? (
+            <EmptyState title="No verified members" body="The local replica does not currently contain a readable membership graph." />
+          ) : <ul className="border-line divide-line divide-y rounded border">
             {members.map((m) => (
               <li key={m.key} className="flex items-center gap-3 p-3">
                 <span className="min-w-0 flex-1">
@@ -108,6 +118,7 @@ export function Members({
                         admin
                       </span>
                     )}
+                    {m.role !== "admin" && <span className="text-mute text-2xs">{roleLabel(m.role)}</span>}
                   </span>
                   <code className="text-mute block truncate text-xs">{m.key}</code>
                 </span>
@@ -115,6 +126,7 @@ export function Members({
                   <span className="flex shrink-0 gap-1">
                     <IconButton
                       label="Set a local name"
+                      disabled={busy === m.key}
                       onClick={() =>
                         void act(m.key, async () => {
                           const name = await ask.prompt({
@@ -135,6 +147,7 @@ export function Members({
                       <IconButton
                         label="Remove (rotates the space key)"
                         variant="danger"
+                        disabled={busy === m.key}
                         onClick={() =>
                           void act(m.key, async () => {
                             try {
@@ -145,7 +158,8 @@ export function Members({
                               if (e instanceof ConfirmRequired) {
                                 if (
                                   await ask.confirm({
-                                    title: e.question,
+                                    title: `Remove ${memberName(m.key, m)} from this space?`,
+                                    body: `${e.question} They will lose future access and the space encryption key will rotate. This does not erase copies they already received.`,
                                     confirmText: "Remove",
                                     danger: true,
                                   })
@@ -170,17 +184,22 @@ export function Members({
                 )}
               </li>
             ))}
-          </ul>
+          </ul>}
         </section>
 
         {isAdmin && !readOnly && (
           <Invite spaceId={spaceId} ticket={ticket} setTicket={setTicket} onError={onError} />
         )}
 
+        {logError && <InlineError message={logError} onRetry={() => void load()} />}
         {log.length > 0 && <MemberLog entries={log} members={members} />}
       </div>
     </div>
   );
+}
+
+function roleLabel(role: string): string {
+  return ({ viewer: "Viewer · read only", contributor: "Contributor · can edit", member: "Member · can edit", administrator: "Administrator · full control" } as Record<string, string>)[role] ?? role;
 }
 
 /**
@@ -202,6 +221,9 @@ function MemberLog({ entries, members }: { entries: MemberLogEntry[]; members: M
     remove_member: "removed",
     set_role: "set the role of",
     add_agent: "sponsored agent",
+    grant_capability: "granted an access capability",
+    activate_implementation: "activated a new access policy",
+    mint_epoch: "rotated the space encryption key",
     unknown: "(unrecognized op)",
   };
 
@@ -213,12 +235,17 @@ function MemberLog({ entries, members }: { entries: MemberLogEntry[]; members: M
       <ul className="border-line divide-line divide-y rounded border">
         {/* Newest first — an audit log answers "what just changed access". */}
         {[...entries].reverse().map((e) => (
-          <li key={e.op} className="flex items-center gap-2 p-2.5 text-sm">
+          <li key={e.op} className="flex items-start gap-2 p-2.5 text-sm">
             <span className="min-w-0 flex-1">
               <span className="font-medium">{name(e.actor)}</span>{" "}
               <span className="text-dim">{PHRASE[e.kind] ?? e.kind}</span>
               {e.subject && <span className="font-medium"> {name(e.subject)}</span>}
               {e.role && <span className="text-mute"> as {e.role}</span>}
+              <details className="text-mute mt-1 text-xs">
+                <summary className="w-fit cursor-default">Technical details</summary>
+                <code className="mt-1 block break-all">Signed operation {e.op}</code>
+                <span>{e.authorized ? "Signature verified and the access rule accepted this change." : "The access rule rejected or could not decode this operation."}</span>
+              </details>
             </span>
             {!e.authorized && (
               <span
@@ -301,6 +328,12 @@ function Invite({
    *  this is the "that link left the building" control. */
   const revoke = async () => {
     if (!ticket) return;
+    if (!await ask.confirm({
+      title: "Revoke this invite link?",
+      body: "Anyone who has not joined yet will be unable to use it. Existing members keep their access. You can create a new link afterward.",
+      confirmText: "Revoke invite",
+      danger: true,
+    })) return;
     try {
       await rpc(spaceId, { cmd: "invite_revoke", invite: ticket });
       setTicket(null);
@@ -343,6 +376,7 @@ function Invite({
                 Reusable — admits anyone with the link until it expires
               </label>
             </div>
+            <p className="text-mute text-xs">Invite links are access capabilities. Share them only with intended recipients and revoke exposed links promptly.</p>
             <Button variant="outline" size="md" onClick={() => void mint()} className="w-fit">
               <UserPlus className="size-3.5" />
               Create invite link
