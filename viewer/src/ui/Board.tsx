@@ -1,7 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
-import { MoreHorizontal, Plus } from "lucide-react";
+import { ChevronRight, ExternalLink, Flag, Info, MoreHorizontal, Plus, Tags, UserPlus } from "lucide-react";
 
+import { loadBoardScroll, saveBoardScroll } from "../core/boardState";
+import type { IssueField } from "../core/registry";
 import type { BoardColumn, BoardPos, BoardView, MemberDto, Row } from "../types";
 import { AvatarStack, stackFor } from "./Avatar";
 import { catalogColor } from "./colors";
@@ -34,6 +36,7 @@ export function Board({
   onSelect,
   onCreate,
   onDrop,
+  onEdit,
   readOnly,
 }: {
   board: BoardView;
@@ -46,6 +49,7 @@ export function Board({
   onCreate: (status: string) => void;
   /** A card landed. `pos` is null when the target column can't be ordered. */
   onDrop: (reff: string, status: string, pos: BoardPos | null) => void;
+  onEdit: (reff: string, field: Extract<IssueField, "priority" | "assignee" | "label">) => void;
   readOnly: boolean;
 }) {
   /** The card in flight, and the column it left. */
@@ -53,6 +57,11 @@ export function Board({
   /** Where it would land. Rendered as the gap. */
   const [over, setOver] = useState<{ col: string; pos: BoardPos } | null>(null);
   const [announcement, setAnnouncement] = useState("");
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useLayoutEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollLeft = loadBoardScroll(board.project.id);
+  }, [board.project.id]);
 
   const finish = (col: BoardColumn) => {
     if (!drag || !over) return reset();
@@ -82,7 +91,13 @@ export function Board({
   };
 
   return (
-    <div className="flex min-h-0 flex-1 gap-3 overflow-x-auto p-3">
+    <div
+      ref={scrollRef}
+      className="flex min-h-0 flex-1 gap-3 overflow-x-auto p-3"
+      aria-label="Issue board"
+      tabIndex={0}
+      onScroll={(event) => saveBoardScroll(board.project.id, event.currentTarget.scrollLeft)}
+    >
       <p className="sr-only" aria-live="polite">{announcement}</p>
       {board.columns.map((col) => (
         <Column
@@ -100,6 +115,7 @@ export function Board({
           onOver={(pos) => setOver({ col: col.state.id, pos })}
           onDrop={() => finish(col)}
           onMove={move}
+          onEdit={onEdit}
           columns={board.columns}
           readOnly={readOnly}
         />
@@ -127,6 +143,7 @@ function Column({
   onOver,
   onDrop,
   onMove,
+  onEdit,
   columns,
   readOnly,
 }: {
@@ -143,18 +160,36 @@ function Column({
   onOver: (pos: BoardPos) => void;
   onDrop: () => void;
   onMove: (row: Row, col: BoardColumn) => void;
+  onEdit: (reff: string, field: Extract<IssueField, "priority" | "assignee" | "label">) => void;
   columns: BoardColumn[];
   readOnly: boolean;
 }) {
   const rows = col.rows.filter((r) => !r.tombstone);
   const active = drag !== null && !readOnly;
+  const [collapsed, setCollapsed] = useState(false);
 
   return (
-    <section className={`group/col flex shrink-0 flex-col ${rows.length ? "w-72" : "w-60"}`}>
+    <section className={`group/col flex shrink-0 flex-col transition-[width] ${collapsed ? "w-10" : rows.length ? "w-72" : "w-60"}`}>
       <header className="flex h-8 shrink-0 items-center gap-2 px-1">
+        <button
+          className="text-mute hover:text-fg flex size-6 items-center justify-center rounded"
+          onClick={() => setCollapsed((value) => !value)}
+          aria-label={`${collapsed ? "Expand" : "Collapse"} ${col.state.name}`}
+          aria-expanded={!collapsed}
+        >
+          <ChevronRight className={`size-3 transition-transform ${collapsed ? "" : "rotate-90"}`} />
+        </button>
+        {!collapsed && <>
         <StatusIcon category={col.state.category} color={catalogColor(col.state.color)} />
         <h2 className="text-base font-semibold">{col.state.name}</h2>
         <span className="text-mute text-sm tabular-nums">{rows.length}</span>
+        {col.state.category === "done" && (
+          <Info
+            className="text-mute size-3.5"
+            role="img"
+            aria-label="Completed issues follow completion order. Move an issue here; its completion time determines its position."
+          />
+        )}
         {!readOnly && (
           <IconButton
             label={`New issue in ${col.state.name}`}
@@ -196,7 +231,16 @@ function Column({
             </DropdownMenu.Content>
           </DropdownMenu.Portal>
         </DropdownMenu.Root>
+        </>}
       </header>
+      {collapsed ? (
+        <button
+          className="text-mute hover:text-fg flex min-h-0 flex-1 items-start justify-center py-2 text-xs [writing-mode:vertical-rl]"
+          onClick={() => setCollapsed(false)}
+        >
+          {col.state.name} · {rows.length}
+        </button>
+      ) : (
       <ul
         aria-label={`${col.state.name} issues`}
         data-board-collection
@@ -237,6 +281,7 @@ function Column({
             onOver={onOver}
             columns={columns}
             onMove={onMove}
+            onEdit={onEdit}
           />
         ))}
         {rows.length === 0 && (
@@ -264,6 +309,7 @@ function Column({
           </li>
         )}
       </ul>
+      )}
     </section>
   );
 }
@@ -296,6 +342,7 @@ function Card({
   onOver,
   columns,
   onMove,
+  onEdit,
 }: {
   row: Row;
   members: MemberDto[];
@@ -310,6 +357,7 @@ function Card({
   onOver: (pos: BoardPos) => void;
   columns: BoardColumn[];
   onMove: (row: Row, col: BoardColumn) => void;
+  onEdit: (reff: string, field: Extract<IssueField, "priority" | "assignee" | "label">) => void;
 }) {
   const el = useRef<HTMLLIElement>(null);
   // Selection moves by keyboard, so it has to drag the viewport with it.
@@ -405,8 +453,22 @@ function Card({
                       />
                       <span className="flex-1">{column.state.name}</span>
                       <span className="text-mute tabular-nums">{column.rows.length}</span>
+                      {column.state.category === "done" && <span className="sr-only">Completion time determines order</span>}
                     </DropdownMenu.Item>
                   ))}
+                  <DropdownMenu.Separator className="bg-line my-1 h-px" />
+                  <DropdownMenu.Item onSelect={() => onSelect(row.reff)} className="data-[highlighted]:bg-hover flex cursor-default items-center gap-2 rounded px-2 py-1.5 text-sm outline-none">
+                    <ExternalLink className="size-3.5" /> Open issue
+                  </DropdownMenu.Item>
+                  <DropdownMenu.Item onSelect={() => onEdit(row.reff, "priority")} className="data-[highlighted]:bg-hover flex cursor-default items-center gap-2 rounded px-2 py-1.5 text-sm outline-none">
+                    <Flag className="size-3.5" /> Set priority
+                  </DropdownMenu.Item>
+                  <DropdownMenu.Item onSelect={() => onEdit(row.reff, "assignee")} className="data-[highlighted]:bg-hover flex cursor-default items-center gap-2 rounded px-2 py-1.5 text-sm outline-none">
+                    <UserPlus className="size-3.5" /> Assign
+                  </DropdownMenu.Item>
+                  <DropdownMenu.Item onSelect={() => onEdit(row.reff, "label")} className="data-[highlighted]:bg-hover flex cursor-default items-center gap-2 rounded px-2 py-1.5 text-sm outline-none">
+                    <Tags className="size-3.5" /> Add label
+                  </DropdownMenu.Item>
                 </DropdownMenu.Content>
               </DropdownMenu.Portal>
             </DropdownMenu.Root>

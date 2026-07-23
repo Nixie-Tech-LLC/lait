@@ -1353,6 +1353,11 @@ export function App() {
               }}
               onCreate={(status) => setComposing({ status })}
               onDrop={dropCard}
+              onEdit={(reff, nextField) => {
+                api.select(reff);
+                setDetail(true);
+                setField(nextField);
+              }}
               readOnly={readOnly}
             />
           ) : shown && view === "list" ? (
