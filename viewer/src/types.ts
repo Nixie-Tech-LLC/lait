@@ -81,6 +81,8 @@ export interface Row {
   due_date?: number | null;
   /** Estimate points (the scale is the team's convention). */
   estimate?: number | null;
+  /** Resolved label names (absent/empty = none). */
+  label_names?: string[];
 }
 
 export interface BoardColumn {
@@ -441,10 +443,14 @@ export type Request =
   | { cmd: "board"; project?: string | null; project_hint?: string | null }
   | { cmd: "history"; reff: string }
   | { cmd: "issue_graph"; reff: string }
-  | { cmd: "project_new"; name: string; key: string }
+  | { cmd: "project_new"; name: string; key: string; color?: string | null }
   | { cmd: "project_list" }
+  | { cmd: "project_edit"; project: string; name?: string | null; color?: string | null }
   | { cmd: "label_new"; name: string; color?: string | null }
   | { cmd: "label_list" }
+  | { cmd: "label_edit"; label: string; name?: string | null; color?: string | null }
+  | { cmd: "label_delete"; label: string }
+  | { cmd: "space_rename"; name: string }
   | { cmd: "activity"; since?: number }
   | { cmd: "inbox"; clear?: boolean }
   | { cmd: "member_add"; who: string; admin?: boolean; as_name?: string | null }

@@ -9,6 +9,7 @@ import { Avatar, AvatarStack, memberName, stackFor } from "./Avatar";
 import { ApplicationState } from "./AppState";
 import { catalogColor } from "./colors";
 import { PriorityIcon, StatusIcon } from "./icons";
+import { MenuContent, MenuItem } from "./layout";
 import { Button, IconButton } from "./primitives";
 import { dueLabel, dueTone } from "./time";
 
@@ -405,16 +406,12 @@ function IssueRow({
           </IconButton>
         </DropdownMenu.Trigger>
         <DropdownMenu.Portal>
-          <DropdownMenu.Content
-            align="end"
-            sideOffset={4}
-            className="border-line-strong bg-raised shadow-overlay z-50 min-w-48 rounded-lg border p-1"
-          >
-            <RowMenuItem onSelect={() => onOpen(row.reff)}>
+          <MenuContent align="end">
+            <MenuItem onSelect={() => onOpen(row.reff)}>
               <ExternalLink className="size-3.5" />
               Open focused
-            </RowMenuItem>
-            <RowMenuItem
+            </MenuItem>
+            <MenuItem
               onSelect={() => {
                 const url = new URL(window.location.href);
                 url.searchParams.set("issue", row.reff);
@@ -424,36 +421,20 @@ function IssueRow({
             >
               <Copy className="size-3.5" />
               Copy link
-            </RowMenuItem>
+            </MenuItem>
             {!readOnly && (
-              <RowMenuItem onSelect={() => onToggleCheck(row.reff, false)}>
+              <MenuItem onSelect={() => onToggleCheck(row.reff, false)}>
                 <CheckSquare className="size-3.5" />
                 {checked ? "Remove from selection" : "Add to selection"}
-              </RowMenuItem>
+              </MenuItem>
             )}
-          </DropdownMenu.Content>
+          </MenuContent>
         </DropdownMenu.Portal>
       </DropdownMenu.Root>
     </li>
   );
 }
 
-function RowMenuItem({
-  children,
-  onSelect,
-}: {
-  children: React.ReactNode;
-  onSelect: () => void;
-}) {
-  return (
-    <DropdownMenu.Item
-      onSelect={onSelect}
-      className="data-[highlighted]:bg-hover flex cursor-default items-center gap-2 rounded px-2 py-1.5 text-sm outline-none"
-    >
-      {children}
-    </DropdownMenu.Item>
-  );
-}
 
 /** Tiny local join — `clsx` is a dependency, but a 3-line filter beats an import
  *  for the two call sites that need it. */

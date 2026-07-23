@@ -74,7 +74,7 @@ export function Palette({ ctx, onClose }: { ctx: Ctx; onClose: () => void }) {
                     onClose();
                     void b.command.run({ ...ctx, overlay: false });
                   }}
-                  className="data-[selected=true]:bg-accent data-[selected=true]:text-accent-fg flex cursor-default items-center gap-3 rounded px-3 py-1.5"
+                  className="data-[selected=true]:bg-active flex cursor-default items-center gap-3 rounded px-3 py-1.5"
                 >
                   <span className="flex-1">{b.command.title}</span>
                   <span className="flex gap-1">

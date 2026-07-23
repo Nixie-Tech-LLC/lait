@@ -145,6 +145,7 @@ fn restarted_joiner_daemon_reconverges_from_its_persisted_store() {
                 Request::ProjectNew {
                     name: "Engineering".into(),
                     key: "ENG".into(),
+                    color: None,
                 }
             ),
             Response::Ref { .. }

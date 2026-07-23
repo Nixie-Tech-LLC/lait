@@ -26,6 +26,24 @@ const NAMED: Record<string, string> = {
   teal: "light-dark(#0d9488, #2dd4bf)",
 };
 
+/**
+ * The catalog colours a person may choose from — the palette above minus the
+ * `grey` alias. This is the vocabulary a colour picker offers: every name here
+ * resolves to a designed, theme-aware token, so a chosen colour is one we can
+ * promise contrast for. Order runs warm-to-cool from the neutral.
+ */
+export const CATALOG_COLORS = [
+  "gray",
+  "red",
+  "orange",
+  "yellow",
+  "green",
+  "teal",
+  "blue",
+  "purple",
+  "pink",
+] as const;
+
 /** A CSS colour for a catalog colour name. Accepts a literal hex passthrough,
  *  since nothing stops a catalog from carrying one. */
 export function catalogColor(name: string): string {

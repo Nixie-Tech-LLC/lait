@@ -1,5 +1,5 @@
 import type { DisplayState } from "./display";
-import type { FilterState } from "./filter";
+import { EMPTY_FILTER, type FilterState } from "./filter";
 
 const KEY = "lait.saved-views";
 
@@ -10,10 +10,16 @@ export interface SavedView {
   display: DisplayState;
 }
 
+/** A view saved before a filter axis existed lacks that field; fold it over the
+ *  empty filter so `.length` reads never touch `undefined`. */
+function normalize(view: SavedView): SavedView {
+  return { ...view, filter: { ...EMPTY_FILTER, ...view.filter } };
+}
+
 export function loadSavedViews(space: string, project: string): SavedView[] {
   try {
     const all = JSON.parse(localStorage.getItem(KEY) ?? "{}") as Record<string, SavedView[]>;
-    return all[scope(space, project)] ?? [];
+    return (all[scope(space, project)] ?? []).map(normalize);
   } catch {
     return [];
   }

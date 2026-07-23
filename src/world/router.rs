@@ -313,8 +313,12 @@ impl<'a> IssueRouter<'a> {
                 | Request::History { .. }
                 | Request::ProjectNew { .. }
                 | Request::ProjectList
+                | Request::ProjectEdit { .. }
                 | Request::LabelNew { .. }
                 | Request::LabelList
+                | Request::LabelEdit { .. }
+                | Request::LabelDelete { .. }
+                | Request::SpaceRename { .. }
                 | Request::Activity { .. }
                 | Request::RoleList
                 | Request::RoleShow { .. }
@@ -680,12 +684,16 @@ impl<'a> IssueRouter<'a> {
                     false,
                 ))
             }
-            Request::ProjectNew { name, key } => {
+            Request::ProjectNew { name, key, color } => {
                 let id = ProjectId::mint(self.clock).as_str().to_string();
                 self.submit(&IssueIntent::ProjectNew {
                     id,
                     name,
                     key: key.clone(),
+                    // Optional on the wire, resolved to the birth default here — the
+                    // same shape `LabelNew` uses, so an omitted colour still lands a
+                    // sensible one rather than an empty string.
+                    color: color.unwrap_or_else(|| "blue".into()),
                     device: facts.device.clone(),
                     ts: facts.now,
                 })
@@ -703,6 +711,24 @@ impl<'a> IssueRouter<'a> {
                     .map_err(Self::effect_err)?;
                 Ok((Response::Projects { projects }, false))
             }
+            Request::ProjectEdit {
+                project,
+                name,
+                color,
+            } => {
+                let id = snapshot.resolve_project(&project).ok_or_else(|| {
+                    Response::not_found(format!("no project matches {project:?}"))
+                })?;
+                self.submit(&IssueIntent::ProjectEdit {
+                    id,
+                    name,
+                    color,
+                    device: facts.device.clone(),
+                    ts: facts.now,
+                })
+                .map_err(Self::effect_err)?;
+                Ok((Response::Ref { reff: project }, true))
+            }
             Request::LabelNew { name, color } => {
                 let id = LabelId::mint(self.clock).as_str().to_string();
                 self.submit(&IssueIntent::LabelNew {
@@ -719,6 +745,41 @@ impl<'a> IssueRouter<'a> {
                 let labels: Vec<LabelDto> =
                     self.query(&IssueQuery::Labels).map_err(Self::effect_err)?;
                 Ok((Response::Labels { labels }, false))
+            }
+            Request::LabelEdit { label, name, color } => {
+                let id = snapshot
+                    .resolve_label(&label)
+                    .ok_or_else(|| Response::not_found(format!("no label matches {label:?}")))?;
+                self.submit(&IssueIntent::LabelEdit {
+                    id,
+                    name,
+                    color,
+                    device: facts.device.clone(),
+                    ts: facts.now,
+                })
+                .map_err(Self::effect_err)?;
+                Ok((Response::Ref { reff: label }, true))
+            }
+            Request::LabelDelete { label } => {
+                let id = snapshot
+                    .resolve_label(&label)
+                    .ok_or_else(|| Response::not_found(format!("no label matches {label:?}")))?;
+                self.submit(&IssueIntent::LabelDelete {
+                    id,
+                    device: facts.device.clone(),
+                    ts: facts.now,
+                })
+                .map_err(Self::effect_err)?;
+                Ok((Response::Ref { reff: label }, true))
+            }
+            Request::SpaceRename { name } => {
+                self.submit(&IssueIntent::SpaceRename {
+                    name: name.clone(),
+                    device: facts.device.clone(),
+                    ts: facts.now,
+                })
+                .map_err(Self::effect_err)?;
+                Ok((Response::Ref { reff: name }, true))
             }
             Request::RoleList => {
                 let roles: serde_json::Value =

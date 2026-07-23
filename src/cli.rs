@@ -1678,7 +1678,7 @@ pub async fn run_invite(
     )
     .await?;
     let token = match resp {
-        Response::Text { text } => text.trim().to_string(),
+        Response::Ref { reff } => reff.trim().to_string(),
         other => {
             print_response(&other, out);
             return Ok(());

@@ -66,6 +66,7 @@ fn response_dtos_round_trip() {
     let row = Row {
         due_date: None,
         estimate: None,
+        label_names: Vec::new(),
         reff: "iss_3f9ab2c".into(),
         doc_id: doc_id.clone(),
         project_id: project.id.clone(),

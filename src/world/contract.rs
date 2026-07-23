@@ -482,6 +482,7 @@ pub enum IssueIntent {
         id: String,
         name: String,
         key: String,
+        color: String,
         device: String,
         ts: u64,
     },
@@ -489,6 +490,36 @@ pub enum IssueIntent {
         id: String,
         name: String,
         color: String,
+        device: String,
+        ts: u64,
+    },
+    /// Rename and/or recolor a project in place. `key` is deliberately not
+    /// editable — it seeds every alias. An in-place `map_set` over the same
+    /// catalog key; LWW, `project.configure`-gated.
+    ProjectEdit {
+        id: String,
+        name: Option<String>,
+        color: Option<String>,
+        device: String,
+        ts: u64,
+    },
+    /// Rename and/or recolor a label in place. Issues reference labels by id,
+    /// so a rename re-points every use for free. `catalog.label.configure`-gated.
+    LabelEdit {
+        id: String,
+        name: Option<String>,
+        color: Option<String>,
+        device: String,
+        ts: u64,
+    },
+    /// Remove a label from the registry. Ids left on issues resolve to the raw id
+    /// (graceful degradation), so this is a hard `MapRemove`. `catalog.label.configure`-gated.
+    LabelDelete { id: String, device: String, ts: u64 },
+    /// Set the space's mutable display label. The genesis/seed id is
+    /// name-independent, so this is a plain LWW `RegisterSet` on the catalog
+    /// `name` — never touches identity. `demand_admin`-gated.
+    SpaceRename {
+        name: String,
         device: String,
         ts: u64,
     },

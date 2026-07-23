@@ -101,6 +101,7 @@ fn seed_project_and_issue(rt: &tokio::runtime::Runtime, home: &Path) -> String {
         Request::ProjectNew {
             name: "Eng".into(),
             key: "ENG".into(),
+            color: None,
         },
     );
     assert!(

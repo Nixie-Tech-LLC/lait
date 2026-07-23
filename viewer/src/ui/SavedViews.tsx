@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 import type { DisplayState } from "../core/display";
 import type { FilterState } from "../core/filter";
 import { loadSavedViews, removeView, saveView, type SavedView } from "../core/savedViews";
-import { Button, IconButton } from "./primitives";
+import { Button, IconButton, PopoverContent } from "./primitives";
 
 export function SavedViews({ space, project, filter, display, onApply, onChange }: { space: string; project: string; filter: FilterState; display: DisplayState; onApply: (view: SavedView) => void; onChange?: () => void }) {
   const [views, setViews] = useState(() => loadSavedViews(space, project));
@@ -29,8 +29,7 @@ export function SavedViews({ space, project, filter, display, onApply, onChange 
           <Bookmark className="size-4" />
         </IconButton>
       </Popover.Trigger>
-      <Popover.Portal>
-        <Popover.Content align="end" sideOffset={4} className="border-line-strong bg-raised shadow-overlay z-50 w-72 rounded-lg border p-2">
+      <PopoverContent align="end" className="w-72 p-2">
           <div className="mb-2 px-1">
             <p className="font-semibold">Saved views</p>
             <p className="text-mute text-xs">Private to this browser and local space.</p>
@@ -55,8 +54,7 @@ export function SavedViews({ space, project, filter, display, onApply, onChange 
               <Plus className="size-3" /> Save
             </Button>
           </div>
-        </Popover.Content>
-      </Popover.Portal>
+      </PopoverContent>
     </Popover.Root>
   );
 }

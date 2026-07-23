@@ -37,13 +37,15 @@ describe("viewer routes", () => {
       project: "WEB",
       view: "list",
       issue: null,
-      filter: { text: "login bug", mine: true, label: "customer", status: ["todo", "doing"] },
+      filter: { text: "login bug", mine: true, label: "customer", status: ["todo", "doing"], priority: [], assignees: [] },
     });
     expect(parseRoute(new URL(href, "http://lait.local")).filter).toEqual({
       text: "login bug",
       mine: true,
       label: "customer",
       status: ["todo", "doing"],
+      priority: [],
+      assignees: [],
     });
   });
 

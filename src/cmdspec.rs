@@ -999,14 +999,35 @@ pub fn specs() -> Vec<Spec> {
                     vec![
                         A::pos("key", "Short KEY (e.g. ENG) — becomes the KEY in KEY-1 refs."),
                         A::pos_opt("name", "Project name (default: the key, title-cased)."),
+                        A::val("color", "Hex/name color (default: blue)."),
                     ],
                     |m| {
                         let key = req_str(m, "key");
                         let name = opt_str(m, "name").unwrap_or_else(|| title_case(&key));
-                        Ok(Request::ProjectNew { name, key })
+                        Ok(Request::ProjectNew {
+                            name,
+                            key,
+                            color: opt_str(m, "color"),
+                        })
                     },
                 )
                 .alias(&["new"]),
+                Spec::req(
+                    "edit",
+                    "Rename and/or recolor a project: `projects edit ENG --name Engineering --color blue`. The KEY is immutable.",
+                    vec![
+                        A::pos("project", "Project KEY or prj_ id."),
+                        A::val("name", "New name."),
+                        A::val("color", "New color (hex/name)."),
+                    ],
+                    |m| {
+                        Ok(Request::ProjectEdit {
+                            project: req_str(m, "project"),
+                            name: opt_str(m, "name"),
+                            color: opt_str(m, "color"),
+                        })
+                    },
+                ),
                 Spec::req("ls", "List projects.", vec![], |_| Ok(Request::ProjectList)),
             ],
             ..Spec::req("projects", "Manage the project registry.", vec![], |_| {
@@ -1029,6 +1050,33 @@ pub fn specs() -> Vec<Spec> {
                         })
                     },
                 ),
+                Spec::req(
+                    "edit",
+                    "Rename and/or recolor a label: `labels edit bug --name defect --color red`.",
+                    vec![
+                        A::pos("label", "Label name or lbl_ id."),
+                        A::val("name", "New name."),
+                        A::val("color", "New color (hex/name)."),
+                    ],
+                    |m| {
+                        Ok(Request::LabelEdit {
+                            label: req_str(m, "label"),
+                            name: opt_str(m, "name"),
+                            color: opt_str(m, "color"),
+                        })
+                    },
+                ),
+                Spec::req(
+                    "rm",
+                    "Delete a label from the registry: `labels rm bug`. Issues keep the raw id until it's re-created.",
+                    vec![A::pos("label", "Label name or lbl_ id.")],
+                    |m| {
+                        Ok(Request::LabelDelete {
+                            label: req_str(m, "label"),
+                        })
+                    },
+                )
+                .alias(&["delete"]),
                 Spec::req("ls", "List labels.", vec![], |_| Ok(Request::LabelList)),
             ],
             ..Spec::req("labels", "Manage the label registry.", vec![], |_| {
@@ -1667,6 +1715,16 @@ pub fn specs() -> Vec<Spec> {
         Spec::req("status", "Show node and space status.", vec![], |_| {
             Ok(Request::Status)
         }),
+        Spec::req(
+            "rename",
+            "Rename this space (a mutable display label — the seed id is unchanged). Admin only.",
+            vec![A::pos("name", "New space name.")],
+            |m| {
+                Ok(Request::SpaceRename {
+                    name: req_str(m, "name"),
+                })
+            },
+        ),
         Spec {
             subs: vec![Spec::req(
                 "revoke",

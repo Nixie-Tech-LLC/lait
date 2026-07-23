@@ -269,6 +269,9 @@ pub struct ProjectNewArgs {
     pub name: String,
     /// Short key (the `ENG` in `ENG-142`).
     pub key: String,
+    /// Catalog colour name or hex (default: blue).
+    #[serde(default)]
+    pub color: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -731,6 +734,7 @@ impl LaitMcp {
         self.run(Request::ProjectNew {
             name: a.name,
             key: a.key,
+            color: a.color,
         })
         .await
     }

@@ -396,6 +396,7 @@ fn issues_reference_performance_gate() {
             Request::ProjectNew {
                 name: format!("Project {p:02}"),
                 key: key.clone(),
+                color: None,
             },
         );
         project_keys.push(key);

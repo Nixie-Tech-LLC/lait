@@ -1,14 +1,18 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
-import { ChevronRight, ExternalLink, Flag, Info, MoreHorizontal, Plus, Tags, UserPlus } from "lucide-react";
+import { MenuContent, MenuItem } from "./layout";
+import { CalendarClock, ChevronRight, ExternalLink, Flag, Gauge, Info, MoreHorizontal, Plus, Tags, UserPlus } from "lucide-react";
 
 import { loadBoardScroll, saveBoardScroll } from "../core/boardState";
 import type { IssueField } from "../core/registry";
-import type { BoardColumn, BoardPos, BoardView, MemberDto, Row } from "../types";
+import type { BoardColumn, BoardPos, BoardView, LabelDto, MemberDto, Row } from "../types";
 import { AvatarStack, stackFor } from "./Avatar";
 import { catalogColor } from "./colors";
 import { PriorityIcon, StatusIcon } from "./icons";
 import { IconButton } from "./primitives";
+import { dueLabel, dueTone } from "./time";
+
+const DUE_TONE = { overdue: "text-danger", soon: "text-warn", later: "text-mute" } as const;
 
 /**
  * The board — the same fetch as the list, laid out sideways.
@@ -31,6 +35,7 @@ import { IconButton } from "./primitives";
 export function Board({
   board,
   members,
+  labels,
   selection,
   optimistic,
   onSelect,
@@ -42,6 +47,7 @@ export function Board({
   board: BoardView;
   /** The ACL, for resolving assignee keys to faces. */
   members: MemberDto[];
+  labels: LabelDto[];
   selection: string | null;
   /** Docs carrying an unconfirmed local prediction. */
   optimistic: ReadonlySet<string>;
@@ -104,6 +110,7 @@ export function Board({
           key={col.state.id}
           col={col}
           members={members}
+          labels={labels}
           selection={selection}
           optimistic={optimistic}
           drag={drag}
@@ -148,6 +155,7 @@ export function boardMovePosition(col: BoardColumn): BoardPos | null {
 function Column({
   col,
   members,
+  labels,
   selection,
   optimistic,
   drag,
@@ -165,6 +173,7 @@ function Column({
 }: {
   col: BoardColumn;
   members: MemberDto[];
+  labels: LabelDto[];
   selection: string | null;
   optimistic: ReadonlySet<string>;
   drag: { reff: string; from: string } | null;
@@ -222,29 +231,21 @@ function Column({
             </IconButton>
           </DropdownMenu.Trigger>
           <DropdownMenu.Portal>
-            <DropdownMenu.Content
-              align="end"
-              sideOffset={4}
-              className="border-line-strong bg-raised shadow-overlay z-50 min-w-44 rounded-lg border p-1"
-            >
+            <MenuContent align="end">
               {!readOnly && (
-                <DropdownMenu.Item
-                  onSelect={() => onCreate(col.state.id)}
-                  className="data-[highlighted]:bg-hover flex cursor-default items-center gap-2 rounded px-2 py-1.5 text-sm outline-none"
-                >
+                <MenuItem onSelect={() => onCreate(col.state.id)}>
                   <Plus className="size-3.5" />
                   New issue
-                </DropdownMenu.Item>
+                </MenuItem>
               )}
-              <DropdownMenu.Item
+              <MenuItem
                 disabled={!rows[0]}
                 onSelect={() => rows[0] && onSelect(rows[0].reff)}
-                className="data-[highlighted]:bg-hover data-[disabled]:text-mute flex cursor-default items-center gap-2 rounded px-2 py-1.5 text-sm outline-none"
               >
                 Open first issue
                 <span className="text-mute ml-auto tabular-nums">{rows.length}</span>
-              </DropdownMenu.Item>
-            </DropdownMenu.Content>
+              </MenuItem>
+            </MenuContent>
           </DropdownMenu.Portal>
         </DropdownMenu.Root>
         </>}
@@ -286,6 +287,7 @@ function Column({
             key={row.reff}
             row={row}
             members={members}
+          labels={labels}
             selected={row.reff === selection}
             pending={optimistic.has(row.doc_id)}
             dragging={drag?.reff === row.reff}
@@ -347,6 +349,7 @@ function DropLine() {
 function Card({
   row,
   members,
+  labels,
   selected,
   pending,
   dragging,
@@ -362,6 +365,7 @@ function Card({
 }: {
   row: Row;
   members: MemberDto[];
+  labels: LabelDto[];
   selected: boolean;
   pending: boolean;
   dragging: boolean;
@@ -423,8 +427,8 @@ function Card({
         className={[
           "bg-raised group/card cursor-default rounded border p-2 transition-[border-color,box-shadow,opacity] duration-150",
           selected
-            ? "border-accent ring-accent shadow-sm ring-1"
-            : "border-line hover:border-line-strong hover:shadow-sm",
+            ? "border-accent ring-accent shadow-raised ring-1"
+            : "border-line hover:border-line-strong hover:shadow-raised",
           row.provisional ? "opacity-60" : "",
           row.tombstone ? "opacity-60" : "",
           // The card left the deck: dim the hole it came from rather than removing
@@ -448,20 +452,15 @@ function Card({
                 </IconButton>
               </DropdownMenu.Trigger>
               <DropdownMenu.Portal>
-                <DropdownMenu.Content
-                  align="end"
-                  sideOffset={4}
-                  className="border-line-strong bg-raised shadow-overlay z-50 min-w-44 rounded-lg border p-1"
-                >
+                <MenuContent align="end">
                   <DropdownMenu.Label className="text-mute px-2 py-1 text-2xs font-semibold uppercase">
                     Move to
                   </DropdownMenu.Label>
                   {columns.map((column) => (
-                    <DropdownMenu.Item
+                    <MenuItem
                       key={column.state.id}
                       disabled={column.state.id === row.status}
                       onSelect={() => onMove(row, column)}
-                      className="data-[highlighted]:bg-hover data-[disabled]:text-mute flex cursor-default items-center gap-2 rounded px-2 py-1.5 text-sm outline-none"
                     >
                       <StatusIcon
                         category={column.state.category}
@@ -470,26 +469,60 @@ function Card({
                       <span className="flex-1">{column.state.name}</span>
                       <span className="text-mute tabular-nums">{column.rows.length}</span>
                       {column.state.category === "done" && <span className="sr-only">Completion time determines order</span>}
-                    </DropdownMenu.Item>
+                    </MenuItem>
                   ))}
                   <DropdownMenu.Separator className="bg-line my-1 h-px" />
-                  <DropdownMenu.Item onSelect={() => onSelect(row.reff)} className="data-[highlighted]:bg-hover flex cursor-default items-center gap-2 rounded px-2 py-1.5 text-sm outline-none">
+                  <MenuItem onSelect={() => onSelect(row.reff)}>
                     <ExternalLink className="size-3.5" /> Open issue
-                  </DropdownMenu.Item>
-                  <DropdownMenu.Item onSelect={() => onEdit(row.reff, "priority")} className="data-[highlighted]:bg-hover flex cursor-default items-center gap-2 rounded px-2 py-1.5 text-sm outline-none">
+                  </MenuItem>
+                  <MenuItem onSelect={() => onEdit(row.reff, "priority")}>
                     <Flag className="size-3.5" /> Set priority
-                  </DropdownMenu.Item>
-                  <DropdownMenu.Item onSelect={() => onEdit(row.reff, "assignee")} className="data-[highlighted]:bg-hover flex cursor-default items-center gap-2 rounded px-2 py-1.5 text-sm outline-none">
+                  </MenuItem>
+                  <MenuItem onSelect={() => onEdit(row.reff, "assignee")}>
                     <UserPlus className="size-3.5" /> Assign
-                  </DropdownMenu.Item>
-                  <DropdownMenu.Item onSelect={() => onEdit(row.reff, "label")} className="data-[highlighted]:bg-hover flex cursor-default items-center gap-2 rounded px-2 py-1.5 text-sm outline-none">
+                  </MenuItem>
+                  <MenuItem onSelect={() => onEdit(row.reff, "label")}>
                     <Tags className="size-3.5" /> Add label
-                  </DropdownMenu.Item>
-                </DropdownMenu.Content>
+                  </MenuItem>
+                </MenuContent>
               </DropdownMenu.Portal>
             </DropdownMenu.Root>
           )}
         </div>
+        {((row.label_names?.length ?? 0) > 0 || row.due_date != null || row.estimate != null) && (
+          <div className="mb-1.5 flex flex-wrap items-center gap-1">
+            {(row.label_names ?? []).slice(0, 3).map((name) => {
+              const def = labels.find((l) => l.name === name);
+              return (
+                <span
+                  key={name}
+                  className="border-line-strong flex items-center gap-1 rounded-full border px-1.5 text-2xs"
+                >
+                  <span
+                    className="size-1.5 shrink-0 rounded-full"
+                    style={{ background: catalogColor(def?.color ?? "gray") }}
+                  />
+                  {name}
+                </span>
+              );
+            })}
+            {(row.label_names?.length ?? 0) > 3 && (
+              <span className="text-mute text-2xs">+{row.label_names!.length - 3}</span>
+            )}
+            {row.due_date != null && (
+              <span className={`flex items-center gap-1 text-2xs ${DUE_TONE[dueTone(row.due_date)]}`}>
+                <CalendarClock className="size-3" />
+                {dueLabel(row.due_date)}
+              </span>
+            )}
+            {row.estimate != null && (
+              <span className="text-mute flex items-center gap-1 text-2xs">
+                <Gauge className="size-3" />
+                {row.estimate}
+              </span>
+            )}
+          </div>
+        )}
         <div className="flex items-center gap-2">
           <PriorityIcon priority={row.priority} />
           <span className="text-mute font-mono text-2xs tabular-nums">

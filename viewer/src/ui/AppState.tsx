@@ -16,7 +16,7 @@ import {
 } from "lucide-react";
 
 import type { SpaceRow, StatusInfo } from "../types";
-import { Button, cn } from "./primitives";
+import { Button, cn, PopoverContent } from "./primitives";
 
 export type ApplicationStateKind =
   | "loading"
@@ -221,12 +221,7 @@ export function TrustPopover({
           {trustSummary(liveness, localReady, peers, degraded)}
         </span>
       </Popover.Trigger>
-      <Popover.Portal>
-        <Popover.Content
-          align="end"
-          sideOffset={6}
-          className="border-line-strong bg-raised shadow-overlay z-50 w-80 rounded-lg border p-3"
-        >
+      <PopoverContent align="end" sideOffset={6} className="w-80 p-3">
           <div className="mb-3 flex items-center gap-2">
             <ShieldCheck className="text-accent size-4" />
             <div>
@@ -326,8 +321,7 @@ export function TrustPopover({
             {status?.membership ? ` · ${status.membership}` : ""}
           </div>
           <Popover.Arrow className="fill-line-strong" />
-        </Popover.Content>
-      </Popover.Portal>
+      </PopoverContent>
     </Popover.Root>
   );
 }

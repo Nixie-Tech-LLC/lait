@@ -1,5 +1,5 @@
 import { Command } from "cmdk";
-import { Clock3, Search } from "lucide-react";
+import { AlertTriangle, Clock3, Search } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
 import { rpc } from "../api";
@@ -36,6 +36,9 @@ export function IssueSearch({
   useReturnFocus();
   const [available, setAvailable] = useState(rows);
   const [query, setQuery] = useState("");
+  /** Projects whose board couldn't be read this pass — the search covers
+   *  everything EXCEPT these, and a silent drop would read as "no matches". */
+  const [unreached, setUnreached] = useState<string[]>([]);
   useEffect(() => {
     let alive = true;
     void Promise.allSettled(
@@ -45,20 +48,27 @@ export function IssueSearch({
     ).then((replies) => {
       if (!alive) return;
       const merged = new Map<string, Row>();
-      for (const result of replies) {
-        if (result.status !== "fulfilled" || result.value.kind !== "board") continue;
+      const failed: string[] = [];
+      replies.forEach((result, index) => {
+        if (result.status !== "fulfilled" || result.value.kind !== "board") {
+          const project = projects[index];
+          if (project) failed.push(project.name);
+          return;
+        }
         for (const column of result.value.columns) {
           for (const row of column.rows) {
             if (!row.tombstone) merged.set(row.reff, row);
           }
         }
-      }
+      });
+      setUnreached(failed);
       if (merged.size) {
         setAvailable([...merged.values()]);
       }
     }).catch(() => {
       // The active board remains a useful, honest subset when every broader
       // projection is unavailable.
+      if (alive) setUnreached(projects.map((p) => p.name));
     });
     return () => {
       alive = false;
@@ -163,6 +173,20 @@ export function IssueSearch({
             {results.map((row) => <IssueResult key={row.reff} row={row} projectById={projectById} stateById={stateById} onOpen={choose} />)}
           </Command.Group>
         </Command.List>
+        {unreached.length > 0 && (
+          <div
+            className="border-line text-warn flex items-center gap-2 border-t px-4 py-2 text-xs"
+            role="status"
+            title={unreached.join(", ")}
+          >
+            <AlertTriangle className="size-3.5 shrink-0" />
+            <span className="min-w-0 flex-1 truncate">
+              Search is incomplete — {unreached.length}{" "}
+              {unreached.length === 1 ? "project" : "projects"} couldn’t be read
+              ({unreached.join(", ")}).
+            </span>
+          </div>
+        )}
       </Command>
     </div>
   );

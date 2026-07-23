@@ -1272,6 +1272,7 @@ export function App() {
             filter={filter}
             labels={labels}
             states={states}
+            members={members}
             focusToken={focusToken}
             resultCount={shown?.columns.reduce(
               (count, column) => count + column.rows.filter((row) => !row.tombstone).length,
@@ -1364,6 +1365,7 @@ export function App() {
             <Board
               board={shown}
               members={members}
+              labels={labels}
               selection={selection}
               optimistic={optimistic}
               onSelect={(reff) => {
@@ -1590,6 +1592,7 @@ export function App() {
           states={states}
           labels={labels}
           members={members}
+          projects={projects}
           onStatus={(id) =>
             void bulk((reff) => rpc(current, { cmd: "issue_edit", reff, status: id }))
           }
@@ -1597,9 +1600,19 @@ export function App() {
             void bulk((reff) => rpc(current, { cmd: "issue_edit", reff, priority: id }))
           }
           onLabel={(name) => void bulk((reff) => rpc(current, { cmd: "label", reff, add: [name] }))}
+          onLabelRemove={(name) =>
+            void bulk((reff) => rpc(current, { cmd: "label", reff, remove: [name] }))
+          }
           onAssign={(key) =>
             void bulk((reff) => rpc(current, { cmd: "assign", reff, who: [key], add: true }))
           }
+          onUnassign={(key) =>
+            void bulk((reff) => rpc(current, { cmd: "assign", reff, who: [key], add: false }))
+          }
+          onProject={(id) =>
+            void bulk((reff) => rpc(current, { cmd: "issue_move", reff, project: id }))
+          }
+          onDue={(due) => void bulk((reff) => rpc(current, { cmd: "issue_edit", reff, due }))}
           onDelete={() =>
             void (async () => {
               const n = checked.size;

@@ -2,11 +2,16 @@ import { useEffect, useRef } from "react";
 import { ListFilter, X } from "lucide-react";
 
 import { EMPTY_FILTER, isActive, type FilterState } from "../core/filter";
-import type { LabelDto, WorkflowState } from "../types";
+import { PRIORITY_ORDER, type LabelDto, type MemberDto, type WorkflowState } from "../types";
+import { Avatar, memberName } from "./Avatar";
 import { catalogColor } from "./colors";
-import { StatusIcon } from "./icons";
+import { PriorityIcon, StatusIcon } from "./icons";
 import { Combobox } from "./Picker";
 import { Button, IconButton } from "./primitives";
+
+/** Toggle one id in a multi-select filter axis. */
+const toggle = (list: readonly string[], id: string): string[] =>
+  list.includes(id) ? list.filter((x) => x !== id) : [...list, id];
 
 /**
  * The filter bar.
@@ -30,6 +35,7 @@ export function FilterBar({
   filter,
   labels,
   states,
+  members,
   focusToken,
   resultCount,
   totalCount,
@@ -39,6 +45,7 @@ export function FilterBar({
   filter: FilterState;
   labels: LabelDto[];
   states: WorkflowState[];
+  members: MemberDto[];
   /** Bumped by the `/` command; refocuses without the bar owning the binding. */
   focusToken: number;
   resultCount: number;
@@ -111,15 +118,60 @@ export function FilterBar({
           label: s.name,
           icon: <StatusIcon category={s.category} color={catalogColor(s.color)} />,
         }))}
-        onToggle={(id) =>
-          onChange({
-            ...filter,
-            status: filter.status.includes(id)
-              ? filter.status.filter((x) => x !== id)
-              : [...filter.status, id],
-          })
-        }
+        onToggle={(id) => onChange({ ...filter, status: toggle(filter.status, id) })}
       />
+
+      <Combobox
+        multi
+        label="Priority"
+        selected={filter.priority}
+        className="shrink-0 capitalize"
+        face={
+          <span className={filter.priority.length ? "text-accent" : "text-mute"}>
+            {filter.priority.length === 0
+              ? "Priority"
+              : filter.priority.length === 1
+                ? filter.priority[0]
+                : `${filter.priority.length} priorities`}
+          </span>
+        }
+        // Highest first, matching the detail picker.
+        options={[...PRIORITY_ORDER].reverse().map((p) => ({
+          id: p,
+          label: p,
+          icon: <PriorityIcon priority={p} />,
+        }))}
+        onToggle={(id) => onChange({ ...filter, priority: toggle(filter.priority, id) })}
+      />
+
+      {members.length > 0 && (
+        <Combobox
+          multi
+          label="Assignee"
+          selected={filter.assignees}
+          className="shrink-0"
+          face={
+            <span className={filter.assignees.length ? "text-accent" : "text-mute"}>
+              {filter.assignees.length === 0
+                ? "Assignee"
+                : filter.assignees.length === 1
+                  ? memberName(
+                      filter.assignees[0]!,
+                      members.find((m) => m.key === filter.assignees[0]),
+                    )
+                  : `${filter.assignees.length} assignees`}
+            </span>
+          }
+          options={members.map((m) => ({
+            id: m.key,
+            label: memberName(m.key, m),
+            icon: <Avatar deviceKey={m.key} alias={m.alias} me={m.me} size="sm" />,
+            hint: m.key.slice(0, 6),
+            keywords: [m.key, m.alias],
+          }))}
+          onToggle={(key) => onChange({ ...filter, assignees: toggle(filter.assignees, key) })}
+        />
+      )}
 
       {labels.length > 0 && (
         <Combobox

@@ -89,6 +89,7 @@ fn the_router_maps_the_control_surface_to_the_issues_world() {
         Request::ProjectNew {
             name: "Engineering".into(),
             key: "eng".into(),
+            color: None,
         },
         &facts(),
     );

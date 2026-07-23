@@ -112,8 +112,7 @@ export function DialogHost() {
               <AlertDialog.Action asChild>
                 <Button
                   size="md"
-                  variant="primary"
-                  className={req.danger ? "bg-danger" : undefined}
+                  variant={req.danger ? "destructive" : "primary"}
                   onClick={() => settle(true)}
                 >
                   {req.confirmText ?? "Confirm"}

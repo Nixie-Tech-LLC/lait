@@ -72,6 +72,11 @@
 
   --ease-out: cubic-bezier(0.2, 0, 0.2, 1);
   --shadow-overlay: light-dark(0 8px 30px rgb(0 0 0 / 0.12), 0 8px 30px rgb(0 0 0 / 0.5));
+  /* For elevated-but-not-floating surfaces — a board card lifting on hover, a
+     toast. Tailwind's default `shadow-sm` is a faint black tuned for a white page
+     and all but vanishes on the dark `raised` surface; this carries a real value
+     in dark and a soft one in light, so "lifted" reads in both. */
+  --shadow-raised: light-dark(0 1px 2px rgb(0 0 0 / 0.10), 0 2px 4px rgb(0 0 0 / 0.55));
 }
 
 /* Dark by default; the OS decides unless the user overrode it. `color-scheme` is
@@ -246,6 +251,35 @@
 .ui-surface { animation: ui-surface-in 160ms var(--ease-out) both; }
 .ui-drawer { animation: ui-drawer-in 180ms var(--ease-out) both; }
 .ui-detail { animation: ui-detail-in 160ms var(--ease-out) both; }
+
+/* Exits. A surface that fades in and then vanishes reads as a glitch, not a
+   close. Radix keeps its Content/Overlay mounted while `data-state="closed"` as
+   long as a CSS animation is running on it, so the `[data-state="closed"]`
+   variant *is* the close animation — no JS, and it only ever engages on the
+   Radix-driven surfaces (dialogs, popovers, menus, the drawer). The manually
+   mounted overlays (palette, search, shortcuts) carry no `data-state`, so they
+   keep their enter-only behaviour and unmount instantly, as before. The
+   class+attribute selector outranks the bare `.ui-*` enter rule, so on close the
+   exit wins without touching the entrance. Exits run a touch quicker than
+   entrances — leaving should feel lighter than arriving. */
+@keyframes ui-overlay-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+@keyframes ui-surface-out {
+  from { opacity: 1; scale: 1; }
+  to { opacity: 0; scale: 0.985; }
+}
+
+@keyframes ui-drawer-out {
+  from { translate: 0 0; opacity: 1; }
+  to { translate: -16px 0; opacity: 0; }
+}
+
+.ui-overlay[data-state="closed"] { animation: ui-overlay-out 120ms var(--ease-out) both; }
+.ui-surface[data-state="closed"] { animation: ui-surface-out 130ms var(--ease-out) both; }
+.ui-drawer[data-state="closed"] { animation: ui-drawer-out 150ms var(--ease-out) both; }
 
 /* A focused issue becomes a document with a stable Linear-style property rail.
    The split pane stays single-column until it has enough *container* width; the

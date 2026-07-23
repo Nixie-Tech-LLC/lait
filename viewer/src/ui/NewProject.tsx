@@ -3,6 +3,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
 
 import { rpc } from "../api";
+import { ColorPicker } from "./ColorPicker";
 import { Button, IconButton, Kbd } from "./primitives";
 
 /**
@@ -40,6 +41,7 @@ export function NewProject({
 }) {
   const [name, setName] = useState("");
   const [key, setKey] = useState("");
+  const [color, setColor] = useState("blue");
   /** Once you edit the key yourself, the name stops driving it. */
   const [manual, setManual] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -57,7 +59,7 @@ export function NewProject({
     setBusy(true);
     setFailure("");
     try {
-      const r = await rpc(spaceId, { cmd: "project_new", name: name.trim(), key: upper });
+      const r = await rpc(spaceId, { cmd: "project_new", name: name.trim(), key: upper, color });
       // `project_new` replies with the key as the ref — switch the board to it, so
       // creating a project lands you in it rather than leaving you where you were.
       if (r.kind === "ref") onCreated(r.reff);
@@ -128,6 +130,11 @@ export function NewProject({
                       : "Becomes the KEY in KEY-1 — 1–8 letters")}
                 </span>
               </label>
+
+              <div className="flex flex-col gap-1.5">
+                <span className="text-mute text-2xs uppercase">Color</span>
+                <ColorPicker value={color} onChange={setColor} />
+              </div>
               {failure && (
                 <p className="border-danger/25 bg-danger/5 text-danger rounded border p-2 text-xs" role="alert">
                   Project not created. Your name and key are still here: {failure}
@@ -137,7 +144,7 @@ export function NewProject({
 
             <footer className="border-line flex items-center justify-end gap-2 border-t p-3">
               <Kbd>↵</Kbd>
-              <Button size="md" variant="primary" type="submit" disabled={!ready}>
+              <Button size="md" variant="primary" type="submit" disabled={!ready} loading={busy}>
                 {busy ? "Creating…" : "Create project"}
               </Button>
             </footer>

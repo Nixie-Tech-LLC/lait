@@ -114,6 +114,7 @@ fn two_orbital_daemons_join_admit_and_converge_over_the_socket() {
         Request::ProjectNew {
             name: "Core".into(),
             key: "core".into(),
+            color: None,
         },
     );
     assert!(

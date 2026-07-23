@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+import * as Popover from "@radix-ui/react-popover";
 import {
   AlertTriangle,
   ArchiveRestore,
@@ -21,6 +22,7 @@ import {
   Play,
   RotateCcw,
   Plus,
+  SmilePlus,
   Trash2,
   UserPlus,
   X,
@@ -52,11 +54,13 @@ import { LoadingState } from "./AppState";
 import { catalogColor } from "./colors";
 import { PriorityIcon, StatusIcon } from "./icons";
 import { Markdown } from "./Markdown";
+import { DatePicker } from "./DatePicker";
+import { NewLabelDialog } from "./NewLabel";
 import { Combobox, type Option } from "./Picker";
-import { Button, IconButton } from "./primitives";
+import { Button, IconButton, PopoverContent } from "./primitives";
 import { MenuContent, MenuItem, PropertyRow, SectionHeader, SurfaceHeader, Toast } from "./layout";
 import * as ask from "./dialogs";
-import { dueLabel, dueToInput, dueTone, short, when } from "./time";
+import { dueToInput, dueTone, short, when } from "./time";
 
 /**
  * The issue detail — co-visible beside the list, not an overlay.
@@ -131,6 +135,8 @@ export function IssueDetail({
   const [commentPending, setCommentPending] = useState(false);
   const [commentError, setCommentError] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
+  /** A label name the picker wants to mint — opens the colour step. */
+  const [newLabel, setNewLabel] = useState<string | null>(null);
   const [undoWork, setUndoWork] = useState<{
     message: string;
     action: "start" | "done" | "stop";
@@ -618,11 +624,10 @@ export function IssueDetail({
                   }),
                 );
               }}
-              // `label add` creates unknown names on first use (gray, like the
-              // CLI) — the picker just stops pretending the vocabulary is closed.
-              onCreate={(name) =>
-                void send(() => rpc(spaceId, { cmd: "label", reff, add: [name] }))
-              }
+              // A brand-new label gets a colour before it exists: the picker hands
+              // the name off to the colour step, which registers it via `label_new`
+              // and then attaches it — rather than minting it gray on first use.
+              onCreate={(name) => setNewLabel(name)}
             />
           </PropertyRow>
 
@@ -722,6 +727,24 @@ export function IssueDetail({
           onReply={(replyTo, body) =>
             void send(() => rpc(spaceId, { cmd: "comment", reff, body, reply_to: replyTo }))
           }
+          onCopyLink={(commentId) => {
+            const url = new URL(window.location.href);
+            url.searchParams.set("issue", issue.reff);
+            url.searchParams.set("comment", commentId);
+            void navigator.clipboard.writeText(url.toString());
+          }}
+          onCreateFromComment={(body) =>
+            void (async () => {
+              const title = body.split("\n")[0]!.slice(0, 80).trim() || "Follow-up";
+              const r = await rpc(spaceId, {
+                cmd: "issue_new",
+                title,
+                project: issue.project_id,
+                body,
+              });
+              if (r.kind === "ref") onNavigate(r.reff);
+            })()
+          }
         />
 
         {!locked && (
@@ -761,8 +784,8 @@ export function IssueDetail({
               )}
               <Button
                 variant="primary"
-                disabled={!comment.trim() || commentPending}
-                aria-busy={commentPending}
+                disabled={!comment.trim()}
+                loading={commentPending}
                 onClick={() => void submitComment()}
               >
                 {commentPending ? "Sending…" : commentError ? "Retry" : "Comment"}
@@ -776,6 +799,22 @@ export function IssueDetail({
           {when(issue.created_at)}
         </footer>
       </div>
+      {newLabel !== null && (
+        <NewLabelDialog
+          name={newLabel}
+          onCancel={() => setNewLabel(null)}
+          onCreate={(labelName, color) => {
+            setNewLabel(null);
+            // Two requests, in order: register the label with its colour, then
+            // attach it. `label add` on an existing name only attaches, so the
+            // colour set here is the one that sticks.
+            void send(async () => {
+              await rpc(spaceId, { cmd: "label_new", name: labelName, color });
+              await rpc(spaceId, { cmd: "label", reff, add: [labelName] });
+            });
+          }}
+        />
+      )}
     </aside>
   );
 }
@@ -835,11 +874,12 @@ function IssueOverflow({
 }
 
 /**
- * The due-date control: a native date input wearing the property-row style.
+ * The due-date control — the shared `DatePicker` wearing the property row's tone.
  *
- * The platform's picker beats anything hand-rolled here, and the input's value
- * IS the wire format (`YYYY-MM-DD`, UTC — the engine stores UTC midnight).
- * Clearing goes through the same request with `"none"`.
+ * The engine speaks unix seconds here but the picker speaks `YYYY-MM-DD` (UTC — the
+ * engine stores UTC midnight), so this thin wrapper is the one conversion: seconds
+ * in via `dueToInput`, and `null` back out becomes the request's `"none"`. The
+ * traffic-light tone (overdue/soon/later) rides in as the trigger's colour.
  */
 function DueDate({
   value,
@@ -852,35 +892,15 @@ function DueDate({
 }) {
   const tone =
     value !== null ? { overdue: "text-danger", soon: "text-warn", later: "" }[dueTone(value)] : "";
-  if (readOnly) {
-    return (
-      <span className={`text-dim px-1 py-0.5 ${tone}`}>
-        {value !== null ? dueLabel(value) : "None"}
-      </span>
-    );
-  }
   return (
-    <span className="flex items-center gap-1">
-      <input
-        type="date"
-        value={value !== null ? dueToInput(value) : ""}
-        onChange={(e) => onChange(e.target.value || "none")}
-        onKeyDown={(e) => e.stopPropagation()}
-        aria-label="Due date"
-        className={`hover:bg-hover -mx-1 rounded px-1 py-0.5 text-sm outline-none ${tone} ${
-          value === null ? "text-mute" : ""
-        }`}
-      />
-      {value !== null && (
-        <IconButton
-          label="Clear due date"
-          onClick={() => onChange("none")}
-          className="opacity-0 group-hover/prop:opacity-100 focus-visible:opacity-100"
-        >
-          <X className="size-3" />
-        </IconButton>
-      )}
-    </span>
+    <DatePicker
+      variant="bare"
+      value={value !== null ? dueToInput(value) : null}
+      disabled={readOnly}
+      placeholder="None"
+      className={tone}
+      onChange={(next) => onChange(next ?? "none")}
+    />
   );
 }
 
@@ -1328,6 +1348,8 @@ function Timeline({
   meKey,
   onReact,
   onReply,
+  onCopyLink,
+  onCreateFromComment,
 }: {
   events: ActivityEvent[];
   comments: CommentDto[];
@@ -1337,6 +1359,8 @@ function Timeline({
   meKey: string | null;
   onReact: (comment: string, emoji: string, on: boolean) => void;
   onReply: (replyTo: string, body: string) => void;
+  onCopyLink: (commentId: string) => void;
+  onCreateFromComment: (body: string) => void;
 }) {
   const [visibleCount, setVisibleCount] = useState(40);
   // The naming policy lives here, where the member list is: a key becomes an alias,
@@ -1406,6 +1430,8 @@ function Timeline({
             meKey={meKey}
             onReact={onReact}
             onReply={onReply}
+            onCopyLink={onCopyLink}
+            onCreateFromComment={onCreateFromComment}
           />
         ) : (
           <Event key={`e${entry.order}`} event={entry.event} resolveName={resolveName} />
@@ -1427,6 +1453,8 @@ function Comment({
   meKey,
   onReact,
   onReply,
+  onCopyLink,
+  onCreateFromComment,
 }: {
   comment: CommentDto;
   replies: CommentDto[];
@@ -1435,6 +1463,8 @@ function Comment({
   meKey: string | null;
   onReact: (comment: string, emoji: string, on: boolean) => void;
   onReply: (replyTo: string, body: string) => void;
+  onCopyLink: (commentId: string) => void;
+  onCreateFromComment: (body: string) => void;
 }) {
   const member = memberOf(c.author);
   const [picking, setPicking] = useState(false);
@@ -1488,41 +1518,64 @@ function Comment({
                   </button>
                 );
               })}
-              {canAct &&
-                (picking ? (
-                  REACTION_EMOJIS.map((emoji) => (
-                    <button
-                      key={emoji}
-                      onClick={() => {
-                        setPicking(false);
-                        if (c.id) onReact(c.id, emoji, true);
-                      }}
-                      aria-label={`React ${emoji}`}
-                      className="hover:bg-hover rounded px-1 text-sm"
-                    >
-                      {emoji}
-                    </button>
-                  ))
-                ) : (
-                  <>
-                    <button
-                      onClick={() => setPicking(true)}
-                      aria-label="Add reaction"
-                      className="text-mute hover:text-fg rounded-full px-1 text-xs opacity-0 transition-opacity group-hover/comment:opacity-100 focus-visible:opacity-100"
-                    >
-                      +😊
-                    </button>
-                    {/* Replies to a reply re-anchor to the root: one level. */}
-                    {!c.parent && (
+              {canAct && (
+                <>
+                  {/* A floating palette, like every other pick-from-a-set surface —
+                      it used to swap itself inline for six buttons and shove the
+                      footer sideways. */}
+                  <Popover.Root open={picking} onOpenChange={setPicking}>
+                    <Popover.Trigger asChild>
                       <button
-                        onClick={() => setReplying("")}
+                        aria-label="Add reaction"
+                        className="text-mute hover:text-fg rounded-full px-1 opacity-0 transition-opacity group-hover/comment:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100"
+                      >
+                        <SmilePlus className="size-3.5" />
+                      </button>
+                    </Popover.Trigger>
+                    <PopoverContent align="start" className="flex gap-0.5 p-1">
+                      {REACTION_EMOJIS.map((emoji) => (
+                        <button
+                          key={emoji}
+                          onClick={() => {
+                            setPicking(false);
+                            if (c.id) onReact(c.id, emoji, true);
+                          }}
+                          aria-label={`React ${emoji}`}
+                          className="hover:bg-hover rounded px-1.5 py-1 text-base"
+                        >
+                          {emoji}
+                        </button>
+                      ))}
+                    </PopoverContent>
+                  </Popover.Root>
+                  {/* Replies to a reply re-anchor to the root: one level. */}
+                  {!c.parent && (
+                    <button
+                      onClick={() => setReplying("")}
+                      className="text-mute hover:text-fg text-xs opacity-0 transition-opacity group-hover/comment:opacity-100 focus-visible:opacity-100"
+                    >
+                      Reply
+                    </button>
+                  )}
+                  {c.id && (
+                    <>
+                      <button
+                        onClick={() => onCopyLink(c.id!)}
                         className="text-mute hover:text-fg text-xs opacity-0 transition-opacity group-hover/comment:opacity-100 focus-visible:opacity-100"
                       >
-                        Reply
+                        Copy link
                       </button>
-                    )}
-                  </>
-                ))}
+                      <button
+                        onClick={() => onCreateFromComment(c.body)}
+                        title="Create a new issue from this comment"
+                        className="text-mute hover:text-fg text-xs opacity-0 transition-opacity group-hover/comment:opacity-100 focus-visible:opacity-100"
+                      >
+                        New issue
+                      </button>
+                    </>
+                  )}
+                </>
+              )}
             </div>
           )}
         </div>
@@ -1539,6 +1592,8 @@ function Comment({
                 meKey={meKey}
                 onReact={onReact}
                 onReply={onReply}
+                onCopyLink={onCopyLink}
+                onCreateFromComment={onCreateFromComment}
               />
             ))}
             {replying !== null && (

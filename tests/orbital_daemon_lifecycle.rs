@@ -116,6 +116,7 @@ fn the_orbital_daemon_serves_the_issue_surface_over_the_control_socket() {
         Request::ProjectNew {
             name: "Engineering".into(),
             key: "eng".into(),
+            color: None,
         },
     );
     assert!(

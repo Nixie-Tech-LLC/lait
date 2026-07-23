@@ -1427,6 +1427,7 @@ impl World for IssuesWorld {
                 id,
                 name,
                 key,
+                color,
                 device: _,
                 ts: _,
             } => {
@@ -1447,7 +1448,7 @@ impl World for IssuesWorld {
                     serde_json::to_vec(&serde_json::json!({
                         "name": name.trim(),
                         "key": key,
-                        "color": "blue",
+                        "color": color,
                     }))
                     .expect("project json"),
                 ));
@@ -1488,6 +1489,121 @@ impl World for IssuesWorld {
                     }))
                     .expect("label json"),
                 ));
+                Ok(staging.into_effect(None))
+            }
+            IssueIntent::ProjectEdit {
+                id,
+                name,
+                color,
+                device: _,
+                ts: _,
+            } => {
+                staging.require(contract::demand_space_any("project.configure"));
+                let current = catalog
+                    .projects
+                    .get(&id)
+                    .ok_or(WorldError::InvalidRequest)?;
+                let mut meta = current.clone();
+                if let Some(name) = name {
+                    let name = name.trim().to_string();
+                    if name.is_empty() {
+                        return Err(WorldError::InvalidRequest);
+                    }
+                    // No name-uniqueness guard: projects are unique on KEY, not
+                    // name (which stays immutable here), so two may share a name.
+                    meta.name = name;
+                }
+                if let Some(color) = color {
+                    meta.color = color;
+                }
+                // Nothing changed: don't emit an op that would look like an edit.
+                if meta == *current {
+                    return Ok(staging.into_effect(None));
+                }
+                staging.catalog(map_set(
+                    "projects",
+                    id.clone(),
+                    serde_json::to_vec(&serde_json::json!({
+                        "name": meta.name,
+                        "key": meta.key,
+                        "color": meta.color,
+                    }))
+                    .expect("project json"),
+                ));
+                Ok(staging.into_effect(None))
+            }
+            IssueIntent::LabelEdit {
+                id,
+                name,
+                color,
+                device: _,
+                ts: _,
+            } => {
+                staging.require(contract::demand_space_any("catalog.label.configure"));
+                let current = catalog.labels.get(&id).ok_or(WorldError::InvalidRequest)?;
+                let mut meta = current.clone();
+                if let Some(name) = name {
+                    let name = name.trim().to_string();
+                    if name.is_empty() {
+                        return Err(WorldError::InvalidRequest);
+                    }
+                    // Case-insensitive uniqueness against the OTHER labels — the
+                    // same guard `LabelNew` applies, minus this label itself.
+                    if catalog
+                        .labels
+                        .iter()
+                        .any(|(lid, l)| lid != &id && l.name.eq_ignore_ascii_case(&name))
+                    {
+                        return Err(WorldError::Conflict);
+                    }
+                    meta.name = name;
+                }
+                if let Some(color) = color {
+                    meta.color = color;
+                }
+                if meta == *current {
+                    return Ok(staging.into_effect(None));
+                }
+                staging.catalog(map_set(
+                    "labels",
+                    id.clone(),
+                    serde_json::to_vec(&serde_json::json!({
+                        "name": meta.name,
+                        "color": meta.color,
+                    }))
+                    .expect("label json"),
+                ));
+                Ok(staging.into_effect(None))
+            }
+            IssueIntent::LabelDelete {
+                id,
+                device: _,
+                ts: _,
+            } => {
+                staging.require(contract::demand_space_any("catalog.label.configure"));
+                if !catalog.labels.contains_key(&id) {
+                    return Err(WorldError::InvalidRequest);
+                }
+                staging.catalog(BodyOp::MapRemove {
+                    path: "labels".into(),
+                    key: id,
+                });
+                Ok(staging.into_effect(None))
+            }
+            IssueIntent::SpaceRename {
+                name,
+                device: _,
+                ts: _,
+            } => {
+                staging.require(contract::demand_admin());
+                let name = name.trim();
+                if name.is_empty() {
+                    return Err(WorldError::InvalidRequest);
+                }
+                if catalog.name == name {
+                    return Ok(staging.into_effect(None));
+                }
+                staging.catalog(reg("name", name.to_string().into_bytes()));
                 Ok(staging.into_effect(None))
             }
             IssueIntent::RoleCreate {

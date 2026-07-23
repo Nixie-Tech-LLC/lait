@@ -2,7 +2,7 @@ import * as Popover from "@radix-ui/react-popover";
 import { SlidersHorizontal } from "lucide-react";
 
 import type { DisplayState, GroupBy, OrderBy } from "../core/display";
-import { Button, IconButton } from "./primitives";
+import { Button, IconButton, PopoverContent } from "./primitives";
 
 /**
  * The display-options popover — Linear's `Shift+V` surface, reduced to the axes
@@ -43,12 +43,7 @@ export function DisplayOptions({
           <SlidersHorizontal className="size-4" />
         </IconButton>
       </Popover.Trigger>
-      <Popover.Portal>
-        <Popover.Content
-          sideOffset={4}
-          align="end"
-          className="border-line-strong bg-raised shadow-overlay z-50 flex w-64 flex-col gap-3 rounded-lg border p-3"
-        >
+      <PopoverContent align="end" className="flex w-64 flex-col gap-3 p-3">
           <Axis label={view === "board" ? "Grouping (board is by status)" : "Group by"}>
             {(
               [
@@ -102,8 +97,7 @@ export function DisplayOptions({
             <Choice label="Compact" active={density === "compact"} onClick={() => onDensityChange("compact")} />
             <Choice label="Comfortable" active={density === "comfortable"} onClick={() => onDensityChange("comfortable")} />
           </Axis>
-        </Popover.Content>
-      </Popover.Portal>
+      </PopoverContent>
     </Popover.Root>
   );
 }

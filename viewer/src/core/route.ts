@@ -51,6 +51,8 @@ export function parseRoute(location: Pick<Location, "pathname" | "search">): Vie
     mine: query.get("mine") === "1",
     label: clean(query.get("label")),
     status: query.getAll("status").filter(Boolean),
+    priority: query.getAll("priority").filter(Boolean),
+    assignees: query.getAll("assignee").filter(Boolean),
   };
   const issue = view === "list" || view === "board" ? clean(query.get("issue")) : null;
   const focused = issue !== null && query.get("focus") === "1";
@@ -79,6 +81,8 @@ export function formatRoute(route: ViewerRoute): string {
     if (route.filter.mine) query.set("mine", "1");
     if (route.filter.label) query.set("label", route.filter.label);
     for (const status of route.filter.status) query.append("status", status);
+    for (const priority of route.filter.priority) query.append("priority", priority);
+    for (const assignee of route.filter.assignees) query.append("assignee", assignee);
   }
 
   const path = `/spaces/${encodeURIComponent(route.spaceId)}/${route.view}`;

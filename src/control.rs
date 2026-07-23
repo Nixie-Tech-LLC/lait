@@ -277,14 +277,39 @@ pub enum Request {
     ProjectNew {
         name: String,
         key: String,
+        #[serde(default)]
+        color: Option<String>,
     },
     ProjectList,
+    ProjectEdit {
+        /// KEY or `prj_` id.
+        project: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        color: Option<String>,
+    },
     LabelNew {
         name: String,
         #[serde(default)]
         color: Option<String>,
     },
     LabelList,
+    LabelEdit {
+        /// Name or `lbl_` id.
+        label: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        color: Option<String>,
+    },
+    LabelDelete {
+        /// Name or `lbl_` id.
+        label: String,
+    },
+    SpaceRename {
+        name: String,
+    },
     Activity {
         #[serde(default)]
         since: u64,
@@ -623,8 +648,12 @@ pub fn classify(req: &Request) -> RequestOwner {
         | Request::History { .. }
         | Request::ProjectNew { .. }
         | Request::ProjectList
+        | Request::ProjectEdit { .. }
         | Request::LabelNew { .. }
         | Request::LabelList
+        | Request::LabelEdit { .. }
+        | Request::LabelDelete { .. }
+        | Request::SpaceRename { .. }
         | Request::Activity { .. }
         | Request::RoleList
         | Request::RoleShow { .. }
@@ -771,13 +800,26 @@ pub fn representative_requests() -> Vec<Request> {
         Request::ProjectNew {
             name: s(),
             key: s(),
+            color: None,
         },
         Request::ProjectList,
+        Request::ProjectEdit {
+            project: s(),
+            name: None,
+            color: None,
+        },
         Request::LabelNew {
             name: s(),
             color: None,
         },
         Request::LabelList,
+        Request::LabelEdit {
+            label: s(),
+            name: None,
+            color: None,
+        },
+        Request::LabelDelete { label: s() },
+        Request::SpaceRename { name: s() },
         Request::Activity { since: 0 },
         Request::RoleList,
         Request::RoleShow { role: s() },

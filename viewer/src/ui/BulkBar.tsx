@@ -1,10 +1,11 @@
 import { RotateCcw, Trash2, X } from "lucide-react";
 
 import type { BulkProgress } from "../core/bulk";
-import type { LabelDto, MemberDto, WorkflowState } from "../types";
+import type { LabelDto, MemberDto, ProjectDto, WorkflowState } from "../types";
 import { PRIORITY_ORDER } from "../types";
 import { Avatar, memberName } from "./Avatar";
 import { catalogColor } from "./colors";
+import { DatePicker } from "./DatePicker";
 import { PriorityIcon, StatusIcon } from "./icons";
 import { Combobox } from "./Picker";
 import { Button, IconButton, Kbd } from "./primitives";
@@ -24,10 +25,15 @@ export function BulkBar({
   states,
   labels,
   members,
+  projects,
   onStatus,
   onPriority,
   onLabel,
+  onLabelRemove,
   onAssign,
+  onUnassign,
+  onProject,
+  onDue,
   onDelete,
   onRetryFailures,
   onClear,
@@ -37,17 +43,22 @@ export function BulkBar({
   states: WorkflowState[];
   labels: LabelDto[];
   members: MemberDto[];
+  projects: ProjectDto[];
   onStatus: (id: string) => void;
   onPriority: (id: string) => void;
   onLabel: (name: string) => void;
+  onLabelRemove: (name: string) => void;
   onAssign: (key: string) => void;
+  onUnassign: (key: string) => void;
+  onProject: (id: string) => void;
+  onDue: (due: string) => void;
   onDelete: () => void;
   onRetryFailures: () => void;
   onClear: () => void;
 }) {
   const pending = progress?.pending === true;
   return (
-    <div className="border-line-strong bg-raised shadow-overlay fixed bottom-4 left-1/2 z-40 flex -translate-x-1/2 items-center gap-2 rounded-lg border px-3 py-1.5">
+    <div className="border-line-strong bg-raised shadow-overlay fixed bottom-4 left-1/2 z-40 flex max-w-[calc(100vw-2rem)] -translate-x-1/2 flex-wrap items-center justify-center gap-2 rounded-lg border px-3 py-1.5">
       <span className="text-sm font-medium tabular-nums">{count} selected</span>
       {progress && (
         <>
@@ -128,6 +139,55 @@ export function BulkBar({
           keywords: [m.key, m.alias],
         }))}
         onPick={onAssign}
+      />
+      <Combobox
+        label="Unassign"
+        disabled={pending}
+        value={null}
+        placeholder="Unassign"
+        emptyText={members.length ? "No matches" : "No members yet"}
+        options={members.map((m) => ({
+          id: m.key,
+          label: memberName(m.key, m),
+          icon: <Avatar deviceKey={m.key} alias={m.alias} me={m.me} size="sm" />,
+          hint: m.key.slice(0, 6),
+          keywords: [m.key, m.alias],
+        }))}
+        onPick={onUnassign}
+      />
+      <Combobox
+        label="Remove label"
+        disabled={pending || labels.length === 0}
+        value={null}
+        placeholder="Remove label"
+        emptyText="No labels"
+        options={labels.map((l) => ({
+          id: l.name,
+          label: l.name,
+          swatch: catalogColor(l.color),
+        }))}
+        onPick={onLabelRemove}
+      />
+      <Combobox
+        label="Move to project"
+        disabled={pending}
+        value={null}
+        placeholder="Project"
+        options={projects.map((p) => ({
+          id: p.id,
+          label: p.name,
+          swatch: catalogColor(p.color),
+          hint: p.key,
+          keywords: [p.key],
+        }))}
+        onPick={onProject}
+      />
+      <DatePicker
+        variant="pill"
+        value={null}
+        placeholder="Due"
+        ariaLabel="Set due date on selected"
+        onChange={(next) => onDue(next ?? "none")}
       />
 
       <IconButton label="Delete selected" variant="danger" disabled={pending} onClick={onDelete}>

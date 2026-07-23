@@ -5,7 +5,7 @@ import { Command } from "cmdk";
 import { Check, ChevronDown, Plus } from "lucide-react";
 
 import { cmdkFilter } from "../core/fuzzy";
-import { cn } from "./primitives";
+import { cn, PopoverContent } from "./primitives";
 
 /**
  * A pill that opens a searchable menu — the tracker's workhorse control.
@@ -169,12 +169,7 @@ export function Combobox(props: Props) {
           )}
         />
       </Popover.Trigger>
-      <Popover.Portal>
-        <Popover.Content
-          sideOffset={4}
-          align="start"
-          className="border-line-strong bg-raised shadow-overlay z-50 w-60 overflow-hidden rounded-lg border p-0"
-        >
+      <PopoverContent align="start" className="w-60 overflow-hidden p-0">
           <Command filter={cmdkFilter} loop>
             <Command.Input
               autoFocus
@@ -212,7 +207,7 @@ export function Combobox(props: Props) {
                       setOpen(false);
                     }
                   }}
-                  className="data-[selected=true]:bg-hover flex cursor-default items-center gap-2 rounded px-2 py-1 text-sm outline-none"
+                  className="data-[selected=true]:bg-active flex cursor-default items-center gap-2 rounded px-2 py-1 text-sm outline-none"
                 >
                   {o.icon}
                   {o.swatch && (
@@ -240,7 +235,7 @@ export function Combobox(props: Props) {
                       setQuery("");
                       if (props.multi !== true) setOpen(false);
                     }}
-                    className="data-[selected=true]:bg-hover flex cursor-default items-center gap-2 rounded px-2 py-1 text-sm outline-none"
+                    className="data-[selected=true]:bg-active flex cursor-default items-center gap-2 rounded px-2 py-1 text-sm outline-none"
                   >
                     <Plus className="size-3 shrink-0" />
                     <span className="min-w-0 flex-1 truncate">
@@ -250,8 +245,7 @@ export function Combobox(props: Props) {
                 )}
             </Command.List>
           </Command>
-        </Popover.Content>
-      </Popover.Portal>
+      </PopoverContent>
     </Popover.Root>
   );
 }

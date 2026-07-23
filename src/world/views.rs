@@ -428,36 +428,6 @@ pub fn canonical_for(aliases: &DerivedAliases, doc: &str) -> String {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn completed_issue_keeps_alias_from_authoritative_project() {
-        let doc = "iss_01JU6A5CHEI9UR3SGKEK05KIAR";
-        let mut catalog = CatalogState::default();
-        catalog.projects.insert(
-            "prj_board".into(),
-            ProjectMeta {
-                name: "Board".into(),
-                key: "BOARD".into(),
-                color: "blue".into(),
-            },
-        );
-        catalog.seqs.insert(doc.into(), 5);
-
-        let aliases = derive_aliases(&catalog, |candidate| {
-            (candidate == doc).then_some("prj_board")
-        });
-
-        assert_eq!(aliases.by_doc.get(doc).map(String::as_str), Some("BOARD-5"));
-        assert_eq!(
-            aliases.by_alias.get("board-5").map(String::as_str),
-            Some(doc)
-        );
-    }
-}
-
 fn assignee_summary(assignees: &[ActorId], me: Option<&ActorId>) -> String {
     let mine = me.is_some_and(|m| assignees.contains(m));
     match (assignees.len(), mine) {
@@ -521,6 +491,20 @@ pub fn project_row(
         provisional: issue.is_none(),
         due_date,
         estimate,
+        label_names: issue
+            .map(|i| {
+                i.labels
+                    .iter()
+                    .map(|id| {
+                        catalog
+                            .labels
+                            .get(id)
+                            .map(|l| l.name.clone())
+                            .unwrap_or_else(|| id.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -780,5 +764,35 @@ impl CatalogState {
             [one] => Some(one),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_issue_keeps_alias_from_authoritative_project() {
+        let doc = "iss_01JU6A5CHEI9UR3SGKEK05KIAR";
+        let mut catalog = CatalogState::default();
+        catalog.projects.insert(
+            "prj_board".into(),
+            ProjectMeta {
+                name: "Board".into(),
+                key: "BOARD".into(),
+                color: "blue".into(),
+            },
+        );
+        catalog.seqs.insert(doc.into(), 5);
+
+        let aliases = derive_aliases(&catalog, |candidate| {
+            (candidate == doc).then_some("prj_board")
+        });
+
+        assert_eq!(aliases.by_doc.get(doc).map(String::as_str), Some("BOARD-5"));
+        assert_eq!(
+            aliases.by_alias.get("board-5").map(String::as_str),
+            Some(doc)
+        );
     }
 }

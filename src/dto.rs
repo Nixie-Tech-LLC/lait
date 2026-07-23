@@ -352,6 +352,10 @@ pub struct Row {
     /// Estimate points (scale is the team's convention, not the schema's).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimate: Option<u32>,
+    /// Resolved label names (empty when none). Additive so a card can show label
+    /// dots without a second fetch; older consumers ignore the field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub label_names: Vec<String>,
 }
 
 /// A board column: an ordered slice of rows for one workflow state.

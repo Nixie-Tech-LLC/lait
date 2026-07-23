@@ -500,7 +500,7 @@ impl OrbitalDaemon {
     /// snapshot — `None` when the projection is UNAVAILABLE (undocked, or a
     /// query failed). Status reports the truth; it never converts an
     /// unavailable projection into false zeros.
-    fn counts(&self) -> Option<(usize, usize)> {
+    fn counts(&self) -> Option<(usize, usize, String)> {
         use crate::world::contract::{self, IssueQuery};
         if !self.ensure_session() {
             return None;
@@ -518,12 +518,16 @@ impl OrbitalDaemon {
                 .bytes;
             serde_json::from_slice(&bytes).ok()
         };
-        let projects = query(IssueQuery::Snapshot).and_then(|v| {
-            v.get("catalog")?
-                .get("projects")?
-                .as_object()
-                .map(|m| m.len())
-        })?;
+        let snapshot = query(IssueQuery::Snapshot)?;
+        let catalog = snapshot.get("catalog")?;
+        let projects = catalog.get("projects")?.as_object().map(|m| m.len())?;
+        // The catalog `name` register is the space's mutable display label
+        // (`SpaceRename` writes it); surface it so the rename is visible.
+        let name = catalog
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_string();
         let issues = query(IssueQuery::List {
             project: None,
             label: None,
@@ -533,16 +537,16 @@ impl OrbitalDaemon {
             me: None,
         })
         .and_then(|v| v.as_array().map(|a| a.len()))?;
-        Some((issues, projects))
+        Some((issues, projects, name))
     }
 
     fn status(&self) -> Response {
         let counts = self.counts();
-        let (issues, projects) = counts.unwrap_or((0, 0));
+        let (issues, projects, name) = counts.clone().unwrap_or((0, 0, String::new()));
         Response::Status(Box::new(StatusInfo {
             id: crate::crypto::device_from_seed(&self.device_seed).to_string(),
             nick: String::new(),
-            name: String::new(),
+            name,
             online_peers: self.station.neighbors().len(),
             space: Some(self.station.space_id().as_str().to_string()),
             counts_unavailable: counts.is_none(),
@@ -618,7 +622,7 @@ impl OrbitalDaemon {
     /// onboarding gate list (`docs/UI.md`). Pure over the snapshot the daemon
     /// already computes — the same core the legacy node used.
     fn diagnose(&self, expected_space: Option<String>) -> Response {
-        let (issues, projects) = self.counts().unwrap_or((0, 0));
+        let (issues, projects, _name) = self.counts().unwrap_or((0, 0, String::new()));
         let space = self.station.space_id().as_str().to_string();
         let membership = if self.mechanics.am_i_member() {
             "member"

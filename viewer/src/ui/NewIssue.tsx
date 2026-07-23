@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
-import { Calendar, X } from "lucide-react";
+import { X } from "lucide-react";
 
 import { rpc } from "../api";
 import { clearDraft, loadDraft, saveDraft } from "../core/drafts";
@@ -16,7 +16,9 @@ import { Avatar, AvatarStack } from "./Avatar";
 import { catalogColor } from "./colors";
 import { PriorityIcon, StatusIcon } from "./icons";
 import { Combobox } from "./Picker";
-import { Button, IconButton, Kbd } from "./primitives";
+import { DatePicker } from "./DatePicker";
+import { NewLabelDialog } from "./NewLabel";
+import { Button, IconButton, Kbd, Switch } from "./primitives";
 import { short } from "./time";
 
 /**
@@ -74,6 +76,7 @@ export function NewIssue({
   const [assignees, setAssignees] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [again, setAgain] = useState(false);
+  const [newLabel, setNewLabel] = useState<string | null>(null);
   const [failure, setFailure] = useState("");
   const [recovered] = useState(() =>
     Boolean(
@@ -145,6 +148,7 @@ export function NewIssue({
   };
 
   return (
+    <>
     <Dialog.Root open onOpenChange={(o) => !o && onClose()}>
       <Dialog.Portal>
         <Dialog.Overlay className="ui-overlay fixed inset-0 z-50 bg-black/45 backdrop-blur-[2px]" />
@@ -300,21 +304,17 @@ export function NewIssue({
               onToggle={(name) =>
                 setPicked((p) => (p.includes(name) ? p.filter((x) => x !== name) : [...p, name]))
               }
-              // A typed-but-unknown name is picked like any other: `issue_new`
-              // creates it on first use, so nothing needs minting here.
-              onCreate={(name) => setPicked((p) => (p.includes(name) ? p : [...p, name]))}
+              // A typed-but-unknown name gets a colour first: the colour step
+              // registers it via `label_new`, then it joins the picked set and
+              // `issue_new` attaches the now-coloured label by name.
+              onCreate={(name) => setNewLabel(name)}
             />
-            <label className="border-line hover:bg-hover flex items-center gap-1.5 rounded-full border px-2 py-1 text-sm">
-              <Calendar className="text-mute size-3.5" />
-              <span className="sr-only">Due date</span>
-              <input
-                type="date"
-                value={due}
-                onChange={(event) => setDue(event.target.value)}
-                className="bg-transparent text-sm outline-none"
-                aria-label="Due date"
-              />
-            </label>
+            <DatePicker
+              variant="pill"
+              value={due || null}
+              placeholder="Due date"
+              onChange={(next) => setDue(next ?? "")}
+            />
           </div>
 
           <footer className="border-line flex flex-wrap items-center gap-3 border-t px-4 py-3">
@@ -327,10 +327,10 @@ export function NewIssue({
                     ? "Draft saved on this device"
                     : "Draft saves on this device"}
             </span>
-            <label className="text-mute flex items-center gap-2 text-sm">
-              <input type="checkbox" checked={again} onChange={(e) => setAgain(e.target.checked)} />
-              Create more
-            </label>
+            <div className="text-mute flex items-center gap-2 text-sm">
+              <Switch id="create-more" checked={again} onCheckedChange={setAgain} />
+              <label htmlFor="create-more">Create more</label>
+            </div>
             {(title || body) && !busy && (
               <Button
                 variant="ghost"
@@ -347,7 +347,7 @@ export function NewIssue({
             )}
             <span className="ml-auto flex items-center gap-2">
               <Kbd>↵</Kbd>
-              <Button variant="primary" size="md" disabled={!title.trim() || busy} onClick={() => void create()}>
+              <Button variant="primary" size="md" disabled={!title.trim()} loading={busy} onClick={() => void create()}>
                 {busy ? "Creating…" : "Create issue"}
               </Button>
             </span>
@@ -355,6 +355,22 @@ export function NewIssue({
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>
+    {newLabel !== null && (
+      <NewLabelDialog
+        name={newLabel}
+        onCancel={() => setNewLabel(null)}
+        onCreate={(labelName, color) => {
+          setNewLabel(null);
+          // Register the label with its colour, then add it to the picked set —
+          // `issue_new` attaches by name, so the label already carries its colour
+          // by the time the issue is created.
+          void rpc(spaceId, { cmd: "label_new", name: labelName, color })
+            .then(() => setPicked((p) => (p.includes(labelName) ? p : [...p, labelName])))
+            .catch((e) => onError(e instanceof Error ? e.message : String(e)));
+        }}
+      />
+    )}
+    </>
   );
 }
 

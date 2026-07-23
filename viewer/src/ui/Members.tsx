@@ -320,7 +320,7 @@ function Invite({
   const mint = async () => {
     try {
       const r = await rpc(spaceId, { cmd: "invite", role, reusable, ttl_hours: ttl });
-      if (r.kind === "text") setTicket(r.text.trim());
+      if (r.kind === "ref") setTicket(r.reff.trim());
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e));
     }

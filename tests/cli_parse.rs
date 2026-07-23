@@ -312,6 +312,7 @@ fn projects_add_is_key_first_with_defaulted_name() {
         Request::ProjectNew {
             name: "Ops".into(),
             key: "OPS".into(),
+            color: None,
         },
     );
     parses_to(
@@ -319,6 +320,7 @@ fn projects_add_is_key_first_with_defaulted_name() {
         Request::ProjectNew {
             name: "Operations".into(),
             key: "OPS".into(),
+            color: None,
         },
     );
     // `new` survives as an alias of the SAME shape.
@@ -327,6 +329,7 @@ fn projects_add_is_key_first_with_defaulted_name() {
         Request::ProjectNew {
             name: "Design".into(),
             key: "DSN".into(),
+            color: None,
         },
     );
 }

@@ -12,7 +12,8 @@ import {
 } from "../core/inbox";
 import type { InboxEntry } from "../types";
 import { ApplicationState, EmptyState, LoadingState } from "./AppState";
-import { Button } from "./primitives";
+import { Combobox } from "./Picker";
+import { Button, Checkbox, PopoverContent } from "./primitives";
 import { short, when } from "./time";
 
 /**
@@ -180,31 +181,41 @@ export function Inbox({
               <Settings2 className="size-3.5" /> Preferences
             </button>
           </Popover.Trigger>
-          <Popover.Portal>
-            <Popover.Content align="end" sideOffset={6} className="bg-overlay border-line-strong z-50 w-64 rounded-lg border p-3 shadow-xl outline-none">
+          <PopoverContent align="end" sideOffset={6} className="w-64 p-3">
               <h2 className="mb-1 text-sm font-medium">Inbox preferences</h2>
               <p className="text-mute mb-3 text-xs">Local controls for what is shown on this device. The daemon still delivers the complete feed.</p>
               {(["assigned", "comment", "status"] as InboxKind[]).map((kind) => (
                 <label key={kind} className="hover:bg-hover flex min-h-8 items-center gap-2 rounded px-1.5 text-sm">
-                  <input type="checkbox" checked={preferences.kinds[kind]} onChange={(event) => savePreferences({
-                    ...preferences,
-                    kinds: { ...preferences.kinds, [kind]: event.target.checked },
-                  })} />
+                  <Checkbox
+                    checked={preferences.kinds[kind]}
+                    onCheckedChange={(checked) => savePreferences({
+                      ...preferences,
+                      kinds: { ...preferences.kinds, [kind]: checked === true },
+                    })}
+                  />
                   {causeLabel(kind)}
                 </label>
               ))}
               <div className="bg-line my-2 h-px" />
-              <label className="text-mute block text-xs" htmlFor="inbox-grouping">Group notifications</label>
-              <select id="inbox-grouping" value={preferences.grouping} onChange={(event) => savePreferences({
-                ...preferences,
-                grouping: event.target.value as InboxPreferences["grouping"],
-              })} className="bg-raised border-line mt-1 h-8 w-full rounded border px-2 text-sm">
-                <option value="cause">By cause</option>
-                <option value="chronological">Chronologically</option>
-              </select>
+              <span className="text-mute block text-xs">Group notifications</span>
+              <div className="mt-1">
+                <Combobox
+                  label="Group notifications"
+                  value={{
+                    id: preferences.grouping,
+                    label: preferences.grouping === "cause" ? "By cause" : "Chronologically",
+                  }}
+                  options={[
+                    { id: "cause", label: "By cause" },
+                    { id: "chronological", label: "Chronologically" },
+                  ]}
+                  onPick={(id) =>
+                    savePreferences({ ...preferences, grouping: id as InboxPreferences["grouping"] })
+                  }
+                />
+              </div>
               {snoozedCount > 0 && <button onClick={() => savePreferences({ ...preferences, snoozed: {} })} className="text-accent mt-3 text-xs">Restore {snoozedCount} snoozed</button>}
-            </Popover.Content>
-          </Popover.Portal>
+          </PopoverContent>
         </Popover.Root>
       </div>
 

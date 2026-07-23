@@ -50,13 +50,33 @@ export interface FilterState {
   label: string | null;
   /** Status ids to show. Empty means all — see the module note. Client-side. */
   status: readonly string[];
+  /** Priorities to show. Empty means all. Client-side, like `status`: the row
+   *  already carries the priority the daemon put there, so matching re-derives
+   *  nothing. */
+  priority: readonly string[];
+  /** Assignee keys to show (rows assigned to ANY selected key). Empty means all.
+   *  Client-side: the row carries its assignee keys, so this is a set membership
+   *  test, not the ACL question `mine` answers. */
+  assignees: readonly string[];
 }
 
-export const EMPTY_FILTER: FilterState = { text: "", mine: false, label: null, status: [] };
+export const EMPTY_FILTER: FilterState = {
+  text: "",
+  mine: false,
+  label: null,
+  status: [],
+  priority: [],
+  assignees: [],
+};
 
 /** Whether anything is narrowing the view. */
 export const isActive = (f: FilterState): boolean =>
-  f.text.trim() !== "" || f.mine || f.label !== null || f.status.length > 0;
+  f.text.trim() !== "" ||
+  f.mine ||
+  f.label !== null ||
+  f.status.length > 0 ||
+  f.priority.length > 0 ||
+  f.assignees.length > 0;
 
 /** Whether the daemon has to be asked — i.e. the parts we refuse to guess at. */
 export const needsServer = (f: FilterState): boolean => f.mine || f.label !== null;
@@ -108,7 +128,11 @@ export function applyFilter(
       .map((c) => ({
         ...c,
         rows: c.rows.filter(
-          (r) => matchesText(r, f.text) && (allowed === null || allowed.has(r.doc_id)),
+          (r) =>
+            matchesText(r, f.text) &&
+            (allowed === null || allowed.has(r.doc_id)) &&
+            (f.priority.length === 0 || f.priority.includes(r.priority)) &&
+            (f.assignees.length === 0 || r.assignees.some((a) => f.assignees.includes(a))),
         ),
       })),
   };
