@@ -716,7 +716,10 @@ export function IssueDetail({
               ref={commentRef}
               value={comment}
               placeholder="Leave a comment…"
-              onChange={(e) => setComment(e.target.value)}
+              onChange={(e) => {
+                setComment(e.target.value);
+                setCommentError(null);
+              }}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && comment.trim()) {
                   e.preventDefault();
