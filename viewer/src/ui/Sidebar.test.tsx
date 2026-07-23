@@ -23,6 +23,7 @@ describe("Sidebar navigation", () => {
   it("routes named destinations and governance to their real actions", () => {
     const onGo = vi.fn();
     const onGovernance = vi.fn();
+    const onMyIssues = vi.fn();
     host = document.createElement("div");
     document.body.append(host);
     root = createRoot(host);
@@ -36,9 +37,16 @@ describe("Sidebar navigation", () => {
           currentProject={project.key}
           view="list"
           unread={3}
+          favoriteProjects={[]}
+          recentIssues={[]}
+          savedViews={[]}
           onPickSpace={vi.fn()}
           onPickProject={vi.fn()}
           onGo={onGo}
+          onMyIssues={onMyIssues}
+          onOpenRecent={vi.fn()}
+          onApplySavedView={vi.fn()}
+          onToggleFavorite={vi.fn()}
           onCreateProject={vi.fn()}
           onOpenGovernance={onGovernance}
         /></TooltipProvider>,
@@ -49,6 +57,8 @@ describe("Sidebar navigation", () => {
     expect(onGo).toHaveBeenCalledWith("board");
     click("Activity");
     expect(onGo).toHaveBeenCalledWith("activity");
+    click("My issues");
+    expect(onMyIssues).toHaveBeenCalledOnce();
     click("Governance");
     expect(onGovernance).toHaveBeenCalledOnce();
     expect(host.textContent).toContain("3");

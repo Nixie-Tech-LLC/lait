@@ -30,6 +30,8 @@ import {
 } from "./core/route";
 import { useKeys } from "./core/useKeys";
 import { neighbourState, workTarget } from "./core/workflow";
+import { loadFavoriteProjects, loadRecentIssues, toggleFavoriteProject } from "./core/personalNav";
+import { loadSavedViews, type SavedView } from "./core/savedViews";
 import { Activity } from "./ui/Activity";
 import { EmptyState, InlineError, TrustPopover } from "./ui/AppState";
 import { Board } from "./ui/Board";
@@ -119,6 +121,7 @@ export function App() {
   const [display, setDisplay] = useState<DisplayState>(loadDisplay);
   const [displayOpen, setDisplayOpen] = useState(false);
   const [mobileNav, setMobileNav] = useState(false);
+  const [personalNavRevision, setPersonalNavRevision] = useState(0);
   /** Bulk-selection checks, by canonical ref. Distinct from `selection`: the
    *  focus is one row, the checks are a set, and `x` is the bridge. */
   const [checked, setChecked] = useState<ReadonlySet<string>>(new Set());
@@ -226,6 +229,18 @@ export function App() {
         : groups.flatMap((g) => g.rows.filter((r) => !r.tombstone));
     return display.deleted ? [...live, ...deletedRows] : live;
   }, [view, shown, groups, display.deleted, deletedRows]);
+  const favoriteProjects = useMemo(
+    () => routeSpace ? loadFavoriteProjects(routeSpace) : [],
+    [routeSpace, personalNavRevision],
+  );
+  const recentIssues = useMemo(
+    () => routeSpace ? loadRecentIssues(routeSpace) : [],
+    [routeSpace, personalNavRevision],
+  );
+  const sidebarSavedViews = useMemo(
+    () => routeSpace && project ? loadSavedViews(routeSpace, project) : [],
+    [routeSpace, project, personalNavRevision],
+  );
 
   // Persisted like the sidebar width: an arrangement chosen once should hold.
   useEffect(() => {
@@ -661,7 +676,10 @@ export function App() {
       // linkable, but replaces the current entry rather than polluting Back with
       // every arrow-key stop.
       select: (reff) => {
-        if (routeSpace && reff) rememberIssue(routeSpace, reff);
+        if (routeSpace && reff) {
+          rememberIssue(routeSpace, reff);
+          setPersonalNavRevision((revision) => revision + 1);
+        }
         window.history.replaceState(
           null,
           "",
@@ -967,6 +985,33 @@ export function App() {
   }, [mutationNotice]);
 
   const run = (id: string) => void registry.get(id)?.run(ctx);
+  const openMyIssues = () => {
+    const nextFilter = { ...filter, mine: true };
+    window.history.pushState(null, "", formatRoute({ spaceId: routeSpace, project, view: "list", issue: null, filter: nextFilter }));
+    setView("list");
+    setSelection(null);
+    setFilter(nextFilter);
+  };
+  const openRecentIssue = (reff: string) => {
+    const key = /^([A-Z][A-Z0-9]*)-\d+$/.exec(reff)?.[1] ?? project;
+    window.history.pushState(null, "", formatRoute({ spaceId: routeSpace, project: key, view: "list", issue: reff, filter }));
+    setProject(key);
+    setView("list");
+    setSelection(reff);
+    setDetail(true);
+  };
+  const applySavedView = (saved: SavedView) => {
+    window.history.pushState(null, "", formatRoute({ spaceId: routeSpace, project, view: "list", issue: null, filter: saved.filter }));
+    setView("list");
+    setSelection(null);
+    setFilter(saved.filter);
+    setDisplay(saved.display);
+  };
+  const toggleFavorite = (key: string) => {
+    if (!routeSpace) return;
+    toggleFavoriteProject(routeSpace, key);
+    setPersonalNavRevision((revision) => revision + 1);
+  };
 
   return (
     <TooltipProvider>
@@ -994,9 +1039,16 @@ export function App() {
           currentProject={board?.project.key ?? project}
           view={view}
           unread={unread}
+          favoriteProjects={favoriteProjects}
+          recentIssues={recentIssues}
+          savedViews={sidebarSavedViews}
           onPickSpace={api.pickSpace}
           onPickProject={api.pickProject}
           onGo={api.goto}
+          onMyIssues={openMyIssues}
+          onOpenRecent={openRecentIssue}
+          onApplySavedView={applySavedView}
+          onToggleFavorite={toggleFavorite}
           onCreateProject={api.createProject}
           onOpenGovernance={api.openWorkflow}
         />
@@ -1111,6 +1163,7 @@ export function App() {
                       setFilter(saved.filter);
                       setDisplay(saved.display);
                     }}
+                    onChange={() => setPersonalNavRevision((revision) => revision + 1)}
                   />
                 )}
               </>
@@ -1351,6 +1404,9 @@ export function App() {
               currentProject={board?.project.key ?? project}
               view={view}
               unread={unread}
+              favoriteProjects={favoriteProjects}
+              recentIssues={recentIssues}
+              savedViews={sidebarSavedViews}
               onPickSpace={(id) => {
                 api.pickSpace(id);
                 setMobileNav(false);
@@ -1363,6 +1419,19 @@ export function App() {
                 api.goto(next);
                 setMobileNav(false);
               }}
+              onMyIssues={() => {
+                openMyIssues();
+                setMobileNav(false);
+              }}
+              onOpenRecent={(reff) => {
+                openRecentIssue(reff);
+                setMobileNav(false);
+              }}
+              onApplySavedView={(saved) => {
+                applySavedView(saved);
+                setMobileNav(false);
+              }}
+              onToggleFavorite={toggleFavorite}
               onCreateProject={() => {
                 api.createProject();
                 setMobileNav(false);

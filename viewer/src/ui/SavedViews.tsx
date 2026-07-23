@@ -7,7 +7,7 @@ import type { FilterState } from "../core/filter";
 import { loadSavedViews, removeView, saveView, type SavedView } from "../core/savedViews";
 import { Button, IconButton } from "./primitives";
 
-export function SavedViews({ space, project, filter, display, onApply }: { space: string; project: string; filter: FilterState; display: DisplayState; onApply: (view: SavedView) => void }) {
+export function SavedViews({ space, project, filter, display, onApply, onChange }: { space: string; project: string; filter: FilterState; display: DisplayState; onApply: (view: SavedView) => void; onChange?: () => void }) {
   const [views, setViews] = useState(() => loadSavedViews(space, project));
   const [name, setName] = useState("");
 
@@ -18,6 +18,7 @@ export function SavedViews({ space, project, filter, display, onApply }: { space
     if (!title) return;
     const id = `${Date.now().toString(36)}-${title.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
     setViews(saveView(space, project, { id, name: title, filter, display }));
+    onChange?.();
     setName("");
   };
 
@@ -41,7 +42,7 @@ export function SavedViews({ space, project, filter, display, onApply }: { space
               {views.map((view) => (
                 <div key={view.id} className="group/view hover:bg-hover flex items-center rounded">
                   <button onClick={() => onApply(view)} className="min-w-0 flex-1 truncate px-2 py-1.5 text-left text-sm">{view.name}</button>
-                  <IconButton label={`Delete ${view.name}`} className="opacity-0 group-hover/view:opacity-100 focus-visible:opacity-100" onClick={() => setViews(removeView(space, project, view.id))}>
+                  <IconButton label={`Delete ${view.name}`} className="opacity-0 group-hover/view:opacity-100 focus-visible:opacity-100" onClick={() => { setViews(removeView(space, project, view.id)); onChange?.(); }}>
                     <Trash2 className="size-3" />
                   </IconButton>
                 </div>

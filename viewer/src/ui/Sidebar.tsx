@@ -1,17 +1,23 @@
 import {
   Activity,
+  Bookmark,
   Bot,
   ChevronDown,
   CircleDot,
+  Clock3,
   Folder,
   Inbox,
   LayoutGrid,
   Plus,
   Settings2,
+  Star,
+  StarOff,
+  UserRound,
   Users,
 } from "lucide-react";
 
 import type { View } from "../core/registry";
+import type { SavedView } from "../core/savedViews";
 import type { ProjectDto, SpaceRow } from "../types";
 import { catalogColor } from "./colors";
 import { cn, IconButton } from "./primitives";
@@ -24,9 +30,16 @@ export function Sidebar({
   currentProject,
   view,
   unread,
+  favoriteProjects,
+  recentIssues,
+  savedViews,
   onPickSpace,
   onPickProject,
   onGo,
+  onMyIssues,
+  onOpenRecent,
+  onApplySavedView,
+  onToggleFavorite,
   onCreateProject,
   onOpenGovernance,
 }: {
@@ -36,9 +49,16 @@ export function Sidebar({
   currentProject: string | null;
   view: View;
   unread: number;
+  favoriteProjects: readonly string[];
+  recentIssues: readonly string[];
+  savedViews: readonly SavedView[];
   onPickSpace: (id: string) => void;
   onPickProject: (key: string) => void;
   onGo: (view: View) => void;
+  onMyIssues: () => void;
+  onOpenRecent: (reff: string) => void;
+  onApplySavedView: (view: SavedView) => void;
+  onToggleFavorite: (key: string) => void;
   onCreateProject: () => void;
   onOpenGovernance: () => void;
 }) {
@@ -65,6 +85,21 @@ export function Sidebar({
         <NavItem icon={<Activity />} label="Activity" active={view === "activity"} onClick={() => onGo("activity")} />
       </div>
 
+      <Section title="Your workspace" />
+      <div className="flex flex-col gap-px">
+        <NavItem icon={<UserRound />} label="My issues" onClick={onMyIssues} />
+        {favoriteProjects.map((key) => {
+          const favorite = projects.find((candidate) => candidate.key === key);
+          return favorite ? <NavItem key={key} icon={<Star />} label={favorite.name} onClick={() => onPickProject(key)} compact /> : null;
+        })}
+        {savedViews.map((saved) => (
+          <NavItem key={saved.id} icon={<Bookmark />} label={saved.name} onClick={() => onApplySavedView(saved)} compact />
+        ))}
+        {recentIssues.slice(0, 3).map((reff) => (
+          <NavItem key={reff} icon={<Clock3 />} label={reff} onClick={() => onOpenRecent(reff)} compact />
+        ))}
+      </div>
+
       <Section
         title="Projects"
         action={
@@ -82,11 +117,11 @@ export function Sidebar({
           projects.map((project) => {
             const active = project.key === currentProject;
             return (
-              <div key={project.id} className="mb-0.5">
+              <div key={project.id} className="group/project mb-0.5 flex items-center">
                 <button
                   onClick={() => onPickProject(project.key)}
                   className={cn(
-                    "flex h-7 w-full items-center gap-2 rounded px-2 text-left text-sm",
+                    "flex h-7 min-w-0 flex-1 items-center gap-2 rounded px-2 text-left text-sm",
                     active ? "bg-active text-fg" : "text-dim hover:bg-hover hover:text-fg",
                   )}
                 >
@@ -94,6 +129,13 @@ export function Sidebar({
                   <span className="min-w-0 flex-1 truncate">{project.name}</span>
                   <span className="text-mute font-mono text-2xs">{project.key}</span>
                 </button>
+                <IconButton
+                  label={favoriteProjects.includes(project.key) ? `Remove ${project.name} from favorites` : `Add ${project.name} to favorites`}
+                  className="size-6 opacity-0 group-hover/project:opacity-100 focus-visible:opacity-100"
+                  onClick={() => onToggleFavorite(project.key)}
+                >
+                  {favoriteProjects.includes(project.key) ? <StarOff className="size-3" /> : <Star className="size-3" />}
+                </IconButton>
               </div>
             );
           })

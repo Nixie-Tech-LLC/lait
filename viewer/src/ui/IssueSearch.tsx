@@ -4,29 +4,13 @@ import { useEffect, useMemo, useState } from "react";
 
 import { rpc } from "../api";
 import { cmdkFilter } from "../core/fuzzy";
+import { loadRecentIssues, rememberRecentIssue } from "../core/personalNav";
 import type { Row } from "../types";
 import { PriorityIcon } from "./icons";
 import { Kbd } from "./primitives";
 
-const RECENTS = "lait.issue-recents";
-
 export function rememberIssue(spaceId: string, reff: string): void {
-  try {
-    const all = JSON.parse(localStorage.getItem(RECENTS) ?? "{}") as Record<string, string[]>;
-    all[spaceId] = [reff, ...(all[spaceId] ?? []).filter((x) => x !== reff)].slice(0, 8);
-    localStorage.setItem(RECENTS, JSON.stringify(all));
-  } catch {
-    // Private recents are a convenience, never a requirement for navigation.
-  }
-}
-
-function recentRefs(spaceId: string): string[] {
-  try {
-    const all = JSON.parse(localStorage.getItem(RECENTS) ?? "{}") as Record<string, string[]>;
-    return all[spaceId] ?? [];
-  } catch {
-    return [];
-  }
+  rememberRecentIssue(spaceId, reff);
 }
 
 export function IssueSearch({
@@ -62,7 +46,7 @@ export function IssueSearch({
 
   const recents = useMemo(() => {
     const byRef = new Map(available.map((row) => [row.reff, row]));
-    return recentRefs(spaceId).flatMap((reff) => {
+    return loadRecentIssues(spaceId).flatMap((reff) => {
       const row = byRef.get(reff);
       return row ? [row] : [];
     });
