@@ -6,7 +6,6 @@ import {
   Folder,
   Inbox,
   LayoutGrid,
-  List,
   Plus,
   Settings2,
   Users,
@@ -62,6 +61,8 @@ export function Sidebar({
       <div className="mt-3 flex flex-col gap-px">
         <NavItem icon={<Inbox />} label="Inbox" active={view === "inbox"} badge={unread} onClick={() => onGo("inbox")} />
         <NavItem icon={<CircleDot />} label="Issues" active={view === "list"} onClick={() => onGo("list")} />
+        <NavItem icon={<LayoutGrid />} label="Board" active={view === "board"} onClick={() => onGo("board")} />
+        <NavItem icon={<Activity />} label="Activity" active={view === "activity"} onClick={() => onGo("activity")} />
       </div>
 
       <Section
@@ -93,12 +94,6 @@ export function Sidebar({
                   <span className="min-w-0 flex-1 truncate">{project.name}</span>
                   <span className="text-mute font-mono text-2xs">{project.key}</span>
                 </button>
-                {active && (
-                  <div className="ml-4 border-l border-line pl-1">
-                    <NavItem compact icon={<List />} label="Issues" active={view === "list"} onClick={() => onGo("list")} />
-                    <NavItem compact icon={<LayoutGrid />} label="Board" active={view === "board"} onClick={() => onGo("board")} />
-                  </div>
-                )}
               </div>
             );
           })
@@ -106,7 +101,6 @@ export function Sidebar({
       </div>
 
       <div className="border-line mt-2 flex flex-col gap-px border-t pt-2">
-        <NavItem icon={<Activity />} label="Activity" active={view === "activity"} onClick={() => onGo("activity")} />
         <NavItem icon={<Users />} label="Members" active={view === "members"} onClick={() => onGo("members")} />
         <NavItem icon={<Settings2 />} label="Governance" onClick={onOpenGovernance} />
       </div>

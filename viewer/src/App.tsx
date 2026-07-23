@@ -1,10 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Group, Panel, Separator, useDefaultLayout, usePanelRef } from "react-resizable-panels";
 import {
-  Inbox as InboxIcon,
   Command as CommandIcon,
-  LayoutGrid,
-  List,
   ListFilter,
   PanelLeft,
   Plus,
@@ -1109,33 +1106,6 @@ export function App() {
                 )}
               </>
             )}
-
-            {/* A segmented group without a box around it: adjacency does the
-                grouping, the active fill does the state. */}
-            <span className="mx-1 flex items-center gap-0.5">
-              {(
-                [
-                  ["list", List, "Issues", "G L"],
-                  ["board", LayoutGrid, "Board", "G B"],
-                  ["inbox", InboxIcon, "Inbox", "G I"],
-                ] as const
-              ).map(([v, Icon, label, chord]) => (
-                <IconButton
-                  key={v}
-                  label={label}
-                  chord={chord}
-                  variant={view === v ? "active" : "ghost"}
-                  aria-pressed={view === v}
-                  onClick={() => run(`go.${v}`)}
-                  className="relative"
-                >
-                  <Icon className="size-4" />
-                  {v === "inbox" && unread > 0 && (
-                    <span className="bg-accent absolute top-0.5 right-0.5 size-1.5 rounded-full" />
-                  )}
-                </IconButton>
-              ))}
-            </span>
 
             {!readOnly && current && (
               <IconButton label="New issue" chord="C" onClick={() => run("issue.create")}>

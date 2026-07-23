@@ -47,9 +47,12 @@ describe("Sidebar navigation", () => {
 
     click("Board");
     expect(onGo).toHaveBeenCalledWith("board");
+    click("Activity");
+    expect(onGo).toHaveBeenCalledWith("activity");
     click("Governance");
     expect(onGovernance).toHaveBeenCalledOnce();
     expect(host.textContent).toContain("3");
+    expect([...host.querySelectorAll("button")].filter((item) => item.textContent?.includes("Board"))).toHaveLength(1);
   });
 
   function click(label: string) {
