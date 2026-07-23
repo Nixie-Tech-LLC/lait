@@ -414,6 +414,20 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
             Special::Id => {
                 let seed = load_or_create_identity(&config::identity_dir()?)?;
                 crate::cli::emit_text(crate::crypto::device_from_seed(&seed).as_str(), out);
+                // The actor line (GOV-11): a pending joiner must be able to
+                // name their own actor to the approving admin, and the daemon
+                // resolves it from the actor plane even before admission.
+                // Best-effort: no running daemon, no line — the device id
+                // above stays the stable first line either way.
+                if !out.json {
+                    if let Ok(Response::Ok { message: Some(m) }) =
+                        crate::control::request(&home, &Request::Id).await
+                    {
+                        if let Some(actor_line) = m.lines().nth(1) {
+                            println!("{actor_line}");
+                        }
+                    }
+                }
             }
             Special::Daemon => {
                 tracing_subscriber::fmt()
@@ -653,6 +667,22 @@ async fn run_join_orbital(m: &ArgMatches, link: &str, out: Out) -> Result<()> {
         config::store_dir_for_init(&cwd)?
     };
 
+    // A pre-orbital store at the resolved home is a wrong-directory signal for
+    // a JOINER, not a migration problem (LOCAL-10): a bare `lait join` lands
+    // wherever home resolution points (an unset LAIT_HOME turns it into the
+    // cwd), so name the aim and the ways to re-aim instead of dead-ending on
+    // clean-break guidance meant for the store's owner.
+    if let Some(err) = crate::orbital::unsupported_store_at(&target) {
+        eprintln!("{err}");
+        eprintln!(
+            "this join was aimed at {} — if that is not where you keep this space, \
+             set LAIT_HOME, pass --dir <path>, or cd elsewhere and retry. The old \
+             store there was not touched.",
+            target.display()
+        );
+        std::process::exit(2);
+    }
+
     // Refuse to re-bind a directory that already holds a different space.
     if crate::orbital::space_store_present(&target) {
         match crate::orbital::discover_space_id(&target) {
@@ -701,21 +731,49 @@ async fn run_join_orbital(m: &ArgMatches, link: &str, out: Out) -> Result<()> {
     if !out.json {
         println!("joining space {space} — reaching the inviter…");
     }
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let started = tokio::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(30);
     let mut admitted = false;
+    // Progress beats (GOV-9): a first-time joiner must be able to tell "slow
+    // handshake" from "hung forever" — say when the inviter answered, and keep
+    // a heartbeat with the last failure while they haven't.
+    let mut contacted = false;
+    let mut last_err: Option<String> = None;
+    let mut last_beat = started;
     while tokio::time::Instant::now() < deadline {
-        let _ = crate::control::request(
+        match crate::control::request(
             &target,
             &Request::Connect {
                 ticket: approach.clone(),
             },
         )
-        .await;
+        .await
+        {
+            Ok(Response::Ok { .. }) => {
+                if !contacted && !out.json {
+                    println!("· contacted the inviter — waiting for the admission to seal…");
+                }
+                contacted = true;
+            }
+            Ok(Response::Error { message, .. }) => last_err = Some(message),
+            _ => {}
+        }
         if let Ok(Response::Status(info)) = crate::control::request(&target, &Request::Status).await
         {
             if info.membership == "member" {
                 admitted = true;
                 break;
+            }
+        }
+        if !out.json && last_beat.elapsed() >= std::time::Duration::from_secs(8) {
+            last_beat = tokio::time::Instant::now();
+            let secs = started.elapsed().as_secs();
+            if contacted {
+                println!("· still waiting for the admission to seal… ({secs}s)");
+            } else if let Some(e) = &last_err {
+                println!("· still reaching the inviter ({secs}s) — last attempt: {e}");
+            } else {
+                println!("· still reaching the inviter… ({secs}s)");
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -761,9 +819,16 @@ async fn run_join_cli(m: &ArgMatches, out: Out) -> Result<()> {
              legacy space ticket from an older lait). Ask the inviter for a fresh \
              `lait invite` link."
         )),
+        Err(runtime::coordinates::CoordinatesError::BadLink) => Err(anyhow!(
+            "this invite does not decode as a lait Coordinates link: it contains \
+             characters outside the ticket alphabet. Both the lait://join/<ticket> \
+             form and the bare ticket work — the usual cause is a partial copy, so \
+             re-copy the whole link (line breaks are fine)."
+        )),
         Err(e) => Err(anyhow!(
-            "this invite could not be read as a lait Coordinates link ({e:?}). Ask the \
-             inviter for a fresh `lait invite` link."
+            "this invite could not be read as a lait Coordinates link ({e:?}). \
+             Re-copy the whole link; if it still fails, ask the inviter for a fresh \
+             `lait invite` link."
         )),
     }
 }

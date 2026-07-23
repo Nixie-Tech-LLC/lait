@@ -365,6 +365,13 @@ pub enum Request {
     MemberRemove {
         who: String,
     },
+    /// Elevate or demote an existing member (admin-only): a signed
+    /// `SetGrants` on the ACL. `admin: true` promotes, `false` demotes to a
+    /// plain writing member. Refused for agents and for the last admin.
+    MemberSetRole {
+        who: String,
+        admin: bool,
+    },
     /// Sponsor an agent keypair. Any human member may sponsor;
     /// the agent is sealed the space key but holds no membership or content
     /// authority, and its standing dies with the sponsor.
@@ -703,6 +710,7 @@ pub fn classify(req: &Request) -> RequestOwner {
         // ---- Mechanics: membership, admission, ceremonies, custody, devices ----
         Request::MemberAdd { .. }
         | Request::MemberRemove { .. }
+        | Request::MemberSetRole { .. }
         | Request::Members
         | Request::MemberLog
         | Request::AgentAdd { .. }
@@ -914,6 +922,10 @@ pub fn representative_requests() -> Vec<Request> {
             as_name: None,
         },
         Request::MemberRemove { who: s() },
+        Request::MemberSetRole {
+            who: s(),
+            admin: false,
+        },
         Request::AgentAdd { key: s() },
         Request::KeyRotate,
         Request::InviteRevoke { invite: s() },

@@ -1160,6 +1160,35 @@ pub fn specs() -> Vec<Spec> {
                     },
                 ),
                 Spec::req(
+                    "promote",
+                    "Grant an existing member admin standing (admin-only).",
+                    vec![A::pos(
+                        "who",
+                        "An actor id (full or unique act_ prefix) or a device id.",
+                    )],
+                    |m| {
+                        Ok(Request::MemberSetRole {
+                            who: req_str(m, "who"),
+                            admin: true,
+                        })
+                    },
+                ),
+                Spec::req(
+                    "demote",
+                    "Reduce an admin to a plain member (admin-only; the last \
+                     admin cannot be demoted).",
+                    vec![A::pos(
+                        "who",
+                        "An actor id (full or unique act_ prefix) or a device id.",
+                    )],
+                    |m| {
+                        Ok(Request::MemberSetRole {
+                            who: req_str(m, "who"),
+                            admin: false,
+                        })
+                    },
+                ),
+                Spec::req(
                     "name",
                     "Set (or clear) a local name for a member/key.",
                     vec![

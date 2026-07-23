@@ -371,6 +371,18 @@ impl OrbitalDaemon {
                 },
                 Err(e) => Response::err(format!("{e}")),
             },
+            Request::MemberSetRole { who, admin } => {
+                match self.mechanics.member_set_role(&who, admin) {
+                    Ok(actor) => Response::Ok {
+                        message: Some(if admin {
+                            format!("promoted {} to admin", actor.short())
+                        } else {
+                            format!("{} is now a plain member", actor.short())
+                        }),
+                    },
+                    Err(e) => Response::err(format!("{e}")),
+                }
+            }
             Request::MemberLog => Response::MemberLog {
                 entries: self.mechanics.member_log(),
             },
@@ -446,9 +458,19 @@ impl OrbitalDaemon {
                     Err(e) => Response::err(format!("{e}")),
                 }
             }
-            Request::Id => Response::Ok {
-                message: Some(crate::crypto::device_from_seed(&self.device_seed).to_string()),
-            },
+            Request::Id => {
+                // First line: the device id (the stable, parseable form).
+                // Second line, when the actor plane resolves this device (a
+                // pending joiner's inception counts): the actor id — the
+                // handle admission and role verbs take (GOV-11).
+                let device = crate::crypto::device_from_seed(&self.device_seed).to_string();
+                Response::Ok {
+                    message: Some(match self.mechanics.my_actor() {
+                        Some(actor) => format!("{device}\nactor {}", actor.as_str()),
+                        None => device,
+                    }),
+                }
+            }
             Request::Invite {
                 role,
                 reusable,
@@ -1295,6 +1317,20 @@ impl OrbitalDaemon {
             tokio::select! {
                 _ = self.shutdown.notified() => break,
                 _ = idle_tick.tick() => {
+                    // The store watchdog (LOCAL-9): a daemon must never
+                    // outlive its store. With the directory gone, this
+                    // process can only serve stale memory while blocking its
+                    // own clients (presence is a directory scan) — stop
+                    // loudly instead.
+                    if !self.store_dir().is_dir() {
+                        tracing::error!(
+                            "orbital store at {} is gone — the daemon will not \
+                             outlive its store; stopping",
+                            self.store_dir().display()
+                        );
+                        self.begin_stop();
+                        break;
+                    }
                     if self.should_idle_shutdown(idle_window) {
                         tracing::info!("orbital daemon idle-shutdown after {idle_window:?}");
                         self.begin_stop();
@@ -1316,6 +1352,11 @@ impl OrbitalDaemon {
         // Cleanly stop the Station (releases the store lock, ends tasks).
         let _ = self.station.frontier();
         Ok(())
+    }
+
+    /// This Space's on-disk store directory (the watchdog's liveness probe).
+    fn store_dir(&self) -> PathBuf {
+        orbital_store_root(&self.home).join(self.station.space_id().as_str())
     }
 
     /// Whether the idle window has elapsed with nothing to keep us alive: a

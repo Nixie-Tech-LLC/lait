@@ -253,10 +253,11 @@ impl Inner {
         Ok(())
     }
 
-    /// Resolve an actor by its actor id or by one of its device keys — the
-    /// orbital form of the legacy `resolve_actor`, used to interpret the
-    /// `--to` roots a recovery approver names.
-    pub(super) fn resolve_actor(&self, who: &str) -> Option<ActorId> {
+    /// Resolve an actor by its actor id, one of its device keys, or a unique
+    /// short prefix — the orbital form of the legacy `resolve_actor`, used to
+    /// interpret the `--to` roots a recovery approver names and the `members`
+    /// verbs' subjects.
+    pub(super) fn resolve_actor(&mut self, who: &str) -> Option<ActorId> {
         let who = who.trim();
         if let Some(actor) = ActorId::parse(who) {
             if self.actor_plane().exists(&actor) {
@@ -266,6 +267,29 @@ impl Inner {
         if let Some(device) = DeviceId::parse(who) {
             if let Some(actor) = self.actor_plane().actor_of_device(&device) {
                 return Some(actor.clone());
+            }
+        }
+        // A short display prefix (`act_7b6a9ca4` or its bare hex): every
+        // surface prints short forms, so the verbs must accept one when it
+        // names exactly one known principal (GOV-11). Ambiguity stays None —
+        // never guess an authority subject.
+        let needle = who.strip_prefix("act_").unwrap_or(who).to_ascii_lowercase();
+        if needle.len() >= 6 && needle.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let acl = self.acl();
+            let matches: Vec<ActorId> = acl
+                .members()
+                .into_iter()
+                .map(|(a, _)| a)
+                .chain(acl.agents().into_iter().map(|(a, _)| a))
+                .filter(|a| {
+                    a.as_str()
+                        .strip_prefix("act_")
+                        .unwrap_or(a.as_str())
+                        .starts_with(&needle)
+                })
+                .collect();
+            if let [one] = matches.as_slice() {
+                return Some(one.clone());
             }
         }
         None
@@ -1149,13 +1173,24 @@ impl OrbitalMechanics {
     /// inception must already be known (imported via a prior Contact/admission).
     pub fn member_add(&self, actor_str: &str, admin: bool) -> Result<()> {
         let mut inner = self.lock();
-        let actor = ActorId::parse(actor_str).ok_or_else(|| anyhow!("invalid actor id"))?;
+        let actor = match inner.resolve_actor(actor_str) {
+            Some(actor) => actor,
+            None if ActorId::parse(actor_str).is_some() => {
+                return Err(anyhow!(
+                    "that actor's identity is not known locally yet — has the joiner \
+                     reached this node? (`lait connect` from their side carries it)"
+                ))
+            }
+            None => {
+                return Err(anyhow!(
+                    "no actor matches '{actor_str}' — pass an actor id (full or a unique \
+                     act_ prefix) or one of their device ids"
+                ))
+            }
+        };
         match inner.my_actor() {
             Some(me) if inner.acl().is_admin(&me) => {}
             _ => return Err(anyhow!("only an admin may add members")),
-        }
-        if !inner.actor_plane().exists(&actor) {
-            return Err(anyhow!("that actor's identity is not known locally yet"));
         }
         if inner.acl().is_member(&actor) {
             return Ok(());
@@ -1174,10 +1209,15 @@ impl OrbitalMechanics {
         Ok(())
     }
 
-    /// Remove a member by actor id — admin-only.
+    /// Remove a member by actor id, device id, or unique prefix — admin-only.
     pub fn member_remove(&self, actor_str: &str) -> Result<()> {
         let mut inner = self.lock();
-        let actor = ActorId::parse(actor_str).ok_or_else(|| anyhow!("invalid actor id"))?;
+        let actor = inner.resolve_actor(actor_str).ok_or_else(|| {
+            anyhow!(
+                "no actor matches '{actor_str}' — pass an actor id (full or a unique \
+                 act_ prefix) or one of their device ids"
+            )
+        })?;
         match inner.my_actor() {
             Some(me) if inner.acl().is_admin(&me) => {}
             _ => return Err(anyhow!("only an admin may remove members")),
@@ -1187,6 +1227,64 @@ impl OrbitalMechanics {
         }
         inner.author(AclAction::RemoveMember { actor }, None, vec![], vec![])?;
         Ok(())
+    }
+
+    /// Elevate or demote an existing member (admin-only): author the signed
+    /// [`AclAction::SetGrants`] the replay rules already validate — the
+    /// elevation surface GOV-11 found missing. Refuses to demote the last
+    /// admin (a space with no admin can no longer repair its own membership)
+    /// and to promote an agent (agents hold no membership authority by
+    /// construction). Idempotent on the current role.
+    pub fn member_set_role(&self, actor_str: &str, admin: bool) -> Result<ActorId> {
+        let mut inner = self.lock();
+        let actor = inner.resolve_actor(actor_str).ok_or_else(|| {
+            anyhow!(
+                "no actor matches '{actor_str}' — pass an actor id (full or a unique \
+                 act_ prefix) or one of their device ids"
+            )
+        })?;
+        match inner.my_actor() {
+            Some(me) if inner.acl().is_admin(&me) => {}
+            _ => return Err(anyhow!("only an admin may change a member's role")),
+        }
+        if inner.acl().is_agent(&actor) {
+            return Err(anyhow!(
+                "{} is a sponsored agent — agents hold no membership authority",
+                actor.short()
+            ));
+        }
+        if !inner.acl().is_member(&actor) {
+            return Err(anyhow!(
+                "{} is not a member of this space — `members add` admits first",
+                actor.short()
+            ));
+        }
+        if inner.acl().is_admin(&actor) == admin {
+            return Ok(actor);
+        }
+        if !admin {
+            let acl_state = inner.acl();
+            let admins = acl_state
+                .members()
+                .into_iter()
+                .filter(|(a, _)| acl_state.is_admin(a))
+                .count();
+            if admins <= 1 {
+                return Err(anyhow!(
+                    "refusing to demote the last admin — promote someone else first"
+                ));
+            }
+        }
+        inner.author(
+            AclAction::SetGrants {
+                actor: actor.clone(),
+                grants: acl::membership_grants(admin),
+            },
+            None,
+            vec![],
+            vec![],
+        )?;
+        Ok(actor)
     }
 
     // ---- device management (M3): signed actor-plane authority actions -------
