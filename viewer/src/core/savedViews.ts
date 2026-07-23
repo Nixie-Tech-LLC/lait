@@ -1,5 +1,6 @@
 import type { DisplayState } from "./display";
 import { EMPTY_FILTER, type FilterState } from "./filter";
+import type { WorkView } from "./registry";
 
 const KEY = "lait.saved-views";
 
@@ -8,6 +9,9 @@ export interface SavedView {
   name: string;
   filter: FilterState;
   display: DisplayState;
+  /** The render mode to restore (list/board/calendar/timeline). Absent on views
+   *  saved before the switcher existed — those just keep the current view. */
+  view?: WorkView;
 }
 
 /** A view saved before a filter axis existed lacks that field; fold it over the

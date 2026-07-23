@@ -4,10 +4,11 @@ import { useEffect, useState } from "react";
 
 import type { DisplayState } from "../core/display";
 import type { FilterState } from "../core/filter";
+import type { WorkView } from "../core/registry";
 import { loadSavedViews, removeView, saveView, type SavedView } from "../core/savedViews";
 import { Button, IconButton, PopoverContent } from "./primitives";
 
-export function SavedViews({ space, project, filter, display, onApply, onChange }: { space: string; project: string; filter: FilterState; display: DisplayState; onApply: (view: SavedView) => void; onChange?: () => void }) {
+export function SavedViews({ space, project, view, filter, display, onApply, onChange }: { space: string; project: string; view: WorkView; filter: FilterState; display: DisplayState; onApply: (view: SavedView) => void; onChange?: () => void }) {
   const [views, setViews] = useState(() => loadSavedViews(space, project));
   const [name, setName] = useState("");
 
@@ -17,7 +18,7 @@ export function SavedViews({ space, project, filter, display, onApply, onChange 
     const title = name.trim();
     if (!title) return;
     const id = `${Date.now().toString(36)}-${title.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
-    setViews(saveView(space, project, { id, name: title, filter, display }));
+    setViews(saveView(space, project, { id, name: title, filter, display, view }));
     onChange?.();
     setName("");
   };

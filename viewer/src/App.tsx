@@ -2,7 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Group, Panel, Separator, useDefaultLayout, usePanelRef } from "react-resizable-panels";
 import * as Dialog from "@radix-ui/react-dialog";
 import {
+  CalendarDays,
+  Columns3,
   Command as CommandIcon,
+  GanttChartSquare,
+  List as ListIcon,
   ListFilter,
   PanelLeft,
   Plus,
@@ -19,8 +23,11 @@ import {
   registry,
   type AppApi,
   type Ctx,
+  isWorkView,
+  WORK_VIEWS,
   type IssueField,
   type View,
+  type WorkView,
 } from "./core/registry";
 import {
   formatRoute,
@@ -38,6 +45,8 @@ import { Activity } from "./ui/Activity";
 import { classifyFailure, EmptyState, InlineError, recoveryForError, TrustPopover } from "./ui/AppState";
 import { Board } from "./ui/Board";
 import { BulkBar } from "./ui/BulkBar";
+import { Calendar } from "./ui/Calendar";
+import { Timeline } from "./ui/Timeline";
 import { DisplayOptions } from "./ui/DisplayOptions";
 import { FilterBar } from "./ui/FilterBar";
 import { Inbox } from "./ui/Inbox";
@@ -1104,8 +1113,9 @@ export function App() {
     setDetail(true);
   };
   const applySavedView = (saved: SavedView) => {
-    window.history.pushState(null, "", formatRoute({ spaceId: routeSpace, project, view: "list", issue: null, filter: saved.filter }));
-    setView("list");
+    const nextView = saved.view ?? "list";
+    window.history.pushState(null, "", formatRoute({ spaceId: routeSpace, project, view: nextView, issue: null, filter: saved.filter }));
+    setView(nextView);
     setSelection(null);
     setFilter(saved.filter);
     setDisplay(saved.display);
@@ -1219,6 +1229,10 @@ export function App() {
             <span className="text-dim shrink-0 capitalize">{view}</span>
           </h1>
 
+          {isWorkView(view) && (
+            <ViewSwitcher view={view} onPick={(next) => api.goto(next)} />
+          )}
+
           <span className="ml-auto flex items-center gap-1">
             <TrustPopover
               liveness={liveness}
@@ -1241,16 +1255,18 @@ export function App() {
               <CommandIcon className="size-4" />
             </IconButton>
 
+            {(view === "list" || view === "board" || view === "calendar") && (
+              <IconButton
+                label="Filter"
+                chord="/"
+                variant={isActive(filter) ? "active" : "ghost"}
+                onClick={() => run("filter.open")}
+              >
+                <ListFilter className="size-4" />
+              </IconButton>
+            )}
             {(view === "list" || view === "board") && (
               <>
-                <IconButton
-                  label="Filter"
-                  chord="/"
-                  variant={isActive(filter) ? "active" : "ghost"}
-                  onClick={() => run("filter.open")}
-                >
-                  <ListFilter className="size-4" />
-                </IconButton>
                 <DisplayOptions
                   display={display}
                   view={view}
@@ -1274,6 +1290,7 @@ export function App() {
                   <SavedViews
                     space={routeSpace}
                     project={board.project.key}
+                    view={view === "board" ? "board" : "list"}
                     filter={filter}
                     display={display}
                     onApply={(saved) => {
@@ -1283,6 +1300,7 @@ export function App() {
                         setDetail(false);
                       }
                       setDisplay(saved.display);
+                      if (saved.view && saved.view !== view) api.goto(saved.view);
                     }}
                     onChange={() => setPersonalNavRevision((revision) => revision + 1)}
                   />
@@ -1465,6 +1483,22 @@ export function App() {
               }}
               readOnly={readOnly}
             />
+          ) : shown && view === "calendar" ? (
+            <Calendar
+              board={shown}
+              onSelect={(reff) => {
+                api.select(reff);
+                setDetail(true);
+              }}
+            />
+          ) : view === "timeline" ? (
+            <Timeline
+              projects={projects}
+              onOpenProject={(key) => {
+                api.pickProject(key);
+                api.goto("list");
+              }}
+            />
           ) : shown && view === "list" ? (
             <IssueList
               groups={display.deleted ? [] : groups}
@@ -1499,7 +1533,7 @@ export function App() {
         </div>
       </Panel>
 
-      {detail && selection && current && routeSpace && board && (view === "list" || view === "board") && (
+      {detail && selection && current && routeSpace && board && (view === "list" || view === "board" || view === "calendar") && (
         <>
           <Separator className="bg-line data-[state=dragging]:bg-accent hover:bg-accent/60 relative w-px outline-none transition-colors max-[960px]:hidden">
             <span className="absolute inset-y-0 -left-[3px] w-[7px]" />
@@ -1844,3 +1878,42 @@ contribute({
     },
   ],
 });
+
+/**
+ * The work-view switcher — List / Board / Calendar / Timeline over the *same*
+ * filtered query (SCOPE-6). These four are sibling `View` segments in the URL, so
+ * the switcher is a thin control over `api.goto`; the surface each renders is the
+ * same `shown` set drawn a different way (or, for timeline, the project spans).
+ */
+const WORK_VIEW_META: Record<WorkView, { label: string; icon: React.ReactNode }> = {
+  list: { label: "List", icon: <ListIcon className="size-4" /> },
+  board: { label: "Board", icon: <Columns3 className="size-4" /> },
+  calendar: { label: "Calendar", icon: <CalendarDays className="size-4" /> },
+  timeline: { label: "Timeline", icon: <GanttChartSquare className="size-4" /> },
+};
+
+function ViewSwitcher({ view, onPick }: { view: WorkView; onPick: (v: WorkView) => void }) {
+  return (
+    <div className="border-line ml-2 flex items-center gap-0.5 rounded-md border p-0.5" role="tablist" aria-label="View">
+      {WORK_VIEWS.map((v) => {
+        const active = v === view;
+        return (
+          <button
+            key={v}
+            role="tab"
+            aria-selected={active}
+            aria-label={WORK_VIEW_META[v].label}
+            title={WORK_VIEW_META[v].label}
+            onClick={() => onPick(v)}
+            className={`flex h-6 items-center gap-1.5 rounded px-2 text-xs ${
+              active ? "bg-active text-fg" : "text-mute hover:bg-hover hover:text-fg"
+            }`}
+          >
+            {WORK_VIEW_META[v].icon}
+            <span className="max-md:hidden">{WORK_VIEW_META[v].label}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}

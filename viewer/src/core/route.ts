@@ -26,7 +26,17 @@ export const DEFAULT_ROUTE: ViewerRoute = {
   issue: null,
 };
 
-const VIEWS = new Set<View>(["list", "board", "projects", "inbox", "activity", "members", "settings"]);
+const VIEWS = new Set<View>([
+  "list",
+  "board",
+  "calendar",
+  "timeline",
+  "projects",
+  "inbox",
+  "activity",
+  "members",
+  "settings",
+]);
 const LAST_ROUTE = "lait.last-route";
 
 /**

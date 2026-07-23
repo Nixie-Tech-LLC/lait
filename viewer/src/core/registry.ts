@@ -28,7 +28,24 @@ import type { Field } from "./overlay";
 
 /** The root surfaces. These are also the stable view segments in the viewer URL;
  *  see `route.ts` for the canonical, machine-independent route contract. */
-export type View = "list" | "board" | "projects" | "inbox" | "activity" | "members" | "settings";
+export type View =
+  | "list"
+  | "board"
+  | "calendar"
+  | "timeline"
+  | "projects"
+  | "inbox"
+  | "activity"
+  | "members"
+  | "settings";
+
+/** The work-view render modes a saved view / the switcher toggles between —
+ *  the same filtered query, drawn four ways. A strict subset of `View`. */
+export const WORK_VIEWS = ["list", "board", "calendar", "timeline"] as const;
+export type WorkView = (typeof WORK_VIEWS)[number];
+export function isWorkView(v: View): v is WorkView {
+  return (WORK_VIEWS as readonly string[]).includes(v);
+}
 
 /**
  * A field a picker can be opened on.
