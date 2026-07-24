@@ -14,7 +14,7 @@ import {
 
 import { ConfirmRequired, rpc } from "../api";
 import type { MemberDto, MemberLogEntry } from "../types";
-import { memberName } from "./Avatar";
+import { Avatar, memberName } from "./Avatar";
 import * as ask from "./dialogs";
 import { Combobox } from "./Picker";
 import { Button, IconButton } from "./primitives";
@@ -106,6 +106,7 @@ export function Members({
           ) : <ul className="border-line divide-line divide-y rounded border">
             {members.map((m) => (
               <li key={m.key} className="flex items-center gap-3 p-3">
+                <Avatar deviceKey={m.key} alias={m.alias} me={m.me} className="size-6" />
                 <span className="min-w-0 flex-1">
                   <span className="flex items-center gap-2">
                     <span className="font-medium">

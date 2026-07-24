@@ -931,9 +931,27 @@ impl OrbitalDaemon {
     }
 
     fn members(&self) -> Response {
-        Response::Members {
-            members: self.mechanics.members(),
+        // Overlay this node's local petnames (`aliases.json`) into the roster so
+        // the CLI and the viewer both render a member's name, not a bare actor
+        // id. The alias is local, never synced (the trusted half of the identity
+        // model) — the daemon is this node, so it is the right place to apply it.
+        let mut members = self.mechanics.members();
+        let aliases = read_aliases(&self.home);
+        if !aliases.is_empty() {
+            for m in &mut members {
+                if let Some(name) = aliases.get(&m.key).or_else(|| {
+                    // Aliases may be keyed by a short `act_` prefix the operator
+                    // typed; match a stored key that prefixes this full actor id.
+                    aliases
+                        .iter()
+                        .find(|(k, _)| !k.is_empty() && m.key.starts_with(k.as_str()))
+                        .map(|(_, v)| v)
+                }) {
+                    m.alias = name.clone();
+                }
+            }
         }
+        Response::Members { members }
     }
 
     /// Add a device to this actor from its hex-encoded consent blob (produced

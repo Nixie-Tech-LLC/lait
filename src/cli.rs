@@ -642,7 +642,13 @@ fn daemon_exited_error(status: std::process::ExitStatus, log_path: &Path) -> any
 /// if `$LAIT_AS` names a local agent, as that agent (the shell-scoped selector,
 /// e.g. `LAIT_AS=scout lait new "…"`). Architecture B's "act as" on the CLI.
 pub async fn client(home: &Path, req: Request) -> Result<Response> {
-    let act_as = std::env::var("LAIT_AS").ok().filter(|s| !s.is_empty());
+    // `LAIT_AS` is the CLI's own selector; `LAIT_AGENT` is what the MCP surface
+    // uses (and what an agent's launch env sets). Honour either here so a single
+    // exported var attributes both CLI and MCP calls to the same agent.
+    let act_as = std::env::var("LAIT_AS")
+        .ok()
+        .or_else(|| std::env::var("LAIT_AGENT").ok())
+        .filter(|s| !s.is_empty());
     client_as(home, req, act_as.as_deref()).await
 }
 
