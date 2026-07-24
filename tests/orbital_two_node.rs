@@ -461,6 +461,36 @@ fn members_promote_and_demote_over_the_socket() {
     );
     assert_eq!(role_of(&joiner_actor), "admin");
 
+    // A promoted admin is a FULL admin (GOV-11): promotion installs the
+    // policy-admin meta-grant, not just ACL standing, so the joiner can mint
+    // an invite from its OWN node. Converge the promotion, then mint as the
+    // joiner (the exact capability a half-admin lacked).
+    let minted = poll_until(Duration::from_secs(20), || {
+        req(
+            &client,
+            &joiner_home,
+            Request::Connect {
+                ticket: approach.clone(),
+            },
+        );
+        match req(
+            &client,
+            &joiner_home,
+            Request::Invite {
+                role: Some("contributor".into()),
+                reusable: false,
+                ttl_hours: Some(24),
+            },
+        ) {
+            Response::Ref { .. } => Some(()),
+            _ => None,
+        }
+    });
+    assert!(
+        minted.is_some(),
+        "a promoted admin could not mint an invite — promotion left the meta-grant off"
+    );
+
     // Demote back to a plain member.
     let resp = req(
         &client,
@@ -475,6 +505,34 @@ fn members_promote_and_demote_over_the_socket() {
         "demote failed: {resp:?}"
     );
     assert_eq!(role_of(&joiner_actor), "member");
+
+    // Demotion reverses both layers: once it converges, the joiner can no
+    // longer mint invites (ACL standing gone and the meta-grant revoked).
+    let refused = poll_until(Duration::from_secs(20), || {
+        req(
+            &client,
+            &joiner_home,
+            Request::Connect {
+                ticket: approach.clone(),
+            },
+        );
+        match req(
+            &client,
+            &joiner_home,
+            Request::Invite {
+                role: Some("contributor".into()),
+                reusable: false,
+                ttl_hours: Some(24),
+            },
+        ) {
+            Response::Error { .. } => Some(()),
+            _ => None,
+        }
+    });
+    assert!(
+        refused.is_some(),
+        "a demoted member could still mint invites — the capability layer was not reversed"
+    );
 
     // The last admin cannot demote themselves into a repair-proof space.
     let founder_actor = {

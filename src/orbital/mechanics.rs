@@ -1229,61 +1229,125 @@ impl OrbitalMechanics {
         Ok(())
     }
 
-    /// Elevate or demote an existing member (admin-only): author the signed
-    /// [`AclAction::SetGrants`] the replay rules already validate — the
-    /// elevation surface GOV-11 found missing. Refuses to demote the last
-    /// admin (a space with no admin can no longer repair its own membership)
-    /// and to promote an agent (agents hold no membership authority by
-    /// construction). Idempotent on the current role.
+    /// Elevate or demote an existing member: a **full** role change across both
+    /// authority layers, so a promoted admin is a real admin (GOV-11).
+    ///
+    /// Promotion writes the signed [`AclAction::SetGrants`] (ACL admin standing,
+    /// which gates member add/remove and key rotation) **and** installs the
+    /// administrator role's admission evidence — including the Mechanics
+    /// policy-admin meta-grant, the capability that `may_delegate` (and thus
+    /// invite minting) requires. Without the second half a "promoted" admin
+    /// could manage members but not mint invites; that half-admin was the bug.
+    /// Because minting a policy admin needs policy authority, promotion requires
+    /// the caller to *be* a policy admin (you cannot grant authority you lack).
+    /// Demotion reverses both: ACL standing back to a plain member and the
+    /// admin/meta capability grants revoked (contributor + read remain).
+    ///
+    /// Refuses to demote the last admin, and to promote an agent (agents hold
+    /// no membership authority by construction). Idempotent per layer.
     pub fn member_set_role(&self, actor_str: &str, admin: bool) -> Result<ActorId> {
-        let mut inner = self.lock();
-        let actor = inner.resolve_actor(actor_str).ok_or_else(|| {
-            anyhow!(
-                "no actor matches '{actor_str}' — pass an actor id (full or a unique \
-                 act_ prefix) or one of their device ids"
-            )
-        })?;
-        match inner.my_actor() {
-            Some(me) if inner.acl().is_admin(&me) => {}
-            _ => return Err(anyhow!("only an admin may change a member's role")),
-        }
-        if inner.acl().is_agent(&actor) {
-            return Err(anyhow!(
-                "{} is a sponsored agent — agents hold no membership authority",
-                actor.short()
-            ));
-        }
-        if !inner.acl().is_member(&actor) {
-            return Err(anyhow!(
-                "{} is not a member of this space — `members add` admits first",
-                actor.short()
-            ));
-        }
-        if inner.acl().is_admin(&actor) == admin {
-            return Ok(actor);
-        }
-        if !admin {
-            let acl_state = inner.acl();
-            let admins = acl_state
-                .members()
-                .into_iter()
-                .filter(|(a, _)| acl_state.is_admin(a))
-                .count();
-            if admins <= 1 {
+        // Phase 1 (locked): resolve, gate, flip ACL standing, and collect the
+        // admin-capability grant ids to revoke on demotion.
+        let (actor, revoke_on_demote) = {
+            let mut inner = self.lock();
+            let actor = inner.resolve_actor(actor_str).ok_or_else(|| {
+                anyhow!(
+                    "no actor matches '{actor_str}' — pass an actor id (full or a unique \
+                     act_ prefix) or one of their device ids"
+                )
+            })?;
+            let gate_ok = match inner.my_actor() {
+                // Promotion mints policy authority, so the promoter must hold
+                // it; demotion is an ordinary admin action.
+                Some(me) if admin => inner.acl().is_policy_admin(&me),
+                Some(me) => inner.acl().is_admin(&me),
+                None => false,
+            };
+            if !gate_ok {
+                return Err(anyhow!(if admin {
+                    "only a policy admin may promote a member to a full admin (one who can \
+                     invite and manage policy) — ask a founder or an existing policy admin, \
+                     or admit them with an administrator invite"
+                } else {
+                    "only an admin may change a member's role"
+                }));
+            }
+            if inner.acl().is_agent(&actor) {
                 return Err(anyhow!(
-                    "refusing to demote the last admin — promote someone else first"
+                    "{} is a sponsored agent — agents hold no membership authority",
+                    actor.short()
                 ));
             }
+            if !inner.acl().is_member(&actor) {
+                return Err(anyhow!(
+                    "{} is not a member of this space — `members add` admits first",
+                    actor.short()
+                ));
+            }
+            if !admin {
+                let acl_state = inner.acl();
+                let admins = acl_state
+                    .members()
+                    .into_iter()
+                    .filter(|(a, _)| acl_state.is_admin(a))
+                    .count();
+                if admins <= 1 {
+                    return Err(anyhow!(
+                        "refusing to demote the last admin — promote someone else first"
+                    ));
+                }
+            }
+            // Flip ACL standing only when it needs flipping (idempotent).
+            if inner.acl().is_admin(&actor) != admin {
+                inner.author(
+                    AclAction::SetGrants {
+                        actor: actor.clone(),
+                        grants: acl::membership_grants(admin),
+                    },
+                    None,
+                    vec![],
+                    vec![],
+                )?;
+            }
+            // On demotion, gather the admin/meta capability grants to revoke.
+            let revoke = if admin {
+                Vec::new()
+            } else {
+                let space_res =
+                    mechanics::demand::PolicyResource::space(crate::world::contract::PRODUCT_WORLD);
+                let acl_state = inner.acl();
+                let mut ids = acl_state.effective_capability_grants(
+                    &actor,
+                    &mechanics::demand::PolicyCapability::new(
+                        crate::world::contract::PRODUCT_WORLD,
+                        "space.admin",
+                    ),
+                    &space_res,
+                );
+                ids.extend(acl_state.effective_capability_grants(
+                    &actor,
+                    &acl::policy_admin_capability(),
+                    &acl::policy_admin_resource(),
+                ));
+                ids
+            };
+            (actor, revoke)
+        };
+
+        // Phase 2 (re-locking helpers): sync the capability layer.
+        if admin {
+            // The administrator role's admission evidence uniquely carries the
+            // policy-admin meta-grant; grant_assignments is idempotent and
+            // re-checks that this caller may delegate every capability.
+            let revision = crate::world::roles::built_in("lait.administrator")
+                .ok_or_else(|| anyhow!("built-in administrator role is missing"))?;
+            let evidence = crate::world::roles::role_admission_evidence(&revision, [0u8; 32]);
+            self.grant_assignments(&actor, &evidence.assignments)?;
+        } else {
+            for grant_id in revoke_on_demote {
+                self.revoke_assignment(grant_id)?;
+            }
         }
-        inner.author(
-            AclAction::SetGrants {
-                actor: actor.clone(),
-                grants: acl::membership_grants(admin),
-            },
-            None,
-            vec![],
-            vec![],
-        )?;
         Ok(actor)
     }
 
