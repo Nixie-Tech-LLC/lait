@@ -530,6 +530,32 @@ fn parse_key_n(s: &str) -> Option<String> {
     None
 }
 
+/// Whether a whole token *is* an issue ref (not merely contains one): an `iss_`
+/// handle, or a bare `KEY-n` (`BEACON-7`, `ENG-142`) with nothing else around it.
+/// Used to disambiguate a lone `comment` positional — `comment BEACON-7` means
+/// the ref (body on stdin), while `comment "found it"` means the body. A body
+/// that happens to *mention* a ref (`"fix ENG-7 now"`) has whitespace, so it is
+/// correctly not a bare ref.
+fn looks_like_issue_ref(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() || s.chars().any(char::is_whitespace) {
+        return false;
+    }
+    if s.starts_with("iss_") {
+        return true;
+    }
+    // KEY-n: letters, one '-', digits — the whole token, nothing else.
+    match s.split_once('-') {
+        Some((key, num)) => {
+            !key.is_empty()
+                && key.chars().all(|c| c.is_ascii_alphabetic())
+                && !num.is_empty()
+                && num.chars().all(|c| c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
 /// Infer an issue ref from the current git branch: `eng-142-fix` → `ENG-142`, so
 /// `show`/`edit`/`history` are argument-free while you work the branch. `None` if
 /// not a git repo, detached HEAD, or the branch carries no `KEY-n`.
@@ -827,21 +853,25 @@ pub fn specs() -> Vec<Spec> {
         ),
         Spec::req(
             "comment",
-            "Append a comment (immutable body). One arg on a KEY-n branch = the body (ref inferred). No BODY → read stdin.",
+            "Append a comment (immutable). `comment REF \"text\"`; or `comment \"text\"` on a \
+             KEY-n branch (ref inferred); or `comment REF` with the body piped on stdin.",
             vec![
-                A::pos_opt("reff", "Issue ref (optional on a KEY-n branch when a body is given)."),
+                A::pos_opt("reff", "Issue ref (optional on a KEY-n branch, or when piping a body)."),
                 A::pos_opt("body", "Comment body (omit to read stdin)."),
                 A::val("reply_to", "Reply to a comment (its `cmt_…` id, from `show --json`).")
                     .long("reply-to"),
             ],
             |m| {
-                // Grammar: `comment [ref] [body]`. With ONE positional, it's
-                // ambiguous — resolve it as the BODY and infer the ref from the
-                // git branch (the branch-native loop: `lait comment "found it"`).
-                // A ref that happens to look like a body still works explicitly:
-                // `lait comment ENG-1 "body"`.
+                // Grammar: `comment [ref] [body]`. A LONE positional is ambiguous;
+                // disambiguate by SHAPE, not position, so `comment BEACON-7`
+                // (body piped on stdin) is not silently read as the body:
+                //   - looks like an issue ref  ⇒ it's the REF, body from stdin;
+                //   - anything else            ⇒ it's the BODY, ref from the branch
+                //     (the branch-native loop `lait comment "found it"`).
+                // Two args are always ref + body, unambiguously.
                 let (reff, body) = match (opt_str(m, "reff"), opt_str(m, "body")) {
                     (Some(r), Some(b)) => (Some(r), Some(b)),
+                    (Some(only), None) if looks_like_issue_ref(&only) => (Some(only), None),
                     (Some(only), None) => (None, Some(only)),
                     _ => (None, None),
                 };
@@ -850,7 +880,8 @@ pub fn specs() -> Vec<Spec> {
                     None => infer_ref_from_git_branch().ok_or_else(|| {
                         anyhow!(
                             "no issue ref given, and none could be inferred from the git branch — \
-                             pass one: `lait comment ENG-142 \"...\"`"
+                             pass one: `lait comment ENG-142 \"...\"` (a lone `ENG-142` is read as \
+                             the ref, with the body on stdin)"
                         )
                     })?,
                 };
@@ -863,6 +894,12 @@ pub fn specs() -> Vec<Spec> {
                         s.trim_end().to_string()
                     }
                 };
+                if body.trim().is_empty() {
+                    anyhow::bail!(
+                        "no comment body — give it as an argument (`lait comment {reff} \"...\"`) \
+                         or pipe it on stdin"
+                    );
+                }
                 Ok(Request::Comment {
                     reff,
                     body,
@@ -2593,6 +2630,25 @@ mod tests {
         assert_eq!(parse_key_n("142-eng"), None);
         assert_eq!(parse_key_n("release/v0.4.5"), None);
         assert_eq!(parse_key_n("feat/onboarding-dx-bridge"), None);
+    }
+
+    #[test]
+    fn a_lone_comment_arg_is_a_ref_by_shape_not_the_body() {
+        // The footgun this fixes: `lait comment BEACON-7` (body piped on stdin)
+        // must read BEACON-7 as the REF, not silently as the body.
+        assert!(looks_like_issue_ref("BEACON-7"));
+        assert!(looks_like_issue_ref("ENG-142"));
+        assert!(looks_like_issue_ref("iss_01JU74CAT"));
+        // A body — even one mentioning a ref — is not a bare ref (it has spaces).
+        assert!(!looks_like_issue_ref("found it"));
+        assert!(!looks_like_issue_ref("fix ENG-7 now"));
+        assert!(!looks_like_issue_ref("this looks done to me"));
+        // Not KEY-n shaped.
+        assert!(!looks_like_issue_ref("main"));
+        assert!(!looks_like_issue_ref("142-eng"));
+        assert!(!looks_like_issue_ref("ENG-"));
+        assert!(!looks_like_issue_ref("-7"));
+        assert!(!looks_like_issue_ref(""));
     }
 
     #[test]
