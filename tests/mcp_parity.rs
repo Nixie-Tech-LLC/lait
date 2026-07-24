@@ -67,6 +67,7 @@ fn response_dtos_round_trip() {
         start_date: None,
         target_date: None,
         archived: false,
+        team: String::new(),
     };
     let row = Row {
         due_date: None,
@@ -133,6 +134,10 @@ fn response_dtos_round_trip() {
             comments: vec![],
             created_by: lait::ids::ActorId::from_incept_hash(&"a".repeat(64)),
             created_at: 1000,
+            followers: vec![],
+            milestone: None,
+            cycle: None,
+            attachments: vec![],
             provisional: false,
             corrupt_records: vec![],
         })),
@@ -193,6 +198,10 @@ fn issue_response_status_field_survives_the_kind_tag() {
         comments: vec![],
         created_by: lait::ids::ActorId::from_incept_hash(&"a".repeat(64)),
         created_at: 0,
+        followers: vec![],
+        milestone: None,
+        cycle: None,
+        attachments: vec![],
         provisional: false,
         corrupt_records: vec![],
     }));

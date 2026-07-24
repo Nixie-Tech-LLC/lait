@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
-import { Archive, ArchiveRestore, ArrowLeft, ArrowRight } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowLeft, ArrowRight, X } from "lucide-react";
 
 import { rpc } from "../api";
-import type { MemberDto, ProjectDto, ProjectUpdateDto } from "../types";
+import type { MemberDto, MilestoneDto, ProjectDto, ProjectUpdateDto } from "../types";
 import { Avatar, memberName } from "./Avatar";
 import { catalogColor } from "./colors";
 import { ColorPicker } from "./ColorPicker";
@@ -148,6 +148,12 @@ export function ProjectOverview({
               readOnly={readOnly}
               onSave={(description) => void edit({ description })}
             />
+            <Milestones
+              spaceId={spaceId}
+              projectKey={project.key}
+              readOnly={readOnly}
+              onError={onError}
+            />
             <Updates
               spaceId={spaceId}
               projectKey={project.key}
@@ -285,6 +291,143 @@ function Description({
       className="border-line focus:border-line-strong placeholder:text-mute w-full resize-y rounded border bg-transparent p-2 outline-none"
       aria-label="Project description"
     />
+  );
+}
+
+/**
+ * The project's milestones (SCOPE-1): named targets with derived progress.
+ * Records live in the catalog's `project_milestones` map; the counts are
+ * derived by the engine from issues' milestone pointers, never stored.
+ */
+function Milestones({
+  spaceId,
+  projectKey,
+  readOnly,
+  onError,
+}: {
+  spaceId: string;
+  projectKey: string;
+  readOnly: boolean;
+  onError: (message: string) => void;
+}) {
+  const [milestones, setMilestones] = useState<MilestoneDto[] | null>(null);
+  const [draft, setDraft] = useState("");
+  const [target, setTarget] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const r = await rpc(spaceId, { cmd: "milestone_list", project: projectKey });
+      if (r.kind === "milestones") setMilestones(r.milestones);
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    }
+  }, [spaceId, projectKey, onError]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const add = async () => {
+    const name = draft.trim();
+    if (!name) return;
+    setAdding(true);
+    try {
+      await rpc(spaceId, {
+        cmd: "milestone_set",
+        project: projectKey,
+        name,
+        target,
+      });
+      setDraft("");
+      setTarget(null);
+      await load();
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  const remove = async (id: string) => {
+    try {
+      await rpc(spaceId, { cmd: "milestone_set", project: projectKey, milestone: id, remove: true });
+      await load();
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  if (milestones !== null && milestones.length === 0 && readOnly) return null;
+  return (
+    <section className="mt-8">
+      <h2 className="text-mute mb-3 text-2xs font-semibold tracking-wider uppercase">
+        Milestones
+      </h2>
+      {milestones === null && <p className="text-mute text-sm">Loading…</p>}
+      {milestones !== null && milestones.length === 0 && (
+        <p className="text-mute mb-2 text-sm">No milestones yet.</p>
+      )}
+      <ol className="flex flex-col gap-2">
+        {milestones?.map((m) => {
+          const pct = m.total === 0 ? 0 : Math.round((m.done / m.total) * 100);
+          return (
+            <li
+              key={m.id}
+              className="border-line group flex items-center gap-3 rounded border px-3 py-2"
+            >
+              <div className="min-w-0 flex-1">
+                <div className="flex items-baseline gap-2 text-sm">
+                  <span className="text-ink truncate font-medium">{m.name}</span>
+                  {m.target_date != null && (
+                    <span className="text-mute text-xs">→ {toInput(m.target_date)}</span>
+                  )}
+                  <span className="text-mute ml-auto shrink-0 text-xs">
+                    {m.done}/{m.total} · {pct}%
+                  </span>
+                </div>
+                <span className="bg-line mt-1.5 block h-1 w-full overflow-hidden rounded-full">
+                  <span className="bg-ok block h-full" style={{ width: `${pct}%` }} />
+                </span>
+              </div>
+              {!readOnly && (
+                <IconButton
+                  label={`Remove milestone ${m.name}`}
+                  className="opacity-0 group-hover:opacity-100"
+                  onClick={() => void remove(m.id)}
+                >
+                  <X className="size-3.5" />
+                </IconButton>
+              )}
+            </li>
+          );
+        })}
+      </ol>
+      {!readOnly && (
+        <div className="mt-2 flex items-center gap-2">
+          <input
+            value={draft}
+            placeholder="New milestone…"
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && draft.trim()) void add();
+            }}
+            className="border-line focus:border-line-strong placeholder:text-mute min-w-0 flex-1 rounded border bg-transparent px-2 py-1 text-sm outline-none"
+            aria-label="New milestone name"
+          />
+          <DatePicker
+            variant="bare"
+            value={target}
+            placeholder="Target"
+            ariaLabel="Milestone target date"
+            onChange={setTarget}
+          />
+          <Button variant="outline" disabled={!draft.trim() || adding} onClick={() => void add()}>
+            Add
+          </Button>
+        </div>
+      )}
+    </section>
   );
 }
 

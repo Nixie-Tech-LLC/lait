@@ -94,6 +94,76 @@ impl Snapshot {
             .map(|(id, _)| id.clone())
     }
 
+    /// Resolve a milestone within a project (`mls_` id or case-insensitive name).
+    fn resolve_milestone(&self, project: &str, reff: &str) -> Option<String> {
+        let reff = reff.trim();
+        let map = self.value["catalog"]["milestones"][project].as_object()?;
+        if map.contains_key(reff) {
+            return Some(reff.to_string());
+        }
+        map.iter()
+            .find(|(_, m)| {
+                m["name"]
+                    .as_str()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(reff))
+                    && m["tombstone"].as_bool() != Some(true)
+            })
+            .map(|(id, _)| id.clone())
+    }
+
+    /// Resolve a cycle within a project (`cyc_` id or case-insensitive name).
+    fn resolve_cycle(&self, project: &str, reff: &str) -> Option<String> {
+        let reff = reff.trim();
+        let map = self.value["catalog"]["cycles"][project].as_object()?;
+        if map.contains_key(reff) {
+            return Some(reff.to_string());
+        }
+        map.iter()
+            .find(|(_, c)| {
+                c["name"]
+                    .as_str()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(reff))
+                    && c["tombstone"].as_bool() != Some(true)
+            })
+            .map(|(id, _)| id.clone())
+    }
+
+    /// Resolve an initiative (`ini_` id or case-insensitive name).
+    fn resolve_initiative(&self, reff: &str) -> Option<(String, serde_json::Value)> {
+        let reff = reff.trim();
+        let map = self.value["catalog"]["initiatives"].as_object()?;
+        if let Some(v) = map.get(reff) {
+            return Some((reff.to_string(), v.clone()));
+        }
+        map.iter()
+            .find(|(_, i)| {
+                i["name"]
+                    .as_str()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(reff))
+                    && i["tombstone"].as_bool() != Some(true)
+            })
+            .map(|(id, v)| (id.clone(), v.clone()))
+    }
+
+    /// Resolve a team (`tm_` id, KEY, or case-insensitive name).
+    fn resolve_team(&self, reff: &str) -> Option<(String, serde_json::Value)> {
+        let reff = reff.trim();
+        let map = self.value["catalog"]["teams"].as_object()?;
+        if let Some(v) = map.get(reff) {
+            return Some((reff.to_string(), v.clone()));
+        }
+        let upper = reff.to_ascii_uppercase();
+        map.iter()
+            .find(|(_, t)| {
+                t["tombstone"].as_bool() != Some(true)
+                    && (t["key"].as_str() == Some(upper.as_str())
+                        || t["name"]
+                            .as_str()
+                            .is_some_and(|n| n.eq_ignore_ascii_case(reff)))
+            })
+            .map(|(id, v)| (id.clone(), v.clone()))
+    }
+
     /// Resolve a label ref (`lbl_` id or case-insensitive name).
     fn resolve_label(&self, reff: &str) -> Option<String> {
         let reff = reff.trim();
@@ -324,6 +394,24 @@ impl<'a> IssueRouter<'a> {
                 | Request::ProjectEdit { .. }
                 | Request::ProjectUpdates { .. }
                 | Request::ProjectUpdatePost { .. }
+                | Request::ProjectDelete { .. }
+                | Request::Follow { .. }
+                | Request::MilestoneList { .. }
+                | Request::MilestoneSet { .. }
+                | Request::IssueMilestone { .. }
+                | Request::CycleList { .. }
+                | Request::CycleSet { .. }
+                | Request::IssueCycle { .. }
+                | Request::InitiativeList
+                | Request::InitiativeSet { .. }
+                | Request::TeamList
+                | Request::TeamSet { .. }
+                | Request::TriageList
+                | Request::TriageSubmit { .. }
+                | Request::TriageDecide { .. }
+                | Request::Attach { .. }
+                | Request::Detach { .. }
+                | Request::AttachmentGet { .. }
                 | Request::LabelNew { .. }
                 | Request::LabelList
                 | Request::LabelEdit { .. }
@@ -731,6 +819,7 @@ impl<'a> IssueRouter<'a> {
                 start,
                 target,
                 archived,
+                team,
             } => {
                 let id = snapshot.resolve_project(&project).ok_or_else(|| {
                     Response::not_found(format!("no project matches {project:?}"))
@@ -752,6 +841,16 @@ impl<'a> IssueRouter<'a> {
                         l.to_string()
                     }
                 });
+                let team = match team.as_deref().map(str::trim) {
+                    None => None,
+                    Some("") | Some("none") => Some(String::new()),
+                    Some(sel) => Some(
+                        snapshot
+                            .resolve_team(sel)
+                            .ok_or_else(|| Response::not_found(format!("no team matches {sel:?}")))?
+                            .0,
+                    ),
+                };
                 self.submit(&IssueIntent::ProjectEdit {
                     id,
                     name,
@@ -761,11 +860,483 @@ impl<'a> IssueRouter<'a> {
                     start_date: parse_date(start)?,
                     target_date: parse_date(target)?,
                     archived,
+                    team,
                     device: facts.device.clone(),
                     ts: facts.now,
                 })
                 .map_err(Self::effect_err)?;
                 Ok((Response::Ref { reff: project }, true))
+            }
+            Request::ProjectDelete { project } => {
+                let id = snapshot.resolve_project(&project).ok_or_else(|| {
+                    Response::not_found(format!("no project matches {project:?}"))
+                })?;
+                self.submit(&IssueIntent::ProjectDelete {
+                    id,
+                    device: facts.device.clone(),
+                    ts: facts.now,
+                })
+                .map_err(|e| match e {
+                    WorldError::Conflict => Response::err(
+                        "that project still has issues (live or deleted) — move them with \
+                         `issue move`, or archive the project instead; only an empty project \
+                         can be hard-deleted",
+                    ),
+                    other => Self::effect_err(other),
+                })?;
+                Ok((
+                    Response::Ok {
+                        message: Some(format!("deleted project {project} (it was empty)")),
+                    },
+                    true,
+                ))
+            }
+            Request::Follow { reff, on } => {
+                let doc = self.resolve(&snapshot, &reff)?;
+                self.submit(&IssueIntent::Follow {
+                    doc: doc.clone(),
+                    actor: facts.actor.clone(),
+                    on,
+                    device: facts.device.clone(),
+                    ts: facts.now,
+                })
+                .map_err(Self::effect_err)?;
+                Ok((self.ref_response(&doc), true))
+            }
+            Request::MilestoneList { project } => {
+                let id = snapshot.resolve_project(&project).ok_or_else(|| {
+                    Response::not_found(format!("no project matches {project:?}"))
+                })?;
+                let milestones: Vec<crate::dto::MilestoneDto> = self
+                    .query(&IssueQuery::Milestones { project: id })
+                    .map_err(Self::effect_err)?;
+                Ok((Response::Milestones { milestones }, false))
+            }
+            Request::MilestoneSet {
+                project,
+                milestone,
+                name,
+                target,
+                remove,
+            } => {
+                let project_id = snapshot.resolve_project(&project).ok_or_else(|| {
+                    Response::not_found(format!("no project matches {project:?}"))
+                })?;
+                let id = match &milestone {
+                    Some(sel) => snapshot
+                        .resolve_milestone(&project_id, sel)
+                        .ok_or_else(|| {
+                            Response::not_found(format!("no milestone matches {sel:?}"))
+                        })?,
+                    None => crate::ids::mint_milestone_id(self.clock),
+                };
+                let target_date = match target.as_deref() {
+                    None => None,
+                    Some("none") | Some("") => Some(None),
+                    Some(text) => Some(Some(parse_due(text).ok_or_else(bad_due)?)),
+                };
+                self.submit(&IssueIntent::MilestoneSet {
+                    project_id,
+                    id: id.clone(),
+                    name,
+                    target_date,
+                    tombstone: remove.then_some(true),
+                    device: facts.device.clone(),
+                    ts: facts.now,
+                })
+                .map_err(Self::effect_err)?;
+                Ok((Response::Ref { reff: id }, true))
+            }
+            Request::IssueMilestone { reff, milestone } => {
+                let doc = self.resolve(&snapshot, &reff)?;
+                let milestone = match milestone.as_deref().map(str::trim) {
+                    None | Some("") | Some("none") => None,
+                    Some(sel) => {
+                        // Milestones are project-scoped: resolve within the
+                        // issue's own project.
+                        let view: IssueView = self
+                            .query(&IssueQuery::View {
+                                doc: doc.clone(),
+                                me: None,
+                            })
+                            .map_err(Self::effect_err)?;
+                        let project = view.project_id.as_str().to_string();
+                        Some(snapshot.resolve_milestone(&project, sel).ok_or_else(|| {
+                            Response::not_found(format!(
+                                "no milestone matches {sel:?} in this issue's project"
+                            ))
+                        })?)
+                    }
+                };
+                self.submit(&IssueIntent::IssueMilestone {
+                    doc: doc.clone(),
+                    milestone,
+                    device: facts.device.clone(),
+                    ts: facts.now,
+                })
+                .map_err(Self::effect_err)?;
+                Ok((self.ref_response(&doc), true))
+            }
+            Request::CycleList { project } => {
+                let id = snapshot.resolve_project(&project).ok_or_else(|| {
+                    Response::not_found(format!("no project matches {project:?}"))
+                })?;
+                let cycles: Vec<crate::dto::CycleDto> = self
+                    .query(&IssueQuery::Cycles { project: id })
+                    .map_err(Self::effect_err)?;
+                Ok((Response::Cycles { cycles }, false))
+            }
+            Request::CycleSet {
+                project,
+                cycle,
+                name,
+                start,
+                end,
+                remove,
+            } => {
+                let project_id = snapshot.resolve_project(&project).ok_or_else(|| {
+                    Response::not_found(format!("no project matches {project:?}"))
+                })?;
+                let id = match &cycle {
+                    Some(sel) => snapshot
+                        .resolve_cycle(&project_id, sel)
+                        .ok_or_else(|| Response::not_found(format!("no cycle matches {sel:?}")))?,
+                    None => crate::ids::mint_cycle_id(self.clock),
+                };
+                let parse_edge = |v: Option<String>| -> Result<Option<Option<u64>>, Response> {
+                    match v.as_deref() {
+                        None => Ok(None),
+                        Some("none") | Some("") => Ok(Some(None)),
+                        Some(text) => Ok(Some(Some(parse_due(text).ok_or_else(bad_due)?))),
+                    }
+                };
+                self.submit(&IssueIntent::CycleSet {
+                    project_id,
+                    id: id.clone(),
+                    name,
+                    start: parse_edge(start)?,
+                    end: parse_edge(end)?,
+                    tombstone: remove.then_some(true),
+                    device: facts.device.clone(),
+                    ts: facts.now,
+                })
+                .map_err(Self::effect_err)?;
+                Ok((Response::Ref { reff: id }, true))
+            }
+            Request::IssueCycle { reff, cycle } => {
+                let doc = self.resolve(&snapshot, &reff)?;
+                let cycle = match cycle.as_deref().map(str::trim) {
+                    None | Some("") | Some("none") => None,
+                    Some(sel) => {
+                        let view: IssueView = self
+                            .query(&IssueQuery::View {
+                                doc: doc.clone(),
+                                me: None,
+                            })
+                            .map_err(Self::effect_err)?;
+                        let project = view.project_id.as_str().to_string();
+                        Some(snapshot.resolve_cycle(&project, sel).ok_or_else(|| {
+                            Response::not_found(format!(
+                                "no cycle matches {sel:?} in this issue's project"
+                            ))
+                        })?)
+                    }
+                };
+                self.submit(&IssueIntent::IssueCycle {
+                    doc: doc.clone(),
+                    cycle,
+                    device: facts.device.clone(),
+                    ts: facts.now,
+                })
+                .map_err(Self::effect_err)?;
+                Ok((self.ref_response(&doc), true))
+            }
+            Request::InitiativeList => {
+                let initiatives: Vec<crate::dto::InitiativeDto> = self
+                    .query(&IssueQuery::Initiatives)
+                    .map_err(Self::effect_err)?;
+                Ok((Response::Initiatives { initiatives }, false))
+            }
+            Request::InitiativeSet {
+                initiative,
+                name,
+                description,
+                owner,
+                health,
+                target,
+                add_projects,
+                remove_projects,
+                remove,
+            } => {
+                let current = match &initiative {
+                    Some(sel) => Some(snapshot.resolve_initiative(sel).ok_or_else(|| {
+                        Response::not_found(format!("no initiative matches {sel:?}"))
+                    })?),
+                    None => None,
+                };
+                let id = current
+                    .as_ref()
+                    .map(|(id, _)| id.clone())
+                    .unwrap_or_else(|| crate::ids::mint_initiative_id(self.clock));
+                // Merge membership against the current record; the intent
+                // carries the complete replacement list.
+                let projects = if add_projects.is_empty() && remove_projects.is_empty() {
+                    None
+                } else {
+                    let mut members: Vec<String> = current
+                        .as_ref()
+                        .and_then(|(_, v)| v["projects"].as_array().cloned())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|p| p.as_str().map(String::from))
+                        .collect();
+                    for sel in &add_projects {
+                        let id = snapshot.resolve_project(sel).ok_or_else(|| {
+                            Response::not_found(format!("no project matches {sel:?}"))
+                        })?;
+                        if !members.contains(&id) {
+                            members.push(id);
+                        }
+                    }
+                    for sel in &remove_projects {
+                        if let Some(id) = snapshot.resolve_project(sel) {
+                            members.retain(|m| m != &id);
+                        }
+                    }
+                    Some(members)
+                };
+                let owner = owner.map(|o| {
+                    let o = o.trim();
+                    if o.eq_ignore_ascii_case("none") {
+                        String::new()
+                    } else {
+                        o.to_string()
+                    }
+                });
+                let target_date = match target.as_deref() {
+                    None => None,
+                    Some("none") | Some("") => Some(None),
+                    Some(text) => Some(Some(parse_due(text).ok_or_else(bad_due)?)),
+                };
+                self.submit(&IssueIntent::InitiativeSet {
+                    id: id.clone(),
+                    name,
+                    description,
+                    owner,
+                    health,
+                    target_date,
+                    projects,
+                    tombstone: remove.then_some(true),
+                    device: facts.device.clone(),
+                    ts: facts.now,
+                })
+                .map_err(Self::effect_err)?;
+                Ok((Response::Ref { reff: id }, true))
+            }
+            Request::TeamList => {
+                let teams: Vec<crate::dto::TeamDto> =
+                    self.query(&IssueQuery::Teams).map_err(Self::effect_err)?;
+                Ok((Response::Teams { teams }, false))
+            }
+            Request::TeamSet {
+                team,
+                name,
+                key,
+                icon,
+                lead,
+                add_members,
+                remove_members,
+                remove,
+            } => {
+                let current =
+                    match &team {
+                        Some(sel) => Some(snapshot.resolve_team(sel).ok_or_else(|| {
+                            Response::not_found(format!("no team matches {sel:?}"))
+                        })?),
+                        None => None,
+                    };
+                let id = current
+                    .as_ref()
+                    .map(|(id, _)| id.clone())
+                    .unwrap_or_else(|| crate::ids::mint_team_id(self.clock));
+                let members = if add_members.is_empty() && remove_members.is_empty() {
+                    None
+                } else {
+                    let mut members: Vec<String> = current
+                        .as_ref()
+                        .and_then(|(_, v)| v["members"].as_array().cloned())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|m| m.as_str().map(String::from))
+                        .collect();
+                    for actor in &add_members {
+                        let actor = actor.trim().to_string();
+                        if !members.contains(&actor) {
+                            members.push(actor);
+                        }
+                    }
+                    for actor in &remove_members {
+                        let actor = actor.trim();
+                        members.retain(|m| m != actor);
+                    }
+                    Some(members)
+                };
+                let lead = lead.map(|l| {
+                    let l = l.trim();
+                    if l.eq_ignore_ascii_case("none") {
+                        String::new()
+                    } else {
+                        l.to_string()
+                    }
+                });
+                self.submit(&IssueIntent::TeamSet {
+                    id: id.clone(),
+                    name,
+                    key,
+                    icon,
+                    lead,
+                    members,
+                    tombstone: remove.then_some(true),
+                    device: facts.device.clone(),
+                    ts: facts.now,
+                })
+                .map_err(Self::effect_err)?;
+                Ok((Response::Ref { reff: id }, true))
+            }
+            Request::TriageList => {
+                let items: Vec<crate::dto::TriageDto> =
+                    self.query(&IssueQuery::Triage).map_err(Self::effect_err)?;
+                Ok((Response::TriageItems { items }, false))
+            }
+            Request::TriageSubmit {
+                title,
+                body,
+                source,
+            } => {
+                let id = crate::ids::mint_triage_id(self.clock);
+                self.submit(&IssueIntent::TriageSubmit {
+                    id: id.clone(),
+                    title,
+                    body: body.unwrap_or_default(),
+                    source: source.unwrap_or_else(|| "cli".into()),
+                    actor: facts.actor.clone(),
+                    device: facts.device.clone(),
+                    ts: facts.now,
+                })
+                .map_err(Self::effect_err)?;
+                Ok((Response::Ref { reff: id }, true))
+            }
+            Request::TriageDecide {
+                id,
+                outcome,
+                project,
+                target,
+                note,
+            } => {
+                let outcome = outcome.trim().to_ascii_lowercase();
+                let (project_id, doc) = match outcome.as_str() {
+                    "accepted" => {
+                        let sel = project.as_deref().ok_or_else(|| {
+                            Response::err("accepting needs a project: pass -p <project>")
+                        })?;
+                        let project_id = snapshot.resolve_project(sel).ok_or_else(|| {
+                            Response::not_found(format!("no project matches {sel:?}"))
+                        })?;
+                        let doc = DocId::mint(self.clock).as_str().to_string();
+                        (Some(project_id), Some(doc))
+                    }
+                    "duplicate" => {
+                        let sel = target.as_deref().ok_or_else(|| {
+                            Response::err("duplicate needs the existing issue: pass its ref")
+                        })?;
+                        (None, Some(self.resolve(&snapshot, sel)?))
+                    }
+                    _ => (None, None),
+                };
+                let effect = self
+                    .submit(&IssueIntent::TriageDecide {
+                        id: id.clone(),
+                        outcome: outcome.clone(),
+                        project: project_id,
+                        doc,
+                        note: note.unwrap_or_default(),
+                        actor: facts.actor.clone(),
+                        device: facts.device.clone(),
+                        ts: facts.now,
+                    })
+                    .map_err(|e| match e {
+                        WorldError::Conflict => {
+                            Response::err("that triage item was already decided")
+                        }
+                        other => Self::effect_err(other),
+                    })?;
+                let message = match (outcome.as_str(), &effect.doc) {
+                    ("accepted", Some(doc)) => {
+                        format!("accepted into {}", self.reff_for(&self.snapshot(), doc))
+                    }
+                    ("duplicate", _) => "marked duplicate".into(),
+                    _ => "declined".into(),
+                };
+                Ok((
+                    Response::Ok {
+                        message: Some(message),
+                    },
+                    true,
+                ))
+            }
+            Request::Attach {
+                reff,
+                name,
+                mime,
+                data_b64,
+                comment,
+            } => {
+                let doc = self.resolve(&snapshot, &reff)?;
+                self.submit(&IssueIntent::Attach {
+                    doc: doc.clone(),
+                    id: crate::ids::mint_attachment_id(self.clock),
+                    name,
+                    mime: mime.unwrap_or_else(|| "application/octet-stream".into()),
+                    data_b64,
+                    comment,
+                    actor: facts.actor.clone(),
+                    device: facts.device.clone(),
+                    ts: facts.now,
+                })
+                .map_err(|e| match e {
+                    WorldError::LimitExceeded => Response::err(format!(
+                        "attachment refused: at most {} files per issue, {} KiB each",
+                        super::contract::MAX_ATTACHMENTS_PER_ISSUE,
+                        super::contract::MAX_ATTACHMENT_BYTES / 1024,
+                    )),
+                    other => Self::effect_err(other),
+                })?;
+                Ok((self.ref_response(&doc), true))
+            }
+            Request::Detach { reff, id } => {
+                let doc = self.resolve(&snapshot, &reff)?;
+                self.submit(&IssueIntent::Detach {
+                    doc: doc.clone(),
+                    id,
+                    device: facts.device.clone(),
+                    ts: facts.now,
+                })
+                .map_err(Self::effect_err)?;
+                Ok((self.ref_response(&doc), true))
+            }
+            Request::AttachmentGet { reff, id } => {
+                let doc = self.resolve(&snapshot, &reff)?;
+                let record: serde_json::Value = self
+                    .query(&IssueQuery::Attachment { doc, id })
+                    .map_err(Self::effect_err)?;
+                Ok((
+                    Response::Attachment {
+                        name: record["name"].as_str().unwrap_or_default().to_string(),
+                        mime: record["mime"].as_str().unwrap_or_default().to_string(),
+                        data_b64: record["data_b64"].as_str().unwrap_or_default().to_string(),
+                    },
+                    false,
+                ))
             }
             Request::ProjectUpdates { project } => {
                 let id = snapshot.resolve_project(&project).ok_or_else(|| {

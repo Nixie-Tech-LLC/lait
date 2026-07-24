@@ -42,6 +42,9 @@ pub struct ProjectMeta {
     /// intact. Additive: pre-archive projects decode as live. See CUSTOM-9.
     #[serde(default)]
     pub archived: bool,
+    /// The owning team's id (empty = none). Additive (GOV-7).
+    #[serde(default)]
+    pub team: String,
 }
 
 /// One project status update — an immutable post in the project's updates feed
@@ -68,6 +71,115 @@ pub struct ProjectUpdate {
 pub struct LabelMeta {
     pub name: String,
     pub color: String,
+}
+
+/// One project milestone — an editable record in the Catalog's
+/// `project_milestones` map (keyed `<project>/<milestone>`), LWW per record
+/// like `projects` (milestones are renamed and retargeted; the whole record is
+/// rewritten on edit so untouched fields never drop). Progress is derived
+/// from issues' `milestone` registers, never stored (SCOPE-1).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Milestone {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub target_date: Option<u64>,
+    #[serde(default)]
+    pub tombstone: bool,
+}
+
+/// One cycle (time-boxed iteration) — an editable record in the Catalog's
+/// `cycles` map (keyed `<project>/<cycle>`), same LWW-record shape as
+/// milestones (BOARD-11).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cycle {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    /// The box, unix seconds (0 = unset — a named backlog bucket).
+    #[serde(default)]
+    pub start: u64,
+    #[serde(default)]
+    pub end: u64,
+    #[serde(default)]
+    pub tombstone: bool,
+}
+
+/// One initiative — the strategic layer above projects (SCOPE-8): a named
+/// goal grouping several projects, with owner/health/target date. Progress is
+/// derived from the member projects' issues, never stored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Initiative {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Owner actor key (empty = none).
+    #[serde(default)]
+    pub owner: String,
+    /// `on_track` | `at_risk` | `off_track` | "" — self-reported, like
+    /// project-update health.
+    #[serde(default)]
+    pub health: String,
+    #[serde(default)]
+    pub target_date: Option<u64>,
+    /// Ordered member project ids.
+    #[serde(default)]
+    pub projects: Vec<String>,
+    #[serde(default)]
+    pub tombstone: bool,
+}
+
+/// One team — a durable work-owning group (GOV-7). Team membership is
+/// product-level (actor keys), managed independently of the space ACL:
+/// belonging to a team confers no authority, and the ACL confers no team.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Team {
+    pub id: String,
+    pub name: String,
+    /// Short uppercase handle, immutable after creation (like a project key).
+    pub key: String,
+    #[serde(default)]
+    pub icon: String,
+    /// Lead actor key (empty = none).
+    #[serde(default)]
+    pub lead: String,
+    /// Member actor keys, sorted.
+    #[serde(default)]
+    pub members: Vec<String>,
+    #[serde(default)]
+    pub tombstone: bool,
+}
+
+/// One triage-intake item (SCOPE-7): reported work reviewed BEFORE it enters
+/// a project's workflow. Catalog-level (submission needs no project), decided
+/// exactly once — the outcome fields are written by the review intent and the
+/// record is never edited afterwards.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriageItem {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    /// Where this came from (free text: "cli", an integration name, …).
+    #[serde(default)]
+    pub source: String,
+    /// The submitting actor key.
+    pub submitted_by: String,
+    pub ts: u64,
+    /// "" (pending) | `accepted` | `declined` | `duplicate`.
+    #[serde(default)]
+    pub outcome: String,
+    /// The issue the item became (accepted) or duplicates (duplicate).
+    #[serde(default)]
+    pub doc: String,
+    #[serde(default)]
+    pub decided_by: String,
+    #[serde(default)]
+    pub decided_ts: u64,
+    #[serde(default)]
+    pub note: String,
 }
 
 /// The parsed catalog Body.
@@ -100,6 +212,16 @@ pub struct CatalogState {
     pub role_revisions: BTreeMap<String, Vec<StoredRoleRevision>>,
     /// project id -> grow-only status-update log (SCOPE-1 updates feed).
     pub project_updates: BTreeMap<String, Vec<ProjectUpdate>>,
+    /// project id -> milestone id -> milestone (SCOPE-1).
+    pub milestones: BTreeMap<String, BTreeMap<String, Milestone>>,
+    /// project id -> cycle id -> cycle (BOARD-11).
+    pub cycles: BTreeMap<String, BTreeMap<String, Cycle>>,
+    /// initiative id -> initiative (SCOPE-8).
+    pub initiatives: BTreeMap<String, Initiative>,
+    /// team id -> team (GOV-7).
+    pub teams: BTreeMap<String, Team>,
+    /// triage-intake id -> item (SCOPE-7).
+    pub triage: BTreeMap<String, TriageItem>,
 }
 
 /// A role revision as stored in the catalog `roles` map: hex revision id,
@@ -184,6 +306,45 @@ impl CatalogState {
                     .entry(project.to_string())
                     .or_default()
                     .push(update);
+            }
+        }
+        for (key, raw) in map_str(view, "project_milestones") {
+            let Some((project, _id)) = key.rsplit_once('/') else {
+                continue;
+            };
+            if let Ok(m) = serde_json::from_str::<Milestone>(&raw) {
+                state
+                    .milestones
+                    .entry(project.to_string())
+                    .or_default()
+                    .insert(m.id.clone(), m);
+            }
+        }
+        for (key, raw) in map_str(view, "cycles") {
+            let Some((project, _id)) = key.rsplit_once('/') else {
+                continue;
+            };
+            if let Ok(c) = serde_json::from_str::<Cycle>(&raw) {
+                state
+                    .cycles
+                    .entry(project.to_string())
+                    .or_default()
+                    .insert(c.id.clone(), c);
+            }
+        }
+        for (id, raw) in map_str(view, "initiatives") {
+            if let Ok(i) = serde_json::from_str::<Initiative>(&raw) {
+                state.initiatives.insert(id, i);
+            }
+        }
+        for (id, raw) in map_str(view, "teams") {
+            if let Ok(t) = serde_json::from_str::<Team>(&raw) {
+                state.teams.insert(id, t);
+            }
+        }
+        for (id, raw) in map_str(view, "triage") {
+            if let Ok(t) = serde_json::from_str::<TriageItem>(&raw) {
+                state.triage.insert(id, t);
             }
         }
         for (id, raw) in map_str(view, "roles") {
@@ -293,13 +454,45 @@ pub struct IssueState {
     pub duedate: Option<u64>,
     pub estimate: Option<u32>,
     pub assignees: Vec<ActorId>,
+    /// Subscribed actors, independent of assignment (INBOX-9): an add-wins
+    /// set mirroring `assignees` storage.
+    pub followers: Vec<ActorId>,
+    /// The milestone this issue targets (empty register = none; SCOPE-1).
+    pub milestone: Option<String>,
+    /// The cycle this issue is scheduled in (BOARD-11).
+    pub cycle: Option<String>,
     pub labels: Vec<String>,
     pub comments: Vec<StoredComment>,
     /// comment id -> sorted `(emoji, actor)` pairs, parsed from the
     /// `reactions/<comment id>` sets. Malformed values are dropped, not
     /// surfaced — a reaction is not worth a corrupt-record row.
     pub reactions: BTreeMap<String, Vec<(String, String)>>,
+    /// Attachment records, metadata only — the base64 payload stays in the
+    /// Body map and is served solely by the `Attachment` query, so the
+    /// derived-snapshot cache never holds file bytes (CREATE-5).
+    pub attachments: Vec<AttachmentMeta>,
     pub events: Vec<IssueEvent>,
+}
+
+/// The metadata half of a stored attachment record — everything except
+/// `data_b64` (serde ignores it on decode, which is the point).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentMeta {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub mime: String,
+    /// Raw (decoded) size in bytes.
+    #[serde(default)]
+    pub size: u64,
+    /// The attaching actor key.
+    #[serde(default)]
+    pub by: String,
+    #[serde(default)]
+    pub ts: u64,
+    /// The comment this file rode with, when any.
+    #[serde(default)]
+    pub comment: String,
 }
 
 impl IssueState {
@@ -314,6 +507,26 @@ impl IssueState {
             })
             .unwrap_or_default();
         assignees.sort();
+        let mut followers: Vec<ActorId> = view
+            .sets
+            .get("followers")
+            .map(|s| {
+                s.iter()
+                    .filter_map(|v| ActorId::parse(&String::from_utf8_lossy(v)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        followers.sort();
+        let mut attachments: Vec<AttachmentMeta> = view
+            .maps
+            .get("attachments")
+            .map(|m| {
+                m.values()
+                    .filter_map(|v| serde_json::from_slice::<AttachmentMeta>(v).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        attachments.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
         let mut labels: Vec<String> = view
             .sets
             .get("labels")
@@ -370,9 +583,13 @@ impl IssueState {
             duedate: reg_str(view, "duedate").and_then(|s| s.parse().ok()),
             estimate: reg_str(view, "estimate").and_then(|s| s.parse().ok()),
             assignees,
+            followers,
+            milestone: reg_str(view, "milestone").filter(|m| !m.is_empty()),
+            cycle: reg_str(view, "cycle").filter(|c| !c.is_empty()),
             labels,
             comments,
             reactions,
+            attachments,
             events,
         }
     }
@@ -635,6 +852,22 @@ pub fn issue_view(
         created_at: issue.created_at,
         due_date: issue.duedate,
         estimate: issue.estimate,
+        followers: issue.followers.clone(),
+        milestone: issue.milestone.clone(),
+        cycle: issue.cycle.clone(),
+        attachments: issue
+            .attachments
+            .iter()
+            .map(|a| crate::dto::AttachmentMetaDto {
+                id: a.id.clone(),
+                name: a.name.clone(),
+                mime: a.mime.clone(),
+                size: a.size,
+                by: a.by.clone(),
+                ts: a.ts,
+                comment: a.comment.clone(),
+            })
+            .collect(),
         provisional: false,
         corrupt_records: Vec::new(),
     }
@@ -671,6 +904,7 @@ pub fn project_dto(id: &str, meta: &ProjectMeta) -> Option<ProjectDto> {
         start_date: meta.start_date,
         target_date: meta.target_date,
         archived: meta.archived,
+        team: meta.team.clone(),
     })
 }
 

@@ -43,6 +43,12 @@ pub fn is_read(req: &Request) -> bool {
         | Request::RoleShow { .. }
         | Request::AccessList { .. }
         | Request::ProjectUpdates { .. }
+        | Request::MilestoneList { .. }
+        | Request::CycleList { .. }
+        | Request::InitiativeList
+        | Request::TeamList
+        | Request::TriageList
+        | Request::AttachmentGet { .. }
         | Request::WorkflowShow { .. }
         | Request::WorkflowValidate { .. }
         | Request::Hello { .. } => true,
@@ -71,6 +77,18 @@ pub fn is_read(req: &Request) -> bool {
         | Request::ProjectNew { .. }
         | Request::ProjectEdit { .. }
         | Request::ProjectUpdatePost { .. }
+        | Request::ProjectDelete { .. }
+        | Request::Follow { .. }
+        | Request::MilestoneSet { .. }
+        | Request::IssueMilestone { .. }
+        | Request::CycleSet { .. }
+        | Request::IssueCycle { .. }
+        | Request::InitiativeSet { .. }
+        | Request::TeamSet { .. }
+        | Request::TriageSubmit { .. }
+        | Request::TriageDecide { .. }
+        | Request::Attach { .. }
+        | Request::Detach { .. }
         | Request::LabelNew { .. }
         | Request::LabelEdit { .. }
         | Request::LabelDelete { .. }

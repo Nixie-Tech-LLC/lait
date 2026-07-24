@@ -112,6 +112,31 @@ fn resolve_space_selector(sel: &str) -> Result<std::path::PathBuf> {
     }
 }
 
+/// A minimal extension→MIME map for attachments — enough for the common
+/// cases; anything else is an honest octet-stream.
+fn mime_for(name: &str) -> String {
+    let ext = name
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "txt" | "log" => "text/plain",
+        "md" => "text/markdown",
+        "json" => "application/json",
+        "csv" => "text/csv",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
 /// Parse arguments, run, and report any failure the way the CLI contract says.
 ///
 /// Returns the process exit code rather than a `Result`: handing an error back to
@@ -425,6 +450,77 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
                     {
                         if let Some(actor_line) = m.lines().nth(1) {
                             println!("{actor_line}");
+                        }
+                    }
+                }
+            }
+            Special::Attach => {
+                let reff = m.get_one::<String>("reff").cloned().unwrap_or_default();
+                let path = m.get_one::<String>("file").cloned().unwrap_or_default();
+                let bytes =
+                    std::fs::read(&path).map_err(|e| anyhow!("could not read {path}: {e}"))?;
+                if bytes.is_empty() {
+                    return Err(anyhow!("{path} is empty — nothing to attach"));
+                }
+                if bytes.len() > crate::world::contract::MAX_ATTACHMENT_BYTES {
+                    return Err(anyhow!(
+                        "{path} is {} KiB — attachments are capped at {} KiB (they ride \
+                         the issue's replicated document). Link large files instead.",
+                        bytes.len() / 1024,
+                        crate::world::contract::MAX_ATTACHMENT_BYTES / 1024
+                    ));
+                }
+                let name = std::path::Path::new(&path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone());
+                let mime = mime_for(&name);
+                let req = Request::Attach {
+                    reff,
+                    name,
+                    mime: Some(mime),
+                    data_b64: data_encoding::BASE64.encode(&bytes),
+                    comment: m.get_one::<String>("comment").cloned(),
+                };
+                crate::cli::run(&home, req, out).await?
+            }
+            Special::AttachmentGet => {
+                let reff = m.get_one::<String>("reff").cloned().unwrap_or_default();
+                let id = m.get_one::<String>("id").cloned().unwrap_or_default();
+                if reff.is_empty() || id.is_empty() {
+                    return Err(anyhow!(
+                        "usage: lait attachment get <reff> <att_id> [--out <path>]"
+                    ));
+                }
+                let resp = crate::cli::client(&home, Request::AttachmentGet { reff, id }).await?;
+                match resp {
+                    Response::Attachment {
+                        name,
+                        mime: _,
+                        data_b64,
+                    } => {
+                        let bytes = data_encoding::BASE64
+                            .decode(data_b64.as_bytes())
+                            .map_err(|_| anyhow!("stored attachment did not decode"))?;
+                        let dest = m
+                            .get_one::<String>("out")
+                            .cloned()
+                            .unwrap_or_else(|| name.clone());
+                        std::fs::write(&dest, &bytes)
+                            .map_err(|e| anyhow!("could not write {dest}: {e}"))?;
+                        if out.json {
+                            crate::cli::emit_ok(
+                                &format!("saved {} bytes to {dest}", bytes.len()),
+                                out,
+                            );
+                        } else {
+                            println!("saved {} bytes to {dest}", bytes.len());
+                        }
+                    }
+                    other => {
+                        let code = crate::cli::print_response(&other, out);
+                        if code != 0 {
+                            std::process::exit(code);
                         }
                     }
                 }

@@ -5,6 +5,8 @@ import {
   AlertTriangle,
   ArchiveRestore,
   Ban,
+  Bell,
+  BellOff,
   Check,
   ChevronLeft,
   ChevronRight,
@@ -12,6 +14,7 @@ import {
   Copy,
   CopyPlus,
   CornerDownRight,
+  Download,
   GitMerge,
   Info,
   Link2,
@@ -19,6 +22,7 @@ import {
   MoreHorizontal,
   Minimize2,
   MoveRight,
+  Paperclip,
   Play,
   RotateCcw,
   Plus,
@@ -36,8 +40,10 @@ import type { IssueField } from "../core/registry";
 import { inverseWorkAction, primaryWorkAction, workTarget } from "../core/workflow";
 import { boundedTail } from "../core/performance";
 import {
+  type AttachmentMetaDto,
   type GraphView,
   type LinkDto,
+  type MilestoneDto,
   type Row,
   PRIORITY_ORDER,
   tsToDate,
@@ -130,6 +136,7 @@ export function IssueDetail({
   const [issue, setIssue] = useState<IssueView | null>(null);
   const [events, setEvents] = useState<ActivityEvent[]>([]);
   const [graph, setGraph] = useState<GraphView | null>(null);
+  const [milestones, setMilestones] = useState<MilestoneDto[]>([]);
   const [draft, setDraft] = useState(() => loadDraft(canonicalSpaceId, reff, "title"));
   const [comment, setComment] = useState(() => loadDraft(canonicalSpaceId, reff, "comment"));
   const [commentPending, setCommentPending] = useState(false);
@@ -179,6 +186,12 @@ export function IssueDetail({
         if (view.kind === "issue") {
           setIssue(view);
           setDraft((current) => current || view.title);
+          // Milestones are project-scoped, so the project comes from the view.
+          const ms = await rpc(spaceId, {
+            cmd: "milestone_list",
+            project: view.project_id,
+          }).catch(() => null);
+          if (alive) setMilestones(ms?.kind === "milestones" ? ms.milestones : []);
         }
         setEvents(hist?.kind === "activity" ? hist.events : []);
         setGraph(gr?.kind === "graph" ? gr : null);
@@ -664,6 +677,53 @@ export function IssueDetail({
             />
           </PropertyRow>
 
+          {(milestones.length > 0 || issue.milestone) && (
+            <PropertyRow label="Milestone">
+              <Combobox
+                variant="bare"
+                label="Milestone"
+                disabled={locked}
+                value={
+                  issue.milestone
+                    ? {
+                        id: issue.milestone,
+                        label:
+                          milestones.find((m) => m.id === issue.milestone)?.name ??
+                          issue.milestone,
+                      }
+                    : null
+                }
+                placeholder="None"
+                options={[
+                  { id: "none", label: "None" },
+                  ...milestones.map((m) => ({
+                    id: m.id,
+                    label: m.name,
+                    hint: `${m.done}/${m.total}`,
+                  })),
+                ]}
+                onPick={(id) =>
+                  void send(() =>
+                    rpc(spaceId, {
+                      cmd: "issue_milestone",
+                      reff,
+                      milestone: id === "none" ? null : id,
+                    }),
+                  )
+                }
+              />
+            </PropertyRow>
+          )}
+
+          <PropertyRow label="Notifications">
+            <FollowToggle
+              issue={issue}
+              meKey={members.find((m) => m.me)?.key ?? null}
+              readOnly={locked}
+              onToggle={(on) => void send(() => rpc(spaceId, { cmd: "follow", reff, on }))}
+            />
+          </PropertyRow>
+
           <PropertyRow label="Project">
             <Combobox
               variant="bare"
@@ -699,6 +759,14 @@ export function IssueDetail({
           value={issue.description}
           readOnly={locked}
           onSave={(description) => void edit({ description })}
+        />
+
+        <Attachments
+          spaceId={spaceId}
+          reff={issue.reff}
+          attachments={issue.attachments ?? []}
+          readOnly={locked}
+          onError={onError}
         />
 
         {graph && (
@@ -870,6 +938,180 @@ function IssueOverflow({
         </MenuContent>
       </DropdownMenu.Portal>
     </DropdownMenu.Root>
+  );
+}
+
+/** Follow/unfollow (INBOX-9): subscribe to activity without holding the assignment. */
+function FollowToggle({
+  issue,
+  meKey,
+  readOnly,
+  onToggle,
+}: {
+  issue: IssueView;
+  meKey: string | null;
+  readOnly: boolean;
+  onToggle: (on: boolean) => void;
+}) {
+  const followers = issue.followers ?? [];
+  const following = meKey != null && followers.includes(meKey);
+  const others = followers.length - (following ? 1 : 0);
+  return (
+    <button
+      type="button"
+      disabled={readOnly || meKey == null}
+      onClick={() => onToggle(!following)}
+      className="text-ink hover:bg-surface-2 flex items-center gap-1.5 rounded px-1.5 py-0.5 text-sm disabled:opacity-50"
+      title={following ? "Stop receiving this issue's activity" : "Receive this issue's activity in your inbox"}
+    >
+      {following ? <BellOff className="size-3.5" /> : <Bell className="size-3.5" />}
+      {following ? "Following" : "Follow"}
+      {others > 0 && <span className="text-mute">+{others}</span>}
+    </button>
+  );
+}
+
+/** Base64 helpers for the attachment payloads (standard alphabet, padded). */
+const bufToB64 = (buf: ArrayBuffer): string => {
+  const bytes = new Uint8Array(buf);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+};
+const b64ToBytes = (b64: string): Uint8Array =>
+  Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+
+/** The engine's cap (contract.rs MAX_ATTACHMENT_BYTES), mirrored for a
+ *  friendly refusal before the bytes ever leave the browser. */
+const MAX_ATTACHMENT_BYTES = 256 * 1024;
+
+/**
+ * Attachments (CREATE-5): bounded files riding the issue document's own
+ * sync + encryption. Metadata comes with the view; payloads are fetched only
+ * on download.
+ */
+function Attachments({
+  spaceId,
+  reff,
+  attachments,
+  readOnly,
+  onError,
+}: {
+  spaceId: string;
+  reff: string;
+  attachments: AttachmentMetaDto[];
+  readOnly: boolean;
+  onError: (m: string) => void;
+}) {
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [busy, setBusy] = useState(false);
+  if (attachments.length === 0 && readOnly) return null;
+
+  const upload = async (file: File) => {
+    if (file.size > MAX_ATTACHMENT_BYTES) {
+      onError(
+        `${file.name} is ${Math.ceil(file.size / 1024)} KiB — attachments are capped at ${MAX_ATTACHMENT_BYTES / 1024} KiB`,
+      );
+      return;
+    }
+    setBusy(true);
+    try {
+      const data_b64 = bufToB64(await file.arrayBuffer());
+      await rpc(spaceId, {
+        cmd: "attach",
+        reff,
+        name: file.name,
+        mime: file.type || null,
+        data_b64,
+      });
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const download = async (att: AttachmentMetaDto) => {
+    try {
+      const r = await rpc(spaceId, { cmd: "attachment_get", reff, id: att.id });
+      if (r.kind !== "attachment") return;
+      const bytes = b64ToBytes(r.data_b64);
+      const blob = new Blob([bytes.buffer as ArrayBuffer], {
+        type: r.mime || "application/octet-stream",
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = r.name || att.name;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  return (
+    <section>
+      <SectionHeader
+        title={`Attachments${attachments.length ? ` (${attachments.length})` : ""}`}
+        action={
+          !readOnly && (
+            <IconButton
+              label="Attach a file"
+              disabled={busy}
+              onClick={() => fileRef.current?.click()}
+            >
+              <Paperclip className="size-3.5" />
+            </IconButton>
+          )
+        }
+      />
+      <input
+        ref={fileRef}
+        type="file"
+        className="hidden"
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          e.target.value = "";
+          if (file) void upload(file);
+        }}
+      />
+      {attachments.length === 0 ? (
+        <p className="text-mute text-sm">No files yet — attach up to 256 KiB each.</p>
+      ) : (
+        <ul className="flex flex-col gap-1">
+          {attachments.map((att) => (
+            <li
+              key={att.id}
+              className="border-line hover:bg-surface-2 group flex items-center gap-2 rounded border px-2 py-1 text-sm"
+            >
+              <Paperclip className="text-mute size-3.5 shrink-0" />
+              <span className="text-ink min-w-0 flex-1 truncate">{att.name}</span>
+              <span className="text-mute shrink-0 text-xs">
+                {Math.max(1, Math.round(att.size / 1024))} KiB
+              </span>
+              <IconButton label={`Download ${att.name}`} onClick={() => void download(att)}>
+                <Download className="size-3.5" />
+              </IconButton>
+              {!readOnly && (
+                <IconButton
+                  label={`Remove ${att.name}`}
+                  onClick={() =>
+                    void rpc(spaceId, { cmd: "detach", reff, id: att.id }).catch((e) =>
+                      onError(e instanceof Error ? e.message : String(e)),
+                    )
+                  }
+                >
+                  <Trash2 className="size-3.5" />
+                </IconButton>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
   );
 }
 

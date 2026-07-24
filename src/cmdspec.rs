@@ -62,6 +62,10 @@ pub enum Special {
     /// New-machine side of device enrollment: consume a `device invite` token
     /// and print a consent blob (no daemon, no store — just this identity).
     DeviceAccept,
+    /// File-touching halves of attachments (CREATE-5): read/encode on attach,
+    /// decode/write on get — the daemon only ever sees base64.
+    Attach,
+    AttachmentGet,
 }
 
 /// One command (or nested group) in the tree.
@@ -1023,6 +1027,9 @@ pub fn specs() -> Vec<Spec> {
                         A::val("lead", "Lead actor key (or `none` to clear)."),
                         A::val("start", "Start date YYYY-MM-DD (or `none`)."),
                         A::val("target", "Target date YYYY-MM-DD (or `none`)."),
+                        A::val("team", "Owning team (KEY/name, or `none` to clear).")
+                            .long("team")
+                            .value_name("TEAM"),
                         A::flag("archive", "Soft-hide this project from pickers and all-project lists."),
                         A::flag("unarchive", "Restore a previously archived project."),
                     ],
@@ -1035,6 +1042,7 @@ pub fn specs() -> Vec<Spec> {
                             lead: opt_str(m, "lead"),
                             start: opt_str(m, "start"),
                             target: opt_str(m, "target"),
+                            team: opt_str(m, "team"),
                             archived: if flag(m, "archive") {
                                 Some(true)
                             } else if flag(m, "unarchive") {
@@ -1042,6 +1050,16 @@ pub fn specs() -> Vec<Spec> {
                             } else {
                                 None
                             },
+                        })
+                    },
+                ),
+                Spec::req(
+                    "delete",
+                    "Hard-delete an EMPTY project (refused while any issue still references it).",
+                    vec![A::pos("project", "Project KEY or prj_ id.")],
+                    |m| {
+                        Ok(Request::ProjectDelete {
+                            project: req_str(m, "project"),
                         })
                     },
                 ),
@@ -1125,6 +1143,546 @@ pub fn specs() -> Vec<Spec> {
             ..Spec::req("labels", "Manage the label registry.", vec![], |_| {
                 Ok(Request::LabelList)
             })
+        },
+        Spec::req(
+            "follow",
+            "Subscribe to an issue's activity without being assigned (it lands in your inbox).",
+            vec![A::pos("reff", "Issue ref.")],
+            |m| {
+                Ok(Request::Follow {
+                    reff: req_str(m, "reff"),
+                    on: true,
+                })
+            },
+        ),
+        Spec::req(
+            "unfollow",
+            "Unsubscribe from an issue's activity.",
+            vec![A::pos("reff", "Issue ref.")],
+            |m| {
+                Ok(Request::Follow {
+                    reff: req_str(m, "reff"),
+                    on: false,
+                })
+            },
+        ),
+        Spec {
+            subs: vec![
+                Spec::req(
+                    "ls",
+                    "List a project's milestones with progress.",
+                    vec![A::pos("project", "Project KEY or prj_ id.")],
+                    |m| {
+                        Ok(Request::MilestoneList {
+                            project: req_str(m, "project"),
+                        })
+                    },
+                ),
+                Spec::req(
+                    "new",
+                    "Create a milestone: `milestone new ENG \"Beta\" --target 2026-09-01`.",
+                    vec![
+                        A::pos("project", "Project KEY or prj_ id."),
+                        A::pos("name", "Milestone name."),
+                        A::val("target", "Target date YYYY-MM-DD (or `none`)."),
+                    ],
+                    |m| {
+                        Ok(Request::MilestoneSet {
+                            project: req_str(m, "project"),
+                            milestone: None,
+                            name: Some(req_str(m, "name")),
+                            target: opt_str(m, "target"),
+                            remove: false,
+                        })
+                    },
+                ),
+                Spec::req(
+                    "edit",
+                    "Rename or retarget a milestone.",
+                    vec![
+                        A::pos("project", "Project KEY or prj_ id."),
+                        A::pos("milestone", "Milestone name or mls_ id."),
+                        A::val("name", "New name."),
+                        A::val("target", "Target date YYYY-MM-DD (or `none`)."),
+                    ],
+                    |m| {
+                        Ok(Request::MilestoneSet {
+                            project: req_str(m, "project"),
+                            milestone: opt_str(m, "milestone"),
+                            name: opt_str(m, "name"),
+                            target: opt_str(m, "target"),
+                            remove: false,
+                        })
+                    },
+                ),
+                Spec::req(
+                    "rm",
+                    "Remove a milestone (issues keep working; the pointer reads as cleared).",
+                    vec![
+                        A::pos("project", "Project KEY or prj_ id."),
+                        A::pos("milestone", "Milestone name or mls_ id."),
+                    ],
+                    |m| {
+                        Ok(Request::MilestoneSet {
+                            project: req_str(m, "project"),
+                            milestone: opt_str(m, "milestone"),
+                            name: None,
+                            target: None,
+                            remove: true,
+                        })
+                    },
+                ),
+                Spec::req(
+                    "set",
+                    "Point an issue at a milestone in its project (`none` clears).",
+                    vec![
+                        A::pos("reff", "Issue ref."),
+                        A::pos("milestone", "Milestone name, mls_ id, or `none`."),
+                    ],
+                    |m| {
+                        Ok(Request::IssueMilestone {
+                            reff: req_str(m, "reff"),
+                            milestone: opt_str(m, "milestone"),
+                        })
+                    },
+                ),
+            ],
+            ..Spec::req(
+                "milestone",
+                "Project milestones: named targets with derived progress.",
+                vec![],
+                |_| anyhow::bail!("pick a subcommand: ls | new | edit | rm | set"),
+            )
+        },
+        Spec {
+            subs: vec![
+                Spec::req(
+                    "ls",
+                    "List a project's cycles with counts.",
+                    vec![A::pos("project", "Project KEY or prj_ id.")],
+                    |m| {
+                        Ok(Request::CycleList {
+                            project: req_str(m, "project"),
+                        })
+                    },
+                ),
+                Spec::req(
+                    "new",
+                    "Create a cycle: `cycle new ENG \"Sprint 12\" --start 2026-08-01 --end 2026-08-14`.",
+                    vec![
+                        A::pos("project", "Project KEY or prj_ id."),
+                        A::pos("name", "Cycle name."),
+                        A::val("start", "Start date YYYY-MM-DD (or `none`)."),
+                        A::val("end", "End date YYYY-MM-DD (or `none`)."),
+                    ],
+                    |m| {
+                        Ok(Request::CycleSet {
+                            project: req_str(m, "project"),
+                            cycle: None,
+                            name: Some(req_str(m, "name")),
+                            start: opt_str(m, "start"),
+                            end: opt_str(m, "end"),
+                            remove: false,
+                        })
+                    },
+                ),
+                Spec::req(
+                    "edit",
+                    "Rename or re-box a cycle.",
+                    vec![
+                        A::pos("project", "Project KEY or prj_ id."),
+                        A::pos("cycle", "Cycle name or cyc_ id."),
+                        A::val("name", "New name."),
+                        A::val("start", "Start date YYYY-MM-DD (or `none`)."),
+                        A::val("end", "End date YYYY-MM-DD (or `none`)."),
+                    ],
+                    |m| {
+                        Ok(Request::CycleSet {
+                            project: req_str(m, "project"),
+                            cycle: opt_str(m, "cycle"),
+                            name: opt_str(m, "name"),
+                            start: opt_str(m, "start"),
+                            end: opt_str(m, "end"),
+                            remove: false,
+                        })
+                    },
+                ),
+                Spec::req(
+                    "rm",
+                    "Remove a cycle (scheduled issues read as unscheduled).",
+                    vec![
+                        A::pos("project", "Project KEY or prj_ id."),
+                        A::pos("cycle", "Cycle name or cyc_ id."),
+                    ],
+                    |m| {
+                        Ok(Request::CycleSet {
+                            project: req_str(m, "project"),
+                            cycle: opt_str(m, "cycle"),
+                            name: None,
+                            start: None,
+                            end: None,
+                            remove: true,
+                        })
+                    },
+                ),
+                Spec::req(
+                    "set",
+                    "Schedule an issue into a cycle (`none` clears).",
+                    vec![
+                        A::pos("reff", "Issue ref."),
+                        A::pos("cycle", "Cycle name, cyc_ id, or `none`."),
+                    ],
+                    |m| {
+                        Ok(Request::IssueCycle {
+                            reff: req_str(m, "reff"),
+                            cycle: opt_str(m, "cycle"),
+                        })
+                    },
+                ),
+            ],
+            ..Spec::req(
+                "cycle",
+                "Cycles: time-boxed iterations per project.",
+                vec![],
+                |_| anyhow::bail!("pick a subcommand: ls | new | edit | rm | set"),
+            )
+        },
+        Spec {
+            subs: vec![
+                Spec::req(
+                    "new",
+                    "Create an initiative: `initiative new \"Q3 platform\" --owner act_… --target 2026-09-30`.",
+                    vec![
+                        A::pos("name", "Initiative name."),
+                        A::val("description", "What this goal is."),
+                        A::val("owner", "Owner actor key (or `none`)."),
+                        A::val("health", "on_track | at_risk | off_track."),
+                        A::val("target", "Target date YYYY-MM-DD (or `none`)."),
+                    ],
+                    |m| {
+                        Ok(Request::InitiativeSet {
+                            initiative: None,
+                            name: Some(req_str(m, "name")),
+                            description: opt_str(m, "description"),
+                            owner: opt_str(m, "owner"),
+                            health: opt_str(m, "health"),
+                            target: opt_str(m, "target"),
+                            add_projects: vec![],
+                            remove_projects: vec![],
+                            remove: false,
+                        })
+                    },
+                ),
+                Spec::req(
+                    "edit",
+                    "Edit an initiative's fields, or its project membership with --add/--remove.",
+                    vec![
+                        A::pos("initiative", "Initiative name or ini_ id."),
+                        A::val("name", "New name."),
+                        A::val("description", "New description."),
+                        A::val("owner", "Owner actor key (or `none`)."),
+                        A::val("health", "on_track | at_risk | off_track."),
+                        A::val("target", "Target date YYYY-MM-DD (or `none`)."),
+                        A::val("add", "Project KEY to add (repeatable via comma list)."),
+                        A::val("remove", "Project KEY to remove (comma list)."),
+                    ],
+                    |m| {
+                        let split = |v: Option<String>| -> Vec<String> {
+                            v.map(|s| {
+                                s.split(',')
+                                    .map(|p| p.trim().to_string())
+                                    .filter(|p| !p.is_empty())
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                        };
+                        Ok(Request::InitiativeSet {
+                            initiative: Some(req_str(m, "initiative")),
+                            name: opt_str(m, "name"),
+                            description: opt_str(m, "description"),
+                            owner: opt_str(m, "owner"),
+                            health: opt_str(m, "health"),
+                            target: opt_str(m, "target"),
+                            add_projects: split(opt_str(m, "add")),
+                            remove_projects: split(opt_str(m, "remove")),
+                            remove: false,
+                        })
+                    },
+                ),
+                Spec::req(
+                    "rm",
+                    "Remove an initiative (its projects are untouched).",
+                    vec![A::pos("initiative", "Initiative name or ini_ id.")],
+                    |m| {
+                        Ok(Request::InitiativeSet {
+                            initiative: Some(req_str(m, "initiative")),
+                            name: None,
+                            description: None,
+                            owner: None,
+                            health: None,
+                            target: None,
+                            add_projects: vec![],
+                            remove_projects: vec![],
+                            remove: true,
+                        })
+                    },
+                ),
+                Spec::req(
+                    "ls",
+                    "List initiatives with their project roll-ups.",
+                    vec![],
+                    |_| Ok(Request::InitiativeList),
+                ),
+            ],
+            ..Spec::req(
+                "initiatives",
+                "Initiatives: named goals grouping projects, with roll-up progress.",
+                vec![],
+                |_| Ok(Request::InitiativeList),
+            )
+        }
+        .alias(&["initiative"]),
+        Spec {
+            subs: vec![
+                Spec::req(
+                    "new",
+                    "Create a team (admin-only): `team new \"Platform\" --key PLT`.",
+                    vec![
+                        A::pos("name", "Team name."),
+                        A::val("key", "Short KEY (immutable after creation)."),
+                        A::val("icon", "Emoji/icon."),
+                        A::val("lead", "Lead actor key (or `none`)."),
+                    ],
+                    |m| {
+                        Ok(Request::TeamSet {
+                            team: None,
+                            name: Some(req_str(m, "name")),
+                            key: opt_str(m, "key"),
+                            icon: opt_str(m, "icon"),
+                            lead: opt_str(m, "lead"),
+                            add_members: vec![],
+                            remove_members: vec![],
+                            remove: false,
+                        })
+                    },
+                ),
+                Spec::req(
+                    "edit",
+                    "Edit a team's name/icon/lead (the KEY is immutable).",
+                    vec![
+                        A::pos("team", "Team KEY, name, or tm_ id."),
+                        A::val("name", "New name."),
+                        A::val("icon", "Emoji/icon."),
+                        A::val("lead", "Lead actor key (or `none`)."),
+                    ],
+                    |m| {
+                        Ok(Request::TeamSet {
+                            team: Some(req_str(m, "team")),
+                            name: opt_str(m, "name"),
+                            key: None,
+                            icon: opt_str(m, "icon"),
+                            lead: opt_str(m, "lead"),
+                            add_members: vec![],
+                            remove_members: vec![],
+                            remove: false,
+                        })
+                    },
+                ),
+                Spec::req(
+                    "add",
+                    "Add members to a team (full actor keys, from `members ls`).",
+                    vec![
+                        A::pos("team", "Team KEY, name, or tm_ id."),
+                        A::pos_multi("who", "Actor keys to add."),
+                    ],
+                    |m| {
+                        Ok(Request::TeamSet {
+                            team: Some(req_str(m, "team")),
+                            name: None,
+                            key: None,
+                            icon: None,
+                            lead: None,
+                            add_members: multi(m, "who"),
+                            remove_members: vec![],
+                            remove: false,
+                        })
+                    },
+                ),
+                Spec::req(
+                    "remove",
+                    "Remove members from a team.",
+                    vec![
+                        A::pos("team", "Team KEY, name, or tm_ id."),
+                        A::pos_multi("who", "Actor keys to remove."),
+                    ],
+                    |m| {
+                        Ok(Request::TeamSet {
+                            team: Some(req_str(m, "team")),
+                            name: None,
+                            key: None,
+                            icon: None,
+                            lead: None,
+                            add_members: vec![],
+                            remove_members: multi(m, "who"),
+                            remove: false,
+                        })
+                    },
+                ),
+                Spec::req(
+                    "rm",
+                    "Remove a team (owned projects keep working, unowned).",
+                    vec![A::pos("team", "Team KEY, name, or tm_ id.")],
+                    |m| {
+                        Ok(Request::TeamSet {
+                            team: Some(req_str(m, "team")),
+                            name: None,
+                            key: None,
+                            icon: None,
+                            lead: None,
+                            add_members: vec![],
+                            remove_members: vec![],
+                            remove: true,
+                        })
+                    },
+                ),
+                Spec::req("ls", "List teams.", vec![], |_| Ok(Request::TeamList)),
+            ],
+            ..Spec::req(
+                "teams",
+                "Teams: durable work-owning groups with product-level membership.",
+                vec![],
+                |_| Ok(Request::TeamList),
+            )
+        }
+        .alias(&["team"]),
+        Spec {
+            subs: vec![
+                Spec::req(
+                    "submit",
+                    "Report work into the intake queue (no project needed).",
+                    vec![
+                        A::pos("title", "What needs looking at."),
+                        A::val("body", "Details."),
+                        A::val("source", "Where this came from."),
+                    ],
+                    |m| {
+                        Ok(Request::TriageSubmit {
+                            title: req_str(m, "title"),
+                            body: opt_str(m, "body"),
+                            source: opt_str(m, "source"),
+                        })
+                    },
+                ),
+                Spec::req(
+                    "accept",
+                    "Accept an item into a project as a fresh issue.",
+                    vec![
+                        A::pos("id", "The trg_ intake id."),
+                        A::val("project", "Target project KEY.")
+                            .long("project")
+                            .short('p')
+                            .value_name("PROJECT"),
+                        A::val("note", "Review note."),
+                    ],
+                    |m| {
+                        Ok(Request::TriageDecide {
+                            id: req_str(m, "id"),
+                            outcome: "accepted".into(),
+                            project: opt_str(m, "project"),
+                            target: None,
+                            note: opt_str(m, "note"),
+                        })
+                    },
+                ),
+                Spec::req(
+                    "decline",
+                    "Decline an item (it stays in the record, decided).",
+                    vec![
+                        A::pos("id", "The trg_ intake id."),
+                        A::val("note", "Why."),
+                    ],
+                    |m| {
+                        Ok(Request::TriageDecide {
+                            id: req_str(m, "id"),
+                            outcome: "declined".into(),
+                            project: None,
+                            target: None,
+                            note: opt_str(m, "note"),
+                        })
+                    },
+                ),
+                Spec::req(
+                    "dupe",
+                    "Mark an item as a duplicate of an existing issue.",
+                    vec![
+                        A::pos("id", "The trg_ intake id."),
+                        A::pos("reff", "The existing issue's ref."),
+                        A::val("note", "Review note."),
+                    ],
+                    |m| {
+                        Ok(Request::TriageDecide {
+                            id: req_str(m, "id"),
+                            outcome: "duplicate".into(),
+                            project: None,
+                            target: opt_str(m, "reff"),
+                            note: opt_str(m, "note"),
+                        })
+                    },
+                ),
+                Spec::req("ls", "The intake queue, pending first.", vec![], |_| {
+                    Ok(Request::TriageList)
+                }),
+            ],
+            ..Spec::req(
+                "triage",
+                "The intake queue: review reported work before it enters the backlog.",
+                vec![],
+                |_| Ok(Request::TriageList),
+            )
+        },
+        Spec::special(
+            "attach",
+            "Attach a file to an issue (≤256 KiB; rides the issue's sync + encryption).",
+            vec![
+                A::pos("reff", "Issue ref."),
+                A::pos("file", "Path to the file."),
+                A::val("comment", "A comment id to associate it with."),
+            ],
+            Special::Attach,
+        ),
+        Spec {
+            subs: vec![
+                Spec::special(
+                    "get",
+                    "Save an attachment to disk.",
+                    vec![
+                        A::pos("reff", "Issue ref."),
+                        A::pos("id", "The att_ attachment id (see `show`)."),
+                        A::val("out", "Output path (default: the stored name)."),
+                    ],
+                    Special::AttachmentGet,
+                ),
+                Spec::req(
+                    "rm",
+                    "Remove an attachment.",
+                    vec![
+                        A::pos("reff", "Issue ref."),
+                        A::pos("id", "The att_ attachment id."),
+                    ],
+                    |m| {
+                        Ok(Request::Detach {
+                            reff: req_str(m, "reff"),
+                            id: req_str(m, "id"),
+                        })
+                    },
+                ),
+            ],
+            ..Spec::special(
+                "attachment",
+                "Fetch or remove issue attachments.",
+                vec![],
+                Special::AttachmentGet,
+            )
         },
         Spec {
             subs: vec![

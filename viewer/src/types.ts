@@ -151,10 +151,38 @@ export interface IssueView {
   /** Due date, unix seconds. Absent = none. */
   due_date?: number | null;
   estimate?: number | null;
+  /** Subscribed actors, independent of assignment (INBOX-9). */
+  followers?: string[];
+  /** Targeted milestone id (SCOPE-1). */
+  milestone?: string | null;
+  /** Scheduled cycle id (BOARD-11). */
+  cycle?: string | null;
+  /** Attachment metadata (CREATE-5). */
+  attachments?: AttachmentMetaDto[];
   provisional: boolean;
   /** Malformed stored records, kept beside the valid projection rather than
    * silently dropped or laundered into sentinel values. */
   corrupt_records?: CorruptRecord[];
+}
+
+/** Attachment metadata on an issue (CREATE-5) — payloads via `attachment_get`. */
+export interface AttachmentMetaDto {
+  id: string;
+  name: string;
+  mime?: string;
+  size: number;
+  by?: string;
+  ts: number;
+  comment?: string;
+}
+
+/** One project milestone with derived progress (SCOPE-1). */
+export interface MilestoneDto {
+  id: string;
+  name: string;
+  target_date?: number | null;
+  total: number;
+  done: number;
 }
 
 export interface CorruptRecord {
@@ -502,6 +530,18 @@ export type Request =
   /** Reply is `updates` — the project's status feed, newest first. */
   | { cmd: "project_updates"; project: string }
   | { cmd: "project_update_post"; project: string; body: string; health?: string | null }
+  /** Subscribe to an issue without being assigned (INBOX-9). */
+  | { cmd: "follow"; reff: string; on?: boolean }
+  /** Reply is `milestones` — the project's milestones with progress (SCOPE-1). */
+  | { cmd: "milestone_list"; project: string }
+  | { cmd: "milestone_set"; project: string; milestone?: string | null; name?: string | null; target?: string | null; remove?: boolean }
+  /** Point an issue at a milestone in its project (`null`/"none" clears). */
+  | { cmd: "issue_milestone"; reff: string; milestone?: string | null }
+  /** Attach a file (standard base64; raw ≤ 256 KiB) — CREATE-5. */
+  | { cmd: "attach"; reff: string; name: string; mime?: string | null; data_b64: string; comment?: string | null }
+  | { cmd: "detach"; reff: string; id: string }
+  /** Reply is `attachment` — the full record incl. payload. */
+  | { cmd: "attachment_get"; reff: string; id: string }
   | { cmd: "label_new"; name: string; color?: string | null }
   | { cmd: "label_list" }
   | { cmd: "label_edit"; label: string; name?: string | null; color?: string | null }
@@ -558,6 +598,8 @@ export type Response =
   | { kind: "inbox"; entries: InboxEntry[]; unread: number }
   | { kind: "projects"; projects: ProjectDto[] }
   | { kind: "updates"; updates: ProjectUpdateDto[] }
+  | { kind: "milestones"; milestones: MilestoneDto[] }
+  | { kind: "attachment"; name: string; mime: string; data_b64: string }
   | { kind: "labels"; labels: LabelDto[] }
   | { kind: "members"; members: MemberDto[] }
   | { kind: "assignments"; rows: AssignmentDto[] }

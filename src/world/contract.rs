@@ -33,6 +33,15 @@ pub const MAX_REACTION_EMOJI_BYTES: usize = 32;
 /// The largest accepted estimate. Every scale humans use tops out far below
 /// this; the cap exists so a typo cannot become a permanent register.
 pub const MAX_ESTIMATE: u32 = 1000;
+/// Attachment bounds (CREATE-5): inline sealed records riding the issue Body
+/// and its existing sync/E2EE. Deliberately tight — the content-addressed
+/// blob store is the large-file follow-on, not this.
+pub const MAX_ATTACHMENT_BYTES: usize = 256 * 1024;
+pub const MAX_ATTACHMENTS_PER_ISSUE: usize = 8;
+/// The triage outcomes, frozen.
+pub const TRIAGE_OUTCOMES: [&str; 3] = ["accepted", "declined", "duplicate"];
+/// The self-reported health labels (project updates, initiatives).
+pub const HEALTH_LABELS: [&str; 3] = ["on_track", "at_risk", "off_track"];
 
 pub fn world_id() -> WorldId {
     WorldId::parse(PRODUCT_WORLD).expect("product world id")
@@ -83,6 +92,21 @@ pub fn demand_space_any(capability: &str) -> Vec<u8> {
     ])
     .encode_canonical()
     .expect("canonical space-any demand")
+}
+
+/// `Any(Require(<capability>, Project(<id>)), Require(space.admin, Space))` —
+/// a Project-scoped mutation with the explicit admin override (the shape
+/// `project.delete` uses).
+pub fn demand_project_any(capability: &str, project: &str) -> Vec<u8> {
+    AuthorizationDemand::Any(vec![
+        AuthorizationDemand::require(
+            space_cap(capability),
+            PolicyResource::project(PRODUCT_WORLD, project),
+        ),
+        AuthorizationDemand::require(space_cap("space.admin"), space_resource()),
+    ])
+    .encode_canonical()
+    .expect("canonical project-any demand")
 }
 
 /// `Require(space.issue.read, Space)` — every query's read demand.
@@ -507,6 +531,155 @@ pub enum IssueIntent {
         target_date: Option<Option<u64>>,
         /// Soft-hide toggle: `None` leaves it, `Some(bool)` sets it (CUSTOM-9).
         archived: Option<bool>,
+        /// Owning team id: `None` leaves it, `Some("")` clears (GOV-7).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        team: Option<String>,
+        device: String,
+        ts: u64,
+    },
+    /// Hard-delete an EMPTY project (CUSTOM-10 safe v1): refused while any
+    /// issue — live or tombstoned — still carries its `projectid`, else every
+    /// project-keyed catalog entry is removed. `project.delete`-gated (with
+    /// the admin override).
+    ProjectDelete { id: String, device: String, ts: u64 },
+    /// Toggle one actor's subscription to an issue (INBOX-9). Like `React`,
+    /// writes no history event — following is a personal signal, not a change
+    /// of record.
+    Follow {
+        doc: String,
+        actor: String,
+        on: bool,
+        device: String,
+        ts: u64,
+    },
+    /// Create or edit a project milestone (SCOPE-1): the daemon mints the id
+    /// on create; the whole record is rewritten so untouched fields survive.
+    MilestoneSet {
+        project_id: String,
+        id: String,
+        name: Option<String>,
+        /// Outer `None` leaves the date; inner `None` clears it.
+        #[serde(
+            default,
+            deserialize_with = "double_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        target_date: Option<Option<u64>>,
+        tombstone: Option<bool>,
+        device: String,
+        ts: u64,
+    },
+    /// Point an issue at a milestone (or clear it).
+    IssueMilestone {
+        doc: String,
+        milestone: Option<String>,
+        device: String,
+        ts: u64,
+    },
+    /// Create or edit a cycle (BOARD-11); same record shape as milestones.
+    CycleSet {
+        project_id: String,
+        id: String,
+        name: Option<String>,
+        #[serde(
+            default,
+            deserialize_with = "double_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        start: Option<Option<u64>>,
+        #[serde(
+            default,
+            deserialize_with = "double_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        end: Option<Option<u64>>,
+        tombstone: Option<bool>,
+        device: String,
+        ts: u64,
+    },
+    /// Schedule an issue into a cycle (or clear it).
+    IssueCycle {
+        doc: String,
+        cycle: Option<String>,
+        device: String,
+        ts: u64,
+    },
+    /// Create or edit an initiative (SCOPE-8). Membership arrives as the
+    /// complete replacement list (the router merges add/remove against the
+    /// snapshot), so the record write is LWW-whole like `projects`.
+    InitiativeSet {
+        id: String,
+        name: Option<String>,
+        description: Option<String>,
+        owner: Option<String>,
+        health: Option<String>,
+        #[serde(
+            default,
+            deserialize_with = "double_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        target_date: Option<Option<u64>>,
+        projects: Option<Vec<String>>,
+        tombstone: Option<bool>,
+        device: String,
+        ts: u64,
+    },
+    /// Create or edit a team (GOV-7). `key` binds at creation and is
+    /// immutable after (it seeds nothing yet, but the project-key rule is the
+    /// convention). Members arrive as the complete replacement list.
+    TeamSet {
+        id: String,
+        name: Option<String>,
+        key: Option<String>,
+        icon: Option<String>,
+        lead: Option<String>,
+        members: Option<Vec<String>>,
+        tombstone: Option<bool>,
+        device: String,
+        ts: u64,
+    },
+    /// Report work into the triage intake queue (SCOPE-7) — outside every
+    /// project workflow until reviewed.
+    TriageSubmit {
+        id: String,
+        title: String,
+        body: String,
+        source: String,
+        actor: String,
+        device: String,
+        ts: u64,
+    },
+    /// Decide a pending triage item exactly once. `accepted` atomically
+    /// creates the issue (`doc` = the daemon-minted DocId, `project`
+    /// required) in the same transaction that stamps the outcome; `duplicate`
+    /// names the existing issue in `doc`; `declined` needs neither.
+    TriageDecide {
+        id: String,
+        outcome: String,
+        project: Option<String>,
+        doc: Option<String>,
+        note: String,
+        actor: String,
+        device: String,
+        ts: u64,
+    },
+    /// Attach a bounded file to an issue (CREATE-5): a sealed record in the
+    /// issue Body's `attachments` map, riding the existing sync and E2EE.
+    Attach {
+        doc: String,
+        id: String,
+        name: String,
+        mime: String,
+        data_b64: String,
+        comment: Option<String>,
+        actor: String,
+        device: String,
+        ts: u64,
+    },
+    /// Remove an attachment record.
+    Detach {
+        doc: String,
+        id: String,
         device: String,
         ts: u64,
     },
@@ -711,6 +884,25 @@ pub enum IssueQuery {
     /// A project's workflow revision head(s).
     Workflow {
         project: String,
+    },
+    /// A project's milestones with derived progress (SCOPE-1).
+    Milestones {
+        project: String,
+    },
+    /// A project's cycles with derived counts (BOARD-11).
+    Cycles {
+        project: String,
+    },
+    /// Every live initiative with its derived roll-up (SCOPE-8).
+    Initiatives,
+    /// Every live team with its owned projects (GOV-7).
+    Teams,
+    /// The triage intake queue, pending first (SCOPE-7).
+    Triage,
+    /// One attachment's full record including the payload (CREATE-5).
+    Attachment {
+        doc: String,
+        id: String,
     },
 }
 

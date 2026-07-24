@@ -302,6 +302,184 @@ pub enum Request {
         /// `None` leaves it untouched (CUSTOM-9).
         #[serde(default)]
         archived: Option<bool>,
+        /// Owning team (key/name/`tm_` id), or "" / "none" to clear (GOV-7).
+        #[serde(default)]
+        team: Option<String>,
+    },
+    /// Hard-delete an EMPTY project (CUSTOM-10): refused while any issue —
+    /// live or tombstoned — still references it.
+    ProjectDelete {
+        /// KEY or `prj_` id.
+        project: String,
+    },
+    /// Subscribe to (or unsubscribe from) an issue's activity without holding
+    /// its assignment (INBOX-9). Reply: `Ref`.
+    Follow {
+        reff: String,
+        /// `true` (default) follows; `false` unfollows.
+        #[serde(default = "default_true")]
+        on: bool,
+    },
+    /// A project's milestones with derived progress (SCOPE-1). Reply:
+    /// `Milestones`.
+    MilestoneList {
+        /// KEY or `prj_` id.
+        project: String,
+    },
+    /// Create, edit, or tombstone a project milestone (SCOPE-1).
+    MilestoneSet {
+        /// KEY or `prj_` id.
+        project: String,
+        /// Existing milestone (name or `mls_` id); absent creates one.
+        #[serde(default)]
+        milestone: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        /// `YYYY-MM-DD`, or "none" to clear. Absent leaves it untouched.
+        #[serde(default)]
+        target: Option<String>,
+        /// Tombstone the milestone (issues keep their register; it reads as
+        /// cleared once the milestone is gone).
+        #[serde(default)]
+        remove: bool,
+    },
+    /// Point an issue at a milestone in its project, or clear it with
+    /// `milestone: None`/"none".
+    IssueMilestone {
+        reff: String,
+        #[serde(default)]
+        milestone: Option<String>,
+    },
+    /// A project's cycles with derived counts (BOARD-11). Reply: `Cycles`.
+    CycleList {
+        /// KEY or `prj_` id.
+        project: String,
+    },
+    /// Create, edit, or tombstone a cycle (BOARD-11).
+    CycleSet {
+        /// KEY or `prj_` id.
+        project: String,
+        /// Existing cycle (name or `cyc_` id); absent creates one.
+        #[serde(default)]
+        cycle: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        /// `YYYY-MM-DD`, or "none" to clear. Absent leaves it untouched.
+        #[serde(default)]
+        start: Option<String>,
+        #[serde(default)]
+        end: Option<String>,
+        #[serde(default)]
+        remove: bool,
+    },
+    /// Schedule an issue into a cycle, or clear it.
+    IssueCycle {
+        reff: String,
+        #[serde(default)]
+        cycle: Option<String>,
+    },
+    /// Every live initiative with its roll-up (SCOPE-8). Reply: `Initiatives`.
+    InitiativeList,
+    /// Create, edit, or tombstone an initiative (SCOPE-8).
+    InitiativeSet {
+        /// Existing initiative (name or `ini_` id); absent creates one.
+        #[serde(default)]
+        initiative: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        /// Owner actor key, or "" / "none" to clear.
+        #[serde(default)]
+        owner: Option<String>,
+        /// `on_track` | `at_risk` | `off_track` | "" (none).
+        #[serde(default)]
+        health: Option<String>,
+        /// `YYYY-MM-DD`, or "none" to clear.
+        #[serde(default)]
+        target: Option<String>,
+        /// Project refs to add to / remove from the membership.
+        #[serde(default)]
+        add_projects: Vec<String>,
+        #[serde(default)]
+        remove_projects: Vec<String>,
+        #[serde(default)]
+        remove: bool,
+    },
+    /// Every live team with its owned projects (GOV-7). Reply: `Teams`.
+    TeamList,
+    /// Create, edit, or tombstone a team (GOV-7; admin-only).
+    TeamSet {
+        /// Existing team (KEY, name, or `tm_` id); absent creates one.
+        #[serde(default)]
+        team: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        /// Short handle, set at creation, immutable after.
+        #[serde(default)]
+        key: Option<String>,
+        #[serde(default)]
+        icon: Option<String>,
+        /// Lead actor key, or "" / "none" to clear.
+        #[serde(default)]
+        lead: Option<String>,
+        /// Actor keys to add to / remove from the membership.
+        #[serde(default)]
+        add_members: Vec<String>,
+        #[serde(default)]
+        remove_members: Vec<String>,
+        #[serde(default)]
+        remove: bool,
+    },
+    /// The triage intake queue, pending first (SCOPE-7). Reply: `TriageItems`.
+    TriageList,
+    /// Report work into the intake queue — outside every project workflow
+    /// until reviewed (SCOPE-7).
+    TriageSubmit {
+        title: String,
+        #[serde(default)]
+        body: Option<String>,
+        /// Where this came from (an integration name, "cli", …).
+        #[serde(default)]
+        source: Option<String>,
+    },
+    /// Decide a pending triage item: `accepted` (into `project`), `declined`,
+    /// or `duplicate` (of `target`). Exactly once per item.
+    TriageDecide {
+        /// The `trg_` intake id.
+        id: String,
+        outcome: String,
+        #[serde(default)]
+        project: Option<String>,
+        /// The duplicated issue's ref (duplicate outcome).
+        #[serde(default)]
+        target: Option<String>,
+        #[serde(default)]
+        note: Option<String>,
+    },
+    /// Attach a bounded file to an issue (CREATE-5). `data_b64` is the
+    /// standard-base64 payload (raw size ≤ 256 KiB). Reply: `Ref`.
+    Attach {
+        reff: String,
+        name: String,
+        #[serde(default)]
+        mime: Option<String>,
+        data_b64: String,
+        /// A comment id to associate the file with.
+        #[serde(default)]
+        comment: Option<String>,
+    },
+    /// Remove an attachment record.
+    Detach {
+        reff: String,
+        /// The `att_` attachment id.
+        id: String,
+    },
+    /// One attachment's payload (CREATE-5). Reply: `Attachment`.
+    AttachmentGet {
+        reff: String,
+        /// The `att_` attachment id.
+        id: String,
     },
     /// A project's status-update feed, newest first (SCOPE-1). Reply: `Updates`.
     ProjectUpdates {
@@ -690,6 +868,24 @@ pub fn classify(req: &Request) -> RequestOwner {
         | Request::ProjectEdit { .. }
         | Request::ProjectUpdates { .. }
         | Request::ProjectUpdatePost { .. }
+        | Request::ProjectDelete { .. }
+        | Request::Follow { .. }
+        | Request::MilestoneList { .. }
+        | Request::MilestoneSet { .. }
+        | Request::IssueMilestone { .. }
+        | Request::CycleList { .. }
+        | Request::CycleSet { .. }
+        | Request::IssueCycle { .. }
+        | Request::InitiativeList
+        | Request::InitiativeSet { .. }
+        | Request::TeamList
+        | Request::TeamSet { .. }
+        | Request::TriageList
+        | Request::TriageSubmit { .. }
+        | Request::TriageDecide { .. }
+        | Request::Attach { .. }
+        | Request::Detach { .. }
+        | Request::AttachmentGet { .. }
         | Request::LabelNew { .. }
         | Request::LabelList
         | Request::LabelEdit { .. }
@@ -855,6 +1051,7 @@ pub fn representative_requests() -> Vec<Request> {
             start: None,
             target: None,
             archived: None,
+            team: None,
         },
         Request::ProjectUpdates { project: s() },
         Request::ProjectUpdatePost {
@@ -862,6 +1059,81 @@ pub fn representative_requests() -> Vec<Request> {
             body: s(),
             health: None,
         },
+        Request::ProjectDelete { project: s() },
+        Request::Follow {
+            reff: s(),
+            on: true,
+        },
+        Request::MilestoneList { project: s() },
+        Request::MilestoneSet {
+            project: s(),
+            milestone: None,
+            name: None,
+            target: None,
+            remove: false,
+        },
+        Request::IssueMilestone {
+            reff: s(),
+            milestone: None,
+        },
+        Request::CycleList { project: s() },
+        Request::CycleSet {
+            project: s(),
+            cycle: None,
+            name: None,
+            start: None,
+            end: None,
+            remove: false,
+        },
+        Request::IssueCycle {
+            reff: s(),
+            cycle: None,
+        },
+        Request::InitiativeList,
+        Request::InitiativeSet {
+            initiative: None,
+            name: None,
+            description: None,
+            owner: None,
+            health: None,
+            target: None,
+            add_projects: vec![],
+            remove_projects: vec![],
+            remove: false,
+        },
+        Request::TeamList,
+        Request::TeamSet {
+            team: None,
+            name: None,
+            key: None,
+            icon: None,
+            lead: None,
+            add_members: vec![],
+            remove_members: vec![],
+            remove: false,
+        },
+        Request::TriageList,
+        Request::TriageSubmit {
+            title: s(),
+            body: None,
+            source: None,
+        },
+        Request::TriageDecide {
+            id: s(),
+            outcome: s(),
+            project: None,
+            target: None,
+            note: None,
+        },
+        Request::Attach {
+            reff: s(),
+            name: s(),
+            mime: None,
+            data_b64: s(),
+            comment: None,
+        },
+        Request::Detach { reff: s(), id: s() },
+        Request::AttachmentGet { reff: s(), id: s() },
         Request::LabelNew {
             name: s(),
             color: None,
@@ -1071,6 +1343,32 @@ pub enum Response {
     /// Pinned seeds ("remotes") and their reachability.
     Seeds {
         seeds: Vec<SeedDto>,
+    },
+    /// Reply to [`Request::MilestoneList`].
+    Milestones {
+        milestones: Vec<crate::dto::MilestoneDto>,
+    },
+    /// Reply to [`Request::CycleList`].
+    Cycles {
+        cycles: Vec<crate::dto::CycleDto>,
+    },
+    /// Reply to [`Request::InitiativeList`].
+    Initiatives {
+        initiatives: Vec<crate::dto::InitiativeDto>,
+    },
+    /// Reply to [`Request::TeamList`].
+    Teams {
+        teams: Vec<crate::dto::TeamDto>,
+    },
+    /// Reply to [`Request::TriageList`].
+    TriageItems {
+        items: Vec<crate::dto::TriageDto>,
+    },
+    /// Reply to [`Request::AttachmentGet`] — the full record incl. payload.
+    Attachment {
+        name: String,
+        mime: String,
+        data_b64: String,
     },
     /// A ref resolved to many candidates, represented as a first-class outcome,
     /// or, when `near_miss_for` is set, matched **nothing** and these are the
