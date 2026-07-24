@@ -70,3 +70,26 @@ pub use fabric::{self as fabric};
 // reaching the seam by its historical paths (`crate::transport`, `crate::net`).
 pub use comms as transport;
 pub use comms::policy as net;
+
+/// Clean-env test entrypoint (step 0 of the Agent Experience initiative).
+///
+/// A developer's shell profile may export `$LAIT_HOME`/`$LAIT_STORE` (we hit
+/// exactly this while operating multi-node), and the store/identity resolver in
+/// [`config`] consults them. Inherited into the unit-test process, a stray value
+/// silently redirected `config::tests::discovery_never_creates_but_init_path_does`
+/// to a foreign store and failed it — a poisoned run masquerading as a real
+/// regression. This runs at process load, *before* the test harness spawns any
+/// test thread, so every lib unit test starts from a clean slate by
+/// construction. Tests that *want* these vars set them explicitly afterward
+/// (serialized by their own `ENV_LOCK`), so scrubbing here is safe for them.
+///
+/// Scoped to the lib's own unit tests (`cfg(test)`). Integration binaries link
+/// the non-test lib and pass env deliberately (`Command::env`), so they are
+/// unaffected — and immune already.
+#[cfg(test)]
+#[ctor::ctor]
+fn scrub_ambient_lait_env() {
+    for key in ["LAIT_HOME", "LAIT_STORE", "LAIT_CONFIG_ROOT"] {
+        std::env::remove_var(key);
+    }
+}

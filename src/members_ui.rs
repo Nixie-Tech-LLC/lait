@@ -558,6 +558,7 @@ mod tests {
             MemberDto {
                 key: format!("act_{}", "9f2a".repeat(16)),
                 role: "admin".to_string(),
+                did: None,
                 me: true,
                 sponsor: None,
                 alias: String::new(),
@@ -565,6 +566,7 @@ mod tests {
             MemberDto {
                 key: format!("act_{}", "3b7c".repeat(16)),
                 role: "member".to_string(),
+                did: None,
                 me: false,
                 sponsor: None,
                 alias: "carol".to_string(),

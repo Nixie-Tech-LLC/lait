@@ -2492,6 +2492,20 @@ pub fn specs() -> Vec<Spec> {
         Spec::req("who", "List peers and their online status.", vec![], |_| {
             Ok(Request::Who)
         }),
+        Spec::req(
+            "whoami",
+            "Show who you are in this space: actor, did:key, role, capabilities, \
+             sponsor, and whether your view is complete — in one shot.",
+            vec![],
+            |_| Ok(Request::Whoami),
+        ),
+        Spec::req(
+            "sync",
+            "Converge now and report whether your view is complete — names any \
+             missing epoch key loudly instead of silently showing fewer issues.",
+            vec![],
+            |_| Ok(Request::Sync),
+        ),
         Spec::special(
             "profiles",
             "List your profiles — each a separate private identity.",

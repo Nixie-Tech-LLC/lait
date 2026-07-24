@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import {
+  Bot,
   Check,
   Copy,
   KeyRound,
@@ -121,8 +122,19 @@ export function Members({
                       </span>
                     )}
                     {m.role !== "admin" && <span className="text-mute text-2xs">{roleLabel(m.role)}</span>}
+                    {m.sponsor && (
+                      <span
+                        className="text-mute flex items-center gap-1 text-2xs"
+                        title={`Sponsored agent — standing dies with ${sponsorName(m, members)}`}
+                      >
+                        <Bot className="size-3" />
+                        sponsored · {sponsorName(m, members)}
+                      </span>
+                    )}
                   </span>
-                  <code className="text-mute block truncate text-xs">{m.key}</code>
+                  <code className="text-mute block truncate text-xs" title={m.did ?? m.key}>
+                    {m.did ?? m.key}
+                  </code>
                 </span>
                 {isAdmin && !readOnly && (
                   <span className="flex shrink-0 gap-1">
@@ -202,6 +214,14 @@ export function Members({
 
 function roleLabel(role: string): string {
   return ({ viewer: "Viewer · read only", contributor: "Contributor · can edit", member: "Member · can edit", administrator: "Administrator · full control" } as Record<string, string>)[role] ?? role;
+}
+
+/** The display name of an agent's sponsor, resolved through the same local
+ * petname rule as everyone else (falls back to a short key). Renders the
+ * sponsor relationship as information — "the surface accounts for agents". */
+function sponsorName(m: MemberDto, members: MemberDto[]): string {
+  if (!m.sponsor) return "";
+  return memberName(m.sponsor, members.find((x) => x.key === m.sponsor));
 }
 
 /**

@@ -292,6 +292,27 @@ impl OrbitalDaemon {
     /// Route an issue-family request through the docked Session, or refuse with a
     /// typed "not admitted yet" when this device holds no standing.
     fn route_issue(&self, req: Request) -> Response {
+        // Hard partial-view guard (docs/plans/09 §10 finding 3): a *delegated*
+        // identity — a sponsored agent — must not AUTHOR against a view it knows
+        // is incomplete. "Close what's done" against a missing-epoch partial
+        // view could act on issues it cannot see. A human acting for themselves
+        // gets the loud `whoami`/`sync` signal and judges; an agent is stopped
+        // by construction. Reads are always allowed (that is how it re-syncs).
+        if !crate::serve::policy::is_read(&req) {
+            if let Some(actor) = self.mechanics.my_actor() {
+                if self.mechanics.is_agent(&actor) {
+                    let divergence = self.mechanics.view_divergence();
+                    if !divergence.is_empty() {
+                        return Response::denied(format!(
+                            "refusing to author against a partial view — {}. Run `sync` \
+                             until whole first; a delegated agent must not act on issues \
+                             it cannot see. Nothing was changed.",
+                            divergence.join("; ")
+                        ));
+                    }
+                }
+            }
+        }
         if !self.ensure_session() {
             return Response::err(
                 "not admitted to this space yet — run `lait connect` to reach an \
@@ -471,6 +492,7 @@ impl OrbitalDaemon {
                     }),
                 }
             }
+            Request::Whoami => self.whoami(),
             Request::Invite {
                 role,
                 reusable,
@@ -539,8 +561,80 @@ impl OrbitalDaemon {
         match req {
             Request::Connect { ticket } => self.connect(&ticket),
             Request::Who => Response::Who { peers: self.who() },
+            Request::Sync => self.sync(),
             other => unreachable!("misclassified station request: {other:?}"),
         }
+    }
+
+    /// Converge the keyring against the authority ledger (adopting any
+    /// just-arrived sealed epoch envelopes) and report completeness **loudly**.
+    /// The ambient Contact/Beacon plane exchanges peer material continuously;
+    /// `sync` names the state so a missing epoch key is never inferred from a
+    /// short issue count (`docs/plans/09` §3.4). It supersedes `connect
+    /// <device-id>` as the "am I caught up?" verb.
+    fn sync(&self) -> Response {
+        let divergence = self.mechanics.view_divergence();
+        let whole = divergence.is_empty();
+        let message = if whole {
+            "converged — this view is complete (every authorized epoch key is held)".to_string()
+        } else {
+            format!(
+                "view is PARTIAL — {} authorized epoch key(s) not yet sealed to this \
+                 device; content under them is invisible until they sync",
+                divergence.len()
+            )
+        };
+        Response::Sync {
+            whole,
+            divergence,
+            message,
+        }
+    }
+
+    /// The one-shot identity + standing + view-completeness projection
+    /// (`lait whoami`, the MCP `whoami` tool). Every fact resolved once: actor,
+    /// device, `did:key`, space, role, capabilities, sponsor, and the loud
+    /// partial-view signal — so "who am I / what may I do / is my view complete"
+    /// is a glance, never a deduction (`docs/plans/09` §3.4).
+    fn whoami(&self) -> Response {
+        let device = crate::crypto::device_from_seed(&self.device_seed);
+        let did = crate::crypto::did_key_from_device(&device);
+        let actor = self.mechanics.my_actor();
+        let space = Some(self.mechanics.space().as_str().to_string());
+        let name = Some(crate::config::Settings::load(Some(&self.home)).nick());
+        let divergence = self.mechanics.view_divergence();
+        let partial_view = !divergence.is_empty();
+        let (actor_str, role, member, can_write, capabilities, policy_admin, sponsor) = match &actor
+        {
+            Some(a) => {
+                let (capabilities, policy_admin) = self.mechanics.effective_capabilities(a);
+                (
+                    Some(a.as_str().to_string()),
+                    self.mechanics.role_of(a),
+                    self.mechanics.is_member(a),
+                    self.mechanics.can_write(a),
+                    capabilities,
+                    policy_admin,
+                    self.mechanics.sponsor_of(a).map(|s| s.as_str().to_string()),
+                )
+            }
+            None => (None, "none".to_string(), false, false, vec![], false, None),
+        };
+        Response::Whoami(crate::dto::WhoamiDto {
+            actor: actor_str,
+            device: device.as_str().to_string(),
+            did,
+            space,
+            role,
+            member,
+            can_write,
+            capabilities,
+            policy_admin,
+            sponsor,
+            name,
+            partial_view,
+            divergence,
+        })
     }
 
     /// The reconciled presence assembly: the persistent Neighbor registry's

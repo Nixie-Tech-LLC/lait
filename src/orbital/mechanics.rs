@@ -1102,6 +1102,61 @@ impl OrbitalMechanics {
         self.lock().my_actor()
     }
 
+    /// Whether `actor` holds membership in this space.
+    pub fn is_member(&self, actor: &ActorId) -> bool {
+        self.lock().acl().is_member(actor)
+    }
+
+    /// Whether `actor` holds content-write standing (can author issues).
+    pub fn can_write(&self, actor: &ActorId) -> bool {
+        self.lock().acl().can_write(actor)
+    }
+
+    /// Whether `actor` is a sponsored agent principal.
+    pub fn is_agent(&self, actor: &ActorId) -> bool {
+        self.lock().acl().is_agent(actor)
+    }
+
+    /// The coarse ACL role label of `actor` (`admin` | `member` | `viewer`).
+    pub fn role_of(&self, actor: &ActorId) -> String {
+        acl::role_label(&self.lock().acl().grants(actor)).to_string()
+    }
+
+    /// The sponsoring actor of `actor`, if it is a sponsored agent.
+    pub fn sponsor_of(&self, actor: &ActorId) -> Option<ActorId> {
+        self.lock().acl().sponsor_of(actor).cloned()
+    }
+
+    /// **Loud** partial-view report: the authorized key epochs this device
+    /// cannot open (holds no sealed key for), so content encrypted under them is
+    /// invisible here. Empty when whole. Refreshes the keyring first so a
+    /// just-synced envelope counts. This is the signal `whoami`/`sync` surface
+    /// and the authoring gate enforces — the end of inferring a missing epoch by
+    /// diffing 141-vs-154 issue counts (`docs/plans/09` §10 finding 3).
+    pub fn view_divergence(&self) -> Vec<String> {
+        let mut inner = self.lock();
+        inner.refresh_keyring();
+        let held: std::collections::BTreeSet<[u8; 16]> = inner.keyring.keys().copied().collect();
+        let mut lines = Vec::new();
+        for e in inner.acl().epochs() {
+            if !held.contains(&e.id) {
+                lines.push(format!(
+                    "authorized key epoch gen {} ({}) is not sealed to this device — \
+                     content under it is invisible here; run `lait sync`",
+                    e.gen,
+                    data_encoding::HEXLOWER.encode(&e.id),
+                ));
+            }
+        }
+        lines
+    }
+
+    /// Whether this device's view is *known* to be partial (missing an
+    /// authorized epoch key). A delegated agent must not author against a `true`.
+    pub fn is_view_partial(&self) -> bool {
+        !self.view_divergence().is_empty()
+    }
+
     /// The effective scoped capability names granted to `actor` (sorted,
     /// deduped) plus whether it holds Space policy administration — the
     /// admission gates' assignment oracle.
@@ -1118,32 +1173,40 @@ impl OrbitalMechanics {
         (names, acl_state.is_policy_admin(actor))
     }
 
-    /// The membership roster as `control::MemberDto` rows.
+    /// The membership roster as `control::MemberDto` rows — **one row per
+    /// member**, humans and sponsored agents alike (the "one surface"
+    /// principle). A sponsored member's `role` reflects its real grants (a
+    /// working agent reads as `member`, not a separate `agent` role), and its
+    /// `sponsor` names the human whose standing seats it. Sponsorship is
+    /// rendered as information — a badge + link the viewer draws — never a
+    /// distinct actor class.
     pub fn members(&self) -> Vec<crate::dto::MemberDto> {
         let mut inner = self.lock();
         let acl = inner.acl();
+        let plane = inner.actor_plane();
         let me = inner.my_actor();
-        let mut out: Vec<crate::dto::MemberDto> = acl
-            .members()
+        acl.members()
             .into_iter()
-            .map(|(actor, grants)| crate::dto::MemberDto {
-                key: actor.as_str().to_string(),
-                role: acl::role_label(&grants).to_string(),
-                me: me.as_ref() == Some(&actor),
-                sponsor: None,
-                alias: String::new(),
+            .map(|(actor, grants)| {
+                // A member's `did:key` — a synced-safe, self-certifying handle
+                // (unlike the local alias). An actor may hold several devices;
+                // we present its lowest device id deterministically, so every
+                // node renders the same did for the same member.
+                let did = plane
+                    .devices_of(&actor)
+                    .into_iter()
+                    .min()
+                    .and_then(|d| crate::crypto::did_key_from_device(&d));
+                crate::dto::MemberDto {
+                    key: actor.as_str().to_string(),
+                    role: acl::role_label(&grants).to_string(),
+                    did,
+                    me: me.as_ref() == Some(&actor),
+                    sponsor: acl.sponsor_of(&actor).map(|s| s.as_str().to_string()),
+                    alias: String::new(),
+                }
             })
-            .collect();
-        for (agent, sponsor) in acl.agents() {
-            out.push(crate::dto::MemberDto {
-                key: agent.as_str().to_string(),
-                role: "agent".into(),
-                me: me.as_ref() == Some(&agent),
-                sponsor: Some(sponsor.as_str().to_string()),
-                alias: String::new(),
-            });
-        }
-        out
+            .collect()
     }
 
     /// The signed ACL DAG replayed as an audit log.
@@ -1563,8 +1626,11 @@ impl OrbitalMechanics {
 
     /// Sponsor an agent by its device key (any human member may sponsor). The
     /// agent's inception must already be known locally (it self-incepts on
-    /// join); this authors a signed `AddAgent` and seals it every held epoch.
-    /// Returns the sponsored agent's actor id.
+    /// join); this authors a signed `AddAgent` sealing it every held epoch, and
+    /// grants it **content authority** (the linchpin: a sponsored member is a
+    /// working colleague, not a mute spectator) through the same grant set any
+    /// member carries — never membership authority. Its standing still dies with
+    /// the sponsor. Returns the sponsored agent's actor id.
     pub fn agent_add(&self, key: &str) -> Result<ActorId> {
         let mut inner = self.lock();
         let me = inner
@@ -1573,9 +1639,14 @@ impl OrbitalMechanics {
         if !inner.acl().is_human_member(&me) {
             return Err(anyhow!("only a human member may sponsor an agent"));
         }
-        let agent = inner
-            .resolve_actor(key)
-            .ok_or_else(|| anyhow!("that agent's identity is not known locally yet"))?;
+        let agent = inner.resolve_actor(key).ok_or_else(|| {
+            anyhow!(
+                "that agent's identity is not known here yet — the agent must reach this \
+                 node once so its self-inception lands (run `lait connect` from the agent's \
+                 side, or share an invite it connects with); then `members agent <key>` \
+                 sponsors it"
+            )
+        })?;
         if inner.acl().is_member(&agent) {
             return Err(anyhow!("{} is already a principal", agent.short()));
         }
@@ -1583,6 +1654,7 @@ impl OrbitalMechanics {
         inner.author(
             AclAction::AddAgent {
                 actor: agent.clone(),
+                grants: acl::sponsored_agent_grants(),
             },
             None,
             vec![],

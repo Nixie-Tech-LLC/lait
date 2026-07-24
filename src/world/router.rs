@@ -341,9 +341,11 @@ impl<'a> IssueRouter<'a> {
 
     fn effect_err(e: WorldError) -> Response {
         match e {
-            WorldError::Denied => {
-                Response::err("view-only: your membership grants no write access")
-            }
+            WorldError::Denied => Response::denied(
+                "you lack write standing in this space — a sponsored agent needs a \
+                 human member to grant it write access (`lait agent add`), and a \
+                 view-only member needs an admin to grant it; nothing was changed",
+            ),
             WorldError::Conflict => Response::err("that change conflicts with the current state"),
             WorldError::RequestIdConflict => Response::err("duplicate request"),
             WorldError::InvalidRequest | WorldError::ContractViolation => {

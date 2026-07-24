@@ -262,8 +262,12 @@ export interface InboxEntry {
 
 export interface MemberDto {
   key: string;
-  /** "admin" | "member" — from the signed ACL graph. */
+  /** "admin" | "member" | "viewer" — the coarse label of the ACL grant set. A
+   * sponsored member (agent) is not a separate role; `sponsor` marks it. */
   role: string;
+  /** The member's did:key — the self-certifying, synced-safe interop handle
+   * (`z6Mk…`); a pure function of the key, unlike the local `alias`. */
+  did?: string | null;
   me: boolean;
   /** Present for agents: the actor whose standing sponsors this identity. */
   sponsor?: string | null;

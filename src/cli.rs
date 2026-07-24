@@ -1649,6 +1649,58 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
             }
             0
         }
+        Response::Whoami(w) => {
+            let none = "—".to_string();
+            println!(
+                "actor    {}",
+                w.actor.as_deref().unwrap_or("(not admitted yet)")
+            );
+            if let Some(did) = &w.did {
+                println!("did      {did}");
+            }
+            println!("device   {}", w.device);
+            println!("space    {}", w.space.as_deref().unwrap_or(&none));
+            println!("name     {}", w.name.as_deref().unwrap_or(&none));
+            let write = if w.can_write { "write" } else { "view-only" };
+            println!("standing {} ({})", w.role, write);
+            if let Some(s) = &w.sponsor {
+                println!("sponsor  {s}  (sponsored — standing dies with this member)");
+            }
+            if w.policy_admin {
+                println!("policy   policy-admin (can invite + manage policy)");
+            }
+            if !w.capabilities.is_empty() {
+                println!("caps     {}", w.capabilities.join(", "));
+            }
+            if w.partial_view {
+                eprintln!(
+                    "{}  view is PARTIAL — run `lait sync`:",
+                    paint(out.color, ansi::YELLOW, "!")
+                );
+                for d in &w.divergence {
+                    eprintln!("    - {d}");
+                }
+            } else {
+                println!("view     complete");
+            }
+            0
+        }
+        Response::Sync {
+            whole,
+            divergence,
+            message,
+        } => {
+            if *whole {
+                println!("{message}");
+                0
+            } else {
+                eprintln!("{message}");
+                for d in divergence {
+                    eprintln!("    - {d}");
+                }
+                1
+            }
+        }
         Response::Error {
             message,
             error_kind,
@@ -1663,7 +1715,7 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
 fn exit_code_for_kind(kind: ErrorKind) -> i32 {
     match kind {
         ErrorKind::NotFound => 2,
-        ErrorKind::Error => 1,
+        ErrorKind::Error | ErrorKind::Denied => 1,
     }
 }
 

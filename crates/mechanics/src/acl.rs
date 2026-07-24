@@ -18,8 +18,15 @@
 //! **Grants, not roles.** Standing is an extensible capability set
 //! ([`Grant`]): `Admin` (membership authority) and `Write` (content
 //! authority). A member with **no grants is view-only** — sealed the key,
-//! zero write standing. Agents remain the structural case: sealed but
-//! grant-less, sponsored, and their standing dies with the sponsor.
+//! zero write standing. A **sponsored** member (an agent) is not a separate
+//! kind of actor: it holds the *same* grant set as any member (default
+//! `Write`), authored on a human's sponsorship, and its standing **dies with
+//! that sponsor**. The one hard fence: a sponsored member may hold content
+//! authority (`Write`) but never membership authority (`Admin`) — it authors
+//! no ACL op (the blanket agent-author ban in `judge_op`), so it can file,
+//! close, and comment like a colleague yet cannot add/remove members or rotate
+//! the key. Sponsorship is a membership *modifier*, orthogonal to the grant
+//! set — rendered, never a gate.
 //!
 //! **Names never enter this plane.** The only synced identity facts are keys,
 //! actors, and signed ops; petnames live in each node's local alias store.
@@ -77,6 +84,25 @@ pub fn membership_grants(admin: bool) -> Vec<Grant> {
     }
 }
 
+/// The default grant set a sponsored agent is minted with: content authority,
+/// never membership authority. A colleague, not a spectator (the linchpin of
+/// the Agent Experience initiative) and not an admin. Callers outside the
+/// kernel reach for this instead of naming [`Grant::Write`] directly, so the
+/// `world-flat-standing` clean-break gate (which forbids `Grant::` literals in
+/// `src/orbital/`, `src/world/`, `crates/runtime/`) stays satisfied and the
+/// "agents get content authority only" policy lives in exactly one place.
+pub fn sponsored_agent_grants() -> Vec<Grant> {
+    vec![Grant::Write]
+}
+
+/// Whether a grant set is a legal *sponsored-agent* grant set: any content
+/// grants are fine, but [`Grant::Admin`] (membership authority) is not. The
+/// authorization fence for [`AclAction::AddAgent`] enforces this at replay, so
+/// no synced op can smuggle admin standing onto a sponsored identity.
+pub fn is_sponsorable_grant_set(grants: &[Grant]) -> bool {
+    !grants.contains(&Grant::Admin)
+}
+
 /// Render a grant set as the product's coarse role label.
 pub fn role_label(grants: &[Grant]) -> &'static str {
     if grants.contains(&Grant::Admin) {
@@ -102,10 +128,19 @@ pub enum AclAction {
         actor: ActorId,
         grants: Vec<Grant>,
     },
-    /// Sponsor an agent actor. The sponsor is the op's `by`
-    /// actor; the agent's membership is derived, and dies, with them.
+    /// Sponsor an agent actor with a grant set. The sponsor is the op's `by`
+    /// actor; the agent's membership is derived, and dies, with them — but the
+    /// agent holds real **content** authority through the *same* [`Grant`] set
+    /// any member carries (default [`Grant::Write`]). `grants` may **never**
+    /// include [`Grant::Admin`]: sponsorship confers content authority, never
+    /// membership authority (an agent still authors no ACL op — the blanket
+    /// agent-author ban in `judge_op` stands). This is "add a member on my
+    /// sponsorship," parallel to [`AclAction::AddMember`], not a separate
+    /// agent-write primitive. `grants` is append-only positional, like the
+    /// grant set on `AddMember`.
     AddAgent {
         actor: ActorId,
+        grants: Vec<Grant>,
     },
     /// Mint a space key epoch. **Signed, and authorized only when its
     /// author holds admin standing** — re-keying decides who reads future content
@@ -304,7 +339,7 @@ impl AclAction {
             AclAction::AddMember { actor, .. }
             | AclAction::RemoveMember { actor }
             | AclAction::SetGrants { actor, .. }
-            | AclAction::AddAgent { actor } => Some(actor),
+            | AclAction::AddAgent { actor, .. } => Some(actor),
             AclAction::MintEpoch { .. }
             | AclAction::RevokeInvite { .. }
             | AclAction::GrantCapability { .. }
@@ -426,10 +461,14 @@ pub fn sign_op(seed: &[u8; 32], op: &AclOp, parents: Vec<String>, space_id: &Spa
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AclState {
     /// Every actor sealed into the space, humans and agents alike, with
-    /// their grants. Agents carry no grants.
+    /// their grants. A sponsored (agent) member carries a real grant set too
+    /// (default `Write`) — sponsorship lives in `agents`, orthogonal to the
+    /// grant, never in an empty grant set.
     members: BTreeMap<ActorId, BTreeSet<Grant>>,
     /// agent actor → sponsoring actor. Every key here is also in `members`;
-    /// an agent's presence is derived from its sponsor's.
+    /// an agent's presence — and its grants — are derived from, and die with,
+    /// its sponsor. The grant set says what it may do; this map says whose
+    /// standing keeps it seated.
     agents: BTreeMap<ActorId, ActorId>,
     /// Every **authorized** key-epoch (a valid writer-signed [`AclAction::MintEpoch`]),
     /// keyed by id. The trusted epoch set — key selection and keyring adoption
@@ -923,12 +962,17 @@ fn judge_op(
                 admins.contains(by) || agents_now.get(actor) == Some(by)
             }
             // Any human member may sponsor an agent for themselves; the
-            // agent actor must be fresh (not already a principal).
-            AclAction::AddAgent { actor } => {
+            // agent actor must be fresh (not already a principal). The grant
+            // set confers **content** authority only — a sponsored identity may
+            // never be minted with `Admin` (membership authority stays with
+            // humans), so an injected `AddAgent` carrying `Admin` is refused
+            // here and never goes live.
+            AclAction::AddAgent { actor, grants } => {
                 humans.contains(by)
                     && actor != by
                     && !humans.contains(actor)
                     && !agents_now.contains_key(actor)
+                    && is_sponsorable_grant_set(grants)
             }
             // Minting a key epoch requires **admin standing**:
             // re-keying decides who reads future content, a membership-
@@ -1042,7 +1086,11 @@ fn apply_authorized(
                 admins.remove(actor);
             }
         }
-        AclAction::AddAgent { actor } => {
+        AclAction::AddAgent { actor, .. } => {
+            // Sponsorship only; the grant set is materialized in pass 2. Pass-1
+            // standing (`humans`/`admins`) deliberately does not gain the agent
+            // — it holds content authority, never membership authority, so it
+            // must never be counted as a human author or an admin here.
             agents_now.insert(actor.clone(), op.by.clone());
         }
         AclAction::RemoveMember { actor } => {
@@ -1378,8 +1426,15 @@ fn materialize_authorized(
                 members.insert(actor.clone(), grants.iter().copied().collect());
                 agents.remove(actor);
             }
-            AclAction::AddAgent { actor } => {
-                members.insert(actor.clone(), BTreeSet::new());
+            AclAction::AddAgent { actor, grants } => {
+                // A sponsored member holds its granted content authority through
+                // the *same* grant set any member carries — no longer forced to
+                // an empty (view-only) set. `can_write` then authorizes it with
+                // zero special-casing. It stays in `agents`, so dies-with-sponsor
+                // and the sponsor cascade (below) are untouched; `judge_op`
+                // guaranteed `grants` carries no `Admin`, so it holds content
+                // authority only.
+                members.insert(actor.clone(), grants.iter().copied().collect());
                 agents.insert(actor.clone(), op.by.clone());
             }
             AclAction::RemoveMember { actor } => {
@@ -1476,7 +1531,7 @@ fn materialize_authorized(
                         &op.action,
                         AclAction::AddMember { actor, .. }
                         | AclAction::SetGrants { actor, .. }
-                        | AclAction::AddAgent { actor } if actor == &subject
+                        | AclAction::AddAgent { actor, .. } if actor == &subject
                     )
                 })
             })
@@ -1622,7 +1677,7 @@ fn materialize_authorized(
                         &op.action,
                         AclAction::AddMember { actor: a, .. }
                         | AclAction::SetGrants { actor: a, .. }
-                        | AclAction::AddAgent { actor: a } if a == actor
+                        | AclAction::AddAgent { actor: a, .. } if a == actor
                     )
                 })
         })
@@ -2034,7 +2089,7 @@ mod tests {
     }
 
     #[test]
-    fn agents_are_sponsored_grantless_and_cascade_with_their_sponsor() {
+    fn sponsored_agents_hold_content_authority_and_cascade_with_their_sponsor() {
         let f = fx(1, &[2, 7]);
         let add2 = f.op(
             1,
@@ -2045,23 +2100,31 @@ mod tests {
             },
             vec![],
         );
-        // Member 2 sponsors agent-actor 7.
+        // Member 2 sponsors agent-actor 7 with the default content grant.
         let sponsor = f.op(
             2,
             2,
             AclAction::AddAgent {
                 actor: f.a(7).clone(),
+                grants: sponsored_agent_grants(),
             },
             vec![add2.hash()],
         );
         let st = f.replay(&[add2.clone(), sponsor.clone()]);
         assert!(st.is_member(f.a(7)));
         assert!(st.is_agent(f.a(7)));
-        assert!(!st.can_write(f.a(7)), "agents carry no grants");
+        // The linchpin: a sponsored member is a *writer*, not a mute spectator.
+        assert!(
+            st.can_write(f.a(7)),
+            "a sponsored member holds content authority"
+        );
+        // …but never membership authority.
+        assert!(!st.is_admin(f.a(7)), "a sponsored member is not an admin");
         assert!(!st.is_human_member(f.a(7)));
         assert_eq!(st.sponsor_of(f.a(7)), Some(f.a(2)));
 
-        // The agent may author NO membership op.
+        // Content authority does not become membership authority: the agent may
+        // still author NO ACL op (the blanket agent-author ban stands).
         let agent_op = f.op(
             7,
             7,
@@ -2072,9 +2135,14 @@ mod tests {
             vec![sponsor.hash()],
         );
         let st = f.replay(&[add2.clone(), sponsor.clone(), agent_op]);
-        assert!(!st.is_admin(f.a(7)));
+        assert!(!st.is_admin(f.a(7)), "an agent authors no membership op");
+        assert!(
+            st.can_write(f.a(7)),
+            "its own content grant is unchanged by the refused op"
+        );
 
-        // Removing the sponsor cascades the agent away.
+        // Removing the sponsor cascades the agent away — content authority does
+        // not seat it independently.
         let rm2 = f.op(
             1,
             1,
@@ -2086,6 +2154,43 @@ mod tests {
         let st = f.replay(&[add2, sponsor, rm2]);
         assert!(!st.is_member(f.a(2)));
         assert!(!st.is_member(f.a(7)), "agent dies with its sponsor");
+        assert!(
+            !st.can_write(f.a(7)),
+            "and loses its write standing with it"
+        );
+    }
+
+    #[test]
+    fn sponsoring_an_agent_with_admin_is_unauthorized() {
+        // Sponsorship confers content authority, never membership authority: an
+        // `AddAgent` carrying `Admin` is refused at replay, so no synced op can
+        // smuggle admin standing onto a sponsored identity.
+        let f = fx(1, &[2, 7]);
+        let add2 = f.op(
+            1,
+            1,
+            AclAction::AddMember {
+                actor: f.a(2).clone(),
+                grants: vec![Grant::Write],
+            },
+            vec![],
+        );
+        let bad = f.op(
+            2,
+            2,
+            AclAction::AddAgent {
+                actor: f.a(7).clone(),
+                grants: vec![Grant::Admin, Grant::Write],
+            },
+            vec![add2.hash()],
+        );
+        let st = f.replay(&[add2, bad]);
+        assert!(
+            !st.is_member(f.a(7)),
+            "an AddAgent carrying Admin does not authorize"
+        );
+        assert!(!st.is_agent(f.a(7)));
+        assert!(!st.can_write(f.a(7)));
     }
 
     #[test]
@@ -2270,6 +2375,7 @@ mod tests {
             3,
             AclAction::AddAgent {
                 actor: f.a(7).clone(),
+                grants: sponsored_agent_grants(),
             },
             vec![lose.hash()],
         );

@@ -739,6 +739,17 @@ pub enum Request {
         expected_space: Option<String>,
     },
     Id,
+    /// One-shot identity + standing + view-completeness report (`lait whoami`,
+    /// the MCP `whoami` tool). A read: the full version of `Id`'s actor line —
+    /// actor, `did:key`, role, capabilities, sponsor, space, and the **loud**
+    /// partial-view signal — so neither a human nor an agent ever *infers* "who
+    /// am I / what may I do / is my view complete."
+    Whoami,
+    /// Converge now and report what moved and what is still divergent — the
+    /// workflow verb that supersedes `connect <device-id>`. Surfaces missing-
+    /// epoch / partial-read state **loudly** instead of silently showing fewer
+    /// issues (the 141-vs-154 inference this initiative kills).
+    Sync,
     /// Mint an invite link. It always carries a signed admission capability:
     /// the joiner's explicit acceptance IS the approval, and redemption is
     /// automatic over Contact — there is no approval queue.
@@ -930,10 +941,11 @@ pub fn classify(req: &Request) -> RequestOwner {
         | Request::AccessGrant { .. }
         | Request::AccessRevoke { .. }
         | Request::WorldUpgrade
-        | Request::Id => Mechanics,
+        | Request::Id
+        | Request::Whoami => Mechanics,
 
         // ---- Station: connect/neighbor/Contact ----
-        Request::Connect { .. } | Request::Who => Station,
+        Request::Connect { .. } | Request::Who | Request::Sync => Station,
 
         // ---- Observation: status, subscription, and locally derived
         // projection surfaces (the inbox rebuilds from query after reset and
@@ -1244,6 +1256,8 @@ pub fn representative_requests() -> Vec<Request> {
             expected_space: None,
         },
         Request::Id,
+        Request::Whoami,
+        Request::Sync,
         Request::Invite {
             role: None,
             reusable: false,
@@ -1401,6 +1415,20 @@ pub enum Response {
     Who {
         peers: Vec<PresenceEntry>,
     },
+    /// The one-shot identity + standing + view-completeness projection.
+    Whoami(crate::dto::WhoamiDto),
+    /// The result of a `sync`: whether the view is now whole, and the same loud
+    /// divergence lines `whoami` reports (empty when converged and complete).
+    Sync {
+        /// True when this node's view is complete (holds every authorized epoch
+        /// key and its history) after converging.
+        whole: bool,
+        /// Human-readable divergence lines — what epoch/history is still
+        /// missing. Empty when whole.
+        divergence: Vec<String>,
+        /// A short human summary of what the sync did/found.
+        message: String,
+    },
     Error {
         message: String,
         // Named `error_kind`, not `kind`: the enum's internal tag is `kind`
@@ -1423,6 +1451,12 @@ pub enum ErrorKind {
     #[default]
     Error,
     NotFound,
+    /// The caller's identity lacks the standing this action needs (write access,
+    /// admin, sponsorship). A **typed** authorization failure so a client — the
+    /// MCP agent surface especially — can render an actionable next step ("ask
+    /// your sponsor to grant write access") instead of an opaque blob, and so it
+    /// is never confused with a transient/internal error. Exit `1` like `Error`.
+    Denied,
 }
 
 impl Response {
@@ -1438,6 +1472,15 @@ impl Response {
         Response::Error {
             message: msg.into(),
             error_kind: ErrorKind::NotFound,
+        }
+    }
+    /// The caller lacks the standing this action requires — an authorization
+    /// failure, not an internal one. The message should say what is missing and
+    /// how to get it, so the agent surface can surface a next step.
+    pub fn denied(msg: impl Into<String>) -> Self {
+        Response::Error {
+            message: msg.into(),
+            error_kind: ErrorKind::Denied,
         }
     }
 }

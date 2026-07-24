@@ -36,6 +36,7 @@ pub fn is_read(req: &Request) -> bool {
         | Request::Status
         | Request::Diagnose { .. }
         | Request::Id
+        | Request::Whoami
         | Request::SeedList
         | Request::Log { .. }
         | Request::Who
@@ -118,6 +119,8 @@ pub fn is_read(req: &Request) -> bool {
         | Request::Invite { .. }
         | Request::Join { .. }
         | Request::Connect { .. }
+        // …sync drives convergence on the wire (like connect), not a read…
+        | Request::Sync
         | Request::SeedAdd { .. }
         | Request::SeedRemove { .. }
         // …role/access/workflow authoring mutates replicated policy…

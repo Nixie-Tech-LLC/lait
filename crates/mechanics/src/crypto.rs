@@ -55,6 +55,55 @@ pub fn device_from_seed(seed: &[u8; 32]) -> DeviceId {
     DeviceId::from_key_string(data_encoding::HEXLOWER.encode(pk.as_bytes()))
 }
 
+/// The `did:key` form of an ed25519 public key (the raw bytes a [`DeviceId`]
+/// *is*). A pure, offline, self-certifying function of the key — the interop
+/// lingua franca the agent-identity standards converge on (draft-duda / AIP /
+/// KERI, `docs/plans/09`): lait presents *any* member's identity outward as a
+/// `did` with no registry and no network. The multicodec prefix `0xed01` marks
+/// ed25519-pub; the body is multibase base58btc (`z`-prefixed), per the W3C
+/// did:key spec, so every ed25519 did:key begins `z6Mk`.
+pub fn did_key_from_pubkey(pubkey: &[u8; 32]) -> String {
+    let mut bytes = Vec::with_capacity(34);
+    bytes.extend_from_slice(&[0xed, 0x01]);
+    bytes.extend_from_slice(pubkey);
+    format!("did:key:z{}", base58btc_encode(&bytes))
+}
+
+/// The `did:key` of a [`DeviceId`] (which *is* a hex ed25519 public key).
+/// `None` if the id is not a well-formed 32-byte key.
+pub fn did_key_from_device(device: &DeviceId) -> Option<String> {
+    ed_pubkey_bytes(device).map(|pk| did_key_from_pubkey(&pk))
+}
+
+/// Bitcoin-alphabet base58 encoding (no external crate: the kernel lists no
+/// scaffold, and this is ~20 lines of well-defined arithmetic). Used only to
+/// render a `did:key` multibase body.
+fn base58btc_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    let zeros = input.iter().take_while(|&&b| b == 0).count();
+    let mut buf: Vec<u8> = Vec::new();
+    for &byte in input {
+        let mut carry = byte as u32;
+        for b in buf.iter_mut() {
+            carry += (*b as u32) << 8;
+            *b = (carry % 58) as u8;
+            carry /= 58;
+        }
+        while carry > 0 {
+            buf.push((carry % 58) as u8);
+            carry /= 58;
+        }
+    }
+    let mut out = String::with_capacity(zeros + buf.len());
+    for _ in 0..zeros {
+        out.push('1');
+    }
+    for &b in buf.iter().rev() {
+        out.push(ALPHABET[b as usize] as char);
+    }
+    out
+}
+
 /// Sign an **already-built preimage** with an identity seed's Ed25519 key,
 /// returning the detached 64-byte signature. Mechanics owns key operations; a
 /// higher layer (e.g. runtime's World-action envelope) builds the canonical
@@ -271,6 +320,33 @@ mod tests {
         // wrong key ⇒ None (a blind relay / non-member learns nothing).
         assert!(aead_decrypt(&[0u8; 32], &blob).is_none());
         assert!(aead_decrypt(&k, b"tooshort").is_none());
+    }
+
+    #[test]
+    fn did_key_is_a_deterministic_ed25519_multibase() {
+        let seed = [9u8; 32];
+        let device = device_from_seed(&seed);
+        let did = did_key_from_device(&device).expect("a seed device is a valid ed25519 key");
+        // Every ed25519 did:key begins `did:key:z6Mk` — the multibase base58btc
+        // encoding of the `0xed01` multicodec prefix. This pins both the prefix
+        // and the base58 alphabet.
+        assert!(
+            did.starts_with("did:key:z6Mk"),
+            "ed25519 did:key must be z6Mk-prefixed, got {did}"
+        );
+        // Pure function of the key: same device → same did, every time.
+        assert_eq!(did, did_key_from_device(&device).unwrap());
+        // And it is a function of the key material, not the id string form.
+        let other = device_from_seed(&[10u8; 32]);
+        assert_ne!(did, did_key_from_device(&other).unwrap());
+    }
+
+    #[test]
+    fn base58btc_matches_known_vectors() {
+        // Bitcoin base58 reference vectors (leading-zero handling included).
+        assert_eq!(base58btc_encode(&[0x00, 0x00, 0x01]), "112");
+        assert_eq!(base58btc_encode(b"hello world"), "StV1DL6CwTryKyV");
+        assert_eq!(base58btc_encode(&[]), "");
     }
 
     #[test]
