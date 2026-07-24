@@ -1102,6 +1102,13 @@ impl OrbitalMechanics {
         self.lock().my_actor()
     }
 
+    /// The actor a device belongs to in the actor plane, independent of
+    /// standing — so a provisioned-but-unsponsored agent still resolves to its
+    /// own actor (for `whoami`), even before it holds a seat.
+    pub fn actor_of_device(&self, device: &DeviceId) -> Option<ActorId> {
+        self.lock().actor_plane().actor_of_device(device).cloned()
+    }
+
     /// Whether `actor` holds membership in this space.
     pub fn is_member(&self, actor: &ActorId) -> bool {
         self.lock().acl().is_member(actor)
@@ -1632,35 +1639,102 @@ impl OrbitalMechanics {
     /// member carries — never membership authority. Its standing still dies with
     /// the sponsor. Returns the sponsored agent's actor id.
     pub fn agent_add(&self, key: &str) -> Result<ActorId> {
-        let mut inner = self.lock();
-        let me = inner
-            .my_actor()
-            .ok_or_else(|| anyhow!("no actor identity"))?;
-        if !inner.acl().is_human_member(&me) {
-            return Err(anyhow!("only a human member may sponsor an agent"));
-        }
-        let agent = inner.resolve_actor(key).ok_or_else(|| {
-            anyhow!(
-                "that agent's identity is not known here yet — the agent must reach this \
-                 node once so its self-inception lands (run `lait connect` from the agent's \
-                 side, or share an invite it connects with); then `members agent <key>` \
-                 sponsors it"
-            )
-        })?;
-        if inner.acl().is_member(&agent) {
-            return Err(anyhow!("{} is already a principal", agent.short()));
-        }
-        let sealed = inner.seal_records_for_actor(&agent);
-        inner.author(
-            AclAction::AddAgent {
-                actor: agent.clone(),
-                grants: acl::sponsored_agent_grants(),
-            },
-            None,
-            vec![],
-            sealed,
-        )?;
+        let agent = {
+            let mut inner = self.lock();
+            let me = inner
+                .my_actor()
+                .ok_or_else(|| anyhow!("no actor identity"))?;
+            if !inner.acl().is_human_member(&me) {
+                return Err(anyhow!("only a human member may sponsor an agent"));
+            }
+            let agent = inner.resolve_actor(key).ok_or_else(|| {
+                anyhow!(
+                    "that agent's identity is not known here yet — the agent must reach this \
+                     node once so its self-inception lands (run `lait connect` from the agent's \
+                     side, or share an invite it connects with); then `members agent <key>` \
+                     sponsors it"
+                )
+            })?;
+            if inner.acl().is_member(&agent) {
+                return Err(anyhow!("{} is already a principal", agent.short()));
+            }
+            let sealed = inner.seal_records_for_actor(&agent);
+            inner.author(
+                AclAction::AddAgent {
+                    actor: agent.clone(),
+                    grants: acl::sponsored_agent_grants(),
+                },
+                None,
+                vec![],
+                sealed,
+            )?;
+            agent
+        }; // lock dropped before granting the scoped capabilities below
+
+        // The ACL write grant is *content authority*; a functional
+        // contributor also needs the World's *scoped* capabilities — the
+        // mandatory `space.issue.read` (to even read the catalog) and
+        // `space.contributor` (the write demand). These live in the separate
+        // policy plane, so grant the sponsored member the contributor role's
+        // exact expansion. Requires the sponsor to be able to delegate them
+        // (a policy admin, or a delegate); a plain member cannot hand out
+        // authority it lacks, and the up-front check keeps that a clean refusal
+        // rather than a Write-but-cannot-read half-member.
+        self.grant_contributor_capabilities(&agent)?;
         Ok(agent)
+    }
+
+    /// Grant `actor` the built-in **contributor** role's scoped capabilities
+    /// (`space.contributor` + the mandatory `space.issue.read` baseline) on the
+    /// Space — so a sponsored member can actually read and write, not merely
+    /// hold the ACL write grant. Idempotent (already-effective grants skip).
+    fn grant_contributor_capabilities(&self, actor: &ActorId) -> Result<()> {
+        let contributor = crate::world::roles::built_in("lait.contributor")
+            .ok_or_else(|| anyhow!("built-in contributor role is missing"))?;
+        let assignments =
+            crate::world::roles::role_admission_evidence(&contributor, [0u8; 32]).assignments;
+        self.grant_assignments(actor, &assignments)?;
+        Ok(())
+    }
+
+    /// Provision a **co-located** agent identity in THIS shared store: incept
+    /// its actor from its own seed so the plane knows it — the local analogue of
+    /// a joiner's self-inception arriving over Contact, but with no round trip —
+    /// then sponsor it with the default content grant. One store, one step; this
+    /// is what makes "sponsor once, then it works" true for an agent on the same
+    /// machine (Architecture B). Idempotent: re-provisioning a known, sponsored
+    /// agent returns its actor. Returns the agent's actor id.
+    pub fn provision_agent(&self, agent_seed: &[u8; 32]) -> Result<ActorId> {
+        let agent_device = crypto::device_from_seed(agent_seed);
+        // 1. Incept into the shared actor plane if not already known. The
+        //    inception is self-signed (it proves key ownership); it establishes
+        //    that the actor *exists*, never that it has standing — standing is
+        //    the separate sponsorship below.
+        {
+            let mut inner = self.lock();
+            if inner.actor_plane().actor_of_device(&agent_device).is_none() {
+                let (inception, _actor) = actor::incept_single(
+                    agent_seed,
+                    &inner.space,
+                    super::rand16(),
+                    super::rand16(),
+                    None,
+                );
+                inner
+                    .ledger
+                    .commit_batch(&[LedgerEffect::Actor(inception).encode()], &[])
+                    .map_err(|e| anyhow!("agent inception: {e}"))?;
+            }
+        }
+        // 2. Sponsor with the default content grant. `agent_add` refuses an
+        //    existing principal, which for re-provisioning means "already done".
+        match self.agent_add(&agent_device.to_string()) {
+            Ok(actor) => Ok(actor),
+            Err(e) if e.to_string().contains("already a principal") => self
+                .actor_of_device(&agent_device)
+                .ok_or_else(|| anyhow!("agent inception vanished")),
+            Err(e) => Err(e),
+        }
     }
 
     /// The authority records this Station serves in a Contact (the export

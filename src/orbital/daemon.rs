@@ -81,6 +81,13 @@ pub struct OrbitalDaemon {
     /// un-admitted joiner serves control (Status/Connect/Members) and drives
     /// Contact before it can dock, then docks lazily once admission lands.
     session: Mutex<Option<Session>>,
+    /// Docked Sessions for **sponsored local agent** identities (Architecture
+    /// B): one store, N signing clients. Keyed by the agent's device; docked
+    /// lazily on first use once the agent holds standing, then reused. Each
+    /// Session signs+attributes as *that* agent, sharing the one Replica with
+    /// the human's `session` above. This is how MCP acts as its own identity
+    /// without a second daemon or a second store copy.
+    agent_sessions: Mutex<std::collections::HashMap<crate::ids::DeviceId, Session>>,
     identity: LocalIdentity,
     device_seed: [u8; 32],
     home: PathBuf,
@@ -265,6 +272,7 @@ impl OrbitalDaemon {
             advertised_routes,
             transport: retained_transport,
             session: Mutex::new(session),
+            agent_sessions: Mutex::new(std::collections::HashMap::new()),
             identity,
             device_seed,
             home: home.to_path_buf(),
@@ -291,7 +299,16 @@ impl OrbitalDaemon {
 
     /// Route an issue-family request through the docked Session, or refuse with a
     /// typed "not admitted yet" when this device holds no standing.
-    fn route_issue(&self, req: Request) -> Response {
+    fn route_issue(&self, req: Request, act_as: Option<&str>) -> Response {
+        // Resolve which local identity signs this request: the daemon's primary
+        // (human) when no selector, else a sponsored local agent provisioned
+        // under this home. One store, N signing identities (Architecture B).
+        let seed = match self.acting_seed(act_as) {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
+        let device = crate::crypto::device_from_seed(&seed);
+
         // Hard partial-view guard (docs/plans/09 §10 finding 3): a *delegated*
         // identity — a sponsored agent — must not AUTHOR against a view it knows
         // is incomplete. "Close what's done" against a missing-epoch partial
@@ -299,7 +316,8 @@ impl OrbitalDaemon {
         // gets the loud `whoami`/`sync` signal and judges; an agent is stopped
         // by construction. Reads are always allowed (that is how it re-syncs).
         if !crate::serve::policy::is_read(&req) {
-            if let Some(actor) = self.mechanics.my_actor() {
+            use runtime::AuthorityView;
+            if let Some(actor) = self.mechanics.resolve(&device).map(|r| r.actor) {
                 if self.mechanics.is_agent(&actor) {
                     let divergence = self.mechanics.view_divergence();
                     if !divergence.is_empty() {
@@ -313,29 +331,62 @@ impl OrbitalDaemon {
                 }
             }
         }
-        if !self.ensure_session() {
-            return Response::err(
-                "not admitted to this space yet — run `lait connect` to reach an \
-                 admin and complete admission before filing issues",
-            );
+
+        // The primary (human) uses the always-docked `session`; a sponsored
+        // agent docks lazily into `agent_sessions`, sharing the one Replica.
+        if act_as.is_none() {
+            if !self.ensure_session() {
+                return Response::err(
+                    "not admitted to this space yet — run `lait connect` to reach an \
+                     admin and complete admission before filing issues",
+                );
+            }
+            let guard = self.session.lock().expect("session lock");
+            let session = guard.as_ref().expect("session present after ensure");
+            self.route_with(session, &self.identity, &seed, req)
+        } else {
+            let identity = Runtime::identity_from_seed(&seed);
+            let mut sessions = self.agent_sessions.lock().expect("agent sessions lock");
+            if !sessions.contains_key(&device) {
+                match self
+                    .station
+                    .dock(&crate::world::contract::world_id(), &identity)
+                {
+                    Ok(s) => {
+                        sessions.insert(device.clone(), s);
+                    }
+                    Err(_) => {
+                        return Response::denied(
+                            "this agent identity holds no standing in the space yet — a \
+                             human member must sponsor it (`lait members agent <key>`) \
+                             before it can author. Nothing was changed.",
+                        )
+                    }
+                }
+            }
+            let session = sessions.get(&device).expect("just docked");
+            self.route_with(session, &identity, &seed, req)
         }
-        let guard = self.session.lock().expect("session lock");
-        let session = guard.as_ref().expect("session present after ensure");
-        let router = IssueRouter::new(
-            session,
-            &self.identity,
-            CLOCK.get_or_init(|| SystemUlidSource),
-        );
-        // A background Contact can advance the authority frontier between a
-        // submit's resolve and its commit; that typed refusal committed
-        // nothing and is safe to retry. Absorb the transient here so the
-        // ambient convergence plane never turns a user's write into an error.
-        let mut resp = router.route(req.clone(), &self.facts()).0;
+    }
+
+    /// Route one issue request through a docked Session for a specific identity,
+    /// absorbing the transient "membership changed — retry" a background Contact
+    /// can cause between a submit's resolve and its commit.
+    fn route_with(
+        &self,
+        session: &Session,
+        identity: &LocalIdentity,
+        seed: &[u8; 32],
+        req: Request,
+    ) -> Response {
+        let router = IssueRouter::new(session, identity, CLOCK.get_or_init(|| SystemUlidSource));
+        let facts = self.facts_for(seed);
+        let mut resp = router.route(req.clone(), &facts).0;
         for _ in 0..3 {
             match &resp {
                 Response::Error { message, .. } if message == "membership changed — retry" => {
                     std::thread::sleep(std::time::Duration::from_millis(15));
-                    resp = router.route(req.clone(), &self.facts()).0;
+                    resp = router.route(req.clone(), &facts).0;
                 }
                 _ => break,
             }
@@ -343,9 +394,30 @@ impl OrbitalDaemon {
         resp
     }
 
+    /// Resolve the acting identity's seed. `None` → the daemon's primary (human)
+    /// identity. `Some(name)` → a local agent identity provisioned under this
+    /// home; a missing one is a typed denial the agent surface can act on.
+    fn acting_seed(&self, act_as: Option<&str>) -> Result<[u8; 32], Response> {
+        match act_as {
+            None => Ok(self.device_seed),
+            Some(name) => load_agent_seed(&self.home, name).map_err(|e| {
+                Response::denied(format!(
+                    "no local agent identity '{name}' on this node — provision one with \
+                     `lait members agent --new {name}` (it self-incepts + is sponsored in \
+                     one step), then act as it: {e}"
+                ))
+            }),
+        }
+    }
+
     fn facts(&self) -> RouterFacts {
+        self.facts_for(&self.device_seed)
+    }
+
+    /// Router facts (actor/device) for a specific identity seed.
+    fn facts_for(&self, seed: &[u8; 32]) -> RouterFacts {
         use runtime::AuthorityView;
-        let device = crate::crypto::device_from_seed(&self.device_seed);
+        let device = crate::crypto::device_from_seed(seed);
         let actor = self
             .mechanics
             .resolve(&device)
@@ -364,11 +436,16 @@ impl OrbitalDaemon {
     /// PRODUCTION classifier returns. Tests and the generated routing table
     /// consume the same `control::classify`; there is no second table and no
     /// wildcard terminal owner.
-    fn dispatch(&self, req: Request) -> Response {
+    fn dispatch(&self, req: Request, act_as: Option<&str>) -> Response {
         use crate::control::{classify, RequestOwner};
         match classify(&req) {
-            RequestOwner::Session => self.route_issue(req),
-            RequestOwner::Mechanics => self.dispatch_mechanics(req),
+            // The acting-identity selector matters where the answer is
+            // identity-relative: issue authoring (who signs) and whoami (who am
+            // I). Membership/station/lifecycle ops stay the daemon's — an agent
+            // holds no membership authority, so routing them "as the agent"
+            // would only ever be denied.
+            RequestOwner::Session => self.route_issue(req, act_as),
+            RequestOwner::Mechanics => self.dispatch_mechanics(req, act_as),
             RequestOwner::Station => self.dispatch_station(req),
             RequestOwner::Observation => self.dispatch_observation(req),
             RequestOwner::Lifecycle => self.dispatch_lifecycle(req),
@@ -377,7 +454,7 @@ impl OrbitalDaemon {
 
     /// Membership, admission, device, key, ceremony and custody requests —
     /// served by [`OrbitalMechanics`] over the mechanics primitives.
-    fn dispatch_mechanics(&self, req: Request) -> Response {
+    fn dispatch_mechanics(&self, req: Request, act_as: Option<&str>) -> Response {
         match req {
             Request::Members => self.members(),
             Request::MemberAdd { who, admin, .. } => match self.mechanics.member_add(&who, admin) {
@@ -463,6 +540,7 @@ impl OrbitalDaemon {
                 },
                 Err(e) => Response::err(format!("{e}")),
             },
+            Request::AgentProvision { name } => self.agent_provision(&name),
             Request::WorldUpgrade => {
                 let ours = crate::orbital::issues_implementation_id();
                 match self
@@ -492,7 +570,7 @@ impl OrbitalDaemon {
                     }),
                 }
             }
-            Request::Whoami => self.whoami(),
+            Request::Whoami => self.whoami(act_as),
             Request::Invite {
                 role,
                 reusable,
@@ -596,12 +674,22 @@ impl OrbitalDaemon {
     /// device, `did:key`, space, role, capabilities, sponsor, and the loud
     /// partial-view signal — so "who am I / what may I do / is my view complete"
     /// is a glance, never a deduction (`docs/plans/09` §3.4).
-    fn whoami(&self) -> Response {
-        let device = crate::crypto::device_from_seed(&self.device_seed);
+    fn whoami(&self, act_as: Option<&str>) -> Response {
+        let seed = match self.acting_seed(act_as) {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
+        let device = crate::crypto::device_from_seed(&seed);
         let did = crate::crypto::did_key_from_device(&device);
-        let actor = self.mechanics.my_actor();
+        // The acting device's actor in the plane (independent of standing, so a
+        // provisioned-but-unsponsored agent still sees "who it is / not a member
+        // yet"). For the primary this is `my_actor`.
+        let actor = self.mechanics.actor_of_device(&device);
         let space = Some(self.mechanics.space().as_str().to_string());
-        let name = Some(crate::config::Settings::load(Some(&self.home)).nick());
+        let name = match act_as {
+            None => Some(crate::config::Settings::load(Some(&self.home)).nick()),
+            Some(n) => Some(n.to_string()),
+        };
         let divergence = self.mechanics.view_divergence();
         let partial_view = !divergence.is_empty();
         let (actor_str, role, member, can_write, capabilities, policy_admin, sponsor) = match &actor
@@ -635,6 +723,49 @@ impl OrbitalDaemon {
             partial_view,
             divergence,
         })
+    }
+
+    /// Provision a co-located agent identity by name (the seamless "sponsor
+    /// once" flow): mint/reuse its seed under this home, self-incept it into the
+    /// shared store, and sponsor it with content authority — all local, one
+    /// step. Afterwards a client acts as it via `--as <name>` / MCP.
+    fn agent_provision(&self, name: &str) -> Response {
+        // The name becomes a directory under the home; keep it a plain segment.
+        if name.is_empty()
+            || name.contains(['/', '\\'])
+            || name.contains("..")
+            || name.contains(':')
+        {
+            return Response::err(
+                "an agent name must be a plain identifier (no path separators or '..')",
+            );
+        }
+        // Only a human member may sponsor; surface it before minting a seed.
+        if !self.mechanics.am_i_member() {
+            return Response::denied(
+                "you are not yet a member of this space, so you cannot sponsor an agent — \
+                 complete your own admission first",
+            );
+        }
+        let seed = match load_or_create_agent_seed(&self.home, name) {
+            Ok(s) => s,
+            Err(e) => return Response::err(format!("provision agent '{name}': {e:#}")),
+        };
+        match self.mechanics.provision_agent(&seed) {
+            Ok(actor) => {
+                let device = crate::crypto::device_from_seed(&seed);
+                let did = crate::crypto::did_key_from_device(&device).unwrap_or_default();
+                Response::Ok {
+                    message: Some(format!(
+                        "provisioned + sponsored agent '{name}'\nactor {}\n{did}\n\
+                         it holds write access; act as it with `--as {name}` (or point an \
+                         MCP client at this home with LAIT_AGENT={name})",
+                        actor.as_str()
+                    )),
+                }
+            }
+            Err(e) => Response::err(format!("sponsor agent '{name}': {e:#}")),
+        }
     }
 
     /// The reconciled presence assembly: the persistent Neighbor registry's
@@ -1496,8 +1627,11 @@ impl OrbitalDaemon {
         if reader.read_line(&mut line).await.is_err() {
             return;
         }
-        let req = match serde_json::from_str::<Request>(line.trim()) {
-            Ok(req) => req,
+        let crate::control::ClientRequest {
+            act_as,
+            request: req,
+        } = match serde_json::from_str::<crate::control::ClientRequest>(line.trim()) {
+            Ok(env) => env,
             Err(e) => {
                 let _ = write_line(write_half, &Response::err(format!("bad request: {e}"))).await;
                 return;
@@ -1510,7 +1644,7 @@ impl OrbitalDaemon {
         // Stop is a real teardown request: answer, then signal the serve loop
         // to return (the caller decides whether to exit the process).
         let stop = matches!(req, Request::Stop);
-        let resp = self.dispatch(req);
+        let resp = self.dispatch(req, act_as.as_deref());
         let _ = write_line(write_half, &resp).await;
         if stop {
             self.begin_stop();
@@ -1618,6 +1752,43 @@ fn now_secs() -> u64 {
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Where a co-located sponsored agent's identity seed lives: `agents/<name>/
+/// secret.key` under the daemon's home. Per-agent, tiny (64 hex bytes), beside
+/// the one shared store — Architecture B: N signing identities, O(1) storage.
+fn agent_seed_path(home: &Path, name: &str) -> PathBuf {
+    home.join("agents").join(name).join("secret.key")
+}
+
+/// Create (first call) or load a co-located agent identity seed under `home`.
+/// The seed is the agent's identity — self-certifying, reconstructable, and
+/// persisted outside any working-directory sandbox (§10 finding 1).
+fn load_or_create_agent_seed(home: &Path, name: &str) -> Result<[u8; 32]> {
+    let path = agent_seed_path(home, name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if path.exists() {
+        load_agent_seed(home, name)
+    } else {
+        let seed = crate::crypto::random_seed();
+        std::fs::write(&path, data_encoding::HEXLOWER.encode(&seed))?;
+        Ok(seed)
+    }
+}
+
+/// Load an existing co-located agent identity seed; errors if none is provisioned.
+fn load_agent_seed(home: &Path, name: &str) -> Result<[u8; 32]> {
+    let path = agent_seed_path(home, name);
+    let hex = std::fs::read_to_string(&path)
+        .with_context(|| format!("no agent identity '{name}' provisioned"))?;
+    let raw = data_encoding::HEXLOWER_PERMISSIVE
+        .decode(hex.trim().as_bytes())
+        .map_err(|e| anyhow!("parse agent seed: {e}"))?;
+    raw.as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("agent seed must be 32 bytes"))
 }
 
 /// The idle-shutdown window, from `LAIT_IDLE_SECS` (0 disables), else 30 min —

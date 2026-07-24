@@ -71,6 +71,7 @@ pub fn is_read(req: &Request) -> bool {
         | Request::IssueUnlink { .. }
         | Request::IssueParent { .. }
         | Request::AgentAdd { .. }
+        | Request::AgentProvision { .. }
         | Request::IssueStart { .. }
         | Request::IssueDone { .. }
         | Request::IssueStop { .. }

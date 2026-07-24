@@ -1764,13 +1764,21 @@ pub fn specs() -> Vec<Spec> {
                 .alias(&["alias"]),
                 Spec::req(
                     "agent",
-                    "Sponsor an agent keypair (any member). It can read/write but not \
-                     manage membership or delete; its standing dies with you.",
-                    vec![A::pos("key", "The agent's 64-hex ed25519 public key.")],
-                    |m| {
-                        Ok(Request::AgentAdd {
-                            key: req_str(m, "key"),
-                        })
+                    "Sponsor an agent (any member). It can read/write but not manage \
+                     membership or delete; its standing dies with you. Pass `--new <name>` \
+                     to provision a co-located agent in one step (mint + self-incept + \
+                     sponsor); then act as it with `lait --as <name> …`. Or pass an existing \
+                     agent's 64-hex key to sponsor a key already known here.",
+                    vec![
+                        A::pos_opt("key", "An existing agent's 64-hex ed25519 public key."),
+                        A::val("new", "Provision a new co-located agent with this local name."),
+                    ],
+                    |m| match (opt_str(m, "new"), opt_str(m, "key")) {
+                        (Some(name), _) => Ok(Request::AgentProvision { name }),
+                        (None, Some(key)) => Ok(Request::AgentAdd { key }),
+                        (None, None) => Err(anyhow::anyhow!(
+                            "pass an agent's key to sponsor, or `--new <name>` to provision one"
+                        )),
                     },
                 ),
                 Spec::req(

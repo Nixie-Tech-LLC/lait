@@ -550,12 +550,23 @@ pub enum Request {
         who: String,
         admin: bool,
     },
-    /// Sponsor an agent keypair. Any human member may sponsor;
-    /// the agent is sealed the space key but holds no membership or content
-    /// authority, and its standing dies with the sponsor.
+    /// Sponsor an agent keypair whose inception is already known here. Any human
+    /// member may sponsor; the agent is sealed the space key and holds content
+    /// authority (`Grant::Write`) but never membership authority, and its
+    /// standing dies with the sponsor.
     AgentAdd {
         /// The agent's ed25519 public key (64-hex).
         key: String,
+    },
+    /// Provision a **co-located** agent identity by name, in one step: mint (or
+    /// reuse) its seed under this home, self-incept it into the shared store's
+    /// actor plane, and sponsor it with content authority. This is the seamless
+    /// "sponsor once" flow for an agent on the same machine — no Contact round,
+    /// no second daemon, no second store copy. Afterwards a client acts as it
+    /// via the `act_as` selector (e.g. `lait --as <name> …`, or MCP).
+    AgentProvision {
+        /// The local name for this agent identity.
+        name: String,
     },
     KeyRotate,
     /// Revoke an outstanding invite so it can no longer admit anyone (admin-
@@ -809,6 +820,39 @@ pub enum Request {
     },
 }
 
+/// The wire envelope a client sends: a [`Request`] plus an optional **acting
+/// identity** selector. This is how the multi-tenant daemon (Architecture B)
+/// stays "one surface" — the *same* `Request` set, with a modifier saying *which
+/// local member signs it*. `act_as` names a local identity (an agent profile
+/// name, an actor id, or a device id) the daemon holds a seed for; `None` (the
+/// default) is the daemon's primary — the human. It is flattened and
+/// `skip`-when-`None`, so a request with no selector serializes to *exactly* the
+/// bare `{"cmd":…}` an older client sends — the wire stays backward-compatible in
+/// both directions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientRequest {
+    /// The local identity to sign+attribute this request as. `None` = the
+    /// daemon's primary (human) identity, exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub act_as: Option<String>,
+    #[serde(flatten)]
+    pub request: Request,
+}
+
+impl ClientRequest {
+    /// A plain request as the primary identity (the pre-B behavior).
+    pub fn plain(request: Request) -> Self {
+        Self {
+            act_as: None,
+            request,
+        }
+    }
+    /// A request acting as a named local identity.
+    pub fn acting_as(request: Request, act_as: Option<String>) -> Self {
+        Self { act_as, request }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -921,6 +965,7 @@ pub fn classify(req: &Request) -> RequestOwner {
         | Request::Members
         | Request::MemberLog
         | Request::AgentAdd { .. }
+        | Request::AgentProvision { .. }
         | Request::KeyRotate
         | Request::InviteRevoke { .. }
         | Request::DeviceInvite
@@ -1211,6 +1256,7 @@ pub fn representative_requests() -> Vec<Request> {
             admin: false,
         },
         Request::AgentAdd { key: s() },
+        Request::AgentProvision { name: s() },
         Request::KeyRotate,
         Request::InviteRevoke { invite: s() },
         Request::DeviceInvite,
@@ -1669,9 +1715,9 @@ async fn probe_inner(home: &Path) -> Probe {
     };
     let line = match exchange_raw(
         stream,
-        &Request::Hello {
+        &ClientRequest::plain(Request::Hello {
             protocol_version: CONTROL_PROTOCOL_VERSION,
-        },
+        }),
     )
     .await
     {
@@ -1722,16 +1768,24 @@ async fn probe_inner(home: &Path) -> Probe {
     }
 }
 
-/// Send one request to the daemon and read one response (one-shot path).
+/// Send one request to the daemon and read one response (one-shot path), as the
+/// primary (human) identity.
 pub async fn request(home: &Path, req: &Request) -> Result<Response> {
+    request_as(home, req, None).await
+}
+
+/// Send one request acting as a named local identity (`act_as`) — the
+/// multi-tenant path. `None` is identical to [`request`].
+pub async fn request_as(home: &Path, req: &Request, act_as: Option<&str>) -> Result<Response> {
     let name = control_name(home)?;
     let stream = Stream::connect(name).await.context("connect to daemon")?;
-    exchange(stream, req).await
+    let env = ClientRequest::acting_as(req.clone(), act_as.map(str::to_string));
+    exchange(stream, &env).await
 }
 
 /// Write one request and read one response on an already-open stream.
-async fn exchange(stream: Stream, req: &Request) -> Result<Response> {
-    let line = exchange_raw(stream, req).await?;
+async fn exchange(stream: Stream, env: &ClientRequest) -> Result<Response> {
+    let line = exchange_raw(stream, env).await?;
     serde_json::from_str(line.trim()).context("decode response")
 }
 
@@ -1740,9 +1794,9 @@ async fn exchange(stream: Stream, req: &Request) -> Result<Response> {
 /// Split from [`exchange`] for [`probe`]: typed decoding is exactly what a
 /// version-mismatched daemon breaks, so the handshake has to look at the bytes
 /// before serde gets an opinion about them.
-async fn exchange_raw(stream: Stream, req: &Request) -> Result<String> {
+async fn exchange_raw(stream: Stream, env: &ClientRequest) -> Result<String> {
     let (read_half, mut write_half) = tokio::io::split(stream);
-    let mut line = serde_json::to_string(req).context("encode request")?;
+    let mut line = serde_json::to_string(env).context("encode request")?;
     line.push('\n');
     write_half
         .write_all(line.as_bytes())
@@ -1803,6 +1857,65 @@ pub async fn subscribe(home: &Path, since: u64) -> Result<Subscription> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_request_envelope_is_wire_backward_compatible() {
+        // No selector → serializes to EXACTLY the bare request an older client
+        // sends (the flatten + skip_serializing_if contract), so a pre-B daemon
+        // still decodes it and a bare request still decodes as `act_as: None`.
+        let bare = Request::Inbox { clear: true };
+        let env = ClientRequest::plain(bare.clone());
+        let env_json = serde_json::to_value(&env).unwrap();
+        let bare_json = serde_json::to_value(&bare).unwrap();
+        assert_eq!(
+            env_json, bare_json,
+            "a no-selector envelope IS the bare request"
+        );
+        // A bare request decodes as an envelope with no selector.
+        let decoded: ClientRequest = serde_json::from_value(bare_json.clone()).unwrap();
+        assert!(decoded.act_as.is_none());
+        assert_eq!(serde_json::to_value(&decoded.request).unwrap(), bare_json);
+    }
+
+    #[test]
+    fn client_request_flatten_round_trips_with_selector_and_scalars() {
+        // The flatten gotcha: a selector alongside a Request carrying scalar
+        // fields (bool + Option<u64>) must survive a JSON round trip. Pin it.
+        for req in [
+            Request::Invite {
+                role: Some("contributor".into()),
+                reusable: true,
+                ttl_hours: Some(48),
+            },
+            Request::Inbox { clear: false },
+            Request::Whoami,
+            Request::IssueNew {
+                title: "t".into(),
+                project: None,
+                project_hint: None,
+                assignees: vec![],
+                priority: None,
+                labels: vec![],
+                body: None,
+                due: None,
+                estimate: Some(3),
+            },
+        ] {
+            let env = ClientRequest::acting_as(req.clone(), Some("agent-x".into()));
+            let json = serde_json::to_string(&env).unwrap();
+            assert!(
+                json.contains("\"act_as\":\"agent-x\""),
+                "selector present: {json}"
+            );
+            let back: ClientRequest = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.act_as.as_deref(), Some("agent-x"));
+            assert_eq!(
+                serde_json::to_value(&back.request).unwrap(),
+                serde_json::to_value(&req).unwrap(),
+                "the flattened request must survive: {json}"
+            );
+        }
+    }
 
     #[test]
     fn control_protocol_window_accepts_supported_and_refuses_outside() {

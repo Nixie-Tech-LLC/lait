@@ -74,57 +74,43 @@ special case.
   *outside* a working-directory sandbox — the answer to deterministic-seed
   reconstruction for the common "reset my working dir" case.
 
-## The reframe — attribution already works via the node model
+## Runtime — the multi-tenant daemon (Architecture B), shipped
 
-Per-agent *attribution* does not require the multi-tenant daemon. In lait every
-identity is a full node: an agent with its **own home** (its own `secret.key`) is
-a node like any other; with the linchpin it can **write**, and its writes are
-signed by its own seed and therefore **attributed to it**, converging with the
-human's node over the existing Contact/sync plane. The seamless bar's remaining
-gaps are *storage footprint* (N homes = N copies of the immutable object store)
-and *lifecycle* (managing N homes / the sponsor-inception step). Those are what
-Architectures A and B optimize — they are not prerequisites for a correct,
-attributed sponsored writer.
+**One store, one lock, one always-on daemon; the human and every sponsored agent
+are signing clients of it.** This is the seamless bar, and it is live:
 
-The one operational seam that remains manual: `members agent <key>` needs the
-agent's self-inception to have reached the sponsor once (a Contact round). B's
-shared store makes that trivial; today the error names the step.
+- **Multi-identity daemon.** The daemon holds the human's identity and docks a
+  Session **per local agent identity**, all sharing the one Replica. Each Session
+  signs and attributes as *that* identity. `Session::submit` requires
+  `action.header.actor == docked principal`, so per-agent attribution comes from
+  docking a Session as the agent — not from re-signing.
+- **The `act_as` selector.** The control envelope (`control::ClientRequest`) is a
+  `Request` plus an optional `act_as`, flattened and skip-when-`None`, so a
+  request with no selector is byte-identical to the bare request — the wire stays
+  backward-compatible. A client picks the identity with `LAIT_AS=<name>` (CLI) or
+  `LAIT_AGENT=<name>` (MCP); the daemon signs as that local agent.
+- **One-step provisioning.** `lait members agent --new <name>` mints the agent's
+  seed under the home, **self-incepts it into the shared store's actor plane**
+  (no Contact round — the co-located analogue of a joiner's inception arriving
+  over the wire), sponsors it with content authority, **and** grants it the
+  contributor role's scoped capabilities (`space.contributor` +
+  `space.issue.read`) so it can actually read the catalog and write. The ACL
+  write grant is content authority; the scoped capabilities are the separate
+  policy plane a functional contributor also needs — a sponsored member gets
+  both.
+- **Storage is O(1) by construction.** N agents on one machine share the one
+  store — one `objects/` pool, one journal. There is no N-copy bloat to dedup,
+  because there are not N stores. The separate-store shared-pool + cross-frontier
+  GC path (Architecture A) is therefore unnecessary for the co-located case; B
+  supersedes it. (For genuinely separate nodes — a laptop and a phone — dedup is
+  a future storage optimization, not an attribution or lifecycle requirement.)
 
-## Remaining optimizations (designed, not yet shipped — deliberately)
-
-These change the on-disk object format and the signed-write path. They are
-**intentionally not shipped half-tested**: a naive shared pool corrupts (the
-docket's load-bearing warning), and the user's live space must not be endangered.
-The seams below are verified against the code.
-
-### Storage — shared immutable object pool + cross-frontier GC
-
-`orbital/ws_<id>/objects/<hex64>` is immutable, content-addressed (blake3), and
-idempotent-on-write (`journal/src/lib.rs` `commit`, the `if !final_path.exists()`
-rename). Two members writing the same object converge for free.
-
-- **Seam:** route `object_path` (`journal/src/lib.rs:305`), the commit rename
-  loop, and `read_object` through a shared pool root (`orbital/_pool/objects/`),
-  linked per member via ReFS block-clone / hardlink / alternates. Two `objects/`
-  dirs exist per space (Body + `authority/`); both share the pool since
-  `OBJECT_DOMAIN` is common.
-- **Load-bearing GC:** the current sweep (`journal/src/lib.rs:462` `recover`) is a
-  single-manifest mark-and-sweep — it must **not** run against a shared pool. A
-  cross-frontier GC marks the union of every member's Body + authority manifest
-  `objects` plus any active journal's `new_objects`, under a new pool-level lock,
-  before sweeping. An object is collectable iff no member's frontier names it.
-
-### Runtime — multi-tenant daemon (Architecture B)
-
-One store, one lock, one always-on daemon; members (human + sponsored agents) are
-clients. `Session::submit` requires `action.header.actor == docked principal`
-(`runtime/src/session.rs`), so B docks a Session per local identity and routes a
-request to the right identity's Session, **or** feeds agent-signed actions through
-the Contact incorporation path (`contact_driver.rs` `validate_contact` →
-`incorporate_bundle`), which already ingests foreign-signed transactions and
-preserves their author. The local-submit path must apply the *same* standing
-validation the Contact plane applies to peers — no shortcut because it arrived
-over the local socket.
+Proven end to end (`tests/agent_experience.rs`, and a recorded live run): the
+human sponsors `scout` once; `whoami` as scout shows a distinct actor + `did:key`
++ write standing + read/contributor caps + the sponsor link; scout files,
+comments on, and starts an issue; the activity log attributes scout's work to
+scout's own signing device, distinct from the human's — all in one store, one
+daemon, no restart.
 
 ### Deterministic seed across a *fully* reset sandbox
 

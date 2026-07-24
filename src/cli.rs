@@ -638,12 +638,21 @@ fn daemon_exited_error(status: std::process::ExitStatus, log_path: &Path) -> any
     }
 }
 
-/// Ensure the daemon is up, then send one request.
+/// Ensure the daemon is up, then send one request as the primary identity — or,
+/// if `$LAIT_AS` names a local agent, as that agent (the shell-scoped selector,
+/// e.g. `LAIT_AS=scout lait new "…"`). Architecture B's "act as" on the CLI.
 pub async fn client(home: &Path, req: Request) -> Result<Response> {
+    let act_as = std::env::var("LAIT_AS").ok().filter(|s| !s.is_empty());
+    client_as(home, req, act_as.as_deref()).await
+}
+
+/// Ensure the daemon is up, then send one request acting as `act_as` (a local
+/// agent name, or `None` for the primary human identity).
+pub async fn client_as(home: &Path, req: Request, act_as: Option<&str>) -> Result<Response> {
     ensure_daemon(home).await?;
     // The daemon answered the probe a moment ago, so a failure here is the
     // transport giving out mid-exchange: `3`, daemon unreachable.
-    request(home, &req)
+    crate::control::request_as(home, &req, act_as)
         .await
         .map_err(|e| CliError::unreachable(format!("{e:#}")).into())
 }

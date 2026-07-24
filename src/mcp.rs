@@ -21,7 +21,7 @@ use rmcp::{
 use serde::Deserialize;
 
 use crate::{
-    cli::client,
+    cli::client_as,
     control::{BoardPos, ErrorKind, Filter, Request, Response},
 };
 
@@ -414,6 +414,12 @@ pub struct ConnectArgs {
 #[derive(Clone)]
 pub struct LaitMcp {
     home: PathBuf,
+    /// The local agent identity this server acts as (from `$LAIT_AGENT`), so
+    /// every tool call is signed and attributed to the *agent*, not the human
+    /// whose home hosts the daemon (Architecture B). `None` = the primary
+    /// identity, the pre-B behavior. The human sponsors the agent once
+    /// (`lait members agent --new <name>`); MCP attaches as it thereafter.
+    act_as: Option<String>,
     #[allow(dead_code)]
     tool_router: ToolRouter<LaitMcp>,
 }
@@ -439,8 +445,13 @@ fn parse_position(s: &str) -> Option<BoardPos> {
 #[tool_router]
 impl LaitMcp {
     pub fn new(home: PathBuf) -> Self {
+        // `$LAIT_AGENT` names the sponsored local agent identity this MCP server
+        // acts as, so its work is attributed to the agent (Architecture B). Unset
+        // → the primary identity (pre-B behavior).
+        let act_as = std::env::var("LAIT_AGENT").ok().filter(|s| !s.is_empty());
         Self {
             home,
+            act_as,
             tool_router: Self::tool_router(),
         }
     }
@@ -457,7 +468,7 @@ impl LaitMcp {
     /// message already names the next step; MCP just preserves the typing so the
     /// agent isn't told "internal error" for something it can act on.
     async fn run(&self, req: Request) -> Result<CallToolResult, McpError> {
-        match client(&self.home, req).await {
+        match client_as(&self.home, req, self.act_as.as_deref()).await {
             Ok(Response::Error {
                 message,
                 error_kind,
