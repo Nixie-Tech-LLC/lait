@@ -46,7 +46,14 @@ import { Inbox } from "./ui/Inbox";
 import { IssueSearch, rememberIssue } from "./ui/IssueSearch";
 import { Projects } from "./ui/Projects";
 import { ProjectOverview } from "./ui/ProjectOverview";
-import { SurfaceHeader } from "./ui/layout";
+import {
+  Breadcrumbs,
+  DESTINATION_ICON,
+  DestinationCrumb,
+  ProjectCrumb,
+  SurfaceHeader,
+  type BreadcrumbItem,
+} from "./ui/layout";
 import { Settings } from "./ui/Settings";
 import { IssueDetail } from "./ui/IssueDetail";
 import { IssueList } from "./ui/IssueList";
@@ -1104,6 +1111,80 @@ export function App() {
     [board],
   );
 
+  /**
+   * The header trail names *what you are looking at* and its containers — never
+   * the view mode. Inside a project the tab strip below already says Overview vs
+   * Issues vs Board, so the trail stops at the project; a workspace destination
+   * has no container to climb to, so it is its own root, wearing the sidebar's
+   * icon for it. Every ancestor navigates; the leaf never does.
+   *
+   * The space itself is deliberately *not* a crumb. lait has no team layer under
+   * it (Linear's first crumb is a team, not a workspace), so it would be a
+   * constant on every surface — and one the sidebar already holds, permanently,
+   * one row to the left. Settings is the exception, there the sidebar is gone.
+   */
+  const trail: BreadcrumbItem[] = projectShell
+    ? [
+        liveProjects.length > 1
+          ? {
+              key: "project",
+              control: true,
+              content: (
+                <Combobox
+                  variant="property"
+                  label="Project"
+                  swatchShape="square"
+                  className="max-w-[min(32cqw,240px)] font-medium"
+                  value={
+                    activeProject
+                      ? {
+                          id: activeProject.key,
+                          label: activeProject.name,
+                          swatch: catalogColor(activeProject.color),
+                        }
+                      : null
+                  }
+                  options={[
+                    ...liveProjects,
+                    ...(activeProject &&
+                    !liveProjects.some((candidate) => candidate.key === activeProject.key)
+                      ? projects.filter((candidate) => candidate.key === activeProject.key)
+                      : []),
+                  ].map((candidate) => ({
+                    id: candidate.key,
+                    label: candidate.name,
+                    swatch: catalogColor(candidate.color),
+                    hint: candidate.key,
+                  }))}
+                  onPick={api.pickProject}
+                />
+              ),
+            }
+          : {
+              key: "project",
+              content: (
+                <ProjectCrumb
+                  name={activeProject?.name ?? project ?? "Project"}
+                  color={activeProject ? catalogColor(activeProject.color) : undefined}
+                />
+              ),
+            },
+      ]
+    : [
+        {
+          key: view,
+          content: (
+            <DestinationCrumb
+              icon={
+                DESTINATION_ICON[view as keyof typeof DESTINATION_ICON] ??
+                DESTINATION_ICON.workspace
+              }
+              label={workspaceTitle(view)}
+            />
+          ),
+        },
+      ];
+
   return (
     <TooltipProvider>
     <Group
@@ -1165,40 +1246,7 @@ export function App() {
               <PanelLeft className="size-4" />
             </IconButton>
 
-            <h1 className="ml-1 flex min-w-0 items-center text-sm">
-              {projectShell && liveProjects.length > 1 ? (
-                <Combobox
-                  variant="property"
-                  label="Project"
-                  className="max-w-[min(36cqw,260px)] font-semibold"
-                  value={
-                    activeProject
-                      ? {
-                          id: activeProject.key,
-                          label: activeProject.name,
-                          swatch: catalogColor(activeProject.color),
-                        }
-                      : null
-                  }
-                  options={[
-                    ...liveProjects,
-                    ...(activeProject && !liveProjects.some((p) => p.key === activeProject.key)
-                      ? projects.filter((p) => p.key === activeProject.key)
-                      : []),
-                  ].map((p) => ({
-                    id: p.key,
-                    label: p.name,
-                    swatch: catalogColor(p.color),
-                    hint: p.key,
-                  }))}
-                  onPick={api.pickProject}
-                />
-              ) : projectShell ? (
-                <span className="truncate font-semibold">{activeProject?.name ?? project ?? "Project"}</span>
-              ) : (
-                <span className="truncate font-semibold">{workspaceTitle(view)}</span>
-              )}
-            </h1>
+            <Breadcrumbs className="ml-1" items={trail} />
 
             <span className="ml-auto flex items-center gap-0.5">
               {!projectShell && (
@@ -1472,7 +1520,10 @@ export function App() {
                   return next;
                 })
               }
-              onOpen={() => setDetail(true)}
+              onOpen={() => {
+                setDetail(true);
+                setFocusedDetail(true);
+              }}
               onCreate={(status) => setComposing({ status })}
               readOnly={readOnly}
               filtered={isActive(filter)}
@@ -1542,6 +1593,12 @@ export function App() {
                 api.select(null);
                 setDetail(false);
                 setFocusedDetail(false);
+              }}
+              onOpenProject={(key) => {
+                api.select(null);
+                setDetail(false);
+                setFocusedDetail(false);
+                api.pickProject(key);
               }}
               focused={focusedDetail}
               onToggleFocus={() => {

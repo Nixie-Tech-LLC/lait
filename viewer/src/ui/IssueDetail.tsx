@@ -61,7 +61,17 @@ import { DatePicker } from "./DatePicker";
 import { NewLabelDialog } from "./NewLabel";
 import { Combobox, type Option } from "./Picker";
 import { Button, ChipButton, EditableSurface, IconButton, InlineAction, PopoverContent, Textarea } from "./primitives";
-import { MenuContent, MenuItem, PropertyRow, SectionHeader, SurfaceHeader, Toast } from "./layout";
+import {
+  Breadcrumbs,
+  IssueCrumb,
+  MenuContent,
+  MenuItem,
+  ProjectCrumb,
+  PropertyRow,
+  SectionHeader,
+  SurfaceHeader,
+  Toast,
+} from "./layout";
 import * as ask from "./dialogs";
 import { dueToInput, dueTone, short, when } from "./time";
 
@@ -99,6 +109,7 @@ export function IssueDetail({
   onNext,
   focused,
   onToggleFocus,
+  onOpenProject,
 }: {
   spaceId: string;
   canonicalSpaceId: string;
@@ -126,6 +137,9 @@ export function IssueDetail({
   onNext?: () => void;
   focused: boolean;
   onToggleFocus: () => void;
+  /** Climb to the issue's own project — which is not necessarily the one the list
+   *  behind is showing (My issues and Inbox span projects). */
+  onOpenProject?: ((key: string) => void) | undefined;
 }) {
   const projectStore = useProjectViewerStore();
   const detail = useIssueDetail(spaceId, reff);
@@ -302,11 +316,36 @@ export function IssueDetail({
   const setPicker = (f: IssueField) => (o: boolean) => onOpenField(o ? f : null);
 
   return (
-    <aside className="issue-detail border-line flex h-full min-h-0 flex-col overflow-y-auto border-l">
+    <aside className="issue-detail border-line @container flex h-full min-h-0 flex-col overflow-y-auto border-l">
       <SurfaceHeader className="gap-2">
-        <span className="text-mute font-mono text-xs tabular-nums">
-          {issue.key_alias ?? issue.reff}
-        </span>
+        {/* The issue's own lineage — its project, then itself — not the view you
+            arrived from. "Issues" here was a guess that Board, My issues and Inbox
+            all falsified. Split and focused draw the same trail; the narrow pane
+            simply drops the project and keeps the key. */}
+        <Breadcrumbs
+          items={[
+            {
+              key: "project",
+              optional: true,
+              content: (
+                <ProjectCrumb
+                  name={project?.name ?? issue.project_key ?? "Project"}
+                  color={project ? catalogColor(project.color) : undefined}
+                />
+              ),
+              onNavigate: project && onOpenProject ? () => onOpenProject(project.key) : onClose,
+            },
+            {
+              key: issue.reff,
+              content: (
+                <IssueCrumb
+                  id={issue.key_alias ?? issue.reff}
+                  {...(focused ? { title: issue.title } : {})}
+                />
+              ),
+            },
+          ]}
+        />
         <span className="ml-auto flex items-center gap-0.5">
           <IconButton label="Previous issue" onClick={onPrevious} disabled={!onPrevious}>
             <ChevronLeft className="size-3.5" />
@@ -671,6 +710,7 @@ export function IssueDetail({
             <Combobox
               variant="property"
               label="Project"
+              swatchShape="square"
               disabled={locked}
               open={pickerOpen("project")}
               onOpenChange={setPicker("project")}

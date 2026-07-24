@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ArrowLeft,
+  Cog,
   Hash,
   Palette,
   ShieldCheck,
@@ -19,7 +20,7 @@ import { catalogColor } from "./colors";
 import { ColorPicker } from "./ColorPicker";
 import * as ask from "./dialogs";
 import { StatusIcon } from "./icons";
-import { SurfaceHeader } from "./layout";
+import { Breadcrumbs, DestinationCrumb, SurfaceHeader, WorkspaceCrumb } from "./layout";
 import { Members } from "./Members";
 import { Combobox } from "./Picker";
 import { Button, cn, IconButton, Input, navigationItem, Textarea } from "./primitives";
@@ -92,11 +93,31 @@ export function Settings({
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <SurfaceHeader className="h-11 gap-2 px-3">
+      {/* Same bar geometry as every other surface, so entering Settings doesn't
+          shift the content down. The rail marks the section, so the trail stops
+          at Settings — the same rule the project tabs follow.
+
+          The space is a crumb *here only*: this page hides the workspace sidebar,
+          so this is the one surface where nothing else says which space you are
+          about to administer. */}
+      <SurfaceHeader className="@container gap-0.5">
         <IconButton label="Back to app" onClick={onExit}>
           <ArrowLeft className="size-4" />
         </IconButton>
-        <h1 className="text-sm font-semibold">Settings</h1>
+        <Breadcrumbs
+          className="ml-1"
+          items={[
+            {
+              // Not `optional`: this is the one crumb that carries information no
+              // other surface element holds, so it stays at every width.
+              key: "workspace",
+              label: spaceName || "Workspace",
+              content: <WorkspaceCrumb name={spaceName || "Workspace"} />,
+              onNavigate: onExit,
+            },
+            { key: "settings", content: <DestinationCrumb icon={<Cog />} label="Settings" /> },
+          ]}
+        />
       </SurfaceHeader>
       <div className="flex min-h-0 flex-1">
         <nav className="border-line flex w-48 shrink-0 flex-col gap-0.5 border-r p-2">
@@ -515,6 +536,7 @@ function WorkflowPanel({
         <span className="text-mute text-sm">Project</span>
         <Combobox
           label="Project"
+          swatchShape="square"
           value={
             projectKey
               ? {

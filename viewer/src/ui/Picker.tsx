@@ -75,6 +75,13 @@ type Props = {
    * exactly when the query matches no existing label, not on every keystroke.
    */
   onCreate?: (text: string) => void;
+  /**
+   * The shape a colour swatch takes. Round is the default — a label, a status,
+   * a member colour. Projects are square everywhere else they are identified
+   * (sidebar, project cards, the header crumb), so their pickers say square too:
+   * one object, one glyph, whichever surface you meet it on.
+   */
+  swatchShape?: "dot" | "square";
 } & Mode & {
   variant?: ControlTriggerVariant;
 };
@@ -92,7 +99,9 @@ export function Combobox(props: Props) {
     emptyText,
     variant,
     onCreate,
+    swatchShape,
   } = props;
+  const swatch = cn("size-2 shrink-0", swatchShape === "square" ? "rounded-[3px]" : "rounded-full");
 
   // Open state is internal *and* overridable. A keybinding needs to force it open;
   // a single-select pick needs to close it. Both have to work, so the component owns
@@ -111,9 +120,7 @@ export function Combobox(props: Props) {
   const content = face ?? (
     <>
       {single?.icon}
-      {single?.swatch && (
-        <span className="size-2 shrink-0 rounded-full" style={{ background: single.swatch }} />
-      )}
+      {single?.swatch && <span className={swatch} style={{ background: single.swatch }} />}
       <span className={cn("min-w-0 truncate", !single && "text-mute")}>{single?.label ?? placeholder ?? label}</span>
     </>
   );
@@ -194,9 +201,7 @@ export function Combobox(props: Props) {
                   className="data-[selected=true]:bg-active flex cursor-default items-center gap-2 rounded px-2 py-1 text-sm outline-none"
                 >
                   {o.icon}
-                  {o.swatch && (
-                    <span className="size-2 shrink-0 rounded-full" style={{ background: o.swatch }} />
-                  )}
+                  {o.swatch && <span className={swatch} style={{ background: o.swatch }} />}
                   <span className="min-w-0 flex-1 truncate">{o.label}</span>
                   {o.hint && <span className="text-mute shrink-0 font-mono text-2xs">{o.hint}</span>}
                   {/* Reserve the check's width always, or every row shifts sideways

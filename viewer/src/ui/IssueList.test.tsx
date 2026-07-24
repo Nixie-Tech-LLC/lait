@@ -23,7 +23,7 @@ describe("IssueList semantics", () => {
     host = null;
   });
 
-  it("separates current issue semantics from bulk checkboxes and opens with Enter", () => {
+  it("separates current issue semantics from bulk checkboxes and opens with click or Enter", () => {
     const onOpen = vi.fn();
     const current = row("LIST-1");
     render(current, onOpen);
@@ -32,6 +32,9 @@ describe("IssueList semantics", () => {
     expect(item.tabIndex).toBe(0);
     expect(host!.querySelector('[role="listbox"], [role="option"]')).toBeNull();
     expect(host!.querySelector('[role="checkbox"][aria-label="Select LIST-1"]')).toBeTruthy();
+    act(() => item.click());
+    expect(onOpen).toHaveBeenLastCalledWith(current.reff);
+    onOpen.mockClear();
     act(() => item.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })));
     expect(onOpen).toHaveBeenCalledWith(current.reff);
   });

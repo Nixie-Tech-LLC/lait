@@ -324,8 +324,8 @@ function IssueRow({
       onClick={(event) => {
         event.currentTarget.focus({ preventScroll: true });
         onSelect(row.reff);
+        onOpen(row.reff);
       }}
-      onDoubleClick={() => onOpen(row.reff)}
       onKeyDown={(event) => {
         if (event.target === event.currentTarget && event.key === "Enter") {
           event.preventDefault();

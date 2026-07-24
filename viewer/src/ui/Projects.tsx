@@ -84,12 +84,13 @@ export function Projects({
   return (
     <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
       <div className="mx-auto max-w-5xl">
+        {/* No page title: the header crumb already says Projects, and saying it
+            twice is the noise a breadcrumb is supposed to remove. */}
         <div className="mb-5">
-          <h2 className="text-lg font-semibold">Projects</h2>
           {spaceDescription ? (
-            <p className="text-dim mt-1 max-w-2xl text-sm whitespace-pre-line">{spaceDescription}</p>
+            <p className="text-dim max-w-2xl text-sm whitespace-pre-line">{spaceDescription}</p>
           ) : (
-            <p className="text-dim mt-1 text-sm">
+            <p className="text-dim text-sm">
               {projects.length} {projects.length === 1 ? "project" : "projects"} in this local space
             </p>
           )}
