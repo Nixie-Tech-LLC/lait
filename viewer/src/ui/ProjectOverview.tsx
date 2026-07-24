@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Archive, ArchiveRestore, ArrowLeft, ArrowRight, X } from "lucide-react";
+import { Archive, ArchiveRestore, X } from "lucide-react";
 
 import { rpc } from "../api";
 import type { MemberDto, MilestoneDto, ProjectDto, ProjectUpdateDto } from "../types";
@@ -9,7 +9,7 @@ import { ColorPicker } from "./ColorPicker";
 import { DatePicker } from "./DatePicker";
 import { Markdown } from "./Markdown";
 import { Combobox } from "./Picker";
-import { PropertyRow, SurfaceHeader } from "./layout";
+import { PropertyRow } from "./layout";
 import { Button, EditableSurface, IconButton, PopoverContent, Textarea } from "./primitives";
 import { when } from "./time";
 import * as Popover from "@radix-ui/react-popover";
@@ -42,8 +42,6 @@ export function ProjectOverview({
   members,
   counts,
   readOnly,
-  onOpenIssues,
-  onBack,
   onError,
 }: {
   spaceId: string;
@@ -51,8 +49,6 @@ export function ProjectOverview({
   members: MemberDto[];
   counts: { backlog: number; active: number; done: number; total: number };
   readOnly: boolean;
-  onOpenIssues: () => void;
-  onBack: () => void;
   onError: (message: string) => void;
 }) {
   const edit = async (patch: Record<string, string | boolean | null>) => {
@@ -68,39 +64,6 @@ export function ProjectOverview({
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <SurfaceHeader className="gap-2 px-3">
-        <IconButton label="Back to projects" onClick={onBack}>
-          <ArrowLeft className="size-4" />
-        </IconButton>
-        <span className="text-mute font-mono text-xs">{project.key}</span>
-        {project.archived && (
-          <span className="border-line text-mute rounded-full border px-2 py-px text-2xs">
-            Archived
-          </span>
-        )}
-        {!readOnly && (
-          <Button
-            variant="outline"
-            className="ml-auto"
-            onClick={() => void edit({ archived: !project.archived })}
-          >
-            {project.archived ? (
-              <>
-                <ArchiveRestore className="size-3.5" /> Restore
-              </>
-            ) : (
-              <>
-                <Archive className="size-3.5" /> Archive
-              </>
-            )}
-          </Button>
-        )}
-        <Button className={readOnly ? "ml-auto" : ""} onClick={onOpenIssues}>
-          Open issues
-          <ArrowRight className="size-3" />
-        </Button>
-      </SurfaceHeader>
-
       <div className="min-h-0 flex-1 overflow-y-auto p-6">
         <div className="mx-auto grid max-w-4xl gap-8 md:grid-cols-[minmax(0,1fr)_260px]">
           {/* Title + description */}
@@ -142,6 +105,23 @@ export function ProjectOverview({
                 className="min-w-0 flex-1 bg-transparent text-xl font-semibold outline-none"
                 aria-label="Project name"
               />
+              {project.archived && (
+                <span className="border-line text-mute rounded border px-1.5 py-px text-2xs">
+                  Archived
+                </span>
+              )}
+              {!readOnly && (
+                <IconButton
+                  label={project.archived ? "Restore project" : "Archive project"}
+                  onClick={() => void edit({ archived: !project.archived })}
+                >
+                  {project.archived ? (
+                    <ArchiveRestore className="size-3.5" />
+                  ) : (
+                    <Archive className="size-3.5" />
+                  )}
+                </IconButton>
+              )}
             </div>
             <Description
               value={project.description ?? ""}

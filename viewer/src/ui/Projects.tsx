@@ -2,10 +2,9 @@ import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, ArrowRight, FolderKanban } from "lucide-react";
 
 import { rpc } from "../api";
-import type { BoardView, MemberDto, ProjectDto } from "../types";
+import type { BoardView, ProjectDto } from "../types";
 import { ApplicationState, LoadingState } from "./AppState";
 import { catalogColor } from "./colors";
-import { ProjectOverview } from "./ProjectOverview";
 
 type ProjectHealth = {
   project: ProjectDto;
@@ -22,45 +21,17 @@ type ProjectHealth = {
 export function Projects({
   spaceId,
   projects,
-  members,
   revision,
-  readOnly,
   spaceDescription,
   onOpen,
-  onError,
 }: {
   spaceId: string;
   projects: ProjectDto[];
-  members: MemberDto[];
   revision: number;
-  readOnly: boolean;
   spaceDescription?: string;
   onOpen: (key: string) => void;
-  onError: (message: string) => void;
 }) {
   const [boards, setBoards] = useState<Map<string, BoardView> | null>(null);
-  // `?overview=<key>` deep-links a project's overview (and lets a headless driver
-  // reach it by `open`-ing the URL — no card click needed).
-  const [selected, setSelectedState] = useState<string | null>(
-    () => new URLSearchParams(window.location.search).get("overview"),
-  );
-  const setSelected = (key: string | null) => {
-    setSelectedState(key);
-    const url = new URL(window.location.href);
-    if (key) url.searchParams.set("overview", key);
-    else url.searchParams.delete("overview");
-    window.history.replaceState(null, "", `${url.pathname}${url.search}`);
-  };
-  // Reliable driver hook: `lait:nav { overview }` opens a project's overview.
-  useEffect(() => {
-    const onNav = (event: Event) => {
-      const detail = (event as CustomEvent).detail ?? {};
-      if ("overview" in detail) setSelected(detail.overview ?? null);
-    };
-    window.addEventListener("lait:nav", onNav as EventListener);
-    return () => window.removeEventListener("lait:nav", onNav as EventListener);
-  }, []);
-
   useEffect(() => {
     let alive = true;
     setBoards(null);
@@ -99,27 +70,6 @@ export function Projects({
 
   if (!boards) return <LoadingState title="Loading projects" body="Reading local project projections." />;
 
-  const openProject = selected ? health.find((h) => h.project.key === selected) : null;
-  if (openProject) {
-    return (
-      <ProjectOverview
-        spaceId={spaceId}
-        project={openProject.project}
-        members={members}
-        counts={{
-          backlog: openProject.backlog,
-          active: openProject.active,
-          done: openProject.done,
-          total: openProject.total,
-        }}
-        readOnly={readOnly}
-        onOpenIssues={() => onOpen(openProject.project.key)}
-        onBack={() => setSelected(null)}
-        onError={onError}
-      />
-    );
-  }
-
   if (projects.length === 0) {
     return (
       <ApplicationState
@@ -150,7 +100,7 @@ export function Projects({
             .map(({ project, total, backlog, active, done, unavailable }) => (
             <li key={project.id}>
               <button
-                onClick={() => setSelected(project.key)}
+                onClick={() => onOpen(project.key)}
                 className={`border-line bg-raised hover:border-line-strong hover:bg-hover group flex min-h-32 w-full flex-col rounded-lg border p-4 text-left transition-colors ${
                   project.archived ? "opacity-60" : ""
                 }`}

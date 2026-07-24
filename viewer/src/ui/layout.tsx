@@ -4,7 +4,7 @@ import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 export function SurfaceHeader({ className, ...props }: React.HTMLAttributes<HTMLElement>) {
   return (
     <header
-      className={cn("border-line flex h-11 shrink-0 items-center gap-1 border-b px-2", className)}
+      className={cn("border-line/70 flex h-8 shrink-0 items-center gap-1 border-b px-2", className)}
       {...props}
     />
   );
@@ -32,7 +32,7 @@ export function SectionHeader({
 
 export function PropertyRow({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="group/prop flex min-h-7 items-center gap-2">
+    <div className="issue-property group/prop flex min-h-7 items-center gap-2">
       <dt className="text-mute w-20 shrink-0">{label}</dt>
       <dd className="min-w-0 flex-1">{children}</dd>
     </div>

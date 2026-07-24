@@ -29,12 +29,14 @@ import type { Field } from "./overlay";
 /** The root surfaces. These are also the stable view segments in the viewer URL;
  *  see `route.ts` for the canonical, machine-independent route contract. */
 export type View =
+  | "overview"
   | "list"
   | "board"
   | "calendar"
   | "timeline"
   | "projects"
   | "inbox"
+  | "my-issues"
   | "activity"
   | "settings";
 
@@ -44,6 +46,14 @@ export const WORK_VIEWS = ["list", "board", "calendar", "timeline"] as const;
 export type WorkView = (typeof WORK_VIEWS)[number];
 export function isWorkView(v: View): v is WorkView {
   return (WORK_VIEWS as readonly string[]).includes(v);
+}
+
+/** Surfaces owned by one project home. Workspace destinations must never retain
+ * one of these routes without a canonical project key. */
+export const PROJECT_VIEWS = ["overview", "list", "board", "calendar", "activity"] as const;
+export type ProjectView = (typeof PROJECT_VIEWS)[number];
+export function isProjectView(v: View): v is ProjectView {
+  return (PROJECT_VIEWS as readonly string[]).includes(v);
 }
 
 /**

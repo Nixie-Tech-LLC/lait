@@ -7,7 +7,6 @@ import {
   Ban,
   Bell,
   BellOff,
-  Check,
   ChevronLeft,
   ChevronRight,
   CircleDot,
@@ -23,8 +22,6 @@ import {
   Minimize2,
   MoveRight,
   Paperclip,
-  Play,
-  RotateCcw,
   Plus,
   SmilePlus,
   Trash2,
@@ -37,7 +34,7 @@ import { clearDraft, loadDraft, saveDraft } from "../core/drafts";
 import { describeChanges, describeEvent, type NameResolver } from "../core/activity";
 import type { Field as PredictField } from "../core/overlay";
 import type { IssueField } from "../core/registry";
-import { inverseWorkAction, primaryWorkAction, workTarget } from "../core/workflow";
+import { inverseWorkAction, workTarget } from "../core/workflow";
 import { boundedTail } from "../core/performance";
 import {
   type AttachmentMetaDto,
@@ -240,7 +237,6 @@ export function IssueDetail({
   const state = states.find((s) => s.id === issue.status);
   const project = projects.find((p) => p.id === issue.project_id);
   const locked = readOnly || issue.provisional;
-  const lifecycle = primaryWorkAction(state?.category ?? "backlog");
 
   const runWorkAction = async (
     action: "start" | "done" | "stop",
@@ -334,20 +330,10 @@ export function IssueDetail({
 
   return (
     <aside className="issue-detail border-line flex h-full min-h-0 flex-col overflow-y-auto border-l">
-      <SurfaceHeader className="gap-2 px-3">
+      <SurfaceHeader className="gap-2">
         <span className="text-mute font-mono text-xs tabular-nums">
           {issue.key_alias ?? issue.reff}
         </span>
-        {issue.provisional && (
-          <span className="text-warn text-2xs" title="The issue body hasn't synced yet">
-            provisional
-          </span>
-        )}
-        {tombstone && (
-          <span className="text-danger text-2xs" title="Deleted — restorable at any time">
-            deleted
-          </span>
-        )}
         <span className="ml-auto flex items-center gap-0.5">
           <IconButton label="Previous issue" onClick={onPrevious} disabled={!onPrevious}>
             <ChevronLeft className="size-3.5" />
@@ -355,29 +341,6 @@ export function IssueDetail({
           <IconButton label="Next issue" onClick={onNext} disabled={!onNext}>
             <ChevronRight className="size-3.5" />
           </IconButton>
-          <IconButton
-            label="Copy issue link"
-            onClick={() => void navigator.clipboard.writeText(window.location.href)}
-          >
-            <Copy className="size-3.5" />
-          </IconButton>
-          {!locked && !tombstone && (
-            <Button
-              variant="toolbar"
-              disabled={pendingAction !== null}
-              aria-busy={pendingAction === lifecycle.action}
-              onClick={() => void runWorkAction(lifecycle.action)}
-            >
-              {lifecycle.action === "done" ? (
-                <Check className="size-3" />
-              ) : state?.category === "done" ? (
-                <RotateCcw className="size-3" />
-              ) : (
-                <Play className="size-3" />
-              )}
-              {pendingAction === lifecycle.action ? lifecycle.pendingLabel : lifecycle.label}
-            </Button>
-          )}
           <IconButton label={focused ? "Return to split view" : "Focus issue"} onClick={onToggleFocus}>
             {focused ? <Minimize2 className="size-3.5" /> : <Maximize2 className="size-3.5" />}
           </IconButton>
@@ -387,6 +350,7 @@ export function IssueDetail({
             locked={locked}
             tombstone={tombstone}
             pending={pendingAction !== null}
+            onCopyLink={() => void navigator.clipboard.writeText(window.location.href)}
             onDuplicate={() => void duplicateIssue()}
             onRelate={() => document.getElementById("issue-add-relation")?.click()}
             onAssign={() => onOpenField("assignee")}
@@ -402,6 +366,11 @@ export function IssueDetail({
       </SurfaceHeader>
 
       <div className="issue-detail-body flex flex-col gap-4 p-4">
+        {tombstone && (
+          <div className="border-danger/30 bg-danger/5 text-dim rounded border px-3 py-2 text-sm">
+            This issue is deleted. Restore it from the More actions menu.
+          </div>
+        )}
         {undoWork && (
           <Toast action={<Button
               variant="ghost"
@@ -893,6 +862,7 @@ function IssueOverflow({
   locked,
   tombstone,
   pending,
+  onCopyLink,
   onDuplicate,
   onRelate,
   onAssign,
@@ -906,6 +876,7 @@ function IssueOverflow({
   locked: boolean;
   tombstone: boolean;
   pending: boolean;
+  onCopyLink: () => void;
   onDuplicate: () => void;
   onRelate: () => void;
   onAssign: () => void;
@@ -921,6 +892,7 @@ function IssueOverflow({
       </DropdownMenu.Trigger>
       <DropdownMenu.Portal>
         <MenuContent align="end" className="min-w-52">
+          <MenuItem onSelect={onCopyLink}><Link2 className="size-3.5" /> Copy issue link</MenuItem>
           <MenuItem onSelect={() => void navigator.clipboard.writeText(issueRef)}><Copy className="size-3.5" /> Copy reference</MenuItem>
           {!locked && !tombstone && (
             <>

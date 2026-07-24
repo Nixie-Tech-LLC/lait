@@ -17,10 +17,15 @@ window.dispatchEvent(new CustomEvent("lait:nav", { detail: { view: "settings" } 
 ```
 
 `detail` fields:
-- `{ view }` — `list | board | projects | inbox | activity | settings`
+- `{ view }` — `overview | list | board | calendar | timeline | projects | inbox | my-issues | activity | settings`
 - `{ project }` / `{ issue }` — select a project (KEY) or issue (ref)
 - `{ tab }` — Settings sub-page: `general | members | labels | workflow | access`
-- `{ overview: "<PROJECT_KEY>" }` — Projects → that project's overview page
+- `{ project: "<PROJECT_KEY>", view: "overview" }` — enter that project's overview page
+
+Canonical project URLs are nested under
+`/spaces/:space/projects/:project/{overview|issues|board|calendar|activity}`.
+The old `?project=` and `?overview=` forms remain accepted as compatibility
+inputs but are replaced with the canonical path after navigation.
 
 To reach a sub-state, dispatch the view first, wait ~1s for it to mount, then
 dispatch the sub-state. `wmux browser open <full-route-url>` also works (a full page
