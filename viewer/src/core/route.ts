@@ -27,12 +27,14 @@ export const DEFAULT_ROUTE: ViewerRoute = {
 };
 
 const VIEWS = new Set<View>([
+  "overview",
   "list",
   "board",
   "calendar",
   "timeline",
   "projects",
   "inbox",
+  "my-issues",
   "activity",
   "settings",
 ]);
@@ -41,27 +43,33 @@ const LAST_ROUTE = "lait.last-route";
 /**
  * Canonical URL grammar:
  *
- *   /spaces/:space/:view?project=:project&issue=:issue
+ *   /spaces/:space/:workspace-view
+ *   /spaces/:space/projects/:project/:project-view
  *
- * Query parameters carry optional selection rather than creating multiple path
- * shapes for every surface. Unknown parameters are deliberately preserved by
- * neither parser nor formatter: the route is a small product contract, not a bag
- * of component state.
+ * Project identity is structural because it owns Overview, Issues, Board,
+ * Calendar, and Activity. Query parameters carry optional issue/filter state.
+ * Unknown parameters are deliberately preserved by neither parser nor formatter:
+ * the route is a small product contract, not a bag of component state.
  */
 export function parseRoute(location: Pick<Location, "pathname" | "search">): ViewerRoute {
   const parts = location.pathname.split("/").filter(Boolean).map(decode);
   if (parts[0] !== "spaces" || !parts[1]) return DEFAULT_ROUTE;
 
   const candidate = parts[2];
+  const projectCandidate = candidate === "projects" && parts[3] ? clean(parts[3]) : null;
+  const projectViewCandidate = projectCandidate ? projectView(parts[4]) : null;
   // Members used to be a root destination. It now lives inside workspace
   // settings; old bookmarks still land in Settings instead of a project list.
   const view =
-    candidate === "members"
+    projectViewCandidate ??
+    (candidate === "members"
       ? "settings"
       : candidate && VIEWS.has(candidate as View)
         ? (candidate as View)
-        : "list";
+        : "list");
   const query = new URLSearchParams(location.search);
+  const legacyOverview =
+    candidate === "projects" && !projectCandidate ? clean(query.get("overview")) : null;
   const filter: FilterState = {
     text: clean(query.get("q")) ?? "",
     mine: query.get("mine") === "1",
@@ -70,16 +78,16 @@ export function parseRoute(location: Pick<Location, "pathname" | "search">): Vie
     priority: query.getAll("priority").filter(Boolean),
     assignees: query.getAll("assignee").filter(Boolean),
   };
-  const issue = view === "list" || view === "board" ? clean(query.get("issue")) : null;
+  const issue = displaysIssue(view) ? clean(query.get("issue")) : null;
   const focused = issue !== null && query.get("focus") === "1";
 
   return {
     spaceId: parts[1],
-    project: carriesProjectScope(view) ? clean(query.get("project")) : null,
-    view,
+    project: projectCandidate ?? legacyOverview ?? (isProjectDestination(view) ? clean(query.get("project")) : null),
+    view: legacyOverview ? "overview" : view,
     issue,
     ...(focused ? { focused: true } : {}),
-    ...(carriesProjectScope(view) && isActive(filter) ? { filter } : {}),
+    ...(carriesFilter(view) && isActive(filter) ? { filter } : {}),
   };
 }
 
@@ -87,12 +95,11 @@ export function formatRoute(route: ViewerRoute): string {
   if (!route.spaceId) return "/";
 
   const query = new URLSearchParams();
-  if (route.project && carriesProjectScope(route.view)) query.set("project", route.project);
-  if (route.issue && (route.view === "list" || route.view === "board")) {
+  if (route.issue && displaysIssue(route.view)) {
     query.set("issue", route.issue);
     if (route.focused) query.set("focus", "1");
   }
-  if (carriesProjectScope(route.view) && route.filter && isActive(route.filter)) {
+  if (carriesFilter(route.view) && route.filter && isActive(route.filter)) {
     if (route.filter.text.trim()) query.set("q", route.filter.text.trim());
     if (route.filter.mine) query.set("mine", "1");
     if (route.filter.label) query.set("label", route.filter.label);
@@ -101,7 +108,10 @@ export function formatRoute(route: ViewerRoute): string {
     for (const assignee of route.filter.assignees) query.append("assignee", assignee);
   }
 
-  const path = `/spaces/${encodeURIComponent(route.spaceId)}/${route.view}`;
+  const path =
+    route.project && isProjectDestination(route.view)
+      ? `/spaces/${encodeURIComponent(route.spaceId)}/projects/${encodeURIComponent(route.project)}/${projectSegment(route.view)}`
+      : `/spaces/${encodeURIComponent(route.spaceId)}/${route.view}`;
   const search = query.toString();
   return search ? `${path}?${search}` : path;
 }
@@ -158,8 +168,31 @@ function decode(value: string): string {
   }
 }
 
-/** Only issue arrangements are scoped to one project. Workspace destinations
- * must never inherit a stale project in their canonical URL. */
-function carriesProjectScope(view: View): boolean {
+/** Project-home destinations carry structural project identity; workspace
+ * destinations must never inherit stale project state. */
+function isProjectDestination(view: View): boolean {
+  return view === "overview" || view === "list" || view === "board" || view === "calendar" || view === "activity";
+}
+
+function carriesFilter(view: View): boolean {
   return view === "list" || view === "board" || view === "calendar";
+}
+
+function displaysIssue(view: View): boolean {
+  return view === "list" || view === "board" || view === "calendar";
+}
+
+function projectSegment(view: View): string {
+  return view === "list" ? "issues" : view;
+}
+
+function projectView(segment: string | undefined): View | null {
+  if (!segment) return "overview";
+  if (segment === "issues" || segment === "list") return "list";
+  return segment === "overview" ||
+    segment === "board" ||
+    segment === "calendar" ||
+    segment === "activity"
+    ? segment
+    : null;
 }

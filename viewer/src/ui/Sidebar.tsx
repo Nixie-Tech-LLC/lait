@@ -1,18 +1,16 @@
 import { useState } from "react";
 import {
-  Activity,
   Bookmark,
   Bot,
   ChevronDown,
   ChevronRight,
-  CircleDot,
-  Clock3,
   Cog,
   Folder,
   Inbox,
-  LayoutGrid,
   FolderKanban,
+  GanttChart,
   Plus,
+  Search,
   Star,
   StarOff,
   UserRound,
@@ -36,13 +34,12 @@ export function Sidebar({
   membership,
   currentName,
   favoriteProjects,
-  recentIssues,
   savedViews,
   onPickSpace,
+  onSearch,
   onPickProject,
   onGo,
   onMyIssues,
-  onOpenRecent,
   onApplySavedView,
   onToggleFavorite,
   onCreateProject,
@@ -60,13 +57,12 @@ export function Sidebar({
    *  spaces-list `name` that only refetches on a catalog-dirty doorbell. */
   currentName?: string | undefined;
   favoriteProjects: readonly string[];
-  recentIssues: readonly string[];
   savedViews: readonly SavedView[];
   onPickSpace: (id: string) => void;
+  onSearch: () => void;
   onPickProject: (key: string) => void;
   onGo: (view: View) => void;
   onMyIssues: () => void;
-  onOpenRecent: (reff: string) => void;
   onApplySavedView: (view: SavedView) => void;
   onToggleFavorite: (key: string) => void;
   onCreateProject: () => void;
@@ -75,15 +71,18 @@ export function Sidebar({
   const agent = space?.identity.kind === "agent" ? space.identity.name : null;
   // Linear's density model: favorites are the always-visible projects; the full
   // list folds behind its section header. Default-collapsed once you have
-  // favorites (curation replaces enumeration), open until then so a fresh space
-  // never hides its projects. The choice sticks per device.
+  // favorites or an active project (curation/context replaces enumeration), open
+  // on the workspace portfolio so a fresh space never hides its projects. The
+  // versioned key deliberately resets the old always-open default once.
   const [projectsOpen, setProjectsOpen] = useState<boolean>(() => {
-    const stored = localStorage.getItem("lait.sidebar.allProjects");
-    return stored !== null ? stored === "1" : favoriteProjects.length === 0;
+    const stored = localStorage.getItem("lait.sidebar.projects.v2");
+    return stored !== null
+      ? stored === "1"
+      : favoriteProjects.length === 0 && currentProject === null;
   });
   const toggleProjects = () => {
     setProjectsOpen((open) => {
-      localStorage.setItem("lait.sidebar.allProjects", open ? "0" : "1");
+      localStorage.setItem("lait.sidebar.projects.v2", open ? "0" : "1");
       return !open;
     });
   };
@@ -97,6 +96,7 @@ export function Sidebar({
         memberCount={memberCount}
         membership={membership}
         onPick={onPickSpace}
+        onSearch={onSearch}
         onOpenSettings={() => onGo("settings")}
       />
 
@@ -111,36 +111,16 @@ export function Sidebar({
 
       <div className="mt-3 flex flex-col gap-px">
         <NavItem icon={<Inbox />} label="Inbox" active={view === "inbox"} badge={unread} onClick={() => onGo("inbox")} />
-        <NavItem icon={<CircleDot />} label="Issues" active={view === "list"} onClick={() => onGo("list")} />
-        <NavItem icon={<LayoutGrid />} label="Board" active={view === "board"} onClick={() => onGo("board")} />
-        <NavItem icon={<FolderKanban />} label="Projects" active={view === "projects"} onClick={() => onGo("projects")} />
-        <NavItem icon={<Activity />} label="Activity" active={view === "activity"} onClick={() => onGo("activity")} />
+        <NavItem icon={<UserRound />} label="My issues" active={view === "my-issues"} onClick={onMyIssues} />
       </div>
 
-      <Section title="Your workspace" />
+      <Section title="Workspace" />
       <div className="flex flex-col gap-px">
-        <NavItem icon={<UserRound />} label="My issues" onClick={onMyIssues} />
-        {favoriteProjects.length > 0 && <MiniSection title="Favorites" />}
-        {favoriteProjects.map((key) => {
-          const favorite = projects.find((candidate) => candidate.key === key);
-          return favorite ? (
-            <ProjectRow
-              key={key}
-              project={favorite}
-              active={favorite.key === currentProject}
-              favorited
-              onPick={onPickProject}
-              onToggleFavorite={onToggleFavorite}
-            />
-          ) : null;
-        })}
+        <NavItem icon={<FolderKanban />} label="Projects" active={view === "projects"} onClick={() => onGo("projects")} />
+        <NavItem icon={<GanttChart />} label="Roadmap" active={view === "timeline"} onClick={() => onGo("timeline")} />
         {savedViews.length > 0 && <MiniSection title="Saved views" />}
         {savedViews.map((saved) => (
           <NavItem key={saved.id} icon={<Bookmark />} label={saved.name} onClick={() => onApplySavedView(saved)} compact />
-        ))}
-        {recentIssues.length > 0 && <MiniSection title="Recent" />}
-        {recentIssues.slice(0, 3).map((reff) => (
-          <NavItem key={reff} icon={<Clock3 />} label={reff} onClick={() => onOpenRecent(reff)} compact />
         ))}
       </div>
 
@@ -151,7 +131,7 @@ export function Sidebar({
           aria-expanded={projectsOpen}
         >
           <ChevronRight className={cn("size-3 shrink-0 transition-transform", projectsOpen && "rotate-90")} />
-          <span className="truncate">All projects</span>
+          <span className="truncate">Projects</span>
           <span className="font-normal tabular-nums">{projects.length}</span>
         </button>
         {!agent && (
@@ -161,6 +141,24 @@ export function Sidebar({
         )}
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto">
+        {favoriteProjects.length > 0 && (
+          <div className="mb-2">
+            <MiniSection title="Favorites" />
+            {favoriteProjects.map((key) => {
+              const favorite = projects.find((candidate) => candidate.key === key);
+              return favorite ? (
+                <ProjectRow
+                  key={key}
+                  project={favorite}
+                  active={favorite.key === currentProject}
+                  favorited
+                  onPick={onPickProject}
+                  onToggleFavorite={onToggleFavorite}
+                />
+              ) : null;
+            })}
+          </div>
+        )}
         {projectsOpen ? (
           projects.length === 0 ? (
             <p className="text-mute px-2 py-1 text-sm">No projects yet.</p>
@@ -207,6 +205,7 @@ function SpaceSwitcher({
   memberCount,
   membership,
   onPick,
+  onSearch,
   onOpenSettings,
 }: {
   spaces: SpaceRow[];
@@ -215,72 +214,78 @@ function SpaceSwitcher({
   memberCount?: number | undefined;
   membership?: string | null | undefined;
   onPick: (id: string) => void;
+  onSearch: () => void;
   onOpenSettings: () => void;
 }) {
   const selected = spaces.find((s) => s.id === current) ?? null;
   return (
-    <details className="group relative">
-      <summary className="hover:bg-hover flex min-h-10 list-none items-center gap-2 rounded px-2 py-1 [&::-webkit-details-marker]:hidden">
-        <span className="bg-active flex size-7 shrink-0 items-center justify-center rounded-md">
-          {selected?.identity.kind === "agent" ? <Bot className="text-mute size-4" /> : <Folder className="text-mute size-4" />}
-        </span>
-        <span className="min-w-0 flex-1">
-          <strong className="block truncate text-sm">{(currentName?.trim() || selected?.name) || selected?.space || "Choose a space"}</strong>
-          {selected && (
-            <span className="text-mute block truncate text-[10px] font-normal">
-              {selected.identity.kind === "agent"
-                ? `Agent-owned · read only`
-                : `${membership === "admin" ? "Admin" : membership === "pending" ? "Joining" : "Member"}${memberCount !== undefined ? ` · ${memberCount} ${memberCount === 1 ? "person" : "people"}` : ""}`}
-            </span>
-          )}
-        </span>
-        {selected && <StatusDot status={selected.status} />}
-        <ChevronDown className="text-mute size-3 transition-transform group-open:rotate-180" />
-      </summary>
-      <div className="border-line-strong bg-raised shadow-overlay absolute inset-x-0 top-9 z-40 max-h-72 overflow-y-auto rounded-lg border p-1">
-        {spaces.length === 0 ? (
-          <p className="text-mute px-2 py-3 text-center text-sm">No local spaces</p>
-        ) : (
-          spaces.map((space) => (
-            <button
-              key={`${space.id}-${space.identity.kind === "agent" ? space.identity.name : "own"}`}
-              onClick={(event) => {
-                onPick(space.id);
-                event.currentTarget.closest("details")?.removeAttribute("open");
-              }}
-              className={cn(
-                "flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm",
-                space.id === current ? "bg-active" : "hover:bg-hover",
-              )}
-            >
-              {space.identity.kind === "agent" ? <Bot className="text-mute size-3.5" /> : <Folder className="text-mute size-3.5" />}
-              <span className="min-w-0 flex-1">
-                <span className="block truncate">{space.name || space.space}</span>
-                <span className="text-mute block truncate text-xs">
-                  {space.identity.kind === "agent" ? `Agent · ${space.identity.name}` : "Your local actor"}
-                </span>
+    <div className="flex items-center gap-0.5">
+      <details className="group relative min-w-0 flex-1">
+        <summary className="hover:bg-hover flex min-h-10 list-none items-center gap-2 rounded-md px-2 py-1 [&::-webkit-details-marker]:hidden">
+          <span className="bg-active flex size-7 shrink-0 items-center justify-center rounded-md">
+            {selected?.identity.kind === "agent" ? <Bot className="text-mute size-4" /> : <Folder className="text-mute size-4" />}
+          </span>
+          <span className="min-w-0 flex-1">
+            <strong className="block truncate text-sm">{(currentName?.trim() || selected?.name) || selected?.space || "Choose a space"}</strong>
+            {selected && (
+              <span className="text-mute block truncate text-[10px] font-normal">
+                {selected.identity.kind === "agent"
+                  ? `Agent-owned · read only`
+                  : `${membership === "admin" ? "Admin" : membership === "pending" ? "Joining" : "Member"}${memberCount !== undefined ? ` · ${memberCount} ${memberCount === 1 ? "person" : "people"}` : ""}`}
               </span>
-              <StatusDot status={space.status} />
-            </button>
-          ))
-        )}
-        {selected && (
-          <>
-            <div className="bg-line my-1 h-px" />
-            <button
-              onClick={(event) => {
-                onOpenSettings();
-                event.currentTarget.closest("details")?.removeAttribute("open");
-              }}
-              className="text-dim hover:bg-hover hover:text-fg flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm"
-            >
-              <Cog className="text-mute size-3.5" />
-              Workspace settings
-            </button>
-          </>
-        )}
-      </div>
-    </details>
+            )}
+          </span>
+          {selected && <StatusDot status={selected.status} />}
+          <ChevronDown className="text-mute size-3 transition-transform group-open:rotate-180" />
+        </summary>
+        <div className="border-line-strong bg-raised shadow-overlay absolute inset-x-0 top-9 z-40 max-h-72 overflow-y-auto rounded-lg border p-1">
+          {spaces.length === 0 ? (
+            <p className="text-mute px-2 py-3 text-center text-sm">No local spaces</p>
+          ) : (
+            spaces.map((space) => (
+              <button
+                key={`${space.id}-${space.identity.kind === "agent" ? space.identity.name : "own"}`}
+                onClick={(event) => {
+                  onPick(space.id);
+                  event.currentTarget.closest("details")?.removeAttribute("open");
+                }}
+                className={cn(
+                  "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm",
+                  space.id === current ? "bg-active" : "hover:bg-hover",
+                )}
+              >
+                {space.identity.kind === "agent" ? <Bot className="text-mute size-3.5" /> : <Folder className="text-mute size-3.5" />}
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate">{space.name || space.space}</span>
+                  <span className="text-mute block truncate text-xs">
+                    {space.identity.kind === "agent" ? `Agent · ${space.identity.name}` : "Your local actor"}
+                  </span>
+                </span>
+                <StatusDot status={space.status} />
+              </button>
+            ))
+          )}
+          {selected && (
+            <>
+              <div className="bg-line my-1 h-px" />
+              <button
+                onClick={(event) => {
+                  onOpenSettings();
+                  event.currentTarget.closest("details")?.removeAttribute("open");
+                }}
+                className="text-dim hover:bg-hover hover:text-fg flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm"
+              >
+                <Cog className="text-mute size-3.5" />
+                Workspace settings
+              </button>
+            </>
+          )}
+        </div>
+      </details>
+      <IconButton label="Search issues" chord="Q" onClick={onSearch}>
+        <Search className="size-4" />
+      </IconButton>
+    </div>
   );
 }
 
@@ -304,13 +309,16 @@ function ProjectRow({
     <div className="group/project relative mb-0.5">
       <button
         onClick={() => onPick(project.key)}
+        title={`${project.name} · ${project.key}`}
         className={cn(
           navigationItem({ selected: active }),
         )}
       >
-        <span className="size-2 shrink-0 rounded-sm" style={{ background: catalogColor(project.color) }} />
+        <span
+          className={cn("size-1.5 shrink-0 rounded-sm opacity-75", active && "opacity-100")}
+          style={{ background: catalogColor(project.color) }}
+        />
         <span className="min-w-0 flex-1 truncate">{project.name}</span>
-        <span className="text-mute font-mono text-2xs">{project.key}</span>
       </button>
       <IconButton
         label={favorited ? `Remove ${project.name} from favorites` : `Add ${project.name} to favorites`}

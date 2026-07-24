@@ -292,6 +292,40 @@
   container-type: inline-size;
 }
 
+/* A split issue follows Linear's compact metadata strip: the value and its icon
+   carry the field identity, while the semantic term remains in the definition
+   list for assistive technology. This prevents nine properties from pushing the
+   description and activity below the fold in a narrow pane. */
+@container (max-width: 699px) {
+  .issue-detail-properties {
+    flex-flow: row wrap;
+    gap: 2px 8px;
+  }
+
+  .issue-detail-properties .issue-property {
+    width: auto;
+    min-width: 0;
+    gap: 0;
+  }
+
+  .issue-detail-properties .issue-property > dt {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .issue-detail-properties .issue-property > dd {
+    flex: none;
+    max-width: 220px;
+  }
+}
+
 @container (min-width: 700px) {
   .issue-detail-body {
     display: grid;

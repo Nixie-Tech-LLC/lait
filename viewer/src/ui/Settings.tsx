@@ -92,7 +92,7 @@ export function Settings({
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <SurfaceHeader className="gap-2 px-3">
+      <SurfaceHeader className="h-11 gap-2 px-3">
         <IconButton label="Back to app" onClick={onExit}>
           <ArrowLeft className="size-4" />
         </IconButton>

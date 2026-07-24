@@ -2,15 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Group, Panel, Separator, useDefaultLayout, usePanelRef } from "react-resizable-panels";
 import * as Dialog from "@radix-ui/react-dialog";
 import {
-  CalendarDays,
-  Columns3,
-  Command as CommandIcon,
-  GanttChartSquare,
-  List as ListIcon,
   ListFilter,
   PanelLeft,
   Plus,
-  Search,
 } from "lucide-react";
 
 import { ConfirmRequired, LaitError, rpc, spaces as fetchSpaces } from "./api";
@@ -23,11 +17,11 @@ import {
   registry,
   type AppApi,
   type Ctx,
-  isWorkView,
-  WORK_VIEWS,
+  isProjectView,
+  PROJECT_VIEWS,
   type IssueField,
+  type ProjectView,
   type View,
-  type WorkView,
 } from "./core/registry";
 import {
   formatRoute,
@@ -39,7 +33,7 @@ import {
 } from "./core/route";
 import { useKeys } from "./core/useKeys";
 import { neighbourState, workTarget } from "./core/workflow";
-import { loadFavoriteProjects, loadRecentIssues, toggleFavoriteProject } from "./core/personalNav";
+import { loadFavoriteProjects, toggleFavoriteProject } from "./core/personalNav";
 import { loadSavedViews, type SavedView } from "./core/savedViews";
 import { Activity } from "./ui/Activity";
 import { classifyFailure, EmptyState, InlineError, recoveryForError, TrustPopover } from "./ui/AppState";
@@ -52,10 +46,12 @@ import { FilterBar } from "./ui/FilterBar";
 import { Inbox } from "./ui/Inbox";
 import { IssueSearch, rememberIssue } from "./ui/IssueSearch";
 import { Projects } from "./ui/Projects";
+import { ProjectOverview } from "./ui/ProjectOverview";
 import { SurfaceHeader } from "./ui/layout";
 import { Settings } from "./ui/Settings";
 import { IssueDetail } from "./ui/IssueDetail";
 import { IssueList } from "./ui/IssueList";
+import { MyIssues } from "./ui/MyIssues";
 import { RolesDialog, WorkflowDialog } from "./ui/Governance";
 import { NewIssue } from "./ui/NewIssue";
 import { NewProject } from "./ui/NewProject";
@@ -67,7 +63,6 @@ import { DialogHost } from "./ui/dialogs";
 import { Combobox } from "./ui/Picker";
 import { Button, IconButton, TooltipProvider } from "./ui/primitives";
 import { Sidebar } from "./ui/Sidebar";
-import { SavedViews } from "./ui/SavedViews";
 import {
   applyFilter,
   EMPTY_FILTER,
@@ -247,7 +242,10 @@ export function App() {
   const space = spaces.find((s) => s.id === current) ?? null;
   const readOnly = space ? isReadOnly(space) : false;
   const missingProject =
-    project !== null && projects.length > 0 && !projects.some((candidate) => candidate.key === project);
+    isProjectView(view) &&
+    project !== null &&
+    projects.length > 0 &&
+    !projects.some((candidate) => candidate.key === project);
 
   // Overlay first, then filter: a predicted title should be findable by the text
   // you just typed into it, and a predicted status should filter as its new one.
@@ -276,10 +274,6 @@ export function App() {
   }, [view, shown, groups, display.deleted, deletedRows]);
   const favoriteProjects = useMemo(
     () => routeSpace ? loadFavoriteProjects(routeSpace) : [],
-    [routeSpace, personalNavRevision],
-  );
-  const recentIssues = useMemo(
-    () => routeSpace ? loadRecentIssues(routeSpace) : [],
     [routeSpace, personalNavRevision],
   );
   const sidebarSavedViews = useMemo(
@@ -404,8 +398,8 @@ export function App() {
     void loadSpaces();
   }, [loadSpaces]);
   useEffect(() => {
-    void loadBoard(current, project);
-  }, [current, project, loadBoard]);
+    void loadBoard(isProjectView(view) ? current : null, isProjectView(view) ? project : null);
+  }, [current, project, view, loadBoard]);
 
   /**
    * Name a project once we know there is a choice.
@@ -424,9 +418,9 @@ export function App() {
    * `Special` CLI handler, not a `Request`, so no HTTP endpoint reaches it.)
    */
   useEffect(() => {
-    if (project !== null || projects.length < 2) return;
-    setProject(projects[0]!.key);
-  }, [projects, project]);
+    if (!isProjectView(view) || project !== null || projects.length === 0) return;
+    setProject((projects.find((candidate) => !candidate.archived) ?? projects[0])!.key);
+  }, [projects, project, view]);
 
   /**
    * The three registries every picker reads from — the daemon's, never ours.
@@ -735,12 +729,23 @@ export function App() {
       toggleShortcuts: () => setModal((m) => (m === "shortcuts" ? null : "shortcuts")),
       toggleDetail: () => setDetail((d) => !d),
       goto: (v) => {
-        const issue = v === "list" || v === "board" ? selection : null;
+        const nextProject = isProjectView(v)
+          ? (project ?? board?.project.key ?? liveProjects[0]?.key ?? null)
+          : null;
+        const issue = v === "list" || v === "board" || v === "calendar" ? selection : null;
         window.history.pushState(
           null,
           "",
-          formatRoute({ spaceId: routeSpace, project, view: v, issue, focused: issue ? focusedDetail : false, filter }),
+          formatRoute({
+            spaceId: routeSpace,
+            project: nextProject,
+            view: v,
+            issue,
+            focused: issue ? focusedDetail : false,
+            filter,
+          }),
         );
+        setProject(nextProject);
         setView(v);
         if (!issue) setSelection(null);
       },
@@ -791,12 +796,12 @@ export function App() {
       pickSpace: (id) => {
         const picked = spacesRef.current.find((space) => space.id === id);
         if (!picked) return;
-        const next = { spaceId: picked.space, project: null, view: "list" as const, issue: null };
+        const next = { spaceId: picked.space, project: null, view: "projects" as const, issue: null };
         window.history.pushState(null, "", formatRoute(next));
         setRouteSpace(picked.space);
         setCurrent(picked.id);
         setProject(null);
-        setView("list");
+        setView("projects");
         setSelection(null);
       },
       pickProject: (key) => {
@@ -804,9 +809,11 @@ export function App() {
         // project drops the `mine` authorization filter so its board doesn't come
         // up mysteriously empty. Other facets (status/label/…) ride along as before.
         const scoped = filter.mine ? { ...filter, mine: false } : filter;
-        const next = { spaceId: routeSpace, project: key, view, issue: null, filter: scoped };
+        const nextView = isProjectView(view) ? view : "overview";
+        const next = { spaceId: routeSpace, project: key, view: nextView, issue: null, filter: scoped };
         window.history.pushState(null, "", formatRoute(next));
         setProject(key);
+        setView(nextView);
         setSelection(null);
         if (scoped !== filter) setFilter(scoped);
       },
@@ -980,6 +987,8 @@ export function App() {
       project,
       view,
       selection,
+      board,
+      liveProjects,
       filter,
       guard,
       loadBoard,
@@ -1115,11 +1124,15 @@ export function App() {
 
   const run = (id: string) => void registry.get(id)?.run(ctx);
   const openMyIssues = () => {
-    const nextFilter = { ...filter, mine: true };
-    window.history.pushState(null, "", formatRoute({ spaceId: routeSpace, project, view: "list", issue: null, filter: nextFilter }));
-    setView("list");
+    window.history.pushState(
+      null,
+      "",
+      formatRoute({ spaceId: routeSpace, project: null, view: "my-issues", issue: null }),
+    );
+    setProject(null);
+    setView("my-issues");
     setSelection(null);
-    setFilter(nextFilter);
+    setFilter(EMPTY_FILTER);
   };
   const openRecentIssue = (reff: string) => {
     const key = /^([A-Z][A-Z0-9]*)-\d+$/.exec(reff)?.[1] ?? project;
@@ -1142,6 +1155,23 @@ export function App() {
     toggleFavoriteProject(routeSpace, key);
     setPersonalNavRevision((revision) => revision + 1);
   };
+
+  const activeProject =
+    board?.project ?? projects.find((candidate) => candidate.key === project) ?? null;
+  const projectShell = isProjectView(view) && Boolean(project || activeProject);
+  const projectCounts = useMemo(() => {
+    const counts = { backlog: 0, active: 0, done: 0, total: 0 };
+    for (const column of board?.columns ?? []) {
+      const count = column.rows.filter((row) => !row.tombstone).length;
+      counts[column.state.category] += count;
+      counts.total += count;
+    }
+    return counts;
+  }, [board]);
+  const projectDocIds = useMemo(
+    () => new Set(board?.columns.flatMap((column) => column.rows.map((row) => row.doc_id)) ?? []),
+    [board],
+  );
 
   return (
     <TooltipProvider>
@@ -1173,13 +1203,12 @@ export function App() {
           membership={statusInfo?.membership}
           currentName={statusInfo?.name}
           favoriteProjects={favoriteProjects}
-          recentIssues={recentIssues}
           savedViews={sidebarSavedViews}
           onPickSpace={api.pickSpace}
+          onSearch={() => run("search.issues")}
           onPickProject={api.pickProject}
           onGo={api.goto}
           onMyIssues={openMyIssues}
-          onOpenRecent={openRecentIssue}
           onApplySavedView={applySavedView}
           onToggleFavorite={toggleFavorite}
           onCreateProject={api.createProject}
@@ -1198,156 +1227,107 @@ export function App() {
       </Separator>
 
       <Panel id="main" role="main" className="flex min-w-0 flex-col">
-        {/*
-          Chrome recedes. Linear's header is a breadcrumb and a few ghost icons —
-          no bordered CTA competing with the content, no permanently-lit status
-          badge. Ours had a segmented control, a primary button, and a `Ctrl K`
-          chip all shouting at once; the work is the content, not the toolbar.
-        */}
-        {/* `@container`: the tab labels below collapse on the *header's* own
-            width, not the viewport's — the detail pane stealing half the main
-            column is what actually crowds this row. */}
-        <SurfaceHeader className={view === "settings" ? "hidden" : "@container"}>
-          <IconButton label="Toggle sidebar" chord="⌘B" onClick={() => run("view.sidebar")}>
-            <PanelLeft className="size-4" />
-          </IconButton>
-
-          {/*
-            The project is a *switch*, not a label.
-
-            It read as a title before, which quietly made the client single-project:
-            `board` was sent with `project: null` forever, so a space with three
-            projects only ever showed whichever one the daemon's default chain
-            picked, and the other two were unreachable from the browser. The name was
-            never decoration — it was the one control the header was missing.
-          */}
-          <h1 className="ml-1 flex min-w-0 items-baseline gap-1.5">
-            {liveProjects.length > 1 ? (
-              <Combobox
-                variant="property"
-                label="Project"
-                className="font-semibold"
-                value={
-                  board
-                    ? {
-                        id: board.project.key,
-                        label: board.project.name,
-                        swatch: catalogColor(board.project.color),
-                      }
-                    : null
-                }
-                // Live projects, plus the current one if it happens to be archived
-                // (opened directly) so the switch still shows what you're viewing.
-                options={[
-                  ...liveProjects,
-                  ...(board && !liveProjects.some((p) => p.key === board.project.key)
-                    ? projects.filter((p) => p.key === board.project.key)
-                    : []),
-                ].map((p) => ({
-                  id: p.key,
-                  label: p.name,
-                  swatch: catalogColor(p.color),
-                  hint: p.key,
-                }))}
-                // Straight to the api, not through a command: a command's `run`
-                // takes only a `Ctx`, so "pick *this* project" has no way to travel
-                // through the registry. Same reason `Sidebar` calls `pickSpace`
-                // directly — selection carries an argument, actions don't.
-                onPick={api.pickProject}
-              />
-            ) : (
-              <span className="truncate font-semibold">{board?.project.name ?? "lait"}</span>
-            )}
-            <span className="text-mute shrink-0">/</span>
-            <span className="text-dim shrink-0 capitalize">{view}</span>
-          </h1>
-
-          {isWorkView(view) && (
-            <ViewSwitcher view={view} onPick={(next) => api.goto(next)} />
-          )}
-
-          <span className="ml-auto flex items-center gap-1">
-            <TrustPopover
-              liveness={liveness}
-              status={statusInfo}
-              space={space}
-              localReady={
-                board !== null ||
-                (statusInfo !== null &&
-                  statusInfo.membership !== "pending" &&
-                  statusInfo.counts_unavailable !== true)
-              }
-              latestChange={mutationNotice}
-            />
-
-            <IconButton label="Search issues" chord="Q" onClick={() => run("search.issues")}>
-              <Search className="size-4" />
+        <div className={view === "settings" ? "hidden" : "@container shrink-0"}>
+          <SurfaceHeader className="gap-0.5">
+            <IconButton label="Toggle sidebar" chord="⌘B" onClick={() => run("view.sidebar")}>
+              <PanelLeft className="size-4" />
             </IconButton>
 
-            <IconButton label="Command menu" chord="⌘K" onClick={() => run("palette.open")}>
-              <CommandIcon className="size-4" />
-            </IconButton>
-
-            {(view === "list" || view === "board" || view === "calendar") && (
-              <IconButton
-                label="Filter"
-                chord="/"
-                variant={isActive(filter) ? "active" : "ghost"}
-                onClick={() => run("filter.open")}
-              >
-                <ListFilter className="size-4" />
-              </IconButton>
-            )}
-            {(view === "list" || view === "board") && (
-              <>
-                <DisplayOptions
-                  display={display}
-                  view={view}
-                  open={displayOpen}
-                  onOpenChange={setDisplayOpen}
-                  density={density}
-                  onDensityChange={(nextDensity) => {
-                    setDensity(nextDensity);
-                    applyDensity(nextDensity);
-                  }}
-                  onChange={(nextDisplay) => {
-                    if (nextDisplay.deleted !== display.deleted) {
-                      api.select(null);
-                      setDetail(false);
-                    }
-                    setDisplay(nextDisplay);
-                    if (nextDisplay.deleted && view === "board") api.goto("list");
-                  }}
+            <h1 className="ml-1 flex min-w-0 items-center text-sm">
+              {projectShell && liveProjects.length > 1 ? (
+                <Combobox
+                  variant="property"
+                  label="Project"
+                  className="max-w-[min(36cqw,260px)] font-semibold"
+                  value={
+                    activeProject
+                      ? {
+                          id: activeProject.key,
+                          label: activeProject.name,
+                          swatch: catalogColor(activeProject.color),
+                        }
+                      : null
+                  }
+                  options={[
+                    ...liveProjects,
+                    ...(activeProject && !liveProjects.some((p) => p.key === activeProject.key)
+                      ? projects.filter((p) => p.key === activeProject.key)
+                      : []),
+                  ].map((p) => ({
+                    id: p.key,
+                    label: p.name,
+                    swatch: catalogColor(p.color),
+                    hint: p.key,
+                  }))}
+                  onPick={api.pickProject}
                 />
-                {routeSpace && board && (
-                  <SavedViews
-                    space={routeSpace}
-                    project={board.project.key}
-                    view={view === "board" ? "board" : "list"}
-                    filter={filter}
+              ) : projectShell ? (
+                <span className="truncate font-semibold">{activeProject?.name ?? project ?? "Project"}</span>
+              ) : (
+                <span className="truncate font-semibold">{workspaceTitle(view)}</span>
+              )}
+            </h1>
+
+            <span className="ml-auto flex items-center gap-0.5">
+              {!projectShell && (
+                <TrustPopover
+                  liveness={liveness}
+                  status={statusInfo}
+                  space={space}
+                  localReady={
+                    statusInfo !== null &&
+                    statusInfo.membership !== "pending" &&
+                    statusInfo.counts_unavailable !== true
+                  }
+                  latestChange={mutationNotice}
+                />
+              )}
+
+              {projectShell && (view === "list" || view === "board" || view === "calendar") && (
+                <IconButton
+                  label="Filter"
+                  chord="/"
+                  variant={isActive(filter) ? "active" : "ghost"}
+                  onClick={() => run("filter.open")}
+                >
+                  <ListFilter className="size-4" />
+                </IconButton>
+              )}
+              {projectShell && (view === "list" || view === "board") && (
+                <span className="@max-[420px]:hidden">
+                  <DisplayOptions
                     display={display}
-                    onApply={(saved) => {
-                      setFilter(saved.filter);
-                      if (saved.display.deleted !== display.deleted) {
+                    view={view}
+                    open={displayOpen}
+                    onOpenChange={setDisplayOpen}
+                    density={density}
+                    onDensityChange={(nextDensity) => {
+                      setDensity(nextDensity);
+                      applyDensity(nextDensity);
+                    }}
+                    onChange={(nextDisplay) => {
+                      if (nextDisplay.deleted !== display.deleted) {
                         api.select(null);
                         setDetail(false);
                       }
-                      setDisplay(saved.display);
-                      if (saved.view && saved.view !== view) api.goto(saved.view);
+                      setDisplay(nextDisplay);
+                      if (nextDisplay.deleted && view === "board") api.goto("list");
                     }}
-                    onChange={() => setPersonalNavRevision((revision) => revision + 1)}
                   />
-                )}
-              </>
-            )}
+                </span>
+              )}
 
-            {!readOnly && current && (
-              <IconButton label="New issue" chord="C" onClick={() => run("issue.create")}>
-                <Plus className="size-4" />
-              </IconButton>
-            )}
-          </span>
-        </SurfaceHeader>
+              {projectShell && !readOnly && current && (view === "list" || view === "board" || view === "calendar") && (
+                <IconButton label="New issue" chord="C" onClick={() => run("issue.create")}>
+                  <Plus className="size-4" />
+                </IconButton>
+              )}
+            </span>
+          </SurfaceHeader>
+          {projectShell && isProjectView(view) && (
+            <ProjectTabs view={view} onPick={(next) => api.goto(next)} />
+          )}
+        </div>
 
         {error && (
           <InlineError
@@ -1384,7 +1364,12 @@ export function App() {
           />
         )}
 
-        <div className="group/list flex min-h-0 flex-1 flex-col">
+        <div
+          id={projectShell ? "project-view-panel" : undefined}
+          role={projectShell ? "tabpanel" : undefined}
+          aria-labelledby={projectShell && isProjectView(view) ? `project-tab-${view}` : undefined}
+          className="group/list flex min-h-0 flex-1 flex-col"
+        >
           {!current ? (
             <EmptyState
               icon={<PanelLeft className="size-5" />}
@@ -1423,11 +1408,7 @@ export function App() {
               spaceId={current}
               revision={revision}
               onCountChange={setUnread}
-              onOpen={(reff) => {
-                api.goto("list");
-                api.select(reff);
-                setDetail(true);
-              }}
+              onOpen={openRecentIssue}
             />
           ) : view === "settings" ? (
             <Settings
@@ -1441,25 +1422,37 @@ export function App() {
               onError={setError}
               onExit={() => api.goto("list")}
             />
+          ) : view === "my-issues" ? (
+            <MyIssues
+              spaceId={current}
+              revision={revision}
+              onError={setError}
+              onOpen={openRecentIssue}
+            />
           ) : view === "projects" ? (
             <Projects
               spaceId={current}
               projects={projects}
-              members={members}
               revision={revision}
-              readOnly={readOnly}
               spaceDescription={statusInfo?.description ?? ""}
-              onOpen={(key) => {
-                api.pickProject(key);
-                api.goto("list");
-              }}
+              onOpen={api.pickProject}
+            />
+          ) : view === "overview" && activeProject ? (
+            <ProjectOverview
+              spaceId={current}
+              project={activeProject}
+              members={members}
+              counts={projectCounts}
+              readOnly={readOnly}
               onError={setError}
             />
-          ) : view === "activity" ? (
+          ) : view === "activity" && board ? (
             <Activity
               spaceId={current}
               members={members}
               revision={revision}
+              projectDocIds={projectDocIds}
+              projectName={board.project.name}
               onError={setError}
               onOpen={(reff) => {
                 api.goto("list");
@@ -1695,10 +1688,13 @@ export function App() {
               membership={statusInfo?.membership}
               currentName={statusInfo?.name}
               favoriteProjects={favoriteProjects}
-              recentIssues={recentIssues}
               savedViews={sidebarSavedViews}
               onPickSpace={(id) => {
                 api.pickSpace(id);
+                setMobileNav(false);
+              }}
+              onSearch={() => {
+                run("search.issues");
                 setMobileNav(false);
               }}
               onPickProject={(key) => {
@@ -1711,10 +1707,6 @@ export function App() {
               }}
               onMyIssues={() => {
                 openMyIssues();
-                setMobileNav(false);
-              }}
-              onOpenRecent={(reff) => {
-                openRecentIssue(reff);
                 setMobileNav(false);
               }}
               onApplySavedView={(saved) => {
@@ -1906,43 +1898,73 @@ contribute({
   ],
 });
 
-/**
- * The work-view switcher — List / Board / Calendar / Timeline over the *same*
- * filtered query (SCOPE-6). These four are sibling `View` segments in the URL, so
- * the switcher is a thin control over `api.goto`; the surface each renders is the
- * same `shown` set drawn a different way (or, for timeline, the project spans).
- */
-const WORK_VIEW_META: Record<WorkView, { label: string; icon: React.ReactNode }> = {
-  list: { label: "List", icon: <ListIcon className="size-4" /> },
-  board: { label: "Board", icon: <Columns3 className="size-4" /> },
-  calendar: { label: "Calendar", icon: <CalendarDays className="size-4" /> },
-  timeline: { label: "Timeline", icon: <GanttChartSquare className="size-4" /> },
+const PROJECT_VIEW_META: Record<ProjectView, { label: string }> = {
+  overview: { label: "Overview" },
+  list: { label: "Issues" },
+  board: { label: "Board" },
+  calendar: { label: "Calendar" },
+  activity: { label: "Activity" },
 };
 
-function ViewSwitcher({ view, onPick }: { view: WorkView; onPick: (v: WorkView) => void }) {
+function ProjectTabs({ view, onPick }: { view: ProjectView; onPick: (v: ProjectView) => void }) {
   return (
-    <div className="border-line ml-2 flex items-center gap-0.5 rounded-md border p-0.5" role="tablist" aria-label="View">
-      {WORK_VIEWS.map((v) => {
+    <div
+      className="border-line flex h-7 shrink-0 items-center gap-0.5 overflow-x-auto border-b px-2 [scrollbar-width:none]"
+      role="tablist"
+      aria-label="Project"
+    >
+      {PROJECT_VIEWS.map((v) => {
         const active = v === view;
         return (
           <button
             key={v}
+            id={`project-tab-${v}`}
             role="tab"
             aria-selected={active}
-            aria-label={WORK_VIEW_META[v].label}
-            title={WORK_VIEW_META[v].label}
+            aria-controls="project-view-panel"
+            aria-label={PROJECT_VIEW_META[v].label}
+            title={PROJECT_VIEW_META[v].label}
+            tabIndex={active ? 0 : -1}
             onClick={() => onPick(v)}
-            className={`flex h-6 items-center gap-1.5 rounded px-2 text-xs ${
-              active ? "bg-active text-fg" : "text-mute hover:bg-hover hover:text-fg"
+            onKeyDown={(event) => {
+              const current = PROJECT_VIEWS.indexOf(v);
+              const next =
+                event.key === "ArrowRight"
+                  ? (current + 1) % PROJECT_VIEWS.length
+                  : event.key === "ArrowLeft"
+                    ? (current - 1 + PROJECT_VIEWS.length) % PROJECT_VIEWS.length
+                    : event.key === "Home"
+                      ? 0
+                      : event.key === "End"
+                        ? PROJECT_VIEWS.length - 1
+                        : null;
+              if (next === null) return;
+              event.preventDefault();
+              const nextView = PROJECT_VIEWS[next]!;
+              onPick(nextView);
+              event.currentTarget.parentElement
+                ?.querySelector<HTMLElement>(`#project-tab-${nextView}`)
+                ?.focus();
+            }}
+            className={`flex h-6 items-center rounded-md px-2 text-xs transition-colors ${
+              active
+                ? "bg-active text-fg"
+                : "text-mute hover:bg-hover hover:text-fg"
             }`}
           >
-            {WORK_VIEW_META[v].icon}
-            {/* Icon-only when the header is cramped (container query, so the
-                open detail pane counts). The title tooltip still names it. */}
-            <span className="@max-4xl:hidden">{WORK_VIEW_META[v].label}</span>
+            <span>{PROJECT_VIEW_META[v].label}</span>
           </button>
         );
       })}
     </div>
   );
+}
+
+function workspaceTitle(view: View): string {
+  if (view === "inbox") return "Inbox";
+  if (view === "my-issues") return "My issues";
+  if (view === "projects") return "Projects";
+  if (view === "timeline") return "Roadmap";
+  if (view === "settings") return "Settings";
+  return "Workspace";
 }

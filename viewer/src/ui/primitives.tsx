@@ -196,7 +196,7 @@ export const interactiveRow = cva(
   {
     variants: {
       surface: {
-        list: "border-line/50 border-b",
+        list: "border-line/35 border-b",
         contained: "rounded-md",
       },
       selected: {

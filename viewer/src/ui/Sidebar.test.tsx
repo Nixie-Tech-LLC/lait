@@ -20,9 +20,11 @@ describe("Sidebar navigation", () => {
     host = null;
   });
 
-  it("routes named destinations and gates settings in the workspace menu", () => {
+  it("keeps workspace destinations global and enters project work through a project", () => {
     const onGo = vi.fn();
     const onMyIssues = vi.fn();
+    const onPickProject = vi.fn();
+    const onSearch = vi.fn();
     host = document.createElement("div");
     document.body.append(host);
     root = createRoot(host);
@@ -37,13 +39,12 @@ describe("Sidebar navigation", () => {
           view="list"
           unread={3}
           favoriteProjects={[]}
-          recentIssues={[]}
           savedViews={[]}
           onPickSpace={vi.fn()}
-          onPickProject={vi.fn()}
+          onSearch={onSearch}
+          onPickProject={onPickProject}
           onGo={onGo}
           onMyIssues={onMyIssues}
-          onOpenRecent={vi.fn()}
           onApplySavedView={vi.fn()}
           onToggleFavorite={vi.fn()}
           onCreateProject={vi.fn()}
@@ -51,20 +52,28 @@ describe("Sidebar navigation", () => {
       );
     });
 
-    click("Board");
-    expect(onGo).toHaveBeenCalledWith("board");
-    click("Activity");
-    expect(onGo).toHaveBeenCalledWith("activity");
+    click("Projects");
+    expect(onGo).toHaveBeenCalledWith("projects");
+    click("Roadmap");
+    expect(onGo).toHaveBeenCalledWith("timeline");
     click("My issues");
     expect(onMyIssues).toHaveBeenCalledOnce();
+    click("Search issues");
+    expect(onSearch).toHaveBeenCalledOnce();
+    click("Web");
+    expect(onPickProject).toHaveBeenCalledWith("WEB");
     click("Workspace settings");
     expect(onGo).toHaveBeenCalledWith("settings");
     expect(host.textContent).toContain("3");
-    expect([...host.querySelectorAll("button")].filter((item) => item.textContent?.includes("Board"))).toHaveLength(1);
+    expect([...host.querySelectorAll("button")].some((item) => item.textContent?.includes("Board"))).toBe(false);
+    expect([...host.querySelectorAll("button")].some((item) => item.textContent?.includes("Activity"))).toBe(false);
+    expect(host.querySelector("summary button")).toBeNull();
   });
 
   function click(label: string) {
-    const button = [...host!.querySelectorAll("button")].find((item) => item.textContent?.includes(label));
+    const button = [...host!.querySelectorAll("button")].find(
+      (item) => item.textContent?.includes(label) || item.getAttribute("aria-label") === label,
+    );
     expect(button).toBeTruthy();
     act(() => button?.click());
   }

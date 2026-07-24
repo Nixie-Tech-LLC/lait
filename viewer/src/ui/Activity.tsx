@@ -33,12 +33,16 @@ export function Activity({
   spaceId,
   members,
   revision,
+  projectDocIds,
+  projectName,
   onError,
   onOpen,
 }: {
   spaceId: string;
   members: MemberDto[];
   revision: number;
+  projectDocIds?: ReadonlySet<string>;
+  projectName?: string;
   onError: (m: string) => void;
   onOpen: (reff: string) => void;
 }) {
@@ -50,6 +54,12 @@ export function Activity({
   );
   const resolveName: NameResolver = (key) =>
     memberName(key, memberByKey.get(key));
+  const scopedEvents = useMemo(
+    () => projectDocIds
+      ? events?.filter((event) => event.doc_id !== null && projectDocIds.has(event.doc_id)) ?? null
+      : events,
+    [events, projectDocIds],
+  );
 
   useEffect(() => {
     let alive = true;
@@ -66,7 +76,7 @@ export function Activity({
     };
   }, [spaceId, revision, onError]);
 
-  if (!events) {
+  if (!scopedEvents) {
     return (
       <LoadingState
         title="Loading activity"
@@ -74,29 +84,29 @@ export function Activity({
       />
     );
   }
-  if (events.length === 0) {
+  if (scopedEvents.length === 0) {
     return (
       <EmptyState
         icon={<ActivityIcon className="size-5" />}
-        title="No activity yet"
-        body="Changes made in this session will appear here."
+        title={projectName ? `No activity in ${projectName}` : "No activity yet"}
+        body={projectName ? "Changes to this project's issues will appear here." : "Changes made in this session will appear here."}
       />
     );
   }
 
   return (
     <ul className="min-h-0 flex-1 overflow-y-auto">
-      {events.length > visibleCount && (
+      {scopedEvents.length > visibleCount && (
         <li className="border-line/60 border-b p-2 text-center">
           <Button
             onClick={() => setVisibleCount((count) => count + 80)}
           >
-            Show {Math.min(80, events.length - visibleCount)} older changes
+            Show {Math.min(80, scopedEvents.length - visibleCount)} older changes
           </Button>
         </li>
       )}
       {/* Newest first: the feed answers "what just happened", not "what happened". */}
-      {groupActivity([...boundedTail(events, visibleCount)].reverse()).map((group) => {
+      {groupActivity([...boundedTail(scopedEvents, visibleCount)].reverse()).map((group) => {
         const e = group.events[0]!;
         return (
         <li

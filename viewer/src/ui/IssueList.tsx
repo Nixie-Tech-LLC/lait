@@ -97,7 +97,7 @@ export function IssueList({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="text-mute border-line border-b px-4 py-2 text-sm">
+      <div className="text-mute border-line/70 flex h-7 items-center border-b px-4 text-xs">
         {total} {deletedMode ? "deleted " : ""}{total === 1 ? "issue" : "issues"}
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto">
@@ -120,7 +120,7 @@ export function IssueList({
         ))}
         {deleted.length > 0 && (
           <section>
-            <header className="bg-raised/95 border-line sticky top-0 z-10 flex h-9 items-center gap-2 border-b px-4 backdrop-blur-sm">
+            <header className="bg-bg/95 border-line/70 sticky top-0 z-10 flex h-8 items-center gap-2 border-b px-4 backdrop-blur-sm">
               <Trash2 className="text-mute size-3.5" />
               <h2 className="text-base font-semibold">Deleted</h2>
               <span className="text-mute text-sm tabular-nums">{deleted.length}</span>
@@ -220,15 +220,20 @@ function Group({
     <section>
       {/* Sticky so you never lose which bucket you are reading — the one piece of
           context a long list silently takes away. */}
-      <header className="bg-raised/95 border-line sticky top-0 z-10 flex h-9 items-center gap-2 border-b px-4 backdrop-blur-sm">
-        <IconButton
-          label={`${collapsed ? "Expand" : "Collapse"} ${title}`}
-          onClick={() => setCollapsed((value) => !value)}
-          aria-expanded={!collapsed}
-          className="-ml-2"
-        >
-          <ChevronRight className={`size-3 transition-transform ${collapsed ? "" : "rotate-90"}`} />
-        </IconButton>
+      <header className="bg-bg/95 border-line/70 sticky top-0 z-10 flex h-8 items-center gap-2 border-b px-4 backdrop-blur-sm">
+        {/* The visible slot is the same 16px column as a row checkbox. The
+            control itself remains 24px and overflows the slot symmetrically, so
+            alignment does not come at the cost of a usable pointer target. */}
+        <span className="relative flex size-4 shrink-0 items-center justify-center">
+          <IconButton
+            label={`${collapsed ? "Expand" : "Collapse"} ${title}`}
+            onClick={() => setCollapsed((value) => !value)}
+            aria-expanded={!collapsed}
+            className="absolute"
+          >
+            <ChevronRight className={`size-3 transition-transform ${collapsed ? "" : "rotate-90"}`} />
+          </IconButton>
+        </span>
         <GroupIcon group={group} members={members} />
         <h2 className="text-base font-semibold capitalize">{title}</h2>
         <span className="text-mute text-sm tabular-nums">{rows.length}</span>
@@ -356,7 +361,7 @@ function IssueRow({
       </span>
       <PriorityIcon priority={row.priority} />
       {/* Fixed width + tabular numerals: the ids form a straight edge to scan. */}
-      <span className="text-mute w-20 shrink-0 truncate font-mono text-xs tabular-nums">
+      <span className="text-mute w-16 shrink-0 truncate font-mono text-xs tabular-nums">
         {row.key_alias ?? row.reff}
       </span>
       {state && <StatusIcon category={state.category} color={catalogColor(state.color)} />}
