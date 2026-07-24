@@ -20,6 +20,8 @@ fn every_request_variant_has_a_terminal_owner() {
             priority: None,
             labels: vec![],
             body: None,
+            due: None,
+            estimate: None,
         }),
         RequestOwner::Session
     );

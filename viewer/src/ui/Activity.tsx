@@ -1,11 +1,15 @@
-import { useEffect, useState } from "react";
-import { AlertTriangle } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Activity as ActivityIcon, AlertTriangle } from "lucide-react";
 
 import { rpc } from "../api";
 import { describeChanges, describeEvent, type NameResolver } from "../core/activity";
+import { groupActivity } from "../core/inbox";
+import { boundedTail, indexBy } from "../core/performance";
 import type { ActivityEvent, MemberDto } from "../types";
+import { EmptyState, LoadingState } from "./AppState";
 import { memberName } from "./Avatar";
 import { when } from "./time";
+import { Button, interactiveRow } from "./primitives";
 
 /**
  * The space feed.
@@ -29,18 +33,33 @@ export function Activity({
   spaceId,
   members,
   revision,
+  projectDocIds,
+  projectName,
   onError,
   onOpen,
 }: {
   spaceId: string;
   members: MemberDto[];
   revision: number;
+  projectDocIds?: ReadonlySet<string>;
+  projectName?: string;
   onError: (m: string) => void;
   onOpen: (reff: string) => void;
 }) {
   const [events, setEvents] = useState<ActivityEvent[] | null>(null);
+  const [visibleCount, setVisibleCount] = useState(80);
+  const memberByKey = useMemo(
+    () => indexBy(members, (member) => member.key),
+    [members],
+  );
   const resolveName: NameResolver = (key) =>
-    memberName(key, members.find((m) => m.key === key));
+    memberName(key, memberByKey.get(key));
+  const scopedEvents = useMemo(
+    () => projectDocIds
+      ? events?.filter((event) => event.doc_id !== null && projectDocIds.has(event.doc_id)) ?? null
+      : events,
+    [events, projectDocIds],
+  );
 
   useEffect(() => {
     let alive = true;
@@ -57,24 +76,58 @@ export function Activity({
     };
   }, [spaceId, revision, onError]);
 
-  if (!events) return <p className="text-mute p-4 text-sm">Loading…</p>;
-  if (events.length === 0) {
-    return <p className="text-mute p-8 text-center">No activity yet.</p>;
+  if (!scopedEvents) {
+    return (
+      <LoadingState
+        title="Loading activity"
+        body="Reading the local session history."
+      />
+    );
+  }
+  if (scopedEvents.length === 0) {
+    return (
+      <EmptyState
+        icon={<ActivityIcon className="size-5" />}
+        title={projectName ? `No activity in ${projectName}` : "No activity yet"}
+        body={projectName ? "Changes to this project's issues will appear here." : "Changes made in this session will appear here."}
+      />
+    );
   }
 
   return (
     <ul className="min-h-0 flex-1 overflow-y-auto">
+      {scopedEvents.length > visibleCount && (
+        <li className="border-line/60 border-b p-2 text-center">
+          <Button
+            onClick={() => setVisibleCount((count) => count + 80)}
+          >
+            Show {Math.min(80, scopedEvents.length - visibleCount)} older changes
+          </Button>
+        </li>
+      )}
       {/* Newest first: the feed answers "what just happened", not "what happened". */}
-      {[...events].reverse().map((e) => (
+      {groupActivity([...boundedTail(scopedEvents, visibleCount)].reverse()).map((group) => {
+        const e = group.events[0]!;
+        return (
         <li
-          key={e.seq}
+          key={`${e.seq}-${group.events.length}`}
           onClick={() => onOpen(e.reff)}
-          className="border-line/60 hover:bg-hover flex cursor-default items-baseline gap-3 border-b px-4 py-2"
+          onKeyDown={(event) => {
+            if (event.key === "Enter") onOpen(e.reff);
+          }}
+          tabIndex={0}
+          className={`${interactiveRow({ density: "normal" })} flex items-start gap-3 px-4 py-2.5`}
         >
           <span className="text-mute w-20 shrink-0 truncate font-mono text-xs tabular-nums">
             {e.reff}
           </span>
-          <Line event={e} resolveName={resolveName} />
+          <span className="min-w-0 flex-1">
+            {group.events.map((event, index) => (
+              <span key={event.seq} className={index ? "mt-1 block" : "block"}>
+                <Line event={event} resolveName={resolveName} />
+              </span>
+            ))}
+          </span>
           {/* A concurrent overwrite is worth flagging but never worth blocking on
               (A§9): last-writer-wins already resolved it; you just get told. */}
           {e.collision && (
@@ -83,9 +136,12 @@ export function Activity({
               aria-label="Concurrent overwrite detected"
             />
           )}
-          <time className="text-mute shrink-0 text-xs">{when(e.ts)}</time>
+          <span className="flex shrink-0 items-center gap-2">
+            {group.events.length > 1 && <span className="bg-raised text-mute rounded px-1.5 text-2xs">{group.events.length} changes</span>}
+            <time className="text-mute text-xs">{when(e.ts)}</time>
+          </span>
         </li>
-      ))}
+      )})}
     </ul>
   );
 }
@@ -94,13 +150,15 @@ function Line({ event, resolveName }: { event: ActivityEvent; resolveName: NameR
   const { actor, phrase } = describeEvent(event, resolveName);
   const changes = describeChanges(event);
   return (
-    <span className="min-w-0 flex-1">
+    <span>
       {/* No name when we have no honest one — see core/activity.ts. */}
       {actor && <span className="font-medium">{actor} </span>}
       <span className="text-dim">{phrase}</span>
       {/* `created` and `commented` are the two kinds that carry words of their
           own; everything else is phrased above. */}
-      {event.text && <span className="text-mute ml-2 text-xs">{event.text}</span>}
+      {(event.kind === "created" || event.kind === "commented") && event.text && (
+        <span className="text-mute ml-2 text-xs">{event.text}</span>
+      )}
       {changes && <span className="text-mute ml-2 text-xs">{changes}</span>}
     </span>
   );

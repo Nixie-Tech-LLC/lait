@@ -141,6 +141,12 @@ pub enum Request {
         labels: Vec<String>,
         #[serde(default)]
         body: Option<String>,
+        /// Due date: unix seconds or `YYYY-MM-DD` (UTC midnight).
+        #[serde(default)]
+        due: Option<String>,
+        /// Estimate points.
+        #[serde(default)]
+        estimate: Option<u32>,
     },
     IssueEdit {
         reff: String,
@@ -154,6 +160,13 @@ pub enum Request {
         /// no `LoroText` cursor; the daemon applies it as a text update).
         #[serde(default)]
         description: Option<String>,
+        /// Due date: unix seconds, `YYYY-MM-DD` (UTC midnight), or `none` to
+        /// clear. Absent = untouched.
+        #[serde(default)]
+        due: Option<String>,
+        /// Estimate points, or `none` to clear. Absent = untouched.
+        #[serde(default)]
+        estimate: Option<String>,
     },
     IssueMove {
         reff: String,
@@ -178,6 +191,21 @@ pub enum Request {
     Comment {
         reff: String,
         body: String,
+        /// The comment id being replied to (from `IssueView.comments[].id`),
+        /// when this comment is a reply. One level of nesting.
+        #[serde(default)]
+        reply_to: Option<String>,
+    },
+    /// Toggle an emoji reaction on a comment. Writes no history event — a
+    /// reaction is a social signal, not a change of record.
+    React {
+        reff: String,
+        /// The target comment's id (`IssueView.comments[].id`).
+        comment: String,
+        emoji: String,
+        /// `true` (default) adds the reaction; `false` removes it.
+        #[serde(default = "default_true")]
+        on: bool,
     },
     IssueDelete {
         reff: String,
@@ -249,14 +277,249 @@ pub enum Request {
     ProjectNew {
         name: String,
         key: String,
+        #[serde(default)]
+        color: Option<String>,
     },
     ProjectList,
+    ProjectEdit {
+        /// KEY or `prj_` id.
+        project: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        color: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        /// Lead actor key, or "" / "none" to clear.
+        #[serde(default)]
+        lead: Option<String>,
+        /// `YYYY-MM-DD`, or "none" to clear. Absent leaves it untouched.
+        #[serde(default)]
+        start: Option<String>,
+        #[serde(default)]
+        target: Option<String>,
+        /// Soft-hide toggle: `Some(true)` archives, `Some(false)` restores,
+        /// `None` leaves it untouched (CUSTOM-9).
+        #[serde(default)]
+        archived: Option<bool>,
+        /// Owning team (key/name/`tm_` id), or "" / "none" to clear (GOV-7).
+        #[serde(default)]
+        team: Option<String>,
+    },
+    /// Hard-delete an EMPTY project (CUSTOM-10): refused while any issue —
+    /// live or tombstoned — still references it.
+    ProjectDelete {
+        /// KEY or `prj_` id.
+        project: String,
+    },
+    /// Subscribe to (or unsubscribe from) an issue's activity without holding
+    /// its assignment (INBOX-9). Reply: `Ref`.
+    Follow {
+        reff: String,
+        /// `true` (default) follows; `false` unfollows.
+        #[serde(default = "default_true")]
+        on: bool,
+    },
+    /// A project's milestones with derived progress (SCOPE-1). Reply:
+    /// `Milestones`.
+    MilestoneList {
+        /// KEY or `prj_` id.
+        project: String,
+    },
+    /// Create, edit, or tombstone a project milestone (SCOPE-1).
+    MilestoneSet {
+        /// KEY or `prj_` id.
+        project: String,
+        /// Existing milestone (name or `mls_` id); absent creates one.
+        #[serde(default)]
+        milestone: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        /// `YYYY-MM-DD`, or "none" to clear. Absent leaves it untouched.
+        #[serde(default)]
+        target: Option<String>,
+        /// Tombstone the milestone (issues keep their register; it reads as
+        /// cleared once the milestone is gone).
+        #[serde(default)]
+        remove: bool,
+    },
+    /// Point an issue at a milestone in its project, or clear it with
+    /// `milestone: None`/"none".
+    IssueMilestone {
+        reff: String,
+        #[serde(default)]
+        milestone: Option<String>,
+    },
+    /// A project's cycles with derived counts (BOARD-11). Reply: `Cycles`.
+    CycleList {
+        /// KEY or `prj_` id.
+        project: String,
+    },
+    /// Create, edit, or tombstone a cycle (BOARD-11).
+    CycleSet {
+        /// KEY or `prj_` id.
+        project: String,
+        /// Existing cycle (name or `cyc_` id); absent creates one.
+        #[serde(default)]
+        cycle: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        /// `YYYY-MM-DD`, or "none" to clear. Absent leaves it untouched.
+        #[serde(default)]
+        start: Option<String>,
+        #[serde(default)]
+        end: Option<String>,
+        #[serde(default)]
+        remove: bool,
+    },
+    /// Schedule an issue into a cycle, or clear it.
+    IssueCycle {
+        reff: String,
+        #[serde(default)]
+        cycle: Option<String>,
+    },
+    /// Every live initiative with its roll-up (SCOPE-8). Reply: `Initiatives`.
+    InitiativeList,
+    /// Create, edit, or tombstone an initiative (SCOPE-8).
+    InitiativeSet {
+        /// Existing initiative (name or `ini_` id); absent creates one.
+        #[serde(default)]
+        initiative: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        /// Owner actor key, or "" / "none" to clear.
+        #[serde(default)]
+        owner: Option<String>,
+        /// `on_track` | `at_risk` | `off_track` | "" (none).
+        #[serde(default)]
+        health: Option<String>,
+        /// `YYYY-MM-DD`, or "none" to clear.
+        #[serde(default)]
+        target: Option<String>,
+        /// Project refs to add to / remove from the membership.
+        #[serde(default)]
+        add_projects: Vec<String>,
+        #[serde(default)]
+        remove_projects: Vec<String>,
+        #[serde(default)]
+        remove: bool,
+    },
+    /// Every live team with its owned projects (GOV-7). Reply: `Teams`.
+    TeamList,
+    /// Create, edit, or tombstone a team (GOV-7; admin-only).
+    TeamSet {
+        /// Existing team (KEY, name, or `tm_` id); absent creates one.
+        #[serde(default)]
+        team: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        /// Short handle, set at creation, immutable after.
+        #[serde(default)]
+        key: Option<String>,
+        #[serde(default)]
+        icon: Option<String>,
+        /// Lead actor key, or "" / "none" to clear.
+        #[serde(default)]
+        lead: Option<String>,
+        /// Actor keys to add to / remove from the membership.
+        #[serde(default)]
+        add_members: Vec<String>,
+        #[serde(default)]
+        remove_members: Vec<String>,
+        #[serde(default)]
+        remove: bool,
+    },
+    /// The triage intake queue, pending first (SCOPE-7). Reply: `TriageItems`.
+    TriageList,
+    /// Report work into the intake queue — outside every project workflow
+    /// until reviewed (SCOPE-7).
+    TriageSubmit {
+        title: String,
+        #[serde(default)]
+        body: Option<String>,
+        /// Where this came from (an integration name, "cli", …).
+        #[serde(default)]
+        source: Option<String>,
+    },
+    /// Decide a pending triage item: `accepted` (into `project`), `declined`,
+    /// or `duplicate` (of `target`). Exactly once per item.
+    TriageDecide {
+        /// The `trg_` intake id.
+        id: String,
+        outcome: String,
+        #[serde(default)]
+        project: Option<String>,
+        /// The duplicated issue's ref (duplicate outcome).
+        #[serde(default)]
+        target: Option<String>,
+        #[serde(default)]
+        note: Option<String>,
+    },
+    /// Attach a bounded file to an issue (CREATE-5). `data_b64` is the
+    /// standard-base64 payload (raw size ≤ 256 KiB). Reply: `Ref`.
+    Attach {
+        reff: String,
+        name: String,
+        #[serde(default)]
+        mime: Option<String>,
+        data_b64: String,
+        /// A comment id to associate the file with.
+        #[serde(default)]
+        comment: Option<String>,
+    },
+    /// Remove an attachment record.
+    Detach {
+        reff: String,
+        /// The `att_` attachment id.
+        id: String,
+    },
+    /// One attachment's payload (CREATE-5). Reply: `Attachment`.
+    AttachmentGet {
+        reff: String,
+        /// The `att_` attachment id.
+        id: String,
+    },
+    /// A project's status-update feed, newest first (SCOPE-1). Reply: `Updates`.
+    ProjectUpdates {
+        /// KEY or `prj_` id.
+        project: String,
+    },
+    /// Append an immutable status update to a project's feed (SCOPE-1).
+    ProjectUpdatePost {
+        /// KEY or `prj_` id.
+        project: String,
+        body: String,
+        /// `on_track` | `at_risk` | `off_track` | "" (none).
+        #[serde(default)]
+        health: Option<String>,
+    },
     LabelNew {
         name: String,
         #[serde(default)]
         color: Option<String>,
     },
     LabelList,
+    LabelEdit {
+        /// Name or `lbl_` id.
+        label: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        color: Option<String>,
+    },
+    LabelDelete {
+        /// Name or `lbl_` id.
+        label: String,
+    },
+    SpaceRename {
+        name: String,
+    },
+    /// Set (or clear, empty) the space's overview description (SCOPE-2).
+    SpaceDescribe {
+        description: String,
+    },
     Activity {
         #[serde(default)]
         since: u64,
@@ -280,12 +543,30 @@ pub enum Request {
     MemberRemove {
         who: String,
     },
-    /// Sponsor an agent keypair. Any human member may sponsor;
-    /// the agent is sealed the space key but holds no membership or content
-    /// authority, and its standing dies with the sponsor.
+    /// Elevate or demote an existing member (admin-only): a signed
+    /// `SetGrants` on the ACL. `admin: true` promotes, `false` demotes to a
+    /// plain writing member. Refused for agents and for the last admin.
+    MemberSetRole {
+        who: String,
+        admin: bool,
+    },
+    /// Sponsor an agent keypair whose inception is already known here. Any human
+    /// member may sponsor; the agent is sealed the space key and holds content
+    /// authority (`Grant::Write`) but never membership authority, and its
+    /// standing dies with the sponsor.
     AgentAdd {
         /// The agent's ed25519 public key (64-hex).
         key: String,
+    },
+    /// Provision a **co-located** agent identity by name, in one step: mint (or
+    /// reuse) its seed under this home, self-incept it into the shared store's
+    /// actor plane, and sponsor it with content authority. This is the seamless
+    /// "sponsor once" flow for an agent on the same machine — no Contact round,
+    /// no second daemon, no second store copy. Afterwards a client acts as it
+    /// via the `act_as` selector (e.g. `lait --as <name> …`, or MCP).
+    AgentProvision {
+        /// The local name for this agent identity.
+        name: String,
     },
     KeyRotate,
     /// Revoke an outstanding invite so it can no longer admit anyone (admin-
@@ -431,6 +712,11 @@ pub enum Request {
     AccessRevoke {
         grant_id: String,
     },
+    /// Activate this build's reviewed IssuesWorld implementation for the
+    /// Space (admin-authored ACL action; idempotent when already active).
+    /// The activation is what receipts pin — a build whose descriptor differs
+    /// from the active one should run this before writing.
+    WorldUpgrade,
     /// A project's workflow revision head(s).
     WorkflowShow {
         project: String,
@@ -464,6 +750,17 @@ pub enum Request {
         expected_space: Option<String>,
     },
     Id,
+    /// One-shot identity + standing + view-completeness report (`lait whoami`,
+    /// the MCP `whoami` tool). A read: the full version of `Id`'s actor line —
+    /// actor, `did:key`, role, capabilities, sponsor, space, and the **loud**
+    /// partial-view signal — so neither a human nor an agent ever *infers* "who
+    /// am I / what may I do / is my view complete."
+    Whoami,
+    /// Converge now and report what moved and what is still divergent — the
+    /// workflow verb that supersedes `connect <device-id>`. Surfaces missing-
+    /// epoch / partial-read state **loudly** instead of silently showing fewer
+    /// issues (the 141-vs-154 inference this initiative kills).
+    Sync,
     /// Mint an invite link. It always carries a signed admission capability:
     /// the joiner's explicit acceptance IS the approval, and redemption is
     /// automatic over Contact — there is no approval queue.
@@ -523,6 +820,39 @@ pub enum Request {
     },
 }
 
+/// The wire envelope a client sends: a [`Request`] plus an optional **acting
+/// identity** selector. This is how the multi-tenant daemon (Architecture B)
+/// stays "one surface" — the *same* `Request` set, with a modifier saying *which
+/// local member signs it*. `act_as` names a local identity (an agent profile
+/// name, an actor id, or a device id) the daemon holds a seed for; `None` (the
+/// default) is the daemon's primary — the human. It is flattened and
+/// `skip`-when-`None`, so a request with no selector serializes to *exactly* the
+/// bare `{"cmd":…}` an older client sends — the wire stays backward-compatible in
+/// both directions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientRequest {
+    /// The local identity to sign+attribute this request as. `None` = the
+    /// daemon's primary (human) identity, exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub act_as: Option<String>,
+    #[serde(flatten)]
+    pub request: Request,
+}
+
+impl ClientRequest {
+    /// A plain request as the primary identity (the pre-B behavior).
+    pub fn plain(request: Request) -> Self {
+        Self {
+            act_as: None,
+            request,
+        }
+    }
+    /// A request acting as a named local identity.
+    pub fn acting_as(request: Request, act_as: Option<String>) -> Self {
+        Self { act_as, request }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -574,6 +904,7 @@ pub fn classify(req: &Request) -> RequestOwner {
         | Request::Assign { .. }
         | Request::Label { .. }
         | Request::Comment { .. }
+        | Request::React { .. }
         | Request::IssueDelete { .. }
         | Request::IssueRestore { .. }
         | Request::IssueLink { .. }
@@ -589,8 +920,33 @@ pub fn classify(req: &Request) -> RequestOwner {
         | Request::History { .. }
         | Request::ProjectNew { .. }
         | Request::ProjectList
+        | Request::ProjectEdit { .. }
+        | Request::ProjectUpdates { .. }
+        | Request::ProjectUpdatePost { .. }
+        | Request::ProjectDelete { .. }
+        | Request::Follow { .. }
+        | Request::MilestoneList { .. }
+        | Request::MilestoneSet { .. }
+        | Request::IssueMilestone { .. }
+        | Request::CycleList { .. }
+        | Request::CycleSet { .. }
+        | Request::IssueCycle { .. }
+        | Request::InitiativeList
+        | Request::InitiativeSet { .. }
+        | Request::TeamList
+        | Request::TeamSet { .. }
+        | Request::TriageList
+        | Request::TriageSubmit { .. }
+        | Request::TriageDecide { .. }
+        | Request::Attach { .. }
+        | Request::Detach { .. }
+        | Request::AttachmentGet { .. }
         | Request::LabelNew { .. }
         | Request::LabelList
+        | Request::LabelEdit { .. }
+        | Request::LabelDelete { .. }
+        | Request::SpaceRename { .. }
+        | Request::SpaceDescribe { .. }
         | Request::Activity { .. }
         | Request::RoleList
         | Request::RoleShow { .. }
@@ -605,9 +961,11 @@ pub fn classify(req: &Request) -> RequestOwner {
         // ---- Mechanics: membership, admission, ceremonies, custody, devices ----
         Request::MemberAdd { .. }
         | Request::MemberRemove { .. }
+        | Request::MemberSetRole { .. }
         | Request::Members
         | Request::MemberLog
         | Request::AgentAdd { .. }
+        | Request::AgentProvision { .. }
         | Request::KeyRotate
         | Request::InviteRevoke { .. }
         | Request::DeviceInvite
@@ -627,10 +985,12 @@ pub fn classify(req: &Request) -> RequestOwner {
         | Request::AccessList { .. }
         | Request::AccessGrant { .. }
         | Request::AccessRevoke { .. }
-        | Request::Id => Mechanics,
+        | Request::WorldUpgrade
+        | Request::Id
+        | Request::Whoami => Mechanics,
 
         // ---- Station: connect/neighbor/Contact ----
-        Request::Connect { .. } | Request::Who => Station,
+        Request::Connect { .. } | Request::Who | Request::Sync => Station,
 
         // ---- Observation: status, subscription, and locally derived
         // projection surfaces (the inbox rebuilds from query after reset and
@@ -665,6 +1025,8 @@ pub fn representative_requests() -> Vec<Request> {
             priority: None,
             labels: vec![],
             body: None,
+            due: None,
+            estimate: None,
         },
         Request::IssueEdit {
             reff: s(),
@@ -672,6 +1034,8 @@ pub fn representative_requests() -> Vec<Request> {
             status: None,
             priority: None,
             description: None,
+            due: None,
+            estimate: None,
         },
         Request::IssueMove {
             reff: s(),
@@ -691,6 +1055,13 @@ pub fn representative_requests() -> Vec<Request> {
         Request::Comment {
             reff: s(),
             body: s(),
+            reply_to: None,
+        },
+        Request::React {
+            reff: s(),
+            comment: s(),
+            emoji: s(),
+            on: true,
         },
         Request::IssueDelete { reff: s() },
         Request::IssueRestore { reff: s() },
@@ -725,13 +1096,114 @@ pub fn representative_requests() -> Vec<Request> {
         Request::ProjectNew {
             name: s(),
             key: s(),
+            color: None,
         },
         Request::ProjectList,
+        Request::ProjectEdit {
+            project: s(),
+            name: None,
+            color: None,
+            description: None,
+            lead: None,
+            start: None,
+            target: None,
+            archived: None,
+            team: None,
+        },
+        Request::ProjectUpdates { project: s() },
+        Request::ProjectUpdatePost {
+            project: s(),
+            body: s(),
+            health: None,
+        },
+        Request::ProjectDelete { project: s() },
+        Request::Follow {
+            reff: s(),
+            on: true,
+        },
+        Request::MilestoneList { project: s() },
+        Request::MilestoneSet {
+            project: s(),
+            milestone: None,
+            name: None,
+            target: None,
+            remove: false,
+        },
+        Request::IssueMilestone {
+            reff: s(),
+            milestone: None,
+        },
+        Request::CycleList { project: s() },
+        Request::CycleSet {
+            project: s(),
+            cycle: None,
+            name: None,
+            start: None,
+            end: None,
+            remove: false,
+        },
+        Request::IssueCycle {
+            reff: s(),
+            cycle: None,
+        },
+        Request::InitiativeList,
+        Request::InitiativeSet {
+            initiative: None,
+            name: None,
+            description: None,
+            owner: None,
+            health: None,
+            target: None,
+            add_projects: vec![],
+            remove_projects: vec![],
+            remove: false,
+        },
+        Request::TeamList,
+        Request::TeamSet {
+            team: None,
+            name: None,
+            key: None,
+            icon: None,
+            lead: None,
+            add_members: vec![],
+            remove_members: vec![],
+            remove: false,
+        },
+        Request::TriageList,
+        Request::TriageSubmit {
+            title: s(),
+            body: None,
+            source: None,
+        },
+        Request::TriageDecide {
+            id: s(),
+            outcome: s(),
+            project: None,
+            target: None,
+            note: None,
+        },
+        Request::Attach {
+            reff: s(),
+            name: s(),
+            mime: None,
+            data_b64: s(),
+            comment: None,
+        },
+        Request::Detach { reff: s(), id: s() },
+        Request::AttachmentGet { reff: s(), id: s() },
         Request::LabelNew {
             name: s(),
             color: None,
         },
         Request::LabelList,
+        Request::LabelEdit {
+            label: s(),
+            name: None,
+            color: None,
+        },
+        Request::LabelDelete { label: s() },
+        Request::SpaceRename { name: s() },
+        Request::SpaceDescribe { description: s() },
         Request::Activity { since: 0 },
         Request::RoleList,
         Request::RoleShow { role: s() },
@@ -764,6 +1236,7 @@ pub fn representative_requests() -> Vec<Request> {
             project: None,
         },
         Request::AccessRevoke { grant_id: s() },
+        Request::WorldUpgrade,
         Request::WorkflowShow { project: s() },
         Request::WorkflowValidate { body_json: s() },
         Request::WorkflowSet {
@@ -778,7 +1251,12 @@ pub fn representative_requests() -> Vec<Request> {
             as_name: None,
         },
         Request::MemberRemove { who: s() },
+        Request::MemberSetRole {
+            who: s(),
+            admin: false,
+        },
         Request::AgentAdd { key: s() },
+        Request::AgentProvision { name: s() },
         Request::KeyRotate,
         Request::InviteRevoke { invite: s() },
         Request::DeviceInvite,
@@ -824,6 +1302,8 @@ pub fn representative_requests() -> Vec<Request> {
             expected_space: None,
         },
         Request::Id,
+        Request::Whoami,
+        Request::Sync,
         Request::Invite {
             role: None,
             reusable: false,
@@ -902,6 +1382,10 @@ pub enum Response {
     Projects {
         projects: Vec<ProjectDto>,
     },
+    /// A project's status-update feed (reply to [`Request::ProjectUpdates`]).
+    Updates {
+        updates: Vec<crate::dto::ProjectUpdateDto>,
+    },
     Labels {
         labels: Vec<LabelDto>,
     },
@@ -919,6 +1403,32 @@ pub enum Response {
     /// Pinned seeds ("remotes") and their reachability.
     Seeds {
         seeds: Vec<SeedDto>,
+    },
+    /// Reply to [`Request::MilestoneList`].
+    Milestones {
+        milestones: Vec<crate::dto::MilestoneDto>,
+    },
+    /// Reply to [`Request::CycleList`].
+    Cycles {
+        cycles: Vec<crate::dto::CycleDto>,
+    },
+    /// Reply to [`Request::InitiativeList`].
+    Initiatives {
+        initiatives: Vec<crate::dto::InitiativeDto>,
+    },
+    /// Reply to [`Request::TeamList`].
+    Teams {
+        teams: Vec<crate::dto::TeamDto>,
+    },
+    /// Reply to [`Request::TriageList`].
+    TriageItems {
+        items: Vec<crate::dto::TriageDto>,
+    },
+    /// Reply to [`Request::AttachmentGet`] — the full record incl. payload.
+    Attachment {
+        name: String,
+        mime: String,
+        data_b64: String,
     },
     /// A ref resolved to many candidates, represented as a first-class outcome,
     /// or, when `near_miss_for` is set, matched **nothing** and these are the
@@ -951,6 +1461,20 @@ pub enum Response {
     Who {
         peers: Vec<PresenceEntry>,
     },
+    /// The one-shot identity + standing + view-completeness projection.
+    Whoami(crate::dto::WhoamiDto),
+    /// The result of a `sync`: whether the view is now whole, and the same loud
+    /// divergence lines `whoami` reports (empty when converged and complete).
+    Sync {
+        /// True when this node's view is complete (holds every authorized epoch
+        /// key and its history) after converging.
+        whole: bool,
+        /// Human-readable divergence lines — what epoch/history is still
+        /// missing. Empty when whole.
+        divergence: Vec<String>,
+        /// A short human summary of what the sync did/found.
+        message: String,
+    },
     Error {
         message: String,
         // Named `error_kind`, not `kind`: the enum's internal tag is `kind`
@@ -973,6 +1497,12 @@ pub enum ErrorKind {
     #[default]
     Error,
     NotFound,
+    /// The caller's identity lacks the standing this action needs (write access,
+    /// admin, sponsorship). A **typed** authorization failure so a client — the
+    /// MCP agent surface especially — can render an actionable next step ("ask
+    /// your sponsor to grant write access") instead of an opaque blob, and so it
+    /// is never confused with a transient/internal error. Exit `1` like `Error`.
+    Denied,
 }
 
 impl Response {
@@ -988,6 +1518,15 @@ impl Response {
         Response::Error {
             message: msg.into(),
             error_kind: ErrorKind::NotFound,
+        }
+    }
+    /// The caller lacks the standing this action requires — an authorization
+    /// failure, not an internal one. The message should say what is missing and
+    /// how to get it, so the agent surface can surface a next step.
+    pub fn denied(msg: impl Into<String>) -> Self {
+        Response::Error {
+            message: msg.into(),
+            error_kind: ErrorKind::Denied,
         }
     }
 }
@@ -1067,6 +1606,10 @@ pub struct StatusInfo {
     /// The space display name (synced catalog value; empty on a joiner
     /// whose catalog hasn't arrived yet).
     pub name: String,
+    /// The space overview description (synced catalog value; empty when unset).
+    /// Additive so pre-SCOPE-2 clients decode the status unchanged.
+    #[serde(default)]
+    pub description: String,
     pub online_peers: usize,
     pub space: Option<String>,
     pub issues: usize,
@@ -1172,9 +1715,9 @@ async fn probe_inner(home: &Path) -> Probe {
     };
     let line = match exchange_raw(
         stream,
-        &Request::Hello {
+        &ClientRequest::plain(Request::Hello {
             protocol_version: CONTROL_PROTOCOL_VERSION,
-        },
+        }),
     )
     .await
     {
@@ -1225,16 +1768,24 @@ async fn probe_inner(home: &Path) -> Probe {
     }
 }
 
-/// Send one request to the daemon and read one response (one-shot path).
+/// Send one request to the daemon and read one response (one-shot path), as the
+/// primary (human) identity.
 pub async fn request(home: &Path, req: &Request) -> Result<Response> {
+    request_as(home, req, None).await
+}
+
+/// Send one request acting as a named local identity (`act_as`) — the
+/// multi-tenant path. `None` is identical to [`request`].
+pub async fn request_as(home: &Path, req: &Request, act_as: Option<&str>) -> Result<Response> {
     let name = control_name(home)?;
     let stream = Stream::connect(name).await.context("connect to daemon")?;
-    exchange(stream, req).await
+    let env = ClientRequest::acting_as(req.clone(), act_as.map(str::to_string));
+    exchange(stream, &env).await
 }
 
 /// Write one request and read one response on an already-open stream.
-async fn exchange(stream: Stream, req: &Request) -> Result<Response> {
-    let line = exchange_raw(stream, req).await?;
+async fn exchange(stream: Stream, env: &ClientRequest) -> Result<Response> {
+    let line = exchange_raw(stream, env).await?;
     serde_json::from_str(line.trim()).context("decode response")
 }
 
@@ -1243,9 +1794,9 @@ async fn exchange(stream: Stream, req: &Request) -> Result<Response> {
 /// Split from [`exchange`] for [`probe`]: typed decoding is exactly what a
 /// version-mismatched daemon breaks, so the handshake has to look at the bytes
 /// before serde gets an opinion about them.
-async fn exchange_raw(stream: Stream, req: &Request) -> Result<String> {
+async fn exchange_raw(stream: Stream, env: &ClientRequest) -> Result<String> {
     let (read_half, mut write_half) = tokio::io::split(stream);
-    let mut line = serde_json::to_string(req).context("encode request")?;
+    let mut line = serde_json::to_string(env).context("encode request")?;
     line.push('\n');
     write_half
         .write_all(line.as_bytes())
@@ -1306,6 +1857,65 @@ pub async fn subscribe(home: &Path, since: u64) -> Result<Subscription> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_request_envelope_is_wire_backward_compatible() {
+        // No selector → serializes to EXACTLY the bare request an older client
+        // sends (the flatten + skip_serializing_if contract), so a pre-B daemon
+        // still decodes it and a bare request still decodes as `act_as: None`.
+        let bare = Request::Inbox { clear: true };
+        let env = ClientRequest::plain(bare.clone());
+        let env_json = serde_json::to_value(&env).unwrap();
+        let bare_json = serde_json::to_value(&bare).unwrap();
+        assert_eq!(
+            env_json, bare_json,
+            "a no-selector envelope IS the bare request"
+        );
+        // A bare request decodes as an envelope with no selector.
+        let decoded: ClientRequest = serde_json::from_value(bare_json.clone()).unwrap();
+        assert!(decoded.act_as.is_none());
+        assert_eq!(serde_json::to_value(&decoded.request).unwrap(), bare_json);
+    }
+
+    #[test]
+    fn client_request_flatten_round_trips_with_selector_and_scalars() {
+        // The flatten gotcha: a selector alongside a Request carrying scalar
+        // fields (bool + Option<u64>) must survive a JSON round trip. Pin it.
+        for req in [
+            Request::Invite {
+                role: Some("contributor".into()),
+                reusable: true,
+                ttl_hours: Some(48),
+            },
+            Request::Inbox { clear: false },
+            Request::Whoami,
+            Request::IssueNew {
+                title: "t".into(),
+                project: None,
+                project_hint: None,
+                assignees: vec![],
+                priority: None,
+                labels: vec![],
+                body: None,
+                due: None,
+                estimate: Some(3),
+            },
+        ] {
+            let env = ClientRequest::acting_as(req.clone(), Some("agent-x".into()));
+            let json = serde_json::to_string(&env).unwrap();
+            assert!(
+                json.contains("\"act_as\":\"agent-x\""),
+                "selector present: {json}"
+            );
+            let back: ClientRequest = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.act_as.as_deref(), Some("agent-x"));
+            assert_eq!(
+                serde_json::to_value(&back.request).unwrap(),
+                serde_json::to_value(&req).unwrap(),
+                "the flattened request must survive: {json}"
+            );
+        }
+    }
 
     #[test]
     fn control_protocol_window_accepts_supported_and_refuses_outside() {

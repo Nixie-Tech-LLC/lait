@@ -102,10 +102,29 @@ export const isAttributable = (e: ActivityEvent): boolean => ATTRIBUTABLE.has(e.
  * created empty: `comments`, an empty `description`). Rendering those is noise that
  * makes the one real change ("→ backlog") hard to find, so a change whose before and
  * after read the same is omitted.
+ *
+ * `duedate` values are stored as unix seconds; the history phrase renders them
+ * as the calendar date they name (UTC — same convention as `ui/time.dueLabel`),
+ * because "1784937600" is a fact and "Jul 25" is information.
  */
 export function describeChanges(e: ActivityEvent): string {
+  const render = (field: string, v: string | null): string => {
+    if (v === null) return "—";
+    if (field === "duedate") {
+      const ts = Number(v);
+      if (Number.isFinite(ts) && ts > 0) {
+        return new Date(ts * 1000).toLocaleDateString(undefined, {
+          timeZone: "UTC",
+          year: "numeric",
+          month: "short",
+          day: "numeric",
+        });
+      }
+    }
+    return v;
+  };
   return e.changes
     .filter((c) => (c.from ?? "—") !== (c.to ?? "—"))
-    .map((c) => `${c.field}: ${c.from ?? "—"} → ${c.to ?? "—"}`)
+    .map((c) => `${c.field}: ${render(c.field, c.from ?? null)} → ${render(c.field, c.to ?? null)}`)
     .join(", ");
 }

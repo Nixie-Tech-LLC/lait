@@ -15,7 +15,7 @@
  */
 
 /** dto.rs `SCHEMA_VERSION` — every top-level DTO carries it. */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 3;
 
 /** Unix seconds → Date. The one place the units are converted. */
 export const tsToDate = (ts: number): Date => new Date(ts * 1000);
@@ -51,6 +51,15 @@ export interface ProjectDto {
   name: string;
   key: string;
   color: string;
+  /** Overview markdown (absent/empty = none). */
+  description?: string;
+  /** Lead actor key (absent/empty = none). */
+  lead?: string;
+  /** Planned window, unix seconds. */
+  start_date?: number | null;
+  target_date?: number | null;
+  /** Soft-hidden from pickers and all-project lists (still openable directly). */
+  archived?: boolean;
 }
 
 export interface LabelDto {
@@ -77,6 +86,16 @@ export interface Row {
   assignees: string[];
   tombstone: boolean;
   provisional: boolean;
+  /** Due date, unix seconds. Absent = none. */
+  due_date?: number | null;
+  /** Estimate points (the scale is the team's convention). */
+  estimate?: number | null;
+  /** Resolved label names (absent/empty = none). */
+  label_names?: string[];
+  /** Sub-issue progress: done / total live children. Absent = no children.
+   *  Populated by the board projection only. */
+  child_done?: number | null;
+  child_total?: number | null;
 }
 
 export interface BoardColumn {
@@ -96,6 +115,18 @@ export interface CommentDto {
   /** Unix seconds. */
   ts: number;
   body: string;
+  /** Canonical comment id (`cmt_…`). Absent on comments stored before comment
+   *  identity existed — those cannot anchor reactions or replies. */
+  id?: string | null;
+  /** The comment this one replies to (one level of nesting). */
+  parent?: string | null;
+  /** Emoji reactions, grouped per emoji with the actors who reacted. */
+  reactions?: ReactionDto[];
+}
+
+export interface ReactionDto {
+  emoji: string;
+  actors: string[];
 }
 
 export interface IssueView {
@@ -117,7 +148,47 @@ export interface IssueView {
   created_by: string;
   /** Unix seconds. */
   created_at: number;
+  /** Due date, unix seconds. Absent = none. */
+  due_date?: number | null;
+  estimate?: number | null;
+  /** Subscribed actors, independent of assignment (INBOX-9). */
+  followers?: string[];
+  /** Targeted milestone id (SCOPE-1). */
+  milestone?: string | null;
+  /** Scheduled cycle id (BOARD-11). */
+  cycle?: string | null;
+  /** Attachment metadata (CREATE-5). */
+  attachments?: AttachmentMetaDto[];
   provisional: boolean;
+  /** Malformed stored records, kept beside the valid projection rather than
+   * silently dropped or laundered into sentinel values. */
+  corrupt_records?: CorruptRecord[];
+}
+
+/** Attachment metadata on an issue (CREATE-5) — payloads via `attachment_get`. */
+export interface AttachmentMetaDto {
+  id: string;
+  name: string;
+  mime?: string;
+  size: number;
+  by?: string;
+  ts: number;
+  comment?: string;
+}
+
+/** One project milestone with derived progress (SCOPE-1). */
+export interface MilestoneDto {
+  id: string;
+  name: string;
+  target_date?: number | null;
+  total: number;
+  done: number;
+}
+
+export interface CorruptRecord {
+  locus: string;
+  reason: string;
+  raw?: Record<string, string>;
 }
 
 export interface FieldChange {
@@ -191,9 +262,15 @@ export interface InboxEntry {
 
 export interface MemberDto {
   key: string;
-  /** "admin" | "member" — from the signed ACL graph. */
+  /** "admin" | "member" | "viewer" — the coarse label of the ACL grant set. A
+   * sponsored member (agent) is not a separate role; `sponsor` marks it. */
   role: string;
+  /** The member's did:key — the self-certifying, synced-safe interop handle
+   * (`z6Mk…`); a pure function of the key, unlike the local `alias`. */
+  did?: string | null;
   me: boolean;
+  /** Present for agents: the actor whose standing sponsors this identity. */
+  sponsor?: string | null;
   /** Local petname; never synced. The trusted half of the identity model. */
   alias: string;
 }
@@ -221,6 +298,33 @@ export interface MemberLogEntry {
   authorized: boolean;
 }
 
+/**
+ * One effective scoped capability assignment — `dto.rs` `AssignmentDto`.
+ *
+ * A role grant (`access_grant`) expands the role's pinned definition into one of
+ * these per capability, each with its own `grant_id` (the revocation handle).
+ * `resource` empty = the Space; `[projectId]` = that project's scope.
+ */
+export interface AssignmentDto {
+  grant_id: string;
+  actor: string;
+  world: string;
+  capability: string;
+  resource: string[];
+}
+
+/** One project status update — `dto.rs` `ProjectUpdateDto` (SCOPE-1). */
+export interface ProjectUpdateDto {
+  id: string;
+  /** Authoring actor key. */
+  author: string;
+  /** Post time, unix seconds. */
+  ts: number;
+  body: string;
+  /** `on_track` | `at_risk` | `off_track` | "" (none). */
+  health?: string;
+}
+
 /** A pinned seed ("remote") — a bootstrap + backfill anchor, never trust. */
 export interface SeedDto {
   id: string;
@@ -234,6 +338,8 @@ export interface PresenceEntry {
   id: string;
   nick: string;
   state: string;
+  online: boolean;
+  last_seen_secs: number;
 }
 
 export interface Event {
@@ -256,12 +362,42 @@ export interface StatusInfo {
   nick: string;
   /** Space display name. (Was `room` in the pre-v0.4.2 shape.) */
   name: string;
+  /** Space overview description (SCOPE-2; empty when unset). */
+  description?: string;
   online_peers: number;
   space: string | null;
   issues: number;
   projects: number;
+  /** True means zero counts are unavailable, not an empty space. */
+  counts_unavailable?: boolean;
   /** `admin` | `member` | `pending`. */
   membership: string;
+  degraded_recovery?: DegradedRecoveryHolder[];
+  recovery?: RecoveryStatus | null;
+}
+
+export interface RecoveryArtifactFailure {
+  kind: "undecryptable" | "io";
+  detail: string;
+}
+
+export interface DegradedRecoveryHolder {
+  transcript: string;
+  reason: RecoveryArtifactFailure;
+  is_current_authority?: boolean | null;
+}
+
+export interface RecoveryStatus {
+  authority?: string | null;
+  scheme: "Single" | "FrostThreshold" | "GeneralAccess";
+  k: number;
+  n: number;
+  local_custody:
+    | { state: "not_a_holder" }
+    | { state: "ready" }
+    | { state: "missing" }
+    | { state: "backup_unverified" }
+    | { state: "unreadable"; detail: RecoveryArtifactFailure };
 }
 
 // ---- the supervisor surface (serve-level, not control-plane) ----------------
@@ -353,13 +489,26 @@ export interface Filter {
  * have no browser surface yet — add them here when they grow one.
  */
 export type Request =
-  | { cmd: "issue_new"; title: string; project?: string | null; project_hint?: string | null; assignees?: string[]; priority?: Priority | null; labels?: string[]; body?: string | null }
-  | { cmd: "issue_edit"; reff: string; title?: string | null; status?: string | null; priority?: string | null; description?: string | null }
+  | { cmd: "issue_new"; title: string; project?: string | null; project_hint?: string | null; assignees?: string[]; priority?: Priority | null; labels?: string[]; body?: string | null; due?: string | null; estimate?: number | null }
+  /** `due`: `YYYY-MM-DD` (UTC), unix seconds, or `"none"` to clear; `estimate`:
+   *  a number as a string, or `"none"` to clear. Absent = untouched. */
+  | { cmd: "issue_edit"; reff: string; title?: string | null; status?: string | null; priority?: string | null; description?: string | null; due?: string | null; estimate?: string | null }
   | { cmd: "issue_move"; reff: string; project?: string | null; pos?: BoardPos | null }
   | { cmd: "assign"; reff: string; who: string[]; add?: boolean }
   | { cmd: "label"; reff: string; add?: string[]; remove?: string[] }
-  | { cmd: "comment"; reff: string; body: string }
+  | { cmd: "comment"; reff: string; body: string; reply_to?: string | null }
+  /** Toggle an emoji reaction on a comment. Writes no history event. */
+  | { cmd: "react"; reff: string; comment: string; emoji: string; on?: boolean }
   | { cmd: "issue_delete"; reff: string }
+  /** Clears the tombstone. Restore wins over a concurrent delete. */
+  | { cmd: "issue_restore"; reff: string }
+  /** `kind` is `blocks` | `relates` | `duplicates`; `reff` is the edge's source
+   *  (`reff` blocks `target`), so "blocked by" is the same verb with the ends
+   *  swapped. `relates` is symmetric — the daemon canonicalizes the endpoints. */
+  | { cmd: "issue_link"; reff: string; kind: string; target: string }
+  | { cmd: "issue_unlink"; reff: string; kind: string; target: string }
+  /** `parent: null` clears. The daemon refuses cycles (tree-move CRDT). */
+  | { cmd: "issue_parent"; reff: string; parent?: string | null }
   | { cmd: "issue_start"; reff: string }
   | { cmd: "issue_done"; reff: string }
   | { cmd: "issue_stop"; reff: string }
@@ -368,10 +517,41 @@ export type Request =
   | { cmd: "board"; project?: string | null; project_hint?: string | null }
   | { cmd: "history"; reff: string }
   | { cmd: "issue_graph"; reff: string }
-  | { cmd: "project_new"; name: string; key: string }
+  | { cmd: "project_new"; name: string; key: string; color?: string | null }
   | { cmd: "project_list" }
+  | {
+      cmd: "project_edit";
+      project: string;
+      name?: string | null;
+      color?: string | null;
+      description?: string | null;
+      lead?: string | null;
+      start?: string | null;
+      target?: string | null;
+      /** Soft-hide toggle: true archives, false restores, absent leaves it. */
+      archived?: boolean | null;
+    }
+  /** Reply is `updates` — the project's status feed, newest first. */
+  | { cmd: "project_updates"; project: string }
+  | { cmd: "project_update_post"; project: string; body: string; health?: string | null }
+  /** Subscribe to an issue without being assigned (INBOX-9). */
+  | { cmd: "follow"; reff: string; on?: boolean }
+  /** Reply is `milestones` — the project's milestones with progress (SCOPE-1). */
+  | { cmd: "milestone_list"; project: string }
+  | { cmd: "milestone_set"; project: string; milestone?: string | null; name?: string | null; target?: string | null; remove?: boolean }
+  /** Point an issue at a milestone in its project (`null`/"none" clears). */
+  | { cmd: "issue_milestone"; reff: string; milestone?: string | null }
+  /** Attach a file (standard base64; raw ≤ 256 KiB) — CREATE-5. */
+  | { cmd: "attach"; reff: string; name: string; mime?: string | null; data_b64: string; comment?: string | null }
+  | { cmd: "detach"; reff: string; id: string }
+  /** Reply is `attachment` — the full record incl. payload. */
+  | { cmd: "attachment_get"; reff: string; id: string }
   | { cmd: "label_new"; name: string; color?: string | null }
   | { cmd: "label_list" }
+  | { cmd: "label_edit"; label: string; name?: string | null; color?: string | null }
+  | { cmd: "label_delete"; label: string }
+  | { cmd: "space_rename"; name: string }
+  | { cmd: "space_describe"; description: string }
   | { cmd: "activity"; since?: number }
   | { cmd: "inbox"; clear?: boolean }
   | { cmd: "member_add"; who: string; admin?: boolean; as_name?: string | null }
@@ -384,6 +564,20 @@ export type Request =
   | { cmd: "diagnose"; expected_space?: string | null }
   | { cmd: "id" }
   | { cmd: "invite"; role?: string | null; reusable?: boolean; ttl_hours?: number | null }
+  /** Admin-only. Accepts the invite ticket or its 32-hex nonce. */
+  | { cmd: "invite_revoke"; invite: string }
+  /** Reply is `text` — the revision as pretty JSON (same shape the CLI prints). */
+  | { cmd: "workflow_show"; project: string }
+  | { cmd: "workflow_set"; project: string; expect_heads: string[]; body_json: string }
+  /** Reply is `text` — every role definition as pretty JSON. */
+  | { cmd: "role_list" }
+  /** Reply is `assignments` — effective scoped grants, optionally one actor. */
+  | { cmd: "access_list"; actor?: string | null }
+  /** Expand a role's pinned caps and install them for an actor (Space- or
+   *  project-scoped). All-or-nothing; authority-first. */
+  | { cmd: "access_grant"; actor: string; role: string; project?: string | null }
+  /** Revoke one effective capability assignment by its 64-hex grant id. */
+  | { cmd: "access_revoke"; grant_id: string }
   | { cmd: "join"; ticket: string }
   | { cmd: "seed_list" }
   | { cmd: "log"; since: number }
@@ -407,8 +601,12 @@ export type Response =
   | { kind: "activity"; events: ActivityEvent[]; last: number }
   | { kind: "inbox"; entries: InboxEntry[]; unread: number }
   | { kind: "projects"; projects: ProjectDto[] }
+  | { kind: "updates"; updates: ProjectUpdateDto[] }
+  | { kind: "milestones"; milestones: MilestoneDto[] }
+  | { kind: "attachment"; name: string; mime: string; data_b64: string }
   | { kind: "labels"; labels: LabelDto[] }
   | { kind: "members"; members: MemberDto[] }
+  | { kind: "assignments"; rows: AssignmentDto[] }
   | { kind: "member_log"; entries: MemberLogEntry[] }
   | { kind: "seeds"; seeds: SeedDto[] }
   /** A ref resolved to several — a first-class outcome (exit 2), never an error. */

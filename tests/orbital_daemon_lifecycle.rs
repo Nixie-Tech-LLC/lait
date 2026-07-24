@@ -116,6 +116,7 @@ fn the_orbital_daemon_serves_the_issue_surface_over_the_control_socket() {
         Request::ProjectNew {
             name: "Engineering".into(),
             key: "eng".into(),
+            color: None,
         },
     );
     assert!(
@@ -137,6 +138,8 @@ fn the_orbital_daemon_serves_the_issue_surface_over_the_control_socket() {
             priority: Some("high".into()),
             labels: vec![],
             body: Some("through the orbital daemon".into()),
+            due: None,
+            estimate: None,
         },
     );
     assert!(
@@ -166,6 +169,7 @@ fn the_orbital_daemon_serves_the_issue_surface_over_the_control_socket() {
         Request::Comment {
             reff: "ENG-1".into(),
             body: "a socket comment".into(),
+            reply_to: None,
         },
     );
     let resp = req(

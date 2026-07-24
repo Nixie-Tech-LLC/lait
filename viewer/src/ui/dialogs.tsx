@@ -97,8 +97,8 @@ export function DialogHost() {
     return (
       <AlertDialog.Root open onOpenChange={(o) => !o && settle(false)}>
         <AlertDialog.Portal>
-          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-black/45 backdrop-blur-[2px]" />
-          <AlertDialog.Content className="border-line-strong bg-raised shadow-overlay fixed top-1/2 left-1/2 z-50 w-[min(440px,92vw)] -translate-x-1/2 -translate-y-1/2 rounded-lg border p-4">
+          <AlertDialog.Overlay className="ui-overlay fixed inset-0 z-50 bg-black/45 backdrop-blur-[2px]" />
+          <AlertDialog.Content className="ui-surface border-line-strong bg-raised shadow-overlay fixed top-1/2 left-1/2 z-50 w-[min(440px,92vw)] -translate-x-1/2 -translate-y-1/2 rounded-lg border p-4">
             <AlertDialog.Title className="text-lg font-semibold">{req.title}</AlertDialog.Title>
             {req.body && (
               <AlertDialog.Description className="text-dim mt-2">{req.body}</AlertDialog.Description>
@@ -112,8 +112,7 @@ export function DialogHost() {
               <AlertDialog.Action asChild>
                 <Button
                   size="md"
-                  variant="primary"
-                  className={req.danger ? "bg-danger" : undefined}
+                  variant={req.danger ? "destructive" : "primary"}
                   onClick={() => settle(true)}
                 >
                   {req.confirmText ?? "Confirm"}
@@ -131,8 +130,8 @@ export function DialogHost() {
   return (
     <Dialog.Root open onOpenChange={(o) => !o && settle(null)}>
       <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/45 backdrop-blur-[2px]" />
-        <Dialog.Content className="border-line-strong bg-raised shadow-overlay fixed top-[18vh] left-1/2 z-50 w-[min(480px,92vw)] -translate-x-1/2 rounded-lg border">
+        <Dialog.Overlay className="ui-overlay fixed inset-0 z-50 bg-black/45 backdrop-blur-[2px]" />
+        <Dialog.Content className="ui-surface border-line-strong bg-raised shadow-overlay fixed top-[18vh] left-1/2 z-50 w-[min(480px,92vw)] -translate-x-1/2 rounded-lg border">
           <form
             onSubmit={(e) => {
               e.preventDefault();

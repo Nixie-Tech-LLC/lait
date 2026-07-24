@@ -89,6 +89,7 @@ fn the_router_maps_the_control_surface_to_the_issues_world() {
         Request::ProjectNew {
             name: "Engineering".into(),
             key: "eng".into(),
+            color: None,
         },
         &facts(),
     );
@@ -105,6 +106,8 @@ fn the_router_maps_the_control_surface_to_the_issues_world() {
             priority: Some("high".into()),
             labels: vec!["bug".into()],
             body: Some("body text".into()),
+            due: None,
+            estimate: None,
         },
         &facts(),
     );
@@ -138,6 +141,8 @@ fn the_router_maps_the_control_surface_to_the_issues_world() {
             status: None,
             priority: None,
             description: None,
+            due: None,
+            estimate: None,
         },
         &facts(),
     );
@@ -145,6 +150,7 @@ fn the_router_maps_the_control_surface_to_the_issues_world() {
         Request::Comment {
             reff: "ENG-1".into(),
             body: "routed comment".into(),
+            reply_to: None,
         },
         &facts(),
     );
@@ -167,6 +173,8 @@ fn the_router_maps_the_control_surface_to_the_issues_world() {
             priority: None,
             labels: vec![],
             body: None,
+            due: None,
+            estimate: None,
         },
         &facts(),
     );
@@ -236,6 +244,8 @@ fn the_router_declares_the_issue_family_it_handles() {
         title: "x".into(),
         project: None,
         project_hint: None,
+        due: None,
+        estimate: None,
         assignees: vec![],
         priority: None,
         labels: vec![],

@@ -85,7 +85,6 @@ impl IssuesWorld {
             }
         }
         let catalog = Arc::new(catalog_state(ctx)?);
-        let aliases = Arc::new(derive_aliases(&catalog));
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         let mut issues: BTreeMap<String, Arc<IssueState>> = BTreeMap::new();
         for doc in catalog.doc_ids() {
@@ -104,6 +103,9 @@ impl IssuesWorld {
             }
             issues.insert(doc, state);
         }
+        let aliases = Arc::new(derive_aliases(&catalog, |doc| {
+            issues.get(doc).map(|issue| issue.project.as_str())
+        }));
         // Registered docs are the live set: drop parses for departed docs.
         cache.issues.retain(|doc, _| issues.contains_key(doc));
         let snap = Arc::new(DerivedSnapshot {
@@ -190,23 +192,35 @@ struct Staging {
     ops: Vec<(BodyKey, BodyOp)>,
     scopes: Vec<BodyKey>,
     declarations: Vec<BodyDeclaration>,
+    /// Whether a catalog op must carry the creation declaration — true exactly
+    /// when the committed snapshot holds no Catalog yet (first-ever write).
+    declare_catalog_on_use: bool,
     /// The canonical demand this mutation requires (defaults to contributor).
     demand: Option<Vec<u8>>,
 }
 
 impl Staging {
-    fn for_space(space: mechanics::ids::SpaceId) -> Self {
+    fn for_space(space: mechanics::ids::SpaceId, declare_catalog_on_use: bool) -> Self {
         Self {
             space,
             ops: Vec::new(),
             scopes: Vec::new(),
             declarations: Vec::new(),
+            declare_catalog_on_use,
             demand: None,
         }
     }
 }
 
 impl Staging {
+    /// Declarations ride ONLY the transaction that may create a Body.
+    ///
+    /// A Body's `(schema, version)` binding is immutable once recorded, and a
+    /// later declaration must equal it exactly — so declaring the compiled-in
+    /// version on every write would turn the first schema-version bump into a
+    /// `ContractViolation` against every pre-existing Body. An existing Body
+    /// resolves its own binding without any declaration; only creation needs
+    /// one, so only creation carries one.
     fn declare_issue(&mut self, key: &BodyKey) {
         if !self.declarations.iter().any(|d| &d.key == key) {
             self.declarations.push(BodyDeclaration {
@@ -215,11 +229,12 @@ impl Staging {
                 schema_version: contract::ISSUE_SCHEMA_VERSION,
             });
         }
-        if !self.scopes.contains(key) {
-            self.scopes.push(key.clone());
-        }
     }
 
+    /// See [`Self::declare_issue`] — attached exactly when this transaction
+    /// may bring the Catalog into being (`declare_catalog_on_use`). Joiners
+    /// adopt the Catalog through Manifest synchronization and never
+    /// re-declare it.
     fn declare_catalog(&mut self) {
         let key = catalog_key(&self.space);
         if !self.declarations.iter().any(|d| d.key == key) {
@@ -229,19 +244,27 @@ impl Staging {
                 schema_version: contract::CATALOG_SCHEMA_VERSION,
             });
         }
-        if !self.scopes.contains(&key) {
-            self.scopes.push(key);
-        }
     }
 
     fn issue(&mut self, key: &BodyKey, op: BodyOp) {
-        self.declare_issue(key);
+        if matches!(op, BodyOp::Create) {
+            self.declare_issue(key);
+        }
+        if !self.scopes.contains(key) {
+            self.scopes.push(key.clone());
+        }
         self.ops.push((key.clone(), op));
     }
 
     fn catalog(&mut self, op: BodyOp) {
-        self.declare_catalog();
-        self.ops.push((catalog_key(&self.space), op));
+        if self.declare_catalog_on_use {
+            self.declare_catalog();
+        }
+        let key = catalog_key(&self.space);
+        if !self.scopes.contains(&key) {
+            self.scopes.push(key.clone());
+        }
+        self.ops.push((key, op));
     }
 
     /// Set the demand this mutation requires (an admin-only intent overrides
@@ -620,8 +643,10 @@ impl World for IssuesWorld {
         intent: WorldIntent,
     ) -> Result<WorldEffect, WorldError> {
         let intent = IssueIntent::from_json(&intent.payload).ok_or(WorldError::InvalidRequest)?;
-        let catalog = catalog_state(ctx)?;
-        let mut staging = Staging::for_space(ctx.principal().space.clone());
+        let catalog_view = checked_catalog_view(ctx)?;
+        let catalog = CatalogState::from_view(catalog_view.as_ref());
+        let mut staging = Staging::for_space(ctx.principal().space.clone(), catalog_view.is_none());
+        drop(catalog_view);
         match intent {
             IssueIntent::InitializeTracker {
                 name,
@@ -743,6 +768,8 @@ impl World for IssuesWorld {
                 labels,
                 new_labels,
                 body,
+                duedate,
+                estimate,
                 actor,
                 device,
                 ts,
@@ -761,6 +788,9 @@ impl World for IssuesWorld {
                         return Err(WorldError::InvalidRequest);
                     }
                 }
+                if duedate == Some(0) || estimate.is_some_and(|e| e > contract::MAX_ESTIMATE) {
+                    return Err(WorldError::InvalidRequest);
+                }
                 let key = issue_key(&doc);
                 staging.issue(&key, BodyOp::Create);
                 staging.issue(&key, reg("projectid", project.as_bytes().to_vec()));
@@ -769,6 +799,12 @@ impl World for IssuesWorld {
                 staging.issue(&key, reg("priority", priority.as_bytes().to_vec()));
                 staging.issue(&key, reg("createdby", actor.as_bytes().to_vec()));
                 staging.issue(&key, reg("createdat", ts.to_string().into_bytes()));
+                if let Some(due) = duedate {
+                    staging.issue(&key, reg("duedate", due.to_string().into_bytes()));
+                }
+                if let Some(points) = estimate {
+                    staging.issue(&key, reg("estimate", points.to_string().into_bytes()));
+                }
                 if let Some(body) = body.filter(|b| !b.is_empty()) {
                     staging.issue(
                         &key,
@@ -823,6 +859,8 @@ impl World for IssuesWorld {
                 status,
                 priority,
                 description,
+                duedate,
+                estimate,
                 device,
                 ts,
             } => {
@@ -831,6 +869,15 @@ impl World for IssuesWorld {
                     && status.is_none()
                     && priority.is_none()
                     && description.is_none()
+                    && duedate.is_none()
+                    && estimate.is_none()
+                {
+                    return Err(WorldError::InvalidRequest);
+                }
+                if duedate == Some(Some(0))
+                    || estimate
+                        .flatten()
+                        .is_some_and(|e| e > contract::MAX_ESTIMATE)
                 {
                     return Err(WorldError::InvalidRequest);
                 }
@@ -906,6 +953,45 @@ impl World for IssuesWorld {
                             from: None,
                             to: None,
                         });
+                    }
+                }
+                if let Some(duedate) = duedate {
+                    if duedate != issue.duedate {
+                        changes.push(EventChange {
+                            f: "duedate".into(),
+                            from: issue.duedate.map(|d| d.to_string()),
+                            to: duedate.map(|d| d.to_string()),
+                        });
+                        match duedate {
+                            Some(due) => {
+                                staging.issue(&key, reg("duedate", due.to_string().into_bytes()))
+                            }
+                            None => staging.issue(
+                                &key,
+                                BodyOp::RegisterClear {
+                                    path: "duedate".into(),
+                                },
+                            ),
+                        }
+                    }
+                }
+                if let Some(estimate) = estimate {
+                    if estimate != issue.estimate {
+                        changes.push(EventChange {
+                            f: "estimate".into(),
+                            from: issue.estimate.map(|e| e.to_string()),
+                            to: estimate.map(|e| e.to_string()),
+                        });
+                        match estimate {
+                            Some(points) => staging
+                                .issue(&key, reg("estimate", points.to_string().into_bytes())),
+                            None => staging.issue(
+                                &key,
+                                BodyOp::RegisterClear {
+                                    path: "estimate".into(),
+                                },
+                            ),
+                        }
                     }
                 }
                 if staging.ops.is_empty() {
@@ -1066,6 +1152,8 @@ impl World for IssuesWorld {
             IssueIntent::Comment {
                 doc,
                 body,
+                id,
+                parent,
                 actor,
                 device,
                 ts,
@@ -1074,6 +1162,29 @@ impl World for IssuesWorld {
                     return Err(WorldError::InvalidRequest);
                 }
                 let issue = issue_state(ctx, &doc).ok_or(WorldError::InvalidRequest)?;
+                if let Some(id) = &id {
+                    // The daemon mints; the World re-validates — including
+                    // uniqueness, because a duplicated id would fuse two
+                    // comments' reactions and replies.
+                    if !contract::is_comment_id(id)
+                        || issue.comments.iter().any(|c| c.id.as_deref() == Some(id))
+                    {
+                        return Err(WorldError::InvalidRequest);
+                    }
+                }
+                if let Some(parent) = &parent {
+                    // A reply needs an addressable target: an existing comment
+                    // that carries an id (pre-identity comments cannot anchor
+                    // threads) and is itself a root — one level, no ladders.
+                    let target = issue
+                        .comments
+                        .iter()
+                        .find(|c| c.id.as_deref() == Some(parent.as_str()))
+                        .ok_or(WorldError::InvalidRequest)?;
+                    if id.is_none() || target.parent.is_some() {
+                        return Err(WorldError::InvalidRequest);
+                    }
+                }
                 let key = issue_key(&doc);
                 staging.issue(
                     &key,
@@ -1084,6 +1195,8 @@ impl World for IssuesWorld {
                             a: actor,
                             t: ts,
                             b: body.clone(),
+                            id,
+                            parent,
                         })
                         .expect("comment json"),
                     },
@@ -1091,6 +1204,43 @@ impl World for IssuesWorld {
                 let mut ev = event("commented", &device, ts);
                 ev.x = body;
                 push_event(&mut staging, ctx, &doc, &ev);
+                Ok(staging.into_effect(Some(doc)))
+            }
+            IssueIntent::React {
+                doc,
+                comment,
+                emoji,
+                actor,
+                on,
+                device: _,
+                ts: _,
+            } => {
+                if ActorId::parse(&actor).is_none()
+                    || !contract::is_comment_id(&comment)
+                    || !contract::is_reaction_emoji(&emoji)
+                {
+                    return Err(WorldError::InvalidRequest);
+                }
+                let issue = issue_state(ctx, &doc).ok_or(WorldError::InvalidRequest)?;
+                if !issue
+                    .comments
+                    .iter()
+                    .any(|c| c.id.as_deref() == Some(comment.as_str()))
+                {
+                    return Err(WorldError::InvalidRequest);
+                }
+                let value = contract::reaction_value(&emoji, &actor);
+                let path = contract::reaction_path(&comment);
+                staging.issue(
+                    &issue_key(&doc),
+                    if on {
+                        BodyOp::SetAdd { path, value }
+                    } else {
+                        BodyOp::SetRemove { path, value }
+                    },
+                );
+                // No history event, deliberately — see the intent's contract
+                // note: a reaction is a social signal, not a change of record.
                 Ok(staging.into_effect(Some(doc)))
             }
             IssueIntent::SetTombstone {
@@ -1277,6 +1427,7 @@ impl World for IssuesWorld {
                 id,
                 name,
                 key,
+                color,
                 device: _,
                 ts: _,
             } => {
@@ -1297,7 +1448,7 @@ impl World for IssuesWorld {
                     serde_json::to_vec(&serde_json::json!({
                         "name": name.trim(),
                         "key": key,
-                        "color": "blue",
+                        "color": color,
                     }))
                     .expect("project json"),
                 ));
@@ -1338,6 +1489,192 @@ impl World for IssuesWorld {
                     }))
                     .expect("label json"),
                 ));
+                Ok(staging.into_effect(None))
+            }
+            IssueIntent::ProjectEdit {
+                id,
+                name,
+                color,
+                description,
+                lead,
+                start_date,
+                target_date,
+                archived,
+                team,
+                device: _,
+                ts: _,
+            } => {
+                staging.require(contract::demand_space_any("project.configure"));
+                let current = catalog
+                    .projects
+                    .get(&id)
+                    .ok_or(WorldError::InvalidRequest)?;
+                let mut meta = current.clone();
+                if let Some(name) = name {
+                    let name = name.trim().to_string();
+                    if name.is_empty() {
+                        return Err(WorldError::InvalidRequest);
+                    }
+                    // No name-uniqueness guard: projects are unique on KEY, not
+                    // name (which stays immutable here), so two may share a name.
+                    meta.name = name;
+                }
+                if let Some(color) = color {
+                    meta.color = color;
+                }
+                if let Some(description) = description {
+                    meta.description = description;
+                }
+                if let Some(lead) = lead {
+                    meta.lead = lead;
+                }
+                if let Some(start) = start_date {
+                    meta.start_date = start;
+                }
+                if let Some(target) = target_date {
+                    meta.target_date = target;
+                }
+                if let Some(archived) = archived {
+                    meta.archived = archived;
+                }
+                if let Some(team) = team {
+                    // Empty clears; a set names a live team.
+                    if !team.is_empty() && !catalog.teams.get(&team).is_some_and(|t| !t.tombstone) {
+                        return Err(WorldError::InvalidRequest);
+                    }
+                    meta.team = team;
+                }
+                // Nothing changed: don't emit an op that would look like an edit.
+                if meta == *current {
+                    return Ok(staging.into_effect(None));
+                }
+                // Serialize the whole record so an edit never drops a field the
+                // caller didn't touch.
+                staging.catalog(map_set(
+                    "projects",
+                    id.clone(),
+                    serde_json::to_vec(&meta).expect("project json"),
+                ));
+                Ok(staging.into_effect(None))
+            }
+            IssueIntent::ProjectUpdatePost {
+                project_id,
+                id,
+                author,
+                body,
+                health,
+                device: _,
+                ts,
+            } => {
+                staging.require(contract::demand_space_any("project.configure"));
+                if !catalog.projects.contains_key(&project_id) {
+                    return Err(WorldError::InvalidRequest);
+                }
+                let body = body.trim();
+                if body.is_empty() {
+                    return Err(WorldError::InvalidRequest);
+                }
+                let update = crate::world::views::ProjectUpdate {
+                    id: id.clone(),
+                    project_id: project_id.clone(),
+                    author,
+                    ts,
+                    body: body.to_string(),
+                    health,
+                };
+                staging.catalog(map_set(
+                    "project_updates",
+                    format!("{project_id}/{id}"),
+                    serde_json::to_vec(&update).expect("project update json"),
+                ));
+                Ok(staging.into_effect(None))
+            }
+            IssueIntent::LabelEdit {
+                id,
+                name,
+                color,
+                device: _,
+                ts: _,
+            } => {
+                staging.require(contract::demand_space_any("catalog.label.configure"));
+                let current = catalog.labels.get(&id).ok_or(WorldError::InvalidRequest)?;
+                let mut meta = current.clone();
+                if let Some(name) = name {
+                    let name = name.trim().to_string();
+                    if name.is_empty() {
+                        return Err(WorldError::InvalidRequest);
+                    }
+                    // Case-insensitive uniqueness against the OTHER labels — the
+                    // same guard `LabelNew` applies, minus this label itself.
+                    if catalog
+                        .labels
+                        .iter()
+                        .any(|(lid, l)| lid != &id && l.name.eq_ignore_ascii_case(&name))
+                    {
+                        return Err(WorldError::Conflict);
+                    }
+                    meta.name = name;
+                }
+                if let Some(color) = color {
+                    meta.color = color;
+                }
+                if meta == *current {
+                    return Ok(staging.into_effect(None));
+                }
+                staging.catalog(map_set(
+                    "labels",
+                    id.clone(),
+                    serde_json::to_vec(&serde_json::json!({
+                        "name": meta.name,
+                        "color": meta.color,
+                    }))
+                    .expect("label json"),
+                ));
+                Ok(staging.into_effect(None))
+            }
+            IssueIntent::LabelDelete {
+                id,
+                device: _,
+                ts: _,
+            } => {
+                staging.require(contract::demand_space_any("catalog.label.configure"));
+                if !catalog.labels.contains_key(&id) {
+                    return Err(WorldError::InvalidRequest);
+                }
+                staging.catalog(BodyOp::MapRemove {
+                    path: "labels".into(),
+                    key: id,
+                });
+                Ok(staging.into_effect(None))
+            }
+            IssueIntent::SpaceRename {
+                name,
+                device: _,
+                ts: _,
+            } => {
+                staging.require(contract::demand_admin());
+                let name = name.trim();
+                if name.is_empty() {
+                    return Err(WorldError::InvalidRequest);
+                }
+                if catalog.name == name {
+                    return Ok(staging.into_effect(None));
+                }
+                staging.catalog(reg("name", name.to_string().into_bytes()));
+                Ok(staging.into_effect(None))
+            }
+            IssueIntent::SpaceDescribe {
+                description,
+                device: _,
+                ts: _,
+            } => {
+                staging.require(contract::demand_admin());
+                // Empty clears; no trim so intentional leading/trailing prose is
+                // preserved. LWW on the catalog `description` register.
+                if catalog.description == description {
+                    return Ok(staging.into_effect(None));
+                }
+                staging.catalog(reg("description", description.into_bytes()));
                 Ok(staging.into_effect(None))
             }
             IssueIntent::RoleCreate {
@@ -1516,6 +1853,657 @@ impl World for IssuesWorld {
                 staging.require(contract::demand_space_any("catalog.workflow.configure"));
                 Ok(staging.into_effect(None))
             }
+            IssueIntent::ProjectDelete {
+                id,
+                device: _,
+                ts: _,
+            } => {
+                staging.require(contract::demand_project_any("project.delete", &id));
+                if !catalog.projects.contains_key(&id) {
+                    return Err(WorldError::InvalidRequest);
+                }
+                // The safe v1 (CUSTOM-10): a project still referenced by ANY
+                // issue — live or tombstoned — refuses. Every doc's alias keys
+                // off its project; deleting under one would orphan it
+                // silently. Reassign (`issue move`) or archive instead.
+                let referenced = ctx
+                    .bodies_with_schema(&contract::world_id(), &contract::issue_schema())
+                    .iter()
+                    .filter_map(|key| ctx.read_collaborative(key))
+                    .any(|view| IssueState::from_view(&view).project == id);
+                if referenced {
+                    return Err(WorldError::Conflict);
+                }
+                let map_remove = |path: &str, key: String| BodyOp::MapRemove {
+                    path: path.into(),
+                    key,
+                };
+                staging.catalog(map_remove("projects", id.clone()));
+                if catalog.aliases.contains_key(&id) {
+                    staging.catalog(map_remove("aliases", id.clone()));
+                }
+                for rev in catalog.workflow_revisions.get(&id).into_iter().flatten() {
+                    staging.catalog(map_remove(
+                        "workflow_revisions",
+                        format!("{id}/{}", rev.revision_id),
+                    ));
+                }
+                for update in catalog.project_updates.get(&id).into_iter().flatten() {
+                    staging.catalog(map_remove("project_updates", format!("{id}/{}", update.id)));
+                }
+                for mid in catalog
+                    .milestones
+                    .get(&id)
+                    .into_iter()
+                    .flat_map(|m| m.keys())
+                {
+                    staging.catalog(map_remove("project_milestones", format!("{id}/{mid}")));
+                }
+                for cid in catalog.cycles.get(&id).into_iter().flat_map(|c| c.keys()) {
+                    staging.catalog(map_remove("cycles", format!("{id}/{cid}")));
+                }
+                // Initiatives referencing the project drop it from their
+                // member list in the same transaction.
+                for (iid, initiative) in &catalog.initiatives {
+                    if initiative.projects.contains(&id) {
+                        let mut updated = initiative.clone();
+                        updated.projects.retain(|p| p != &id);
+                        staging.catalog(map_set(
+                            "initiatives",
+                            iid.clone(),
+                            serde_json::to_vec(&updated).expect("initiative json"),
+                        ));
+                    }
+                }
+                Ok(staging.into_effect(None))
+            }
+            IssueIntent::Follow {
+                doc,
+                actor,
+                on,
+                device: _,
+                ts: _,
+            } => {
+                if ActorId::parse(&actor).is_none() {
+                    return Err(WorldError::InvalidRequest);
+                }
+                let _issue = issue_state(ctx, &doc).ok_or(WorldError::InvalidRequest)?;
+                let value = actor.into_bytes();
+                staging.issue(
+                    &issue_key(&doc),
+                    if on {
+                        BodyOp::SetAdd {
+                            path: "followers".into(),
+                            value,
+                        }
+                    } else {
+                        BodyOp::SetRemove {
+                            path: "followers".into(),
+                            value,
+                        }
+                    },
+                );
+                // No history event, like `React` — following is a personal
+                // signal, not a change of record.
+                Ok(staging.into_effect(Some(doc)))
+            }
+            IssueIntent::MilestoneSet {
+                project_id,
+                id,
+                name,
+                target_date,
+                tombstone,
+                device: _,
+                ts: _,
+            } => {
+                staging.require(contract::demand_space_any("project.configure"));
+                if !catalog.projects.contains_key(&project_id) || id.is_empty() {
+                    return Err(WorldError::InvalidRequest);
+                }
+                let current = catalog
+                    .milestones
+                    .get(&project_id)
+                    .and_then(|m| m.get(&id))
+                    .cloned();
+                let mut record = match current.clone() {
+                    Some(m) => m,
+                    None => {
+                        let name = name.clone().unwrap_or_default();
+                        if name.trim().is_empty() {
+                            return Err(WorldError::InvalidRequest);
+                        }
+                        crate::world::views::Milestone {
+                            id: id.clone(),
+                            project_id: project_id.clone(),
+                            name: name.trim().to_string(),
+                            target_date: None,
+                            tombstone: false,
+                        }
+                    }
+                };
+                if current.is_some() {
+                    if let Some(name) = &name {
+                        if name.trim().is_empty() {
+                            return Err(WorldError::InvalidRequest);
+                        }
+                        record.name = name.trim().to_string();
+                    }
+                }
+                if let Some(target) = target_date {
+                    record.target_date = target;
+                }
+                if let Some(tombstone) = tombstone {
+                    record.tombstone = tombstone;
+                }
+                if current.as_ref() == Some(&record) {
+                    return Ok(staging.into_effect(None));
+                }
+                staging.catalog(map_set(
+                    "project_milestones",
+                    format!("{project_id}/{id}"),
+                    serde_json::to_vec(&record).expect("milestone json"),
+                ));
+                Ok(staging.into_effect(None))
+            }
+            IssueIntent::IssueMilestone {
+                doc,
+                milestone,
+                device,
+                ts,
+            } => {
+                let issue = issue_state(ctx, &doc).ok_or(WorldError::InvalidRequest)?;
+                let label = match &milestone {
+                    Some(m) => {
+                        let record = catalog
+                            .milestones
+                            .get(&issue.project)
+                            .and_then(|ms| ms.get(m))
+                            .filter(|r| !r.tombstone)
+                            .ok_or(WorldError::InvalidRequest)?;
+                        staging.issue(&issue_key(&doc), reg("milestone", m.as_bytes().to_vec()));
+                        record.name.clone()
+                    }
+                    None => {
+                        staging.issue(
+                            &issue_key(&doc),
+                            BodyOp::RegisterClear {
+                                path: "milestone".into(),
+                            },
+                        );
+                        "none".into()
+                    }
+                };
+                if issue.milestone == milestone {
+                    return Ok(unchanged_effect(Some(doc)));
+                }
+                let mut ev = event("milestoned", &device, ts);
+                ev.x = label;
+                push_event(&mut staging, ctx, &doc, &ev);
+                Ok(staging.into_effect(Some(doc)))
+            }
+            IssueIntent::CycleSet {
+                project_id,
+                id,
+                name,
+                start,
+                end,
+                tombstone,
+                device: _,
+                ts: _,
+            } => {
+                staging.require(contract::demand_space_any("project.configure"));
+                if !catalog.projects.contains_key(&project_id) || id.is_empty() {
+                    return Err(WorldError::InvalidRequest);
+                }
+                let current = catalog
+                    .cycles
+                    .get(&project_id)
+                    .and_then(|c| c.get(&id))
+                    .cloned();
+                let mut record = match current.clone() {
+                    Some(c) => c,
+                    None => {
+                        let name = name.clone().unwrap_or_default();
+                        if name.trim().is_empty() {
+                            return Err(WorldError::InvalidRequest);
+                        }
+                        crate::world::views::Cycle {
+                            id: id.clone(),
+                            project_id: project_id.clone(),
+                            name: name.trim().to_string(),
+                            start: 0,
+                            end: 0,
+                            tombstone: false,
+                        }
+                    }
+                };
+                if current.is_some() {
+                    if let Some(name) = &name {
+                        if name.trim().is_empty() {
+                            return Err(WorldError::InvalidRequest);
+                        }
+                        record.name = name.trim().to_string();
+                    }
+                }
+                if let Some(start) = start {
+                    record.start = start.unwrap_or(0);
+                }
+                if let Some(end) = end {
+                    record.end = end.unwrap_or(0);
+                }
+                if record.start != 0 && record.end != 0 && record.end < record.start {
+                    return Err(WorldError::InvalidRequest);
+                }
+                if let Some(tombstone) = tombstone {
+                    record.tombstone = tombstone;
+                }
+                if current.as_ref() == Some(&record) {
+                    return Ok(staging.into_effect(None));
+                }
+                staging.catalog(map_set(
+                    "cycles",
+                    format!("{project_id}/{id}"),
+                    serde_json::to_vec(&record).expect("cycle json"),
+                ));
+                Ok(staging.into_effect(None))
+            }
+            IssueIntent::IssueCycle {
+                doc,
+                cycle,
+                device,
+                ts,
+            } => {
+                let issue = issue_state(ctx, &doc).ok_or(WorldError::InvalidRequest)?;
+                let label = match &cycle {
+                    Some(c) => {
+                        let record = catalog
+                            .cycles
+                            .get(&issue.project)
+                            .and_then(|cs| cs.get(c))
+                            .filter(|r| !r.tombstone)
+                            .ok_or(WorldError::InvalidRequest)?;
+                        staging.issue(&issue_key(&doc), reg("cycle", c.as_bytes().to_vec()));
+                        record.name.clone()
+                    }
+                    None => {
+                        staging.issue(
+                            &issue_key(&doc),
+                            BodyOp::RegisterClear {
+                                path: "cycle".into(),
+                            },
+                        );
+                        "none".into()
+                    }
+                };
+                if issue.cycle == cycle {
+                    return Ok(unchanged_effect(Some(doc)));
+                }
+                let mut ev = event("cycled", &device, ts);
+                ev.x = label;
+                push_event(&mut staging, ctx, &doc, &ev);
+                Ok(staging.into_effect(Some(doc)))
+            }
+            IssueIntent::InitiativeSet {
+                id,
+                name,
+                description,
+                owner,
+                health,
+                target_date,
+                projects,
+                tombstone,
+                device: _,
+                ts: _,
+            } => {
+                staging.require(contract::demand_space_any("project.create"));
+                if id.is_empty() {
+                    return Err(WorldError::InvalidRequest);
+                }
+                let current = catalog.initiatives.get(&id).cloned();
+                let mut record = match current.clone() {
+                    Some(i) => i,
+                    None => {
+                        let name = name.clone().unwrap_or_default();
+                        if name.trim().is_empty() {
+                            return Err(WorldError::InvalidRequest);
+                        }
+                        crate::world::views::Initiative {
+                            id: id.clone(),
+                            name: name.trim().to_string(),
+                            ..Default::default()
+                        }
+                    }
+                };
+                if current.is_some() {
+                    if let Some(name) = &name {
+                        if name.trim().is_empty() {
+                            return Err(WorldError::InvalidRequest);
+                        }
+                        record.name = name.trim().to_string();
+                    }
+                }
+                if let Some(description) = description {
+                    record.description = description;
+                }
+                if let Some(owner) = owner {
+                    if !owner.is_empty() && ActorId::parse(&owner).is_none() {
+                        return Err(WorldError::InvalidRequest);
+                    }
+                    record.owner = owner;
+                }
+                if let Some(health) = health {
+                    if !health.is_empty() && !contract::HEALTH_LABELS.contains(&health.as_str()) {
+                        return Err(WorldError::InvalidRequest);
+                    }
+                    record.health = health;
+                }
+                if let Some(target) = target_date {
+                    record.target_date = target;
+                }
+                if let Some(projects) = projects {
+                    for project in &projects {
+                        if !catalog.projects.contains_key(project) {
+                            return Err(WorldError::InvalidRequest);
+                        }
+                    }
+                    record.projects = projects;
+                }
+                if let Some(tombstone) = tombstone {
+                    record.tombstone = tombstone;
+                }
+                if current.as_ref() == Some(&record) {
+                    return Ok(staging.into_effect(None));
+                }
+                staging.catalog(map_set(
+                    "initiatives",
+                    id.clone(),
+                    serde_json::to_vec(&record).expect("initiative json"),
+                ));
+                Ok(staging.into_effect(None))
+            }
+            IssueIntent::TeamSet {
+                id,
+                name,
+                key,
+                icon,
+                lead,
+                members,
+                tombstone,
+                device: _,
+                ts: _,
+            } => {
+                staging.require(contract::demand_admin());
+                if id.is_empty() {
+                    return Err(WorldError::InvalidRequest);
+                }
+                let current = catalog.teams.get(&id).cloned();
+                let mut record = match current.clone() {
+                    Some(t) => t,
+                    None => {
+                        let name = name.clone().unwrap_or_default();
+                        let key = key.clone().unwrap_or_default().to_ascii_uppercase();
+                        if name.trim().is_empty()
+                            || key.is_empty()
+                            || key.len() > 8
+                            || !key.bytes().all(|b| b.is_ascii_alphabetic())
+                        {
+                            return Err(WorldError::InvalidRequest);
+                        }
+                        if catalog.teams.values().any(|t| !t.tombstone && t.key == key) {
+                            return Err(WorldError::Conflict);
+                        }
+                        crate::world::views::Team {
+                            id: id.clone(),
+                            name: name.trim().to_string(),
+                            key,
+                            ..Default::default()
+                        }
+                    }
+                };
+                if current.is_some() {
+                    // The key binds at creation, like a project key.
+                    if key.is_some_and(|k| k.to_ascii_uppercase() != record.key) {
+                        return Err(WorldError::InvalidRequest);
+                    }
+                    if let Some(name) = &name {
+                        if name.trim().is_empty() {
+                            return Err(WorldError::InvalidRequest);
+                        }
+                        record.name = name.trim().to_string();
+                    }
+                }
+                if let Some(icon) = icon {
+                    record.icon = icon;
+                }
+                if let Some(lead) = lead {
+                    if !lead.is_empty() && ActorId::parse(&lead).is_none() {
+                        return Err(WorldError::InvalidRequest);
+                    }
+                    record.lead = lead;
+                }
+                if let Some(mut members) = members {
+                    for member in &members {
+                        if ActorId::parse(member).is_none() {
+                            return Err(WorldError::InvalidRequest);
+                        }
+                    }
+                    members.sort();
+                    members.dedup();
+                    record.members = members;
+                }
+                if let Some(tombstone) = tombstone {
+                    record.tombstone = tombstone;
+                }
+                if current.as_ref() == Some(&record) {
+                    return Ok(staging.into_effect(None));
+                }
+                staging.catalog(map_set(
+                    "teams",
+                    id.clone(),
+                    serde_json::to_vec(&record).expect("team json"),
+                ));
+                Ok(staging.into_effect(None))
+            }
+            IssueIntent::TriageSubmit {
+                id,
+                title,
+                body,
+                source,
+                actor,
+                device: _,
+                ts,
+            } => {
+                if title.trim().is_empty()
+                    || id.is_empty()
+                    || ActorId::parse(&actor).is_none()
+                    || catalog.triage.contains_key(&id)
+                {
+                    return Err(WorldError::InvalidRequest);
+                }
+                let item = crate::world::views::TriageItem {
+                    id: id.clone(),
+                    title: title.trim().to_string(),
+                    body,
+                    source,
+                    submitted_by: actor,
+                    ts,
+                    ..Default::default()
+                };
+                staging.catalog(map_set(
+                    "triage",
+                    id,
+                    serde_json::to_vec(&item).expect("triage json"),
+                ));
+                Ok(staging.into_effect(None))
+            }
+            IssueIntent::TriageDecide {
+                id,
+                outcome,
+                project,
+                doc,
+                note,
+                actor,
+                device,
+                ts,
+            } => {
+                staging.require(contract::demand_space_any("project.create"));
+                if !contract::TRIAGE_OUTCOMES.contains(&outcome.as_str())
+                    || ActorId::parse(&actor).is_none()
+                {
+                    return Err(WorldError::InvalidRequest);
+                }
+                let item = catalog.triage.get(&id).ok_or(WorldError::InvalidRequest)?;
+                // Decided exactly once.
+                if !item.outcome.is_empty() {
+                    return Err(WorldError::Conflict);
+                }
+                let mut decided = item.clone();
+                decided.outcome = outcome.clone();
+                decided.decided_by = actor.clone();
+                decided.decided_ts = ts;
+                decided.note = note;
+                match outcome.as_str() {
+                    "accepted" => {
+                        // Atomically create the issue in the same transaction
+                        // that stamps the outcome — an accept can never half
+                        // happen.
+                        let project = project.ok_or(WorldError::InvalidRequest)?;
+                        let doc = doc.ok_or(WorldError::InvalidRequest)?;
+                        if !catalog.projects.contains_key(&project) || DocId::parse(&doc).is_none()
+                        {
+                            return Err(WorldError::InvalidRequest);
+                        }
+                        let key = issue_key(&doc);
+                        staging.issue(&key, BodyOp::Create);
+                        staging.issue(&key, reg("projectid", project.as_bytes().to_vec()));
+                        staging.issue(&key, reg("title", item.title.as_bytes().to_vec()));
+                        staging.issue(&key, reg("status", DEFAULT_STATUS.as_bytes().to_vec()));
+                        staging.issue(&key, reg("priority", "none".as_bytes().to_vec()));
+                        staging.issue(
+                            &key,
+                            reg("createdby", item.submitted_by.as_bytes().to_vec()),
+                        );
+                        staging.issue(&key, reg("createdat", ts.to_string().into_bytes()));
+                        if !item.body.is_empty() {
+                            staging.issue(
+                                &key,
+                                BodyOp::TextSplice {
+                                    path: "description".into(),
+                                    index: 0,
+                                    delete: 0,
+                                    insert: item.body.clone(),
+                                },
+                            );
+                        }
+                        let next = catalog.aliases.get(&project).copied().unwrap_or(0) + 1;
+                        staging.catalog(map_set("aliases", project.clone(), next.to_string()));
+                        staging.catalog(map_set("seqs", doc.clone(), next.to_string()));
+                        board_insert_top(&mut staging, &catalog, &project, &doc);
+                        push_event(&mut staging, ctx, &doc, &event("created", &device, ts));
+                        decided.doc = doc;
+                    }
+                    "duplicate" => {
+                        let doc = doc.ok_or(WorldError::InvalidRequest)?;
+                        let _target = issue_state(ctx, &doc).ok_or(WorldError::InvalidRequest)?;
+                        decided.doc = doc;
+                    }
+                    _ => {}
+                }
+                staging.catalog(map_set(
+                    "triage",
+                    id,
+                    serde_json::to_vec(&decided).expect("triage json"),
+                ));
+                let doc = (!decided.doc.is_empty() && decided.outcome == "accepted")
+                    .then(|| decided.doc.clone());
+                Ok(staging.into_effect(doc))
+            }
+            IssueIntent::Attach {
+                doc,
+                id,
+                name,
+                mime,
+                data_b64,
+                comment,
+                actor,
+                device,
+                ts,
+            } => {
+                if ActorId::parse(&actor).is_none()
+                    || !id.starts_with("att_")
+                    || name.trim().is_empty()
+                {
+                    return Err(WorldError::InvalidRequest);
+                }
+                let issue = issue_state(ctx, &doc).ok_or(WorldError::InvalidRequest)?;
+                if issue.attachments.iter().any(|a| a.id == id) {
+                    return Err(WorldError::InvalidRequest);
+                }
+                if issue.attachments.len() >= contract::MAX_ATTACHMENTS_PER_ISSUE {
+                    return Err(WorldError::LimitExceeded);
+                }
+                let raw = data_encoding::BASE64
+                    .decode(data_b64.as_bytes())
+                    .map_err(|_| WorldError::InvalidRequest)?;
+                if raw.is_empty() || raw.len() > contract::MAX_ATTACHMENT_BYTES {
+                    return Err(WorldError::LimitExceeded);
+                }
+                if let Some(comment) = &comment {
+                    if !issue
+                        .comments
+                        .iter()
+                        .any(|c| c.id.as_deref() == Some(comment.as_str()))
+                    {
+                        return Err(WorldError::InvalidRequest);
+                    }
+                }
+                let name = name.trim().to_string();
+                let record = serde_json::json!({
+                    "id": id,
+                    "name": name,
+                    "mime": mime,
+                    "size": raw.len() as u64,
+                    "by": actor,
+                    "ts": ts,
+                    "comment": comment.unwrap_or_default(),
+                    "data_b64": data_b64,
+                });
+                staging.issue(
+                    &issue_key(&doc),
+                    BodyOp::MapSet {
+                        path: "attachments".into(),
+                        key: id,
+                        value: serde_json::to_vec(&record).expect("attachment json"),
+                    },
+                );
+                let mut ev = event("attached", &device, ts);
+                ev.x = name;
+                push_event(&mut staging, ctx, &doc, &ev);
+                Ok(staging.into_effect(Some(doc)))
+            }
+            IssueIntent::Detach {
+                doc,
+                id,
+                device,
+                ts,
+            } => {
+                let issue = issue_state(ctx, &doc).ok_or(WorldError::InvalidRequest)?;
+                let Some(meta) = issue.attachments.iter().find(|a| a.id == id) else {
+                    return Err(WorldError::InvalidRequest);
+                };
+                let name = meta.name.clone();
+                staging.issue(
+                    &issue_key(&doc),
+                    BodyOp::MapRemove {
+                        path: "attachments".into(),
+                        key: id,
+                    },
+                );
+                let mut ev = event("detached", &device, ts);
+                ev.x = name;
+                push_event(&mut staging, ctx, &doc, &ev);
+                Ok(staging.into_effect(Some(doc)))
+            }
         }
     }
 
@@ -1581,6 +2569,15 @@ impl World for IssuesWorld {
                         if &issue.project != project {
                             continue;
                         }
+                    } else if catalog
+                        .projects
+                        .get(&issue.project)
+                        .is_some_and(|m| m.archived)
+                    {
+                        // No explicit project: an archived project's issues stay
+                        // out of the all-project list (CUSTOM-9). Opening the
+                        // project by ref passes `project` and bypasses this.
+                        continue;
                     }
                     let tomb = catalog.tombstones.contains(doc);
                     let done = catalog.status_category(&issue.status) == StatusCategory::Done;
@@ -1709,7 +2706,10 @@ impl World for IssuesWorld {
                 let actor = ActorId::parse(&actor).ok_or(WorldError::InvalidRequest)?;
                 let mut entries: Vec<serde_json::Value> = Vec::new();
                 for (doc, issue) in &snap.issues {
-                    if !issue.assignees.contains(&actor) {
+                    // Addressed-to-you: assigned, or subscribed (INBOX-9) —
+                    // followers receive the same event kinds without holding
+                    // the assignment.
+                    if !issue.assignees.contains(&actor) && !issue.followers.contains(&actor) {
                         continue;
                     }
                     let reff = canonical_for(aliases, doc);
@@ -1749,6 +2749,27 @@ impl World for IssuesWorld {
                 projects.sort_by(|a, b| a.key.cmp(&b.key));
                 Ok(projection(
                     serde_json::to_vec(&projects).expect("projects json"),
+                ))
+            }
+            IssueQuery::ProjectUpdates { project } => {
+                let mut updates: Vec<crate::dto::ProjectUpdateDto> = catalog
+                    .project_updates
+                    .get(&project)
+                    .into_iter()
+                    .flatten()
+                    .map(|u| crate::dto::ProjectUpdateDto {
+                        id: u.id.clone(),
+                        author: u.author.clone(),
+                        ts: u.ts,
+                        body: u.body.clone(),
+                        health: u.health.clone(),
+                    })
+                    .collect();
+                // Newest first; ids are ULIDs so id order is time order, a stable
+                // tiebreak when two updates share a second.
+                updates.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| b.id.cmp(&a.id)));
+                Ok(projection(
+                    serde_json::to_vec(&updates).expect("project updates json"),
                 ))
             }
             IssueQuery::Labels => {
@@ -1827,6 +2848,210 @@ impl World for IssuesWorld {
                     serde_json::to_vec(&view).expect("workflow json"),
                 ))
             }
+            IssueQuery::Milestones { project } => {
+                if !catalog.projects.contains_key(&project) {
+                    return Err(WorldError::InvalidRequest);
+                }
+                // Derived progress: live issues of the project targeting each
+                // milestone, done = a Done-category status.
+                let counts = |mid: &str| -> (u32, u32) {
+                    let mut total = 0;
+                    let mut done = 0;
+                    for (doc, issue) in &snap.issues {
+                        if issue.project != project
+                            || issue.milestone.as_deref() != Some(mid)
+                            || catalog.tombstones.contains(doc)
+                        {
+                            continue;
+                        }
+                        total += 1;
+                        if catalog.status_category(&issue.status) == StatusCategory::Done {
+                            done += 1;
+                        }
+                    }
+                    (done, total)
+                };
+                let mut rows: Vec<crate::dto::MilestoneDto> = catalog
+                    .milestones
+                    .get(&project)
+                    .into_iter()
+                    .flat_map(|m| m.values())
+                    .filter(|m| !m.tombstone)
+                    .map(|m| {
+                        let (done, total) = counts(&m.id);
+                        crate::dto::MilestoneDto {
+                            id: m.id.clone(),
+                            name: m.name.clone(),
+                            target_date: m.target_date,
+                            total,
+                            done,
+                        }
+                    })
+                    .collect();
+                rows.sort_by(|a, b| {
+                    let key = |d: Option<u64>| d.unwrap_or(u64::MAX);
+                    key(a.target_date)
+                        .cmp(&key(b.target_date))
+                        .then_with(|| a.name.cmp(&b.name))
+                });
+                Ok(projection(serde_json::to_vec(&rows).expect("milestones")))
+            }
+            IssueQuery::Cycles { project } => {
+                if !catalog.projects.contains_key(&project) {
+                    return Err(WorldError::InvalidRequest);
+                }
+                let counts = |cid: &str| -> (u32, u32) {
+                    let mut total = 0;
+                    let mut done = 0;
+                    for (doc, issue) in &snap.issues {
+                        if issue.project != project
+                            || issue.cycle.as_deref() != Some(cid)
+                            || catalog.tombstones.contains(doc)
+                        {
+                            continue;
+                        }
+                        total += 1;
+                        if catalog.status_category(&issue.status) == StatusCategory::Done {
+                            done += 1;
+                        }
+                    }
+                    (done, total)
+                };
+                let mut rows: Vec<crate::dto::CycleDto> = catalog
+                    .cycles
+                    .get(&project)
+                    .into_iter()
+                    .flat_map(|c| c.values())
+                    .filter(|c| !c.tombstone)
+                    .map(|c| {
+                        let (done, total) = counts(&c.id);
+                        crate::dto::CycleDto {
+                            id: c.id.clone(),
+                            name: c.name.clone(),
+                            start: c.start,
+                            end: c.end,
+                            total,
+                            done,
+                        }
+                    })
+                    .collect();
+                rows.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| a.name.cmp(&b.name)));
+                Ok(projection(serde_json::to_vec(&rows).expect("cycles")))
+            }
+            IssueQuery::Initiatives => {
+                let mut rows: Vec<crate::dto::InitiativeDto> = catalog
+                    .initiatives
+                    .values()
+                    .filter(|i| !i.tombstone)
+                    .map(|i| {
+                        let mut total = 0;
+                        let mut done = 0;
+                        for (doc, issue) in &snap.issues {
+                            if !i.projects.contains(&issue.project)
+                                || catalog.tombstones.contains(doc)
+                            {
+                                continue;
+                            }
+                            total += 1;
+                            if catalog.status_category(&issue.status) == StatusCategory::Done {
+                                done += 1;
+                            }
+                        }
+                        crate::dto::InitiativeDto {
+                            id: i.id.clone(),
+                            name: i.name.clone(),
+                            description: i.description.clone(),
+                            owner: i.owner.clone(),
+                            health: i.health.clone(),
+                            target_date: i.target_date,
+                            projects: i
+                                .projects
+                                .iter()
+                                .filter_map(|p| catalog.projects.get(p).map(|m| m.key.clone()))
+                                .collect(),
+                            total,
+                            done,
+                        }
+                    })
+                    .collect();
+                rows.sort_by(|a, b| a.name.cmp(&b.name));
+                Ok(projection(serde_json::to_vec(&rows).expect("initiatives")))
+            }
+            IssueQuery::Teams => {
+                let mut rows: Vec<crate::dto::TeamDto> = catalog
+                    .teams
+                    .values()
+                    .filter(|t| !t.tombstone)
+                    .map(|t| crate::dto::TeamDto {
+                        id: t.id.clone(),
+                        name: t.name.clone(),
+                        key: t.key.clone(),
+                        icon: t.icon.clone(),
+                        lead: t.lead.clone(),
+                        members: t.members.clone(),
+                        projects: catalog
+                            .projects
+                            .values()
+                            .filter(|p| p.team == t.id)
+                            .map(|p| p.key.clone())
+                            .collect(),
+                    })
+                    .collect();
+                rows.sort_by(|a, b| a.key.cmp(&b.key));
+                Ok(projection(serde_json::to_vec(&rows).expect("teams")))
+            }
+            IssueQuery::Triage => {
+                let reff_of = |doc: &str| -> String {
+                    if doc.is_empty() {
+                        String::new()
+                    } else {
+                        aliases
+                            .by_doc
+                            .get(doc)
+                            .cloned()
+                            .unwrap_or_else(|| canonical_for(aliases, doc))
+                    }
+                };
+                let mut rows: Vec<crate::dto::TriageDto> = catalog
+                    .triage
+                    .values()
+                    .map(|t| crate::dto::TriageDto {
+                        id: t.id.clone(),
+                        title: t.title.clone(),
+                        body: t.body.clone(),
+                        source: t.source.clone(),
+                        submitted_by: t.submitted_by.clone(),
+                        ts: t.ts,
+                        outcome: t.outcome.clone(),
+                        reff: reff_of(&t.doc),
+                        decided_by: t.decided_by.clone(),
+                        note: t.note.clone(),
+                    })
+                    .collect();
+                // Pending first (newest first); decided after (newest first).
+                rows.sort_by(|a, b| {
+                    (!a.outcome.is_empty())
+                        .cmp(&(!b.outcome.is_empty()))
+                        .then_with(|| b.ts.cmp(&a.ts))
+                        .then_with(|| a.id.cmp(&b.id))
+                });
+                Ok(projection(serde_json::to_vec(&rows).expect("triage")))
+            }
+            IssueQuery::Attachment { doc, id } => {
+                // The one read that serves file bytes: straight off the Body
+                // map, bypassing the metadata-only snapshot cache.
+                let view = ctx
+                    .read_collaborative(&issue_key(&doc))
+                    .ok_or(WorldError::InvalidRequest)?;
+                let raw = view
+                    .maps
+                    .get("attachments")
+                    .and_then(|m| m.get(&id))
+                    .ok_or(WorldError::InvalidRequest)?;
+                let record: serde_json::Value =
+                    serde_json::from_slice(raw).map_err(|_| WorldError::WorldStateCorrupt)?;
+                Ok(projection(serde_json::to_vec(&record).expect("attachment")))
+            }
         }
     }
 }
@@ -1866,6 +3091,12 @@ fn provisional_view(
         comments: vec![],
         created_by: ActorId::from_incept_hash(&"0".repeat(64)),
         created_at: 0,
+        due_date: None,
+        estimate: None,
+        followers: vec![],
+        milestone: None,
+        cycle: None,
+        attachments: vec![],
         provisional: true,
         corrupt_records: vec![],
     }

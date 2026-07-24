@@ -1,6 +1,7 @@
 import { User } from "lucide-react";
 
 import type { MemberDto } from "../types";
+import { agentLogo } from "./agentLogos";
 import { avatarColor } from "./colors";
 import { cn } from "./primitives";
 import { short } from "./time";
@@ -36,6 +37,12 @@ export function memberName(key: string, member: MemberDto | undefined): string {
  * An unnamed member gets a glyph rather than a letter pulled from their key. A hex
  * digit is not an initial; rendering `7` as though it named someone would be
  * inventing an identity the system does not have.
+ *
+ * The one exception to "no images": a **sponsored agent** whose local petname names
+ * a known coding tool (Claude / Codex / Grok) is drawn with that tool's brand mark
+ * (`agentLogos`). It rides purely on the local `alias`, so it changes nothing about
+ * the key-derived identity underneath — it is a rendering affordance, not a synced
+ * fact.
  */
 export function Avatar({
   deviceKey,
@@ -56,6 +63,10 @@ export function Avatar({
   const name = alias?.trim() ?? "";
   const label = me ? "you" : name || `${deviceKey.slice(0, 8)}…`;
   const color = avatarColor(deviceKey);
+  // A recognized agent (by petname) shows its brand mark instead of the
+  // key-colour + initial. `me` never applies to an agent, so the brand chip and
+  // the "you" ring never collide.
+  const logo = me ? null : agentLogo(name);
 
   return (
     <span
@@ -67,12 +78,21 @@ export function Avatar({
         me && "ring-accent ring-1 ring-offset-1 ring-offset-[var(--color-bg)]",
         className,
       )}
-      style={{ background: color }}
+      style={{ background: logo ? logo.bg : color }}
       role="img"
-      aria-label={label}
-      title={label}
+      aria-label={logo ? `${name} (${logo.title})` : label}
+      title={logo ? `${name} · ${logo.title}` : label}
     >
-      {name ? (
+      {logo ? (
+        <svg
+          viewBox={logo.viewBox}
+          className={size === "sm" ? "size-2.5" : "size-3"}
+          fill={logo.fg}
+          aria-hidden="true"
+        >
+          <path d={logo.path} />
+        </svg>
+      ) : name ? (
         // One grapheme, not `name[0]` — a surrogate pair (an emoji petname) would
         // otherwise render as half a character.
         [...name][0]?.toUpperCase()
@@ -95,10 +115,22 @@ export function stackFor(
   keys: readonly string[],
   members: readonly MemberDto[],
 ): Array<{ key: string; alias: string; me: boolean }> {
+  const indexed = memberIndexes.get(members) ?? indexMembers(members);
   return keys.map((key) => {
-    const m = members.find((x) => x.key === key);
+    const m = indexed.get(key);
     return { key, alias: m?.alias ?? "", me: m?.me ?? false };
   });
+}
+
+/** Row and card rendering calls `stackFor` once per record. Cache the immutable
+ * ACL projection by array identity so that becomes O(assignees), not O(rows ×
+ * assignees × members), without pushing lookup plumbing through every component. */
+const memberIndexes = new WeakMap<readonly MemberDto[], ReadonlyMap<string, MemberDto>>();
+
+function indexMembers(members: readonly MemberDto[]): ReadonlyMap<string, MemberDto> {
+  const indexed = new Map(members.map((member) => [member.key, member]));
+  memberIndexes.set(members, indexed);
+  return indexed;
 }
 
 /**

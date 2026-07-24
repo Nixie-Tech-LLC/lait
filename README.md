@@ -1,14 +1,12 @@
 # lait
 
-**The issue tracker that lives in your repo.**
-
 Track work at typing speed, onboard a teammate with one link, and let your
 coding agents work the board like anyone else — no server, no signup, no
 browser tab. If `cd` gets you into the project, you're already in.
 
 ```console
 $ cd my-project
-$ lait init                          # one-time: this repo now has its own tracker
+$ lait init
 
 $ lait new "fix login race" --start  # file the issue, take it, branch it
 MP-1  fix login race  in_progress  · you
@@ -33,7 +31,7 @@ MP-1  fix login race  done
 - **Works everywhere** // one self-contained binary for macOS, Linux, and
   Windows; offline-first, syncs whenever teammates are online together
 
-Whether you're solo in a side project, a team replacing a heavier tracker, or
+Whether you're solo in a side project, working with a team, or
 wiring up agents that need a shared board, the whole product is the one binary
 below.
 
@@ -108,9 +106,8 @@ Every transcript below is real output from the shipped binary.
 
 ### 1 · Solo: track a repo's work without leaving it
 
-Your tracker lives beside your code the way `.git` does — one per project
-directory, found by walking up from wherever you stand. `lait init` creates it
-and sets up a first **project** (the issue prefix, like `MP-1`, `MP-2`…) named
+The project directory is found by walking up from wherever you stand. `lait init`
+sets up a first **project** (the issue prefix, like `MP-1`, `MP-2`…) named
 after your directory, so there's nothing to configure before the first issue:
 
 ```console
@@ -126,8 +123,7 @@ MP-1
 From there, three views: bare `lait` is your **focus** (unread inbox + what
 you're working on, in under 50 ms), `lait board` prints the columns, and
 `lait serve` opens your spaces in a browser — every space on this machine, live.
-Nothing needs the network — it's your tracker; teammates come later (scenario 2)
-or never.
+Nothing needs the network; teammates come later (scenario 2) or never.
 
 ### 2 · Two of you: onboarding is one link
 
@@ -330,7 +326,7 @@ Or add it to `.mcp.json` by hand:
 }
 ```
 
-Tools exposed: the full tracker surface — `issue_new`, `issue_edit`,
+Tools exposed: the full issue surface — `issue_new`, `issue_edit`,
 `issue_move`, `assign`, `label`, `comment`, `issue_delete`, `issue_view`, `list`,
 `board`, `history`, `project_new`, `project_list`, `label_new`, `label_list`,
 `activity`, `member_add`, `member_remove`, `key_rotate`, `members` — plus

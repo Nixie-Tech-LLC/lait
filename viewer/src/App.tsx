@@ -1,35 +1,64 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Group, Panel, Separator, useDefaultLayout, usePanelRef } from "react-resizable-panels";
+import * as Dialog from "@radix-ui/react-dialog";
 import {
-  Inbox as InboxIcon,
-  LayoutGrid,
-  List,
   ListFilter,
   PanelLeft,
   Plus,
-  Search,
 } from "lucide-react";
 
 import { ConfirmRequired, LaitError, rpc, spaces as fetchSpaces } from "./api";
 import { useDoorbell } from "./doorbell";
-import { coalesce } from "./core/coalesce";
+import { runBounded, type BulkProgress } from "./core/bulk";
+import { groupRows, loadDisplay, saveDisplay, type DisplayState } from "./core/display";
 import {
   contribute,
   registry,
   type AppApi,
   type Ctx,
+  isProjectView,
+  PROJECT_VIEWS,
   type IssueField,
+  type ProjectView,
   type View,
 } from "./core/registry";
+import {
+  formatRoute,
+  loadLastRoute,
+  parseRoute,
+  resolveLocalSpace,
+  saveLastRoute,
+  type ViewerRoute,
+} from "./core/route";
 import { useKeys } from "./core/useKeys";
 import { neighbourState, workTarget } from "./core/workflow";
+import { loadFavoriteProjects, toggleFavoriteProject } from "./core/personalNav";
+import { loadSavedViews, type SavedView } from "./core/savedViews";
 import { Activity } from "./ui/Activity";
+import { classifyFailure, EmptyState, InlineError, recoveryForError, TrustPopover } from "./ui/AppState";
 import { Board } from "./ui/Board";
+import { BulkBar } from "./ui/BulkBar";
+import { Calendar } from "./ui/Calendar";
+import { Timeline } from "./ui/Timeline";
+import { DisplayOptions } from "./ui/DisplayOptions";
 import { FilterBar } from "./ui/FilterBar";
 import { Inbox } from "./ui/Inbox";
-import { Members } from "./ui/Members";
+import { IssueSearch, rememberIssue } from "./ui/IssueSearch";
+import { Projects } from "./ui/Projects";
+import { ProjectOverview } from "./ui/ProjectOverview";
+import {
+  Breadcrumbs,
+  DESTINATION_ICON,
+  DestinationCrumb,
+  ProjectCrumb,
+  SurfaceHeader,
+  type BreadcrumbItem,
+} from "./ui/layout";
+import { Settings } from "./ui/Settings";
 import { IssueDetail } from "./ui/IssueDetail";
 import { IssueList } from "./ui/IssueList";
+import { MyIssues } from "./ui/MyIssues";
+import { RolesDialog, WorkflowDialog } from "./ui/Governance";
 import { NewIssue } from "./ui/NewIssue";
 import { NewProject } from "./ui/NewProject";
 import { Palette } from "./ui/Palette";
@@ -38,7 +67,7 @@ import { catalogColor } from "./ui/colors";
 import * as ask from "./ui/dialogs";
 import { DialogHost } from "./ui/dialogs";
 import { Combobox } from "./ui/Picker";
-import { IconButton, TooltipProvider } from "./ui/primitives";
+import { Button, IconButton, TooltipProvider } from "./ui/primitives";
 import { Sidebar } from "./ui/Sidebar";
 import {
   applyFilter,
@@ -47,21 +76,29 @@ import {
   needsServer,
   type FilterState,
 } from "./core/filter";
-import { applyOverlay, Overlay, PREDICTION_TTL_MS, type Field } from "./core/overlay";
+import { PREDICTION_TTL_MS, type Field } from "./core/overlay";
+import {
+  projectKeys,
+  useProjectBoard,
+  useProjectRegistry,
+  useProjectViewerStore,
+} from "./projectStore";
 import {
   isReadOnly,
   type BoardPos,
-  type BoardView,
-  type LabelDto,
-  type MemberDto,
-  type ProjectDto,
   type Row,
   type SpaceRow,
+  type StatusInfo,
   type WorkflowState,
 } from "./types";
 import "./commands";
 
-type Modal = "palette" | "shortcuts" | null;
+type Modal = "palette" | "issueSearch" | "shortcuts" | "workflow" | "roles" | null;
+type ThemePreference = "system" | "light" | "dark";
+type DensityPreference = "compact" | "comfortable";
+const THEME_PREFERENCE = "lait.theme";
+const DENSITY_PREFERENCE = "lait.density";
+const LAYOUT_PANEL_IDS = ["sidebar", "main", "detail"];
 
 /**
  * The shell.
@@ -73,69 +110,238 @@ type Modal = "palette" | "shortcuts" | null;
  * "click" and "keypress" from drifting apart.
  */
 export function App() {
+  // Read once. The route contains canonical product identity only; this machine
+  // resolves the space id to its own local replica after `/api/spaces` answers.
+  const initialRoute = useRef((() => {
+    const fromUrl = parseRoute(window.location);
+    return fromUrl.spaceId ? fromUrl : (loadLastRoute() ?? fromUrl);
+  })()).current;
   const [spaces, setSpaces] = useState<SpaceRow[]>([]);
+  /** Canonical `ws_…` identity in the URL, distinct from the supervisor's
+   * machine-local store handle used by RPC. */
+  const [routeSpace, setRouteSpace] = useState<string | null>(initialRoute.spaceId);
   const [current, setCurrent] = useState<string | null>(null);
-  const [board, setBoard] = useState<BoardView | null>(null);
-  const [selection, setSelection] = useState<string | null>(null);
+  const [selection, setSelection] = useState<string | null>(initialRoute.issue);
   const [modal, setModal] = useState<Modal>(null);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [detail, setDetail] = useState(true);
-  const [view, setView] = useState<View>("list");
+  const [focusedDetail, setFocusedDetail] = useState(Boolean(initialRoute.focused));
+  const [view, setView] = useState<View>(initialRoute.view);
   const [unread, setUnread] = useState(0);
   /** The composer, and the column it was opened from (null = closed). */
   const [composing, setComposing] = useState<{ status?: string } | null>(null);
   const [composingProject, setComposingProject] = useState(false);
-  const [filter, setFilter] = useState<FilterState>(EMPTY_FILTER);
+  const [filter, setFilter] = useState<FilterState>(initialRoute.filter ?? EMPTY_FILTER);
   const [filterOpen, setFilterOpen] = useState(false);
   const [focusToken, setFocusToken] = useState(0);
-  const [labels, setLabels] = useState<LabelDto[]>([]);
-  const [members, setMembers] = useState<MemberDto[]>([]);
-  const [projects, setProjects] = useState<ProjectDto[]>([]);
+  /** Group / order / show-deleted. Loaded once; every change is persisted. */
+  const initialDisplayScope = `${initialRoute.spaceId ?? "none"}/${initialRoute.project ?? "all"}/${initialRoute.view}`;
+  const [display, setDisplay] = useState<DisplayState>(() => loadDisplay(initialDisplayScope));
+  const [displayOpen, setDisplayOpen] = useState(false);
+  const [mobileNav, setMobileNav] = useState(false);
+  const [personalNavRevision, setPersonalNavRevision] = useState(0);
+  /** Bulk-selection checks, by canonical ref. Distinct from `selection`: the
+   *  focus is one row, the checks are a set, and `x` is the bridge. */
+  const [checked, setChecked] = useState<ReadonlySet<string>>(new Set());
+  const [bulkProgress, setBulkProgress] = useState<BulkProgress | null>(null);
+  const bulkOperation = useRef<((reff: string) => Promise<unknown>) | null>(null);
   /** Which project's board is on screen. `null` = let the daemon's chain pick
    *  (branch key → `project.default` → the only project), same as a bare `lait board`. */
-  const [project, setProject] = useState<string | null>(null);
+  const [project, setProject] = useState<string | null>(initialRoute.project);
   /** The picker a keybinding has asked for. Also an overlay: it owns the keymap. */
   const [field, setField] = useState<IssueField | null>(null);
   /** Doc-ids the daemon says qualify. `null` = the daemon wasn't asked, which is
    *  not the same as "nothing qualifies" — see core/filter.ts. */
   const [allowed, setAllowed] = useState<ReadonlySet<string> | null>(null);
-  /** Local predictions. A ref, not state: the doorbell handler mutates it and we
-   *  re-render explicitly — putting it in state would make every `set` a new Map
-   *  and every render a new overlay. */
-  const overlay = useRef(new Overlay());
-  const [predicted, setPredicted] = useState(0);
-  /** Monotonic load token — see `loadBoard`. A generalisation of an `alive` flag:
-   *  it also orders two loads of the *same* space, which `alive` cannot. Bumped
-   *  when a load is *requested*, not when it starts: once requests coalesce, the
-   *  request is the thing that supersedes, and a run that starts later already
-   *  carries the newer args. */
-  const boardSeq = useRef(0);
+  /** Tombstoned rows, fetched only while the display option shows them.
+   *  Deleting an issue REMOVES it from `boards[P]` (the board genuinely does
+   *  not know it), so the trash comes from `list all:true`, not the board. */
+  const [deletedRows, setDeletedRows] = useState<Row[]>([]);
+  const [mutationNotice, setMutationNotice] = useState("");
   /** Last doorbell epoch seen per space — the daemon-boot nonce (UI.md §4.1). */
   const epochs = useRef(new Map<string, number>());
   // Bumped on every doorbell for this space: the detail pane re-reads off it.
   const [revision, setRevision] = useState(0);
   const sidebar = usePanelRef();
+  const detailPanel = usePanelRef();
+  const [density, setDensity] = useState<DensityPreference>(() => loadDensity());
+  const projectStore = useProjectViewerStore();
+  const boardSpace = isProjectView(view) ? current : null;
+  const { board } = useProjectBoard(boardSpace, isProjectView(view) ? project : null);
+  const labelsResource = useProjectRegistry(
+    current ? projectKeys.labels(current) : "project:none/labels",
+    useCallback(
+      () => current ? projectStore.ensureLabels(current) : Promise.resolve([]),
+      [current, projectStore],
+    ),
+  );
+  const membersResource = useProjectRegistry(
+    current ? projectKeys.members(current) : "project:none/members",
+    useCallback(
+      () => current ? projectStore.ensureMembers(current) : Promise.resolve([]),
+      [current, projectStore],
+    ),
+  );
+  const projectsResource = useProjectRegistry(
+    current ? projectKeys.projects(current) : "project:none/projects",
+    useCallback(
+      () => current ? projectStore.ensureProjects(current) : Promise.resolve([]),
+      [current, projectStore],
+    ),
+  );
+  const statusResource = useProjectRegistry(
+    current ? projectKeys.status(current) : "project:none/status",
+    useCallback(
+      () => current ? projectStore.ensureStatus(current) : Promise.resolve(null as never),
+      [current, projectStore],
+    ),
+  );
+  const labels = labelsResource.data ?? [];
+  const projects = projectsResource.data ?? [];
+  const statusInfo = (statusResource.data ?? null) as StatusInfo | null;
+  const members = useMemo(() => {
+    const source = membersResource.data ?? [];
+    const nick = statusInfo?.nick.trim() ?? "";
+    return nick
+      ? source.map((member) => member.me && !member.alias ? { ...member, alias: nick } : member)
+      : source;
+  }, [membersResource.data, statusInfo?.nick]);
+  /** Projects offered for navigation/creation. Archived ones stay cached but are
+   * hidden from navigation until explicitly opened. */
+  const liveProjects = useMemo(() => projects.filter((p) => !p.archived), [projects]);
+
+  useEffect(() => {
+    applyTheme(loadTheme());
+    applyDensity(loadDensity());
+  }, []);
+
+  useEffect(() => {
+    const prefetch = (event: Event) => {
+      if (!current) return;
+      const target = event.target instanceof Element
+        ? event.target.closest<HTMLElement>("[data-issue-ref]")
+        : null;
+      const reff = target?.dataset.issueRef;
+      if (reff) projectStore.prefetchIssue(current, reff);
+    };
+    document.addEventListener("pointerover", prefetch);
+    document.addEventListener("focusin", prefetch);
+    return () => {
+      document.removeEventListener("pointerover", prefetch);
+      document.removeEventListener("focusin", prefetch);
+    };
+  }, [current, projectStore]);
+  const spacesRef = useRef(spaces);
+  spacesRef.current = spaces;
+  const routeSpaceRef = useRef(routeSpace);
+  routeSpaceRef.current = routeSpace;
+
+  /** Apply browser history without waking a daemon or inventing local identity. */
+  const applyRoute = useCallback((route: ViewerRoute) => {
+    setRouteSpace(route.spaceId);
+    const local = resolveLocalSpace(route.spaceId, spacesRef.current);
+    setCurrent(local?.id ?? null);
+    setProject(route.project);
+    setView(route.view);
+    setSelection(route.issue);
+    setFilter(route.filter ?? EMPTY_FILTER);
+    setDetail(route.issue !== null);
+    setFocusedDetail(Boolean(route.focused));
+  }, []);
+
+  useEffect(() => {
+    const onPopState = () => applyRoute(parseRoute(window.location));
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, [applyRoute]);
+
+  // Selection can be repaired after a board refresh and a multi-project space can
+  // resolve its initial project asynchronously. Replace keeps the address honest
+  // without turning those automatic corrections into Back-button destinations.
+  useEffect(() => {
+    const route = { spaceId: routeSpace, project, view, issue: selection, focused: focusedDetail, filter };
+    const href = formatRoute(route);
+    if (`${window.location.pathname}${window.location.search}` !== href) {
+      window.history.replaceState(null, "", href);
+    }
+    saveLastRoute(route);
+  }, [routeSpace, project, view, selection, focusedDetail, filter]);
+
+  // Settings is a page state, not a panel: its own left rail owns the hierarchy,
+  // so the workspace sidebar steps aside while it's open and returns as you left
+  // it on the way out. Only touches the desktop rail; the mobile drawer is modal
+  // and already dismissed on navigation.
+  const sidebarBeforeSettings = useRef<boolean | null>(null);
+  useEffect(() => {
+    const panel = sidebar.current;
+    if (!panel || window.matchMedia("(max-width: 960px)").matches) return;
+    if (view === "settings") {
+      if (sidebarBeforeSettings.current === null) {
+        sidebarBeforeSettings.current = panel.isCollapsed();
+      }
+      if (!panel.isCollapsed()) panel.collapse();
+    } else if (sidebarBeforeSettings.current !== null) {
+      if (!sidebarBeforeSettings.current && panel.isCollapsed()) panel.expand();
+      sidebarBeforeSettings.current = null;
+    }
+    // `sidebar` is a stable ref; `view` is the trigger.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view]);
 
   const space = spaces.find((s) => s.id === current) ?? null;
   const readOnly = space ? isReadOnly(space) : false;
+  const missingProject =
+    isProjectView(view) &&
+    project !== null &&
+    projects.length > 0 &&
+    !projects.some((candidate) => candidate.key === project);
 
-  // Overlay first, then filter: a predicted title should be findable by the text
-  // you just typed into it, and a predicted status should filter as its new one.
-  // `predicted` is the re-render trigger — the overlay itself is a mutable ref.
   const { shown, optimistic } = useMemo(() => {
     if (!board) return { shown: null, optimistic: new Set<string>() as ReadonlySet<string> };
-    const o = applyOverlay(board, overlay.current);
-    return { shown: applyFilter(o.board, filter, allowed), optimistic: o.optimistic };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [board, filter, allowed, predicted]);
+    return {
+      shown: applyFilter(board, filter, allowed),
+      optimistic: new Set(projectStore.overlay.docs()),
+    };
+  }, [allowed, board, filter, projectStore]);
 
-  // Motion follows what is *visible*: j/k over rows a filter hid would look like
-  // the selection teleporting.
-  const rows: Row[] = useMemo(
-    () => (shown ? shown.columns.flatMap((c) => c.rows.filter((r) => !r.tombstone)) : []),
-    [shown],
+  /** The list's arrangement (the board renders columns straight off `shown`). */
+  const groups = useMemo(() => (shown ? groupRows(shown, display) : []), [shown, display]);
+
+  // Motion follows what is *visible*, in the order it is visible: on the list,
+  // j/k walks the display *groups*; on the board — which always lays out by
+  // status regardless of the grouping option — it walks the columns. The trash
+  // rows join the motion exactly when the display option shows them — a row you
+  // can see but not land on is a trap.
+  const rows: Row[] = useMemo(() => {
+    const live =
+      view === "board" && shown
+        ? shown.columns.flatMap((c) => c.rows.filter((r) => !r.tombstone))
+        : groups.flatMap((g) => g.rows.filter((r) => !r.tombstone));
+    return display.deleted ? deletedRows : live;
+  }, [view, shown, groups, display.deleted, deletedRows]);
+  const favoriteProjects = useMemo(
+    () => routeSpace ? loadFavoriteProjects(routeSpace) : [],
+    [routeSpace, personalNavRevision],
   );
+  const sidebarSavedViews = useMemo(
+    () => routeSpace && project ? loadSavedViews(routeSpace, project) : [],
+    [routeSpace, project, personalNavRevision],
+  );
+  const displayScope = `${routeSpace ?? "none"}/${project ?? "all"}/${view}`;
+  const displayScopeRef = useRef(initialDisplayScope);
+
+  useEffect(() => {
+    if (displayScopeRef.current === displayScope) return;
+    displayScopeRef.current = displayScope;
+    setDisplay(loadDisplay(displayScope));
+  }, [displayScope]);
+
+  // Persisted per canonical project and surface: list grouping must not silently
+  // rewrite the board's display contract, or another space's preference.
+  useEffect(() => {
+    saveDisplay(display, displayScopeRef.current);
+  }, [display]);
 
   const loadSpacesRaw = useCallback(async () => {
     try {
@@ -144,84 +350,34 @@ export function App() {
       setError(null);
       setCurrent((cur) => {
         if (cur) return cur;
+        const requested = routeSpaceRef.current;
+        if (requested) {
+          return resolveLocalSpace(requested, spaces)?.id ?? null;
+        }
         // Attaching an agent brings that agent *online*, so auto-select only our
         // own single unambiguous space — never an agent.
         const mine = spaces.filter((s) => !isReadOnly(s));
-        return mine.length === 1 && mine[0] ? mine[0].id : null;
+        if (mine.length === 1 && mine[0]) {
+          setRouteSpace(mine[0].space);
+          return mine[0].id;
+        }
+        return null;
       });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
   }, []);
 
-  /**
-   * Load the board, and keep trying.
-   *
-   * A failed load must not be terminal. The daemon this space talks to can
-   * restart under us — someone runs `lait shutdown`, an update swaps the binary,
-   * two processes race to respawn it — and the failure lasts milliseconds. But
-   * nothing would re-trigger the load: doorbells arrive through the very
-   * attachment that just broke, so a transient error froze the view and left a
-   * stale banner over it until the user thought to press `r`. The error was
-   * honest; its permanence was the bug.
-   *
-   * Backs off rather than hammering, and gives up after a few tries so a genuinely
-   * dead space says so instead of spinning forever.
-   */
-  const loadBoardRaw = useCallback(async (id: string | null, proj: string | null): Promise<void> => {
-    // Only the newest load may commit. Two doorbells in quick succession issue
-    // two loads, and the one that resolves *last* is not the one issued last —
-    // so an older board could silently overwrite a newer one, and nothing would
-    // correct it until the next ring. The retry below makes it worse by holding a
-    // load open for ~2.8s, long enough to land on a space you have since left and
-    // paint its error over the one you are looking at.
-    const seq = boardSeq.current;
-    const stale = () => seq !== boardSeq.current;
-
-    if (!id) return setBoard(null);
-    for (let attempt = 0; ; attempt++) {
-      try {
-        const r = await rpc(id, { cmd: "board", project: proj });
-        if (stale()) return;
-        setBoard(r.kind === "board" ? r : null);
-        setError(null);
-        return;
-      } catch (e) {
-        if (stale()) return;
-        if (attempt < 3) {
-          await new Promise((r) => window.setTimeout(r, 400 * 2 ** attempt));
-          if (stale()) return;
-          continue;
-        }
-        setBoard(null);
-        setError(e instanceof Error ? e.message : String(e));
-        return;
-      }
+  const loadBoard = useCallback(async (id: string | null, proj: string | null): Promise<void> => {
+    if (!id) return;
+    try {
+      await projectStore.ensureBoard(id, proj, true);
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
     }
-  }, []);
-
-  /**
-   * The two re-reads a doorbell fans out to, coalesced.
-   *
-   * A ring is per commit, not per user action, so a sync burst asked for the same
-   * board ten times in a couple hundred milliseconds. The `seq` guard kept the
-   * *answers* honest, but the questions were all still asked. See `core/coalesce.ts`
-   * for why this is one-in-flight-plus-one-trailing rather than a plain throttle —
-   * the trailing run is what makes the read postdate the news that provoked it.
-   *
-   * Bumping `boardSeq` here rather than inside the run is what lets a queued request
-   * cut a doomed one short: a load for the space you just left sees `stale()` at its
-   * next check and returns without painting, and a retry chain mid-backoff stops
-   * waiting out its ~2.8s once there is a newer question to answer.
-   */
-  const loadBoard = useMemo(() => {
-    const run = coalesce(loadBoardRaw);
-    return (id: string | null, proj: string | null): Promise<void> => {
-      boardSeq.current++;
-      return run(id, proj);
-    };
-  }, [loadBoardRaw]);
-  const loadSpaces = useMemo(() => coalesce(loadSpacesRaw), [loadSpacesRaw]);
+  }, [projectStore]);
+  const loadSpaces = useCallback(() => loadSpacesRaw(), [loadSpacesRaw]);
 
   // The project is read through a ref by the doorbell handler and the sweep, which
   // must not re-subscribe every time it changes.
@@ -231,15 +387,6 @@ export function App() {
   useEffect(() => {
     void loadSpaces();
   }, [loadSpaces]);
-  useEffect(() => {
-    void loadBoard(current, project);
-  }, [current, project, loadBoard]);
-
-  // A project selected in one space does not exist in the next one.
-  useEffect(() => {
-    setProject(null);
-  }, [current]);
-
   /**
    * Name a project once we know there is a choice.
    *
@@ -257,56 +404,31 @@ export function App() {
    * `Special` CLI handler, not a `Request`, so no HTTP endpoint reaches it.)
    */
   useEffect(() => {
-    if (project !== null || projects.length < 2) return;
-    setProject(projects[0]!.key);
-  }, [projects, project]);
+    if (!isProjectView(view) || project !== null || projects.length === 0) return;
+    setProject((projects.find((candidate) => !candidate.archived) ?? projects[0])!.key);
+  }, [projects, project, view]);
 
-  /**
-   * The three registries every picker reads from — the daemon's, never ours.
-   *
-   * Fetched together because they share a lifetime (this space, this revision) and
-   * a failure mode: none of them is worth an error banner. A picker with fewer
-   * options is a smaller menu; a red bar across the board is a broken app. The
-   * board is the thing whose failure is worth shouting about, and it already does.
-   *
-   * Same race as `loadBoard`: switch space mid-flight and the old space's members
-   * would land in the new space's assignee picker — hence `alive`.
-   */
+  // The trash. Scoped to the board's project so the group matches the view,
+  // re-read on every doorbell (a remote delete is exactly the news it carries).
   useEffect(() => {
-    if (!current) {
-      setLabels([]);
-      setMembers([]);
-      setProjects([]);
-      return;
-    }
+    if (!current || !display.deleted) return setDeletedRows([]);
     let alive = true;
     void (async () => {
-      const [l, m, p, s] = await Promise.all([
-        rpc(current, { cmd: "label_list" }).catch(() => null),
-        rpc(current, { cmd: "members" }).catch(() => null),
-        rpc(current, { cmd: "project_list" }).catch(() => null),
-        rpc(current, { cmd: "status" }).catch(() => null),
-      ]);
-      if (!alive) return;
-      if (l?.kind === "labels") setLabels(l.labels);
-      if (p?.kind === "projects") setProjects(p.projects);
-      if (m?.kind === "members") {
-        // `members` carries no alias for **you**: a petname is something you assign
-        // to other people, so `replica.rs::members` reports `alias: ""` for `me`.
-        // Your own name lives in `user.nick`, which only `status` reports — and
-        // without it yours is the one avatar in the space with no letter on it,
-        // which is a strange way to meet yourself. Patched here rather than in the
-        // avatar, so every surface agrees on what you are called.
-        const nick = s?.kind === "status" ? s.nick.trim() : "";
-        setMembers(
-          nick ? m.members.map((x) => (x.me && !x.alias ? { ...x, alias: nick } : x)) : m.members,
-        );
+      try {
+        const r = await rpc(current, {
+          cmd: "list",
+          project: board?.project.key ?? null,
+          filter: { all: true },
+        });
+        if (alive && r.kind === "list") setDeletedRows(r.rows.filter((x) => x.tombstone));
+      } catch {
+        if (alive) setDeletedRows([]);
       }
     })();
     return () => {
       alive = false;
     };
-  }, [current, revision]);
+  }, [current, display.deleted, board?.project.key, revision]);
 
   // `mine`/`label` are server truth: ask `list`, keep the doc-ids, intersect.
   useEffect(() => {
@@ -331,7 +453,28 @@ export function App() {
 
   // A selection that no longer exists (deleted, filtered away) must not linger.
   useEffect(() => {
-    setSelection((s) => (s && rows.some((r) => r.reff === s) ? s : (rows[0]?.reff ?? null)));
+    // Preserve a deep-linked issue until its board arrives. Treating the initial
+    // empty rows array as authoritative would erase `?issue=…` before the first
+    // request even had a chance to resolve it.
+    if (!board || (view !== "list" && view !== "board")) return;
+    // Keep an explicit unknown ref so the detail surface can say it is missing.
+    // Redirecting it to the first row would rewrite a broken/shared link into a
+    // different issue and make the failure invisible.
+    setSelection((selected) => {
+      if (display.deleted) {
+        return selected && rows.some((row) => row.reff === selected) ? selected : null;
+      }
+      return selected ?? rows[0]?.reff ?? null;
+    });
+  }, [board, view, rows, display.deleted]);
+
+  // Checks on rows that left the view are stale writes waiting to happen: a
+  // bulk action must only ever touch what the user can currently see checked.
+  useEffect(() => {
+    setChecked((c) => {
+      const live = new Set([...c].filter((reff) => rows.some((r) => r.reff === reff)));
+      return live.size === c.size ? c : live;
+    });
   }, [rows]);
 
   useEffect(() => {
@@ -344,9 +487,7 @@ export function App() {
     useCallback(
       (d) => {
         if (!d) {
-          // We can't say which docs moved, so no prediction can be trusted.
-          overlay.current.clear();
-          setPredicted((n) => n + 1);
+          projectStore.overlay.clear();
           void loadSpaces();
           void loadBoard(current, projectRef.current);
           setRevision((r) => r + 1);
@@ -364,29 +505,14 @@ export function App() {
         const rebaseline = d.reset || (prev !== undefined && prev !== d.epoch);
 
         if (d.space !== current) return;
-        // The doorbell is the spine of the optimism: it names the docs that
-        // moved, and the arrival of truth about a doc is what kills every guess
-        // about it — no ids to match, nothing to reconcile. Re-read FIRST, then
-        // drop the predictions: clearing before the fresh rows land would flash
-        // the old server value for a frame, which is the one thing the optimism
-        // exists to prevent.
-        void loadBoard(current, projectRef.current).then(() => {
-          const docs = Object.values(d.dirty_by_project).flat();
-          let cleared = false;
-          for (const doc of docs) cleared = overlay.current.clearDoc(doc) || cleared;
-          if (rebaseline) {
-            overlay.current.clear();
-            cleared = true;
-          }
-          if (cleared) setPredicted((n) => n + 1);
-        });
+        void projectStore.handleDoorbell(rebaseline ? { ...d, reset: true } : d);
         setRevision((r) => r + 1);
         // On a rebaseline the space list is exactly as suspect as the board: a
         // daemon that restarted may have changed its own name, projects, or
         // whether it is up at all.
         if (rebaseline || d.dirty_catalog.length) void loadSpaces();
       },
-      [current, loadBoard, loadSpaces],
+      [current, loadBoard, loadSpaces, projectStore],
     ),
   );
 
@@ -404,6 +530,10 @@ export function App() {
   selRef.current = selection;
   const statesRef = useRef(states);
   statesRef.current = states;
+  const checkedRef = useRef(checked);
+  checkedRef.current = checked;
+  const membersRef = useRef(members);
+  membersRef.current = members;
   // The *filtered* board: reordering has to land relative to a neighbour you can
   // actually see, or `J` jumps the card past rows a filter is hiding.
   const shownRef = useRef(shown);
@@ -425,19 +555,20 @@ export function App() {
    */
   const predict = useCallback(
     async (doc: string, field: Field, value: string, send: () => Promise<unknown>) => {
-      overlay.current.set(doc, field, value);
-      setPredicted((n) => n + 1);
+      setMutationNotice(`Saving ${field} on this device…`);
       try {
-        await send();
+        await projectStore.predictValue(currentRef.current ?? "", doc, field, value, send);
+        setMutationNotice(`${field} saved on this device`);
+        return true;
       } catch (e) {
-        overlay.current.clearDoc(doc);
-        setPredicted((n) => n + 1);
+        setMutationNotice(`${field} was refused · local value restored`);
         if (!(e instanceof ConfirmRequired)) {
           setError(e instanceof LaitError ? e.message : String(e));
         }
+        return false;
       }
     },
-    [],
+    [projectStore],
   );
 
   /** Writes never refetch — the daemon rings and the doorbell reloads. */
@@ -450,18 +581,107 @@ export function App() {
     }
   }, []);
 
+  /**
+   * One request per checked issue with a small concurrency ceiling. Independent
+   * refusals do not stop the run, and the itemized result targets retry precisely.
+   */
+  const bulk = useCallback(
+    async (
+      fn: (reff: string) => Promise<unknown>,
+      retryRefs?: readonly string[],
+    ) => {
+      const requested = retryRefs
+        ? new Set(retryRefs)
+        : checkedRef.current;
+      const targets = rowsRef.current.filter((row) => requested.has(row.reff));
+      if (!targets.length) return null;
+      bulkOperation.current = fn;
+      setBulkProgress({
+        done: 0,
+        total: targets.length,
+        pending: true,
+        successes: [],
+        failures: [],
+      });
+      const result = await runBounded(
+        targets,
+        (row) => fn(row.reff),
+        3,
+        (done, total) =>
+          setBulkProgress((currentProgress) => ({
+            done,
+            total,
+            pending: true,
+            successes: currentProgress?.successes ?? [],
+            failures: currentProgress?.failures ?? [],
+          })),
+      );
+      const failures = result.failures.map(({ item, message }) => ({
+        reff: item.reff,
+        label: item.key_alias ?? item.reff,
+        message,
+      }));
+      const finalProgress: BulkProgress = {
+        done: targets.length,
+        total: targets.length,
+        pending: false,
+        successes: result.successes.map((row) => row.reff),
+        failures,
+      };
+      setBulkProgress(finalProgress);
+      if (!failures.length) {
+        window.setTimeout(() => setBulkProgress(null), 1600);
+      }
+      return finalProgress;
+    },
+    [],
+  );
+
   const api: AppApi = useMemo(
     () => ({
       openPalette: () => setModal("palette"),
+      openIssueSearch: () => setModal("issueSearch"),
       closePalette: () => setModal(null),
       toggleShortcuts: () => setModal((m) => (m === "shortcuts" ? null : "shortcuts")),
       toggleDetail: () => setDetail((d) => !d),
-      goto: (v) => setView(v),
+      goto: (v) => {
+        const nextProject = isProjectView(v)
+          ? (project ?? board?.project.key ?? liveProjects[0]?.key ?? null)
+          : null;
+        const issue = v === "list" || v === "board" || v === "calendar" ? selection : null;
+        window.history.pushState(
+          null,
+          "",
+          formatRoute({
+            spaceId: routeSpace,
+            project: nextProject,
+            view: v,
+            issue,
+            focused: issue ? focusedDetail : false,
+            filter,
+          }),
+        );
+        setProject(nextProject);
+        setView(v);
+        if (!issue) setSelection(null);
+      },
       openFilter: () => {
         setFilterOpen(true);
         setFocusToken((t) => t + 1);
       },
+      clearFilter: () => {
+        window.history.replaceState(
+          null,
+          "",
+          formatRoute({ spaceId: routeSpace, project, view, issue: selection, filter: EMPTY_FILTER }),
+        );
+        setFilter(EMPTY_FILTER);
+      },
       toggleSidebar: () => {
+        if (window.matchMedia("(max-width: 960px)").matches) {
+          setMobileNav((open) => !open);
+          return;
+        }
         const p = sidebar.current;
         if (!p) return;
         if (p.isCollapsed()) p.expand();
@@ -473,10 +693,46 @@ export function App() {
         void loadBoard(current, projectRef.current);
         setToast("Refreshed");
       },
-      select: (reff) => setSelection(reff),
-      predict: (doc, field, value, send) => void predict(doc, field, value, send),
-      pickSpace: (id) => setCurrent(id),
-      pickProject: (key) => setProject(key),
+      // Row motion can update selection many times a second. It remains directly
+      // linkable, but replaces the current entry rather than polluting Back with
+      // every arrow-key stop.
+      select: (reff) => {
+        if (routeSpace && reff) {
+          rememberIssue(routeSpace, reff);
+          setPersonalNavRevision((revision) => revision + 1);
+        }
+        window.history.replaceState(
+          null,
+          "",
+          formatRoute({ spaceId: routeSpace, project, view, issue: reff, focused: reff ? focusedDetail : false, filter }),
+        );
+        setSelection(reff);
+      },
+      predict: (doc, field, value, send) => predict(doc, field, value, send),
+      pickSpace: (id) => {
+        const picked = spacesRef.current.find((space) => space.id === id);
+        if (!picked) return;
+        const next = { spaceId: picked.space, project: null, view: "projects" as const, issue: null };
+        window.history.pushState(null, "", formatRoute(next));
+        setRouteSpace(picked.space);
+        setCurrent(picked.id);
+        setProject(null);
+        setView("projects");
+        setSelection(null);
+      },
+      pickProject: (key) => {
+        // "My issues" is a destination, not a sticky scope: opening a specific
+        // project drops the `mine` authorization filter so its board doesn't come
+        // up mysteriously empty. Other facets (status/label/…) ride along as before.
+        const scoped = filter.mine ? { ...filter, mine: false } : filter;
+        const nextView = isProjectView(view) ? view : "overview";
+        const next = { spaceId: routeSpace, project: key, view: nextView, issue: null, filter: scoped };
+        window.history.pushState(null, "", formatRoute(next));
+        setProject(key);
+        setView(nextView);
+        setSelection(null);
+        if (scoped !== filter) setFilter(scoped);
+      },
 
       // A picker needs its subject visible: opening the assignee menu over a pane
       // you closed is a menu with no context.
@@ -594,9 +850,93 @@ export function App() {
             throw e;
           }
         }),
+
+      restoreIssue: (reff) => {
+        if (!current) return;
+        // `issue_restore` on a live issue still writes a "restored" event, so
+        // refusing here keeps the history honest rather than politely noisy.
+        const row = rowsRef.current.find((r) => r.reff === reff);
+        if (row && !row.tombstone) return setToast("Not deleted");
+        void guard(() => rpc(current, { cmd: "issue_restore", reff }));
+      },
+
+      /** Toggle, not set: `i` on an issue you hold puts it down (Linear's `I`
+       *  self-assigns; the toggle is what a second press should honestly mean). */
+      assignMe: () => {
+        const row = selectedRow();
+        const me = membersRef.current.find((m) => m.me);
+        if (!row || !current || !me) return;
+        const add = !row.assignees.includes(me.key);
+        void guard(() => rpc(current, { cmd: "assign", reff: row.reff, who: [me.key], add }));
+      },
+
+      /** Column top/bottom. Same done-column refusal as `reorder`, same reason. */
+      moveTo: (pos) => {
+        const row = selectedRow();
+        const shownBoard = shownRef.current;
+        if (!row || !current || !shownBoard) return;
+        const col = shownBoard.columns.find((c) => c.state.id === row.status);
+        if (!col || col.state.category === "done") return;
+        void guard(() => rpc(current, { cmd: "issue_move", reff: row.reff, pos: { at: pos } }));
+      },
+
+      toggleCheck: () => {
+        const row = selectedRow();
+        if (!row) return;
+        setChecked((c) => {
+          const next = new Set(c);
+          if (!next.delete(row.reff)) next.add(row.reff);
+          return next;
+        });
+      },
+      checkAll: () => setChecked(new Set(rowsRef.current.map((r) => r.reff))),
+      clearChecks: () => setChecked(new Set()),
+      openDisplay: () => setDisplayOpen(true),
+      openWorkflow: () => setModal("workflow"),
+      openRoles: () => setModal("roles"),
+      setTheme: (theme) => applyTheme(theme),
     }),
-    [current, guard, loadBoard, loadSpaces, predict, selectedRow],
+    [
+      applyRoute,
+      current,
+      routeSpace,
+      project,
+      view,
+      selection,
+      board,
+      liveProjects,
+      filter,
+      guard,
+      loadBoard,
+      loadSpaces,
+      predict,
+      selectedRow,
+    ],
   );
+
+  // Deep-link / automation hook: a `lait:nav` CustomEvent drives navigation
+  // without a synthetic DOM click. The handler DEFERS the actual navigation to a
+  // fresh task, so the dispatcher's call stack (e.g. a headless `eval`) unwinds
+  // before React re-renders — a re-render *inside* an eval detaches its execution
+  // context, which is why clicking a nav item from automation is unreliable but a
+  // dispatched event is not. Harmless in normal use: nothing dispatches it.
+  //   window.dispatchEvent(new CustomEvent("lait:nav", { detail: { view, project, issue } }))
+  useEffect(() => {
+    const onNav = (event: Event) => {
+      const detail = ((event as CustomEvent).detail ?? {}) as {
+        view?: View;
+        project?: string | null;
+        issue?: string | null;
+      };
+      setTimeout(() => {
+        if (typeof detail.view === "string") api.goto(detail.view);
+        if ("project" in detail) api.pickProject(detail.project ?? null);
+        if ("issue" in detail) api.select(detail.issue ?? null);
+      }, 0);
+    };
+    window.addEventListener("lait:nav", onNav as EventListener);
+    return () => window.removeEventListener("lait:nav", onNav as EventListener);
+  }, [api]);
 
   const ctx: Ctx = useMemo(
     () => ({
@@ -604,12 +944,13 @@ export function App() {
       spaceId: current,
       readOnly,
       selection,
+      checkedCount: checked.size,
       // An open picker owns the keymap exactly as the palette does: `j` in the
       // assignee menu is cmdk's, not the board's.
       overlay: modal !== null || field !== null,
       app: api,
     }),
-    [view, current, readOnly, selection, modal, field, api],
+    [view, current, readOnly, selection, checked, modal, field, api],
   );
 
   /**
@@ -660,8 +1001,48 @@ export function App() {
   );
 
   const pending = useKeys(ctx);
-  // Width + collapsed state, persisted to localStorage by the library.
-  const layout = useDefaultLayout({ id: "lait.layout", panelIds: ["sidebar", "main"] });
+  const detailVisible = Boolean(
+    detail &&
+    selection &&
+    current &&
+    routeSpace &&
+    board &&
+    (view === "list" || view === "board" || view === "calendar"),
+  );
+  // Keep one panel topology for every view. The old two-id declaration mounted a
+  // third panel only for issue-capable views, so the library rebalanced the
+  // sidebar whenever that panel entered or left. Programmatic collapse/expand is
+  // intentionally not persisted; only the user's resize choices are.
+  const layout = useDefaultLayout({
+    id: "lait.layout.v2",
+    panelIds: LAYOUT_PANEL_IDS,
+    onlySaveAfterUserInteractions: true,
+  });
+
+  /**
+   * Full width is a *view*, not an overlay.
+   *
+   * It draws in the work area, beside the sidebar, exactly like the list and the
+   * board — so the shell stays navigable while you read. It used to be a `fixed
+   * inset-0` sheet, which took the sidebar with it and made the one surface
+   * people dwell on the one they could not leave except by closing it.
+   *
+   * Mechanically it is the split pane's own move run the other way: the third
+   * panel collapses and the issue is drawn in the main one. Stretching that
+   * third panel to 100% instead would mean re-negotiating its ceiling with the
+   * layout library mid-collapse, which it applies a render later and against the
+   * old constraint — leaving the list stubbornly on screen.
+   */
+  const fullWidthDetail = detailVisible && focusedDetail;
+
+  // Layout effects run before paint, so a route without a selected issue never
+  // flashes the detail panel's stored width. `expand` restores the last user size.
+  useLayoutEffect(() => {
+    const panel = detailPanel.current;
+    if (!panel) return;
+    if (detailVisible && !fullWidthDetail) panel.expand();
+    else panel.collapse();
+  }, [detailPanel, detailVisible, fullWidthDetail]);
 
   useEffect(() => {
     registry.validate();
@@ -681,16 +1062,219 @@ export function App() {
   // the one thing it exists to do.
   useEffect(() => {
     const t = window.setInterval(() => {
-      if (!overlay.current.sweep()) return;
-      setPredicted((n) => n + 1);
+      if (!currentRef.current || !projectStore.expirePredictions(currentRef.current)) return;
+      setMutationNotice("Local confirmation was delayed; refreshing authoritative state");
       void loadBoard(currentRef.current, projectRef.current);
-      // The detail pane reads off `revision`, not the board.
       setRevision((r) => r + 1);
     }, PREDICTION_TTL_MS / 2);
     return () => window.clearInterval(t);
-  }, [loadBoard]);
+  }, [loadBoard, projectStore]);
+
+  useEffect(() => {
+    if (!mutationNotice || mutationNotice.startsWith("Saving")) return;
+    const timeout = window.setTimeout(() => setMutationNotice(""), 3200);
+    return () => window.clearTimeout(timeout);
+  }, [mutationNotice]);
 
   const run = (id: string) => void registry.get(id)?.run(ctx);
+  const openMyIssues = () => {
+    window.history.pushState(
+      null,
+      "",
+      formatRoute({ spaceId: routeSpace, project: null, view: "my-issues", issue: null }),
+    );
+    setProject(null);
+    setView("my-issues");
+    setSelection(null);
+    setFilter(EMPTY_FILTER);
+  };
+  const openRecentIssue = (reff: string) => {
+    const key = /^([A-Z][A-Z0-9]*)-\d+$/.exec(reff)?.[1] ?? project;
+    window.history.pushState(null, "", formatRoute({ spaceId: routeSpace, project: key, view: "list", issue: reff, filter }));
+    setProject(key);
+    setView("list");
+    setSelection(reff);
+    setDetail(true);
+  };
+  const applySavedView = (saved: SavedView) => {
+    const nextView = saved.view ?? "list";
+    window.history.pushState(null, "", formatRoute({ spaceId: routeSpace, project, view: nextView, issue: null, filter: saved.filter }));
+    setView(nextView);
+    setSelection(null);
+    setFilter(saved.filter);
+    setDisplay(saved.display);
+  };
+  const toggleFavorite = (key: string) => {
+    if (!routeSpace) return;
+    toggleFavoriteProject(routeSpace, key);
+    setPersonalNavRevision((revision) => revision + 1);
+  };
+
+  const activeProject =
+    board?.project ?? projects.find((candidate) => candidate.key === project) ?? null;
+  const projectShell = isProjectView(view) && Boolean(project || activeProject);
+  const projectCounts = useMemo(() => {
+    const counts = { backlog: 0, active: 0, done: 0, total: 0 };
+    for (const column of board?.columns ?? []) {
+      const count = column.rows.filter((row) => !row.tombstone).length;
+      counts[column.state.category] += count;
+      counts.total += count;
+    }
+    return counts;
+  }, [board]);
+  const projectDocIds = useMemo(
+    () => new Set(board?.columns.flatMap((column) => column.rows.map((row) => row.doc_id)) ?? []),
+    [board],
+  );
+
+  /**
+   * The header trail names *what you are looking at* and its containers — never
+   * the view mode. Inside a project the tab strip below already says Overview vs
+   * Issues vs Board, so the trail stops at the project; a workspace destination
+   * has no container to climb to, so it is its own root, wearing the sidebar's
+   * icon for it. Every ancestor navigates; the leaf never does.
+   *
+   * The space itself is deliberately *not* a crumb. lait has no team layer under
+   * it (Linear's first crumb is a team, not a workspace), so it would be a
+   * constant on every surface — and one the sidebar already holds, permanently,
+   * one row to the left. Settings is the exception, there the sidebar is gone.
+   */
+  const trail: BreadcrumbItem[] = projectShell
+    ? [
+        liveProjects.length > 1
+          ? {
+              key: "project",
+              control: true,
+              content: (
+                <Combobox
+                  variant="property"
+                  label="Project"
+                  swatchShape="square"
+                  className="max-w-[min(32cqw,240px)] font-medium"
+                  value={
+                    activeProject
+                      ? {
+                          id: activeProject.key,
+                          label: activeProject.name,
+                          swatch: catalogColor(activeProject.color),
+                        }
+                      : null
+                  }
+                  options={[
+                    ...liveProjects,
+                    ...(activeProject &&
+                    !liveProjects.some((candidate) => candidate.key === activeProject.key)
+                      ? projects.filter((candidate) => candidate.key === activeProject.key)
+                      : []),
+                  ].map((candidate) => ({
+                    id: candidate.key,
+                    label: candidate.name,
+                    swatch: catalogColor(candidate.color),
+                    hint: candidate.key,
+                  }))}
+                  onPick={api.pickProject}
+                />
+              ),
+            }
+          : {
+              key: "project",
+              content: (
+                <ProjectCrumb
+                  name={activeProject?.name ?? project ?? "Project"}
+                  color={activeProject ? catalogColor(activeProject.color) : undefined}
+                />
+              ),
+            },
+      ]
+    : [
+        {
+          key: view,
+          content: (
+            <DestinationCrumb
+              icon={
+                DESTINATION_ICON[view as keyof typeof DESTINATION_ICON] ??
+                DESTINATION_ICON.workspace
+              }
+              label={workspaceTitle(view)}
+            />
+          ),
+        },
+      ];
+
+  /**
+   * The open issue, built once and hung in one of two places: the third panel
+   * when it is a split, the work area itself when it is full width. One element,
+   * so the two placements cannot drift into two different issue surfaces.
+   */
+  const issuePane =
+    detailVisible && selection && current && routeSpace && board ? (
+      rows.some((row) => row.reff === selection) ||
+      deletedRows.some((row) => row.reff === selection) ? (
+        <IssueDetail
+          // Remount on a different issue: a stale draft must not survive into
+          // the next one, and `key` says that in one line.
+          key={selection}
+          spaceId={current}
+          canonicalSpaceId={routeSpace}
+          reff={selection}
+          states={states}
+          members={members}
+          labels={labels}
+          projects={projects}
+          readOnly={readOnly}
+          // A deleted issue is not on the board at all, so the trash rows
+          // are the only place its tombstone can be read from.
+          tombstone={deletedRows.some((r) => r.reff === selection)}
+          openField={field}
+          onOpenField={setField}
+          onError={setError}
+          onDelete={api.deleteIssue}
+          onPredict={api.predict}
+          onNavigate={api.select}
+          onClose={() => {
+            api.select(null);
+            setDetail(false);
+            setFocusedDetail(false);
+          }}
+          onOpenProject={(key) => {
+            api.select(null);
+            setDetail(false);
+            setFocusedDetail(false);
+            api.pickProject(key);
+          }}
+          focused={focusedDetail}
+          onToggleFocus={() => {
+            const next = !focusedDetail;
+            window.history.pushState(
+              null,
+              "",
+              formatRoute({ spaceId: routeSpace, project, view, issue: selection, focused: next, filter }),
+            );
+            setFocusedDetail(next);
+          }}
+          {...(rows.findIndex((row) => row.reff === selection) > 0
+            ? {
+                onPrevious: () =>
+                  api.select(rows[rows.findIndex((row) => row.reff === selection) - 1]!.reff),
+              }
+            : {})}
+          {...(rows.findIndex((row) => row.reff === selection) >= 0 &&
+          rows.findIndex((row) => row.reff === selection) < rows.length - 1
+            ? {
+                onNext: () =>
+                  api.select(rows[rows.findIndex((row) => row.reff === selection) + 1]!.reff),
+              }
+            : {})}
+        />
+      ) : (
+        <EmptyState
+          kind="unavailable"
+          title="Issue not found in this local project"
+          body={`${selection} is not present in the current local projection. It may belong to another project, still be arriving, or not exist on this replica.`}
+          action={<Button onClick={() => api.select(null)}>Clear selection</Button>}
+        />
+      )
+    ) : null;
 
   return (
     <TooltipProvider>
@@ -705,253 +1289,400 @@ export function App() {
         id="sidebar"
         panelRef={sidebar}
         defaultSize="18%"
-        minSize="140px"
+        minSize="180px"
         maxSize="32%"
         collapsible
         collapsedSize={0}
-        className="bg-raised"
+        groupResizeBehavior="preserve-pixel-size"
+        className="bg-raised max-[960px]:hidden"
       >
-        <Sidebar spaces={spaces} current={current} onPick={api.pickSpace} />
+        <Sidebar
+          spaces={spaces}
+          current={current}
+          projects={liveProjects}
+          currentProject={board?.project.key ?? project}
+          view={view}
+          unread={unread}
+          memberCount={members.length}
+          membership={statusInfo?.membership}
+          currentName={statusInfo?.name}
+          favoriteProjects={favoriteProjects}
+          savedViews={sidebarSavedViews}
+          onPickSpace={api.pickSpace}
+          onSearch={() => run("search.issues")}
+          onPickProject={api.pickProject}
+          onGo={api.goto}
+          onMyIssues={openMyIssues}
+          onApplySavedView={applySavedView}
+          onToggleFavorite={toggleFavorite}
+          onCreateProject={api.createProject}
+        />
       </Panel>
 
       {/* A 1px seam with a 7px hit area: thin to look at, big enough to grab. */}
-      <Separator className="bg-line data-[state=dragging]:bg-accent hover:bg-accent/60 relative w-px outline-none transition-colors">
+      <Separator
+        className={
+          view === "settings"
+            ? "pointer-events-none invisible relative w-px max-[960px]:hidden"
+            : "bg-line data-[state=dragging]:bg-accent hover:bg-accent/60 relative w-px outline-none transition-colors max-[960px]:hidden"
+        }
+      >
         <span className="absolute inset-y-0 -left-[3px] w-[7px]" />
       </Separator>
 
-      <Panel id="main" className="flex min-w-0 flex-col">
-        {/*
-          Chrome recedes. Linear's header is a breadcrumb and a few ghost icons —
-          no bordered CTA competing with the content, no permanently-lit status
-          badge. Ours had a segmented control, a primary button, and a `Ctrl K`
-          chip all shouting at once; the work is the content, not the toolbar.
-        */}
-        <header className="border-line flex h-11 shrink-0 items-center gap-1 border-b px-2">
-          <IconButton label="Toggle sidebar" chord="⌘B" onClick={() => run("view.sidebar")}>
-            <PanelLeft className="size-4" />
-          </IconButton>
-
-          {/*
-            The project is a *switch*, not a label.
-
-            It read as a title before, which quietly made the client single-project:
-            `board` was sent with `project: null` forever, so a space with three
-            projects only ever showed whichever one the daemon's default chain
-            picked, and the other two were unreachable from the browser. The name was
-            never decoration — it was the one control the header was missing.
-          */}
-          <h1 className="ml-1 flex min-w-0 items-baseline gap-1.5">
-            {projects.length > 1 ? (
-              <Combobox
-                variant="bare"
-                label="Project"
-                className="font-semibold"
-                value={
-                  board
-                    ? {
-                        id: board.project.key,
-                        label: board.project.name,
-                        swatch: catalogColor(board.project.color),
-                      }
-                    : null
-                }
-                options={projects.map((p) => ({
-                  id: p.key,
-                  label: p.name,
-                  swatch: catalogColor(p.color),
-                  hint: p.key,
-                }))}
-                // Straight to the api, not through a command: a command's `run`
-                // takes only a `Ctx`, so "pick *this* project" has no way to travel
-                // through the registry. Same reason `Sidebar` calls `pickSpace`
-                // directly — selection carries an argument, actions don't.
-                onPick={api.pickProject}
-              />
-            ) : (
-              <span className="truncate font-semibold">{board?.project.name ?? "lait"}</span>
-            )}
-            <span className="text-mute shrink-0">/</span>
-            <span className="text-dim shrink-0 capitalize">{view}</span>
-          </h1>
-
-          <span className="ml-auto flex items-center gap-1">
-            {/* Only when it is worth saying. A permanently-lit "live" is noise;
-                a silent failure is worse. So: nothing when healthy, a warning
-                when not. */}
-            {liveness !== "live" && (
-              <span
-                className="text-warn mr-1 flex items-center gap-1.5 text-xs"
-                title={`Doorbell stream: ${liveness}`}
-                role="status"
-              >
-                <span className="bg-warn size-1.5 animate-pulse rounded-full" />
-                {liveness}
-              </span>
-            )}
-
-            <IconButton label="Search commands" chord="⌘K" onClick={() => run("palette.open")}>
-              <Search className="size-4" />
+      <Panel id="main" role="main" className="flex min-w-0 flex-col">
+        {/* A full-width issue brings its own header — the trail, the pager, the
+            overflow — so the shell's would be a second one saying less. */}
+        <div
+          className={
+            view === "settings" || fullWidthDetail ? "hidden" : "@container shrink-0"
+          }
+        >
+          <SurfaceHeader className="gap-0.5">
+            <IconButton label="Toggle sidebar" chord="⌘B" onClick={() => run("view.sidebar")}>
+              <PanelLeft className="size-4" />
             </IconButton>
 
-            {(view === "list" || view === "board") && (
-              <IconButton
-                label="Filter"
-                chord="/"
-                variant={isActive(filter) ? "active" : "ghost"}
-                onClick={() => run("filter.open")}
-              >
-                <ListFilter className="size-4" />
-              </IconButton>
-            )}
+            <Breadcrumbs className="ml-1" items={trail} />
 
-            {/* A segmented group without a box around it: adjacency does the
-                grouping, the active fill does the state. */}
-            <span className="mx-1 flex items-center gap-0.5">
-              {(
-                [
-                  ["list", List, "Issues", "G L"],
-                  ["board", LayoutGrid, "Board", "G B"],
-                  ["inbox", InboxIcon, "Inbox", "G I"],
-                ] as const
-              ).map(([v, Icon, label, chord]) => (
+            <span className="ml-auto flex items-center gap-0.5">
+              {!projectShell && (
+                <TrustPopover
+                  liveness={liveness}
+                  status={statusInfo}
+                  space={space}
+                  localReady={
+                    statusInfo !== null &&
+                    statusInfo.membership !== "pending" &&
+                    statusInfo.counts_unavailable !== true
+                  }
+                  latestChange={mutationNotice}
+                />
+              )}
+
+              {projectShell && (view === "list" || view === "board" || view === "calendar") && (
                 <IconButton
-                  key={v}
-                  label={label}
-                  chord={chord}
-                  variant={view === v ? "active" : "ghost"}
-                  aria-pressed={view === v}
-                  onClick={() => run(`go.${v}`)}
-                  className="relative"
+                  label="Filter"
+                  chord="/"
+                  variant={isActive(filter) ? "active" : "ghost"}
+                  onClick={() => run("filter.open")}
                 >
-                  <Icon className="size-4" />
-                  {v === "inbox" && unread > 0 && (
-                    <span className="bg-accent absolute top-0.5 right-0.5 size-1.5 rounded-full" />
-                  )}
+                  <ListFilter className="size-4" />
                 </IconButton>
-              ))}
-            </span>
+              )}
+              {projectShell && (view === "list" || view === "board") && (
+                <span className="@max-[420px]:hidden">
+                  <DisplayOptions
+                    display={display}
+                    view={view}
+                    open={displayOpen}
+                    onOpenChange={setDisplayOpen}
+                    density={density}
+                    onDensityChange={(nextDensity) => {
+                      setDensity(nextDensity);
+                      applyDensity(nextDensity);
+                    }}
+                    onChange={(nextDisplay) => {
+                      if (nextDisplay.deleted !== display.deleted) {
+                        api.select(null);
+                        setDetail(false);
+                      }
+                      setDisplay(nextDisplay);
+                      if (nextDisplay.deleted && view === "board") api.goto("list");
+                    }}
+                  />
+                </span>
+              )}
 
-            {!readOnly && current && (
-              <IconButton label="New issue" chord="C" onClick={() => run("issue.create")}>
-                <Plus className="size-4" />
-              </IconButton>
-            )}
-          </span>
-        </header>
+              {projectShell && !readOnly && current && (view === "list" || view === "board" || view === "calendar") && (
+                <IconButton label="New issue" chord="C" onClick={() => run("issue.create")}>
+                  <Plus className="size-4" />
+                </IconButton>
+              )}
+            </span>
+          </SurfaceHeader>
+          {projectShell && isProjectView(view) && (
+            <ProjectTabs view={view} onPick={(next) => api.goto(next)} />
+          )}
+        </div>
 
         {error && (
-          <p className="border-line text-danger border-b px-4 py-2 text-sm" role="alert">
-            {error}
-          </p>
+          <InlineError
+            {...recoveryForError(error)}
+            failureKind={classifyFailure(error)}
+            message={error}
+            onRetry={api.refresh}
+            onDismiss={() => setError(null)}
+            onCopy={() =>
+              void navigator.clipboard.writeText(
+                [`Viewer error`, error, window.location.href].join("\n"),
+              )
+            }
+          />
         )}
 
-        {filterOpen && (view === "list" || view === "board") && (
+        {fullWidthDetail && (
+          <div className="ui-detail flex min-h-0 flex-1 flex-col">{issuePane}</div>
+        )}
+
+        {!fullWidthDetail && filterOpen && (view === "list" || view === "board") && (
           <FilterBar
             filter={filter}
             labels={labels}
             states={states}
+            members={members}
             focusToken={focusToken}
+            resultCount={shown?.columns.reduce(
+              (count, column) => count + column.rows.filter((row) => !row.tombstone).length,
+              0,
+            ) ?? 0}
+            totalCount={board?.columns.reduce(
+              (count, column) => count + column.rows.filter((row) => !row.tombstone).length,
+              0,
+            ) ?? 0}
             onChange={setFilter}
             onClose={() => setFilterOpen(false)}
           />
         )}
 
-        <div className="group/list flex min-h-0 flex-1 flex-col">
+        <div
+          id={projectShell ? "project-view-panel" : undefined}
+          role={projectShell ? "tabpanel" : undefined}
+          aria-labelledby={projectShell && isProjectView(view) ? `project-tab-${view}` : undefined}
+          // Hidden rather than unmounted behind a full-width issue: coming back
+          // should land you where you were in the list, not at the top of it.
+          className={`group/list flex min-h-0 flex-1 flex-col${fullWidthDetail ? " hidden" : ""}`}
+        >
           {!current ? (
-            <p className="text-mute p-8 text-center">Pick a space.</p>
+            <EmptyState
+              icon={<PanelLeft className="size-5" />}
+              title={
+                routeSpace
+                  ? "This space is not on this device"
+                  : spaces.length
+                    ? "Choose a local space"
+                    : "No local spaces yet"
+              }
+              body={
+                routeSpace
+                  ? `The link names ${routeSpace}, but no matching local replica is available. Join or restore the space on this device, then refresh.`
+                  : spaces.length
+                    ? "Select a space from the sidebar to open its local replica."
+                    : "Create or join a space with the lait CLI, then refresh this viewer."
+              }
+            />
+          ) : missingProject ? (
+            <EmptyState
+              kind="unavailable"
+              title="Project not found in this local space"
+              body={`${project} is not available in the current replica. Choose another project from the sidebar or wait for catalog data to arrive.`}
+              action={
+                projects[0] ? (
+                  <Button onClick={() => api.pickProject(projects[0]!.key)}>
+                    Choose {projects[0].name}
+                  </Button>
+                ) : (
+                  <Button onClick={api.refresh}>Refresh projects</Button>
+                )
+              }
+            />
           ) : view === "inbox" ? (
             <Inbox
               spaceId={current}
               revision={revision}
-              onError={setError}
               onCountChange={setUnread}
-              onOpen={(reff) => {
-                api.select(reff);
-                setView("list");
-              }}
+              onOpen={openRecentIssue}
             />
-          ) : view === "members" ? (
-            <Members
+          ) : view === "settings" ? (
+            <Settings
+              spaceId={current}
+              spaceName={statusInfo?.name || space?.name || ""}
+              spaceDescription={statusInfo?.description ?? ""}
+              labels={labels}
+              projects={projects}
+              readOnly={readOnly}
+              revision={revision}
+              onError={setError}
+              onExit={() => api.goto("list")}
+            />
+          ) : view === "my-issues" ? (
+            <MyIssues
               spaceId={current}
               revision={revision}
+              onError={setError}
+              onOpen={openRecentIssue}
+            />
+          ) : view === "projects" ? (
+            <Projects
+              spaceId={current}
+              projects={projects}
+              revision={revision}
+              spaceDescription={statusInfo?.description ?? ""}
+              onOpen={api.pickProject}
+            />
+          ) : view === "overview" && activeProject ? (
+            <ProjectOverview
+              spaceId={current}
+              project={activeProject}
+              members={members}
+              counts={projectCounts}
               readOnly={readOnly}
               onError={setError}
             />
-          ) : view === "activity" ? (
+          ) : view === "activity" && board ? (
             <Activity
               spaceId={current}
               members={members}
               revision={revision}
+              projectDocIds={projectDocIds}
+              projectName={board.project.name}
               onError={setError}
-              onOpen={api.select}
+              onOpen={(reff) => {
+                api.goto("list");
+                api.select(reff);
+                setDetail(true);
+              }}
             />
           ) : shown && view === "board" ? (
             <Board
               board={shown}
+              display={display}
               members={members}
+              labels={labels}
               selection={selection}
               optimistic={optimistic}
-              onSelect={api.select}
+              onSelect={(reff) => {
+                api.select(reff);
+                setDetail(true);
+              }}
               onCreate={(status) => setComposing({ status })}
               onDrop={dropCard}
+              filtered={isActive(filter)}
+              onClearFilter={() => api.clearFilter()}
+              onReassign={(row, groupKey) => {
+                const id = currentRef.current;
+                if (!id) return;
+                if (display.group === "priority") {
+                  if (row.priority === groupKey) return;
+                  void predict(row.doc_id, "priority", groupKey, () =>
+                    rpc(id, { cmd: "issue_edit", reff: row.reff, priority: groupKey }),
+                  );
+                } else if (display.group === "assignee") {
+                  // Reassign = make the target the issue's sole assignee (or clear
+                  // it for the unassigned lane). `assign` is add/remove per key, so
+                  // this is a small batch; the doorbell repaints when it lands.
+                  const target = groupKey === "unassigned" ? null : groupKey;
+                  void guard(async () => {
+                    for (const k of row.assignees) {
+                      if (k !== target)
+                        await rpc(id, { cmd: "assign", reff: row.reff, who: [k], add: false });
+                    }
+                    if (target && !row.assignees.includes(target))
+                      await rpc(id, { cmd: "assign", reff: row.reff, who: [target], add: true });
+                  });
+                }
+              }}
+              onEdit={(reff, nextField) => {
+                api.select(reff);
+                setDetail(true);
+                setField(nextField);
+              }}
               readOnly={readOnly}
+            />
+          ) : shown && view === "calendar" ? (
+            <Calendar
+              board={shown}
+              onSelect={(reff) => {
+                api.select(reff);
+                setDetail(true);
+              }}
+            />
+          ) : view === "timeline" ? (
+            <Timeline
+              projects={liveProjects}
+              onOpenProject={(key) => {
+                api.pickProject(key);
+                api.goto("list");
+              }}
             />
           ) : shown && view === "list" ? (
             <IssueList
-              board={shown}
+              groups={display.deleted ? [] : groups}
+              deleted={display.deleted ? deletedRows : []}
+              deletedMode={display.deleted}
+              states={states}
               members={members}
               selection={selection}
+              checked={checked}
               optimistic={optimistic}
               onSelect={api.select}
-              onOpen={() => setDetail(true)}
+              onToggleCheck={(reff) =>
+                setChecked((c) => {
+                  const next = new Set(c);
+                  if (!next.delete(reff)) next.add(reff);
+                  return next;
+                })
+              }
+              onOpen={() => {
+                setDetail(true);
+                setFocusedDetail(true);
+              }}
               onCreate={(status) => setComposing({ status })}
               readOnly={readOnly}
+              filtered={isActive(filter)}
             />
           ) : (
-            <p className="text-mute p-8 text-center">Not built yet.</p>
+            <EmptyState
+              kind="unavailable"
+              title="This view is unavailable"
+              body="The local projection could not be loaded."
+              action={<Button onClick={api.refresh}>Retry loading</Button>}
+            />
           )}
         </div>
       </Panel>
 
-      {detail && selection && current && board && (view === "list" || view === "board") && (
-        <>
-          <Separator className="bg-line data-[state=dragging]:bg-accent hover:bg-accent/60 relative w-px outline-none transition-colors">
-            <span className="absolute inset-y-0 -left-[3px] w-[7px]" />
-          </Separator>
-          <Panel id="detail" defaultSize="30%" minSize="260px" maxSize="50%">
-            <IssueDetail
-              // Remount on a different issue: a stale draft must not survive into
-              // the next one, and `key` says that in one line.
-              key={selection}
-              spaceId={current}
-              reff={selection}
-              states={states}
-              members={members}
-              labels={labels}
-              projects={projects}
-              readOnly={readOnly}
-              openField={field}
-              onOpenField={setField}
-              revision={revision}
-              onError={setError}
-              onDelete={api.deleteIssue}
-              onPredict={api.predict}
-              onNavigate={api.select}
-            />
-          </Panel>
-        </>
-      )}
+      {/* Nothing to drag when the list beside it is collapsed. */}
+      <Separator
+        disabled={!detailVisible || fullWidthDetail}
+        className={
+          detailVisible && !fullWidthDetail
+            ? "bg-line data-[state=dragging]:bg-accent hover:bg-accent/60 relative w-px outline-none transition-colors max-[960px]:hidden"
+            : "pointer-events-none invisible relative w-px"
+        }
+      >
+        <span className="absolute inset-y-0 -left-[3px] w-[7px]" />
+      </Separator>
+      <Panel
+        id="detail"
+        panelRef={detailPanel}
+        defaultSize="34%"
+        minSize="300px"
+        maxSize="58%"
+        collapsible
+        collapsedSize="0%"
+        className={
+          !detailVisible || fullWidthDetail
+            ? "ui-detail overflow-hidden"
+            : "ui-detail max-[960px]:fixed max-[960px]:inset-0 max-[960px]:z-30 max-[960px]:bg-bg max-[960px]:pt-[env(safe-area-inset-top)] max-[960px]:pb-[env(safe-area-inset-bottom)]"
+        }
+      >
+        {!fullWidthDetail && issuePane}
+      </Panel>
 
-      {composing && current && board && (
+      {composing && current && routeSpace && board && (
         <NewIssue
           spaceId={current}
+          canonicalSpaceId={routeSpace}
           projectKey={board.project.key}
+          projects={liveProjects}
           states={states}
           labels={labels}
           members={members}
           defaultStatus={composing.status}
           onClose={() => setComposing(null)}
           onError={setError}
+          onCreated={setToast}
         />
       )}
       {composingProject && current && (
@@ -961,13 +1692,152 @@ export function App() {
           onClose={() => setComposingProject(false)}
           // Land in what you just made. Creating a project and staying on the old
           // board is the app ignoring the thing you came to do.
-          onCreated={(key) => setProject(key)}
-          onError={setError}
+          onCreated={(key) => {
+            api.pickProject(key);
+            setToast(`Created ${key}`);
+          }}
+        />
+      )}
+      <Dialog.Root open={mobileNav} onOpenChange={setMobileNav}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="ui-overlay fixed inset-0 z-40 hidden bg-black/45 backdrop-blur-[2px] max-[960px]:block" />
+          <Dialog.Content
+            aria-describedby={undefined}
+            className="ui-drawer bg-raised shadow-overlay fixed inset-y-0 left-0 z-40 hidden w-[min(320px,88vw)] pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] outline-none max-[960px]:block"
+          >
+            <Dialog.Title className="sr-only">Workspace navigation</Dialog.Title>
+            <Sidebar
+              spaces={spaces}
+              current={current}
+              projects={liveProjects}
+              currentProject={board?.project.key ?? project}
+              view={view}
+              unread={unread}
+              memberCount={members.length}
+              membership={statusInfo?.membership}
+              currentName={statusInfo?.name}
+              favoriteProjects={favoriteProjects}
+              savedViews={sidebarSavedViews}
+              onPickSpace={(id) => {
+                api.pickSpace(id);
+                setMobileNav(false);
+              }}
+              onSearch={() => {
+                run("search.issues");
+                setMobileNav(false);
+              }}
+              onPickProject={(key) => {
+                api.pickProject(key);
+                setMobileNav(false);
+              }}
+              onGo={(next) => {
+                api.goto(next);
+                setMobileNav(false);
+              }}
+              onMyIssues={() => {
+                openMyIssues();
+                setMobileNav(false);
+              }}
+              onApplySavedView={(saved) => {
+                applySavedView(saved);
+                setMobileNav(false);
+              }}
+              onToggleFavorite={toggleFavorite}
+              onCreateProject={() => {
+                api.createProject();
+                setMobileNav(false);
+              }}
+            />
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+      {checked.size > 0 && !readOnly && current && (
+        <BulkBar
+          count={checked.size}
+          progress={bulkProgress}
+          states={states}
+          labels={labels}
+          members={members}
+          projects={liveProjects}
+          onStatus={(id) =>
+            void bulk((reff) => rpc(current, { cmd: "issue_edit", reff, status: id }))
+          }
+          onPriority={(id) =>
+            void bulk((reff) => rpc(current, { cmd: "issue_edit", reff, priority: id }))
+          }
+          onLabel={(name) => void bulk((reff) => rpc(current, { cmd: "label", reff, add: [name] }))}
+          onLabelRemove={(name) =>
+            void bulk((reff) => rpc(current, { cmd: "label", reff, remove: [name] }))
+          }
+          onAssign={(key) =>
+            void bulk((reff) => rpc(current, { cmd: "assign", reff, who: [key], add: true }))
+          }
+          onUnassign={(key) =>
+            void bulk((reff) => rpc(current, { cmd: "assign", reff, who: [key], add: false }))
+          }
+          onProject={(id) =>
+            void bulk((reff) => rpc(current, { cmd: "issue_move", reff, project: id }))
+          }
+          onDue={(due) => void bulk((reff) => rpc(current, { cmd: "issue_edit", reff, due }))}
+          onDelete={() =>
+            void (async () => {
+              const n = checked.size;
+              // The engine's per-issue question doesn't scale to a set, so the
+              // dialog owns the aggregate phrasing and each request then rides
+              // with `confirm` — the same consent, asked once.
+              const ok = await ask.confirm({
+                title: `Delete ${n} ${n === 1 ? "issue" : "issues"}?`,
+                body: "Deletion tombstones — they can be restored later.",
+                confirmText: "Delete",
+                danger: true,
+              });
+              if (!ok) return;
+              const result = await bulk((reff) =>
+                rpc(current, { cmd: "issue_delete", reff }, { confirm: true }),
+              );
+              if (!result?.failures.length) setChecked(new Set());
+            })()
+          }
+          onRetryFailures={() => {
+            const operation = bulkOperation.current;
+            if (!operation || !bulkProgress?.failures.length) return;
+            void bulk(operation, bulkProgress.failures.map((failure) => failure.reff));
+          }}
+          onClear={() => setChecked(new Set())}
         />
       )}
       <DialogHost />
       {modal === "palette" && <Palette ctx={ctx} onClose={() => setModal(null)} />}
+      {modal === "issueSearch" && current && routeSpace && board && (
+        <IssueSearch
+          spaceId={routeSpace}
+          rpcSpaceId={current}
+          rows={board.columns.flatMap((column) => column.rows).filter((row) => !row.tombstone)}
+          projects={projects}
+          states={states}
+          onClose={() => setModal(null)}
+          onOpen={(row) => {
+            const destination = projects.find((candidate) => candidate.id === row.project_id);
+            if (destination && destination.key !== board.project.key) {
+              api.pickProject(destination.key);
+            }
+            setView("list");
+            setDetail(true);
+            api.select(row.reff);
+          }}
+        />
+      )}
       {modal === "shortcuts" && <Shortcuts ctx={ctx} onClose={() => setModal(null)} />}
+      {modal === "workflow" && current && board && (
+        <WorkflowDialog
+          spaceId={current}
+          projectKey={board.project.key}
+          onClose={() => setModal(null)}
+        />
+      )}
+      {modal === "roles" && current && (
+        <RolesDialog spaceId={current} onClose={() => setModal(null)} />
+      )}
 
       {/* A half-typed sequence must be visible, or `g` reads as a dropped key. */}
       {pending.length > 0 && (
@@ -975,14 +1845,66 @@ export function App() {
           {pending.join(" ")} …
         </div>
       )}
+      {mutationNotice && (
+        <div
+          className="ui-surface border-line-strong bg-raised text-dim shadow-overlay fixed right-4 bottom-4 z-40 rounded border px-3 py-1.5 text-sm"
+          role="status"
+          aria-live="polite"
+        >
+          {mutationNotice}
+        </div>
+      )}
       {toast && (
-        <div className="border-line-strong bg-raised shadow-overlay fixed bottom-4 left-1/2 -translate-x-1/2 rounded border px-3 py-1.5 text-sm">
+        <div
+          className="border-line-strong bg-raised shadow-overlay fixed bottom-4 left-1/2 -translate-x-1/2 rounded border px-3 py-1.5 text-sm"
+          role="status"
+          aria-live="polite"
+        >
           {toast}
         </div>
       )}
     </Group>
     </TooltipProvider>
   );
+}
+
+function loadTheme(): ThemePreference {
+  try {
+    const saved = localStorage.getItem(THEME_PREFERENCE);
+    return saved === "light" || saved === "dark" ? saved : "system";
+  } catch {
+    return "system";
+  }
+}
+
+function applyTheme(theme: ThemePreference): void {
+  if (theme === "system") delete document.documentElement.dataset.theme;
+  else document.documentElement.dataset.theme = theme;
+  try {
+    if (theme === "system") localStorage.removeItem(THEME_PREFERENCE);
+    else localStorage.setItem(THEME_PREFERENCE, theme);
+  } catch {
+    // Appearance remains applied for this page even when storage is unavailable.
+  }
+}
+
+function loadDensity(): DensityPreference {
+  try {
+    return localStorage.getItem(DENSITY_PREFERENCE) === "comfortable" ? "comfortable" : "compact";
+  } catch {
+    return "compact";
+  }
+}
+
+function applyDensity(density: DensityPreference): void {
+  if (density === "comfortable") document.documentElement.dataset.density = density;
+  else delete document.documentElement.dataset.density;
+  try {
+    if (density === "comfortable") localStorage.setItem(DENSITY_PREFERENCE, density);
+    else localStorage.removeItem(DENSITY_PREFERENCE);
+  } catch {
+    // The current page still reflects the choice when storage is unavailable.
+  }
 }
 
 /**
@@ -1004,3 +1926,74 @@ contribute({
     },
   ],
 });
+
+const PROJECT_VIEW_META: Record<ProjectView, { label: string }> = {
+  overview: { label: "Overview" },
+  list: { label: "Issues" },
+  board: { label: "Board" },
+  calendar: { label: "Calendar" },
+  activity: { label: "Activity" },
+};
+
+function ProjectTabs({ view, onPick }: { view: ProjectView; onPick: (v: ProjectView) => void }) {
+  return (
+    <div
+      className="border-line flex h-7 shrink-0 items-center gap-0.5 overflow-x-auto border-b px-2 [scrollbar-width:none]"
+      role="tablist"
+      aria-label="Project"
+    >
+      {PROJECT_VIEWS.map((v) => {
+        const active = v === view;
+        return (
+          <button
+            key={v}
+            id={`project-tab-${v}`}
+            role="tab"
+            aria-selected={active}
+            aria-controls="project-view-panel"
+            aria-label={PROJECT_VIEW_META[v].label}
+            title={PROJECT_VIEW_META[v].label}
+            tabIndex={active ? 0 : -1}
+            onClick={() => onPick(v)}
+            onKeyDown={(event) => {
+              const current = PROJECT_VIEWS.indexOf(v);
+              const next =
+                event.key === "ArrowRight"
+                  ? (current + 1) % PROJECT_VIEWS.length
+                  : event.key === "ArrowLeft"
+                    ? (current - 1 + PROJECT_VIEWS.length) % PROJECT_VIEWS.length
+                    : event.key === "Home"
+                      ? 0
+                      : event.key === "End"
+                        ? PROJECT_VIEWS.length - 1
+                        : null;
+              if (next === null) return;
+              event.preventDefault();
+              const nextView = PROJECT_VIEWS[next]!;
+              onPick(nextView);
+              event.currentTarget.parentElement
+                ?.querySelector<HTMLElement>(`#project-tab-${nextView}`)
+                ?.focus();
+            }}
+            className={`flex h-6 items-center rounded-md px-2 text-xs transition-colors ${
+              active
+                ? "bg-active text-fg"
+                : "text-mute hover:bg-hover hover:text-fg"
+            }`}
+          >
+            <span>{PROJECT_VIEW_META[v].label}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function workspaceTitle(view: View): string {
+  if (view === "inbox") return "Inbox";
+  if (view === "my-issues") return "My issues";
+  if (view === "projects") return "Projects";
+  if (view === "timeline") return "Roadmap";
+  if (view === "settings") return "Settings";
+  return "Workspace";
+}

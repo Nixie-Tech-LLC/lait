@@ -5,6 +5,7 @@ import { cmdkFilter } from "../core/fuzzy";
 import { formatBinding } from "../core/keys";
 import { registry, type Ctx } from "../core/registry";
 import { Kbd } from "./primitives";
+import { useReturnFocus } from "./useReturnFocus";
 
 /**
  * The command palette — a **projection** of the registry, not a menu.
@@ -25,6 +26,7 @@ import { Kbd } from "./primitives";
  * cheerfully shows every command for every query.
  */
 export function Palette({ ctx, onClose }: { ctx: Ctx; onClose: () => void }) {
+  useReturnFocus();
   const results = useMemo(() => {
     // `overlay: true` would hide every command gated on `!overlay` — but those are
     // exactly the ones you opened the palette to run. Rank against the world as it
@@ -40,14 +42,14 @@ export function Palette({ ctx, onClose }: { ctx: Ctx; onClose: () => void }) {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex justify-center bg-black/45 pt-[12vh] backdrop-blur-[2px]"
+      className="ui-overlay fixed inset-0 z-50 flex justify-center bg-black/45 pt-[12vh] backdrop-blur-[2px]"
       onMouseDown={onClose}
     >
       <Command
         label="Command palette"
         loop
         onMouseDown={(e) => e.stopPropagation()}
-        className="border-line-strong bg-raised shadow-overlay flex h-fit max-h-[60vh] w-[min(560px,92vw)] flex-col overflow-hidden rounded-lg border"
+        className="ui-surface border-line-strong bg-raised shadow-overlay flex h-fit max-h-[60vh] w-[min(560px,92vw)] flex-col overflow-hidden rounded-lg border"
         filter={cmdkFilter}
       >
         <Command.Input
@@ -72,7 +74,7 @@ export function Palette({ ctx, onClose }: { ctx: Ctx; onClose: () => void }) {
                     onClose();
                     void b.command.run({ ...ctx, overlay: false });
                   }}
-                  className="data-[selected=true]:bg-accent data-[selected=true]:text-accent-fg flex cursor-default items-center gap-3 rounded px-3 py-1.5"
+                  className="data-[selected=true]:bg-active flex cursor-default items-center gap-3 rounded px-3 py-1.5"
                 >
                   <span className="flex-1">{b.command.title}</span>
                   <span className="flex gap-1">

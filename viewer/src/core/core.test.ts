@@ -20,6 +20,7 @@ const ctx = (over: Partial<Ctx> = {}): Ctx => ({
   spaceId: "s1",
   readOnly: false,
   selection: null,
+  checkedCount: 0,
   overlay: false,
   app: {} as Ctx["app"],
   ...over,
@@ -217,7 +218,7 @@ describe("the core's g-sequences", () => {
       "go.board",
       "go.inbox",
       "go.list",
-      "go.members",
+      "go.projects",
     ]);
     // Every one is a two-chord sequence, not a bare letter — otherwise `g` and
     // `i` would each fire something on their own.

@@ -62,8 +62,19 @@ fn response_dtos_round_trip() {
         name: "Engineering".into(),
         key: "ENG".into(),
         color: "blue".into(),
+        description: String::new(),
+        lead: String::new(),
+        start_date: None,
+        target_date: None,
+        archived: false,
+        team: String::new(),
     };
     let row = Row {
+        due_date: None,
+        estimate: None,
+        label_names: Vec::new(),
+        child_done: None,
+        child_total: None,
         reff: "iss_3f9ab2c".into(),
         doc_id: doc_id.clone(),
         project_id: project.id.clone(),
@@ -104,6 +115,8 @@ fn response_dtos_round_trip() {
             }],
         })),
         Response::Issue(Box::new(IssueView {
+            due_date: None,
+            estimate: None,
             schema_version: SCHEMA_VERSION,
             reff: "iss_3f9ab2c".into(),
             doc_id: doc_id.clone(),
@@ -121,6 +134,10 @@ fn response_dtos_round_trip() {
             comments: vec![],
             created_by: lait::ids::ActorId::from_incept_hash(&"a".repeat(64)),
             created_at: 1000,
+            followers: vec![],
+            milestone: None,
+            cycle: None,
+            attachments: vec![],
             provisional: false,
             corrupt_records: vec![],
         })),
@@ -162,6 +179,8 @@ fn response_dtos_round_trip() {
 fn issue_response_status_field_survives_the_kind_tag() {
     let ulid = SystemUlidSource;
     let resp = Response::Issue(Box::new(IssueView {
+        due_date: None,
+        estimate: None,
         schema_version: SCHEMA_VERSION,
         reff: "iss_x".into(),
         doc_id: DocId::mint(&ulid),
@@ -179,6 +198,10 @@ fn issue_response_status_field_survives_the_kind_tag() {
         comments: vec![],
         created_by: lait::ids::ActorId::from_incept_hash(&"a".repeat(64)),
         created_at: 0,
+        followers: vec![],
+        milestone: None,
+        cycle: None,
+        attachments: vec![],
         provisional: false,
         corrupt_records: vec![],
     }));

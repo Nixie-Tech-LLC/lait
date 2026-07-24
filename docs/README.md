@@ -18,15 +18,16 @@ contract or operate a deployment.
 
 The normal product model is deliberately small:
 
-- `lait init` creates a space; `lait join` creates a local replica from an
-  invite. Other commands never create stores implicitly.
+- `lait init` founds a Space and local Orbit; `lait join` creates a recoverable
+  Orbit from signed Coordinates. Other commands never create stores implicitly.
 - `lait <verb>` is the scriptable and interactive CLI. `--json` returns the
   same versioned DTOs used by other clients.
 - `lait serve` supervises local space daemons and exposes the product over a
   loopback-only HTTP/SSE surface.
 - `lait mcp` exposes the same command contract to agents.
-- The daemon is the only owner of live Loro documents. Clients submit intents
-  and re-read projections after dirty notifications.
+- The daemon activates one Station, which exclusively owns Mechanics, Replica,
+  Fabric, Contacts, hosted Worlds, and Sessions. Clients submit intents and
+  re-read Manifest-pinned projections after Observation notifications.
 
 An identity is an actor, not a device. An `ActorId` remains stable while its
 device keys are added, revoked, or recovered. Names are local petnames and do
@@ -36,9 +37,9 @@ not carry authority.
 
 | Document | Authority |
 |---|---|
-| [`ARCHITECTURE.md`](./ARCHITECTURE.md) | Current implementation boundaries, trust model, and security posture. |
-| [`DATA-CONTRACT.md`](./DATA-CONTRACT.md) | Storage, convergence, authority, and projection invariants. |
-| [`PROTOCOL.md`](./PROTOCOL.md) | Network and local-control compatibility contract. |
+| [`ARCHITECTURE.md`](./ARCHITECTURE.md) | Orbital ownership, crate boundaries, trust model, and World composition. |
+| [`DATA-CONTRACT.md`](./DATA-CONTRACT.md) | Journals, authority, transactions, Manifests, Bodies, convergence, and projections. |
+| [`PROTOCOL.md`](./PROTOCOL.md) | Coordinates, Beacon/presence, Contact, convergence, and local-control compatibility. |
 | [`THREAT-MODEL.md`](./THREAT-MODEL.md) | Assets, adversaries, security claims, and explicit non-goals. |
 
 These documents describe the current branch. Historical phase plans and

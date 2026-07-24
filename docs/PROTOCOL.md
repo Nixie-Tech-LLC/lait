@@ -1,145 +1,251 @@
 # Protocol contract
 
-This document defines the compatibility boundary between lait implementations.
-It covers network protocols and the local daemon control channel. Internal Rust
-types are not themselves the wire specification.
+This document defines LAIT's interoperability boundaries: signed bootstrap and
+discovery packets, direct Contact, replicated authority and Body objects, and
+the local daemon control channel. Rust type names are not wire specifications.
 
 ## 1. Identities and trust anchors
 
-- `SpaceId` identifies a space.
-- `ActorId` identifies a member within that space.
-- `DeviceId` is an ed25519 device key and equals the device's iroh endpoint id.
-- Loro peer ids are internal operation-addressing values and are never user
-  identities.
-- Space tickets carry the genesis trust anchor and founding actor material.
+- `SpaceId` identifies one cryptographic and replication boundary.
+- `ActorId` identifies a member within a Space.
+- `DeviceId` identifies an actor device key.
+- `StationId` identifies a device's active network endpoint.
+- `WorldId` identifies a semantic World.
+- `BodyId` is meaningful only with its World and Space.
 
-Display names, nicknames, paths, project keys, and peer discovery do not confer
-authority.
+Display names, petnames, filesystem paths, project keys, network routes, relay
+addresses, and Loro peer ids confer no authority.
 
-## 2. Versioning
+Space trust is established through signed genesis/Mechanics history. A node
+validates authority at the frontier referenced by the received transaction; it
+does not substitute current membership.
 
-Compatibility is explicit at several layers:
+## 2. Versioning and canonicality
 
-- schema version gates stored data and DTO projections;
-- ALPN suffixes version direct network protocols;
-- signed domains version signature purposes;
-- serde/postcard shapes version encoded messages;
-- the local `Hello` exchange distinguishes compatible daemons.
+Compatibility is explicit at independent layers:
 
-An implementation must fail closed when it cannot interpret an authority or
-storage version. Unknown additive DTO fields may be ignored where the schema
-contract permits it; unknown signed action semantics may not.
+- store markers and manifests;
+- signed packet protocol fields and domains;
+- direct-protocol ALPNs;
+- Contact frame grammar;
+- external JSON DTO/schema versions;
+- local daemon handshake versions.
 
-## 3. Signed domains
+Unknown incompatible versions fail closed. There is no fallback to legacy Space
+tickets, legacy stores, old daemon routing, or historical document codecs.
 
-Signatures bind, at minimum, their protocol domain and space. Distinct uses
-must not share a domain merely because they use the same key type. Current
-domains include actor events, device-binding consent, ACL events, content
-authority, gossip, invites, ceremonies, and space authority.
+Canonical encodings require exact decoding: no trailing bytes, duplicate map
+keys, alternate enum spellings, unsorted set-like sequences, or non-minimal
+representations. Identifiers, hashes, signatures, ordering, and bounds must be
+reproducible by an independent implementation.
 
-Canonical serialization is part of the signed protocol. A second implementation
-must reproduce the same bytes, hashes, ids, parent ordering, and tie-breaks.
+Semantic Rust types remain version-free. Numeric versions belong to encoded
+envelopes, constants, domains, schemas, and fixtures.
 
-## 4. Discovery and presence
+## 3. Coordinates and admission
 
-Peers discover each other through iroh gossip on a space-derived topic.
-Signed gossip carries announce/presence data including the space, sender,
-and presence state. Neighbor events contribute reachability but are not proof of
-membership.
+`SignedCoordinates` is the bootstrap object. Its payload binds the Space,
+approach Station, canonical direct routes, and optionally an admission
+capability. Routes are hints authenticated by the signer, not authority to
+change the joiner's relay or discovery configuration.
 
-Presence is advisory and three-state at the product layer: online, away, or
-offline. It must not be used as an authorization input.
+The current Coordinates wire format is version 2. Direct IPv4 and IPv6 routes
+are sorted and deduplicated canonically and reject unusable addresses, zero
+ports, excess entries, and excess bytes.
 
-## 5. Direct protocols
+Accepting valid Coordinates is the user approval boundary for joining. The
+candidate durably records its signed acceptance proof before dialing. Contact
+then transports the proof and authority material needed for Mechanics to redeem
+the capability. Redemption verifies:
 
-The device endpoint accepts versioned ALPNs for:
+- Space, candidate actor/device, and capability binding;
+- issuer authority at issuance;
+- validity window and explicit revocation;
+- single-use or bounded-reuse policy;
+- the exact World assignment evidence and role provenance.
 
-- a liveness/presence probe;
-- catalog-first synchronization;
-- invite and join handshakes as implemented by the current epoch.
+Membership and initial assignments commit atomically. There is no pending-member
+approval queue or second approval command.
 
-Direct connection success proves reachability of a device key, not membership or
-actor standing. Every authority-bearing payload is independently validated.
+## 4. Beacon, presence, and gossip
 
-## 6. Catalog-first synchronization
+Beacon is signed lossy news. Presence is authenticated directed liveness.
+Gossip may disseminate reachability and change hints. None is durable authority
+or proof that the sender may author a World mutation.
 
-A pull begins with plaintext membership material, then encrypted collaborative
-state:
+A freshness tracker accepts only a cryptographically verified Beacon. Replay,
+wrong-Space, wrong-sender, expired-lease, malformed-route, and signature
+substitution inputs do not update reachability state.
 
-1. Exchange membership version information and import missing signed events and
-   sealed envelopes.
-2. Replay authority and refresh locally held epoch keys.
-3. Exchange an encrypted catalog diff.
-4. Compare catalog rows and version vectors to identify missing or stale issue
-   documents.
-5. Exchange encrypted per-document updates or snapshots.
+Presence uses distinct probe and acknowledgment messages. A successful exchange
+proves the negotiated endpoint controls its key and is reachable at that moment;
+Mechanics still determines actor/device standing.
 
-Catalog heads are discovery hints. The issue document remains authoritative for
-its fields, and the receiver recomputes catalog caches after import.
+Gossip is an optimization. Correctness cannot require every participant to join
+one room, receive every announcement, or be online simultaneously. Direct
+Contact plus persistent Neighbor retry state remains sufficient for eventual
+exchange among reachable peers.
 
-Malformed, undecryptable, unauthorized, or wrong-space frames are rejected.
-Failure to hold the active epoch key never authorizes a plaintext fallback.
+## 5. Contact handshake
 
-## 7. Encryption envelope
+Contact is a bounded direct transcript over the Contact ALPN. The signed Hello
+binds at least:
 
-Encrypted collaborative payloads carry the content-addressed key-epoch id and an
-AEAD ciphertext. The receiver selects a held epoch key by id and authenticates
-the envelope before importing bytes.
+- protocol version;
+- Space and Contact id;
+- initiator and responder Station identities;
+- negotiated transport identity;
+- nonce;
+- canonical holdings count and digest.
 
-Epoch metadata and per-device sealed keys travel in the plaintext membership
-layer because they are required to bootstrap decryption. A sealed envelope is
-accepted only when its key hashes to the commitment in an authorized epoch
-record.
+The signed acknowledgment binds the exact Hello and a responder nonce. Both
+sides bind the authenticated transport peer to the signed Station identity
+before accepting transfer material.
 
-The current implementation provides encrypted peer synchronization. A complete
-content-addressed blind-relay history and relay-side compaction protocol remains
-future work and is not implied by this envelope.
+The Contact protocol field is currently version 2. The ALPN and individual
+domain strings have their own versioning and must not be inferred from that
+field. A clean format break updates the affected bytes and fixtures atomically.
 
-## 8. Actor and membership carriage
+## 6. Holdings declarations and delta transfer
 
-Every authority operation that claims to speak for an actor includes the actor
-and an actor-log frontier. Replay verifies that the signing device belonged to
-that actor at that frontier.
+Before the acknowledgment, the initiator may stream its declared interpreted
+Body heads as `(BodyKey, transaction commitment)` pairs. The declaration is:
 
-Actor device consent is separately signed and nonce-bound. Invite authorization
-is space-bound, expiring, and optionally single-use. Concurrent single-use
-redemptions deterministically admit at most one actor for a nonce.
+- signed indirectly through the Hello's count and domain-separated digest;
+- bounded in entries, bytes, chunks, and deadline;
+- strictly increasing in canonical tuple order;
+- duplicate-free;
+- exactly decodable and exactly re-encodable;
+- represented by count zero and the defined empty digest when empty.
 
-Names never appear in authority decisions. Petnames are local projections.
+Strict ordering/uniqueness and zero-count/empty-digest equivalence are canonical
+requirements. The initial protocol-2 implementation signs and bounds holdings
+but does not yet reject every alternate semantic encoding; that decoder gap must
+be closed before independent interoperability is claimed.
 
-## 9. Local control channel
+Holdings frames are valid only in the pre-ack initiator-to-accepter window.
+Wrong order, contact id, count, digest, bounds, or frame direction aborts the
+transcript.
 
-CLI, web, and MCP clients speak a typed request/response protocol to the daemon
-over a local IPC channel. The protocol is newline-delimited JSON at the transport
-boundary, with a version handshake before normal requests.
+The accepter advertises its complete signed Manifest but may omit transaction
+and Body material for declared heads. It stores no authoritative per-peer
+holdings state. A false or stale declaration can starve only the claimant: the
+receiver refuses the whole advertised root unless locally held plus transferred
+material reconstructs it completely. A later truthful Contact can recover.
 
-The daemon validates a mutation completely before applying it. Responses are
-versioned projections, not serialized Loro documents. Errors have typed
-classification so clients do not infer behavior from prose.
+Opaque heads are not declared as interpreted holdings. This ensures material
+that later becomes interpretable passes through validation again.
 
-`Subscribe` is the streaming verb. Its frames contain:
+## 7. Contact transfer grammar
 
-- a per-daemon epoch;
-- a per-session sequence number;
-- reset/rebaseline indication;
-- dirty scopes for affected projections.
+The transfer carries bounded frame families for:
 
-Frames are doorbells, not deltas. They may be coalesced, duplicated, or replaced
-by a reset without changing correctness because clients re-read state.
+1. ordered Mechanics authority records and their set commitment;
+2. a signed Manifest-root offer;
+3. requested canonical Manifest pages;
+4. requested protected Body chunks and completion commitments;
+5. transcript completion, acknowledgment, or typed abort.
 
-## 10. Conformance
+Each frame binds its Contact id. Records, sets, pages, chunks, payloads, and the
+transcript use distinct domain-separated commitments. Chunk assembly rejects
+conflicting duplicates, overlap, gaps, empty illegal chunks, overflow, and a
+final commitment mismatch. An abort discards staged transfer material.
 
-A conforming implementation must match:
+`TransferAck` proves framing receipt only. It is not evidence that Mechanics or
+Replica accepted the data.
 
-- identifier parsing and formatting;
-- canonical serialization and signed payload construction;
-- content hashes and domain separation;
-- deterministic DAG replay and all precedence/tie-break rules;
-- actor-at-frontier resolution;
-- epoch selection and ciphertext framing;
-- version rejection behavior;
-- local DTO tags, defaults, and error classes advertised as stable;
-- corruption reporting required by the data contract.
+## 8. Convergence and incorporation
 
-Interoperability tests and vectors are required before another implementation is
-claimed compatible. Round-tripping through the same library is insufficient.
+Received material remains inert until the receiver performs the complete local
+validation chain:
+
+```text
+Contact transcript
+  -> staged material
+  -> Mechanics authority incorporation and receipt
+  -> Replica transaction/receipt/parent/payload/quota validation
+  -> one atomic Manifest adoption
+  -> convergence outcome
+```
+
+Remote validation does not invoke World code. It verifies the authority receipt
+at the historical frontier and the authority-approved World implementation id
+bound into the transaction. Unsupported legitimate Bodies may be retained and
+forwarded opaquely.
+
+Manifest adoption is root-atomic. A transfer containing only a prefix of the
+advertised root cannot partially advance the visible Replica. Idempotent replay
+changes nothing; same identity with different bytes is equivocation.
+
+## 9. Replicated object families
+
+The compatibility surface includes canonical encodings and fixtures for:
+
+- Coordinates and admission evidence;
+- Beacon and presence packets;
+- Mechanics effects, checkpoints, and batch receipts;
+- ceremony material and terminal SpaceAuthority effects;
+- World actions and authorization receipts;
+- Body transactions and descriptors;
+- protected Body payloads;
+- Manifest roots and pages;
+- store markers/manifests and journal objects;
+- external DTO identifiers, projections, observations, and errors.
+
+Every signed family has a distinct purpose/domain. Ceremony material cannot
+decode as terminal authority; a framing receipt cannot decode as an
+authorization receipt; an authority-batch receipt cannot substitute for World
+authorization.
+
+## 10. Local control channel
+
+CLI, web, and MCP clients speak one typed local protocol to the per-Space daemon.
+A version handshake precedes requests. The production request classifier assigns
+every request exactly one terminal owner; there is no wildcard product fallback.
+
+Product mutations and queries reach IssuesWorld through a docked Session.
+Membership, devices, custody, and ceremonies reach Mechanics. Neighbor and
+Contact operations reach Station. Lifecycle operations reach Runtime/Orbit/
+Station. Clients never open Replica or Fabric directly.
+
+JSON responses are strict versioned DTOs rather than serialized internal
+objects. Unknown fields reject where the schema says strict; decoded lengths and
+identifier grammars remain enforced after JSON decoding.
+
+`Subscribe` carries Observation doorbells with Station epoch, sequence, reset
+semantics, committed frontier, and dirty scopes. Frames may be coalesced. They
+are not state deltas; clients re-query after notification or reset.
+
+## 11. Failure and resource behavior
+
+Every protocol has explicit limits for frames, records, pages, chunks, payloads,
+holdings, concurrency, and time. A peer cannot request unbounded buffering or
+keep an untracked Station task alive indefinitely.
+
+Dormancy rejects new work, terminates Sessions, cancels Contact/gossip, closes
+Observations, drains tracked tasks within its deadline, persists required state,
+and releases the store lock last.
+
+An unreachable peer, interrupted join, or aborted Contact leaves a recoverable
+Orbit and bounded retry state. It does not create membership, expose a partial
+Manifest, or mutate guarded relay/discovery policy.
+
+## 12. Conformance
+
+An independent implementation must match:
+
+- identifier grammar and canonical byte representation;
+- signed preimages, domains, hashes, and signature verification;
+- version and unknown-input rejection;
+- bounds and abort classifications;
+- Contact state-machine ordering and transcript commitments;
+- historical authority evaluation;
+- transaction and Manifest graph validation;
+- protected/opaque Body behavior;
+- deterministic collaborative convergence;
+- local DTO schemas, errors, and Observation semantics.
+
+Golden vectors must include positive encodings and negative substitution,
+reordering, duplicate, truncation, trailing-byte, wrong-domain, wrong-Space,
+wrong-peer, and over-limit cases. Round-tripping through one implementation is
+not interoperability proof.

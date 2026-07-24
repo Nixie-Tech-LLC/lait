@@ -112,6 +112,8 @@ fn new_issue(rt: &tokio::runtime::Runtime, home: &Path, title: &str) -> Response
         rt,
         home,
         Request::IssueNew {
+            due: None,
+            estimate: None,
             title: title.into(),
             project: Some("ENG".into()),
             project_hint: None,
@@ -143,6 +145,7 @@ fn restarted_joiner_daemon_reconverges_from_its_persisted_store() {
                 Request::ProjectNew {
                     name: "Engineering".into(),
                     key: "ENG".into(),
+                    color: None,
                 }
             ),
             Response::Ref { .. }

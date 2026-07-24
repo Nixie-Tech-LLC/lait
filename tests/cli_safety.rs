@@ -28,6 +28,22 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// Clean-env entrypoint for this binary (step 0 of the Agent Experience
+/// initiative). A developer's shell may export `$LAIT_HOME` pointing at their
+/// *live* node; inherited into a test that spawns a daemon for a temp home (via
+/// `daemon_spawn::spawn`, which pins `LAIT_STORE` but is overridden by an
+/// ambient `LAIT_HOME`), it collided the spawned daemon with the live node's
+/// single-instance lock and failed `a_dead_daemon_is_reported_dead_and_a_live_
+/// one_is_not`. Scrubbed once at binary load, before any test runs, so this
+/// suite is immune by construction. Tests that want these vars set them
+/// explicitly afterward (per-command in the `lait()` helper).
+#[ctor::ctor]
+fn scrub_ambient_lait_env() {
+    for key in ["LAIT_HOME", "LAIT_STORE", "LAIT_CONFIG_ROOT"] {
+        std::env::remove_var(key);
+    }
+}
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_lait")
 }

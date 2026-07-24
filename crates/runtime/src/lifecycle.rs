@@ -794,6 +794,9 @@ impl Station {
 pub struct Neighbor {
     pub station: StationId,
     pub reachability: Reachability,
+    /// When this Neighbor was last heard from (ms since the unix epoch,
+    /// receiver-local; 0 = never observed live). Advisory.
+    pub last_seen_ms: u64,
 }
 
 /// Advisory reachability of a Neighbor.

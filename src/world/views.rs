@@ -25,6 +25,46 @@ pub struct ProjectMeta {
     pub name: String,
     pub key: String,
     pub color: String,
+    /// The overview document — freeform markdown. Additive: projects minted
+    /// before this field decode with an empty string.
+    #[serde(default)]
+    pub description: String,
+    /// The project lead's actor key (empty = none).
+    #[serde(default)]
+    pub lead: String,
+    /// Planned window, unix seconds (None = unset).
+    #[serde(default)]
+    pub start_date: Option<u64>,
+    #[serde(default)]
+    pub target_date: Option<u64>,
+    /// Soft-hidden from pickers, default selection, and all-project lists — but
+    /// still resolvable by id/KEY (so a direct link opens it) with its aliases
+    /// intact. Additive: pre-archive projects decode as live. See CUSTOM-9.
+    #[serde(default)]
+    pub archived: bool,
+    /// The owning team's id (empty = none). Additive (GOV-7).
+    #[serde(default)]
+    pub team: String,
+}
+
+/// One project status update — an immutable post in the project's updates feed
+/// (SCOPE-1). Stored as a grow-only catalog log (`project_updates` keyed
+/// `<project>/<id>`), mirroring how workflow revisions and roles are logged
+/// rather than introducing a per-project collaborative Body: an update is
+/// authored once and never edited, so a record is the honest shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectUpdate {
+    pub id: String,
+    pub project_id: String,
+    /// The authoring actor key.
+    pub author: String,
+    /// Post time, unix seconds.
+    pub ts: u64,
+    pub body: String,
+    /// `on_track` | `at_risk` | `off_track` | "" (none). A self-reported health
+    /// signal, free of any derived-metric coupling.
+    #[serde(default)]
+    pub health: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,10 +73,122 @@ pub struct LabelMeta {
     pub color: String,
 }
 
+/// One project milestone — an editable record in the Catalog's
+/// `project_milestones` map (keyed `<project>/<milestone>`), LWW per record
+/// like `projects` (milestones are renamed and retargeted; the whole record is
+/// rewritten on edit so untouched fields never drop). Progress is derived
+/// from issues' `milestone` registers, never stored (SCOPE-1).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Milestone {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub target_date: Option<u64>,
+    #[serde(default)]
+    pub tombstone: bool,
+}
+
+/// One cycle (time-boxed iteration) — an editable record in the Catalog's
+/// `cycles` map (keyed `<project>/<cycle>`), same LWW-record shape as
+/// milestones (BOARD-11).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cycle {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    /// The box, unix seconds (0 = unset — a named backlog bucket).
+    #[serde(default)]
+    pub start: u64,
+    #[serde(default)]
+    pub end: u64,
+    #[serde(default)]
+    pub tombstone: bool,
+}
+
+/// One initiative — the strategic layer above projects (SCOPE-8): a named
+/// goal grouping several projects, with owner/health/target date. Progress is
+/// derived from the member projects' issues, never stored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Initiative {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Owner actor key (empty = none).
+    #[serde(default)]
+    pub owner: String,
+    /// `on_track` | `at_risk` | `off_track` | "" — self-reported, like
+    /// project-update health.
+    #[serde(default)]
+    pub health: String,
+    #[serde(default)]
+    pub target_date: Option<u64>,
+    /// Ordered member project ids.
+    #[serde(default)]
+    pub projects: Vec<String>,
+    #[serde(default)]
+    pub tombstone: bool,
+}
+
+/// One team — a durable work-owning group (GOV-7). Team membership is
+/// product-level (actor keys), managed independently of the space ACL:
+/// belonging to a team confers no authority, and the ACL confers no team.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Team {
+    pub id: String,
+    pub name: String,
+    /// Short uppercase handle, immutable after creation (like a project key).
+    pub key: String,
+    #[serde(default)]
+    pub icon: String,
+    /// Lead actor key (empty = none).
+    #[serde(default)]
+    pub lead: String,
+    /// Member actor keys, sorted.
+    #[serde(default)]
+    pub members: Vec<String>,
+    #[serde(default)]
+    pub tombstone: bool,
+}
+
+/// One triage-intake item (SCOPE-7): reported work reviewed BEFORE it enters
+/// a project's workflow. Catalog-level (submission needs no project), decided
+/// exactly once — the outcome fields are written by the review intent and the
+/// record is never edited afterwards.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriageItem {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    /// Where this came from (free text: "cli", an integration name, …).
+    #[serde(default)]
+    pub source: String,
+    /// The submitting actor key.
+    pub submitted_by: String,
+    pub ts: u64,
+    /// "" (pending) | `accepted` | `declined` | `duplicate`.
+    #[serde(default)]
+    pub outcome: String,
+    /// The issue the item became (accepted) or duplicates (duplicate).
+    #[serde(default)]
+    pub doc: String,
+    #[serde(default)]
+    pub decided_by: String,
+    #[serde(default)]
+    pub decided_ts: u64,
+    #[serde(default)]
+    pub note: String,
+}
+
 /// The parsed catalog Body.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogState {
     pub name: String,
+    /// The space's overview/description — a plain catalog register beside `name`
+    /// (SCOPE-2). Additive: a space that predates it decodes as empty.
+    pub description: String,
     pub projects: BTreeMap<String, ProjectMeta>,
     pub labels: BTreeMap<String, LabelMeta>,
     pub workflow: Vec<WorkflowState>,
@@ -58,6 +210,18 @@ pub struct CatalogState {
     pub roles: BTreeMap<String, StoredRoleRevision>,
     /// role id -> grow-only custom-role revision log.
     pub role_revisions: BTreeMap<String, Vec<StoredRoleRevision>>,
+    /// project id -> grow-only status-update log (SCOPE-1 updates feed).
+    pub project_updates: BTreeMap<String, Vec<ProjectUpdate>>,
+    /// project id -> milestone id -> milestone (SCOPE-1).
+    pub milestones: BTreeMap<String, BTreeMap<String, Milestone>>,
+    /// project id -> cycle id -> cycle (BOARD-11).
+    pub cycles: BTreeMap<String, BTreeMap<String, Cycle>>,
+    /// initiative id -> initiative (SCOPE-8).
+    pub initiatives: BTreeMap<String, Initiative>,
+    /// team id -> team (GOV-7).
+    pub teams: BTreeMap<String, Team>,
+    /// triage-intake id -> item (SCOPE-7).
+    pub triage: BTreeMap<String, TriageItem>,
 }
 
 /// A role revision as stored in the catalog `roles` map: hex revision id,
@@ -94,6 +258,7 @@ impl CatalogState {
         };
         let mut state = Self {
             name: reg_str(view, "name").unwrap_or_default(),
+            description: reg_str(view, "description").unwrap_or_default(),
             ..Self::default()
         };
         for (id, raw) in map_str(view, "projects") {
@@ -128,6 +293,58 @@ impl CatalogState {
                     .entry(project.to_string())
                     .or_default()
                     .push(rev);
+            }
+        }
+        for (key, raw) in map_str(view, "project_updates") {
+            // Key: `<project>/<update id>` — grow-only log entries.
+            let Some((project, _id)) = key.rsplit_once('/') else {
+                continue;
+            };
+            if let Ok(update) = serde_json::from_str::<ProjectUpdate>(&raw) {
+                state
+                    .project_updates
+                    .entry(project.to_string())
+                    .or_default()
+                    .push(update);
+            }
+        }
+        for (key, raw) in map_str(view, "project_milestones") {
+            let Some((project, _id)) = key.rsplit_once('/') else {
+                continue;
+            };
+            if let Ok(m) = serde_json::from_str::<Milestone>(&raw) {
+                state
+                    .milestones
+                    .entry(project.to_string())
+                    .or_default()
+                    .insert(m.id.clone(), m);
+            }
+        }
+        for (key, raw) in map_str(view, "cycles") {
+            let Some((project, _id)) = key.rsplit_once('/') else {
+                continue;
+            };
+            if let Ok(c) = serde_json::from_str::<Cycle>(&raw) {
+                state
+                    .cycles
+                    .entry(project.to_string())
+                    .or_default()
+                    .insert(c.id.clone(), c);
+            }
+        }
+        for (id, raw) in map_str(view, "initiatives") {
+            if let Ok(i) = serde_json::from_str::<Initiative>(&raw) {
+                state.initiatives.insert(id, i);
+            }
+        }
+        for (id, raw) in map_str(view, "teams") {
+            if let Ok(t) = serde_json::from_str::<Team>(&raw) {
+                state.teams.insert(id, t);
+            }
+        }
+        for (id, raw) in map_str(view, "triage") {
+            if let Ok(t) = serde_json::from_str::<TriageItem>(&raw) {
+                state.triage.insert(id, t);
             }
         }
         for (id, raw) in map_str(view, "roles") {
@@ -233,10 +450,49 @@ pub struct IssueState {
     pub created_by: Option<ActorId>,
     pub created_at: u64,
     pub description: String,
+    /// Unix seconds; absent register = no due date.
+    pub duedate: Option<u64>,
+    pub estimate: Option<u32>,
     pub assignees: Vec<ActorId>,
+    /// Subscribed actors, independent of assignment (INBOX-9): an add-wins
+    /// set mirroring `assignees` storage.
+    pub followers: Vec<ActorId>,
+    /// The milestone this issue targets (empty register = none; SCOPE-1).
+    pub milestone: Option<String>,
+    /// The cycle this issue is scheduled in (BOARD-11).
+    pub cycle: Option<String>,
     pub labels: Vec<String>,
     pub comments: Vec<StoredComment>,
+    /// comment id -> sorted `(emoji, actor)` pairs, parsed from the
+    /// `reactions/<comment id>` sets. Malformed values are dropped, not
+    /// surfaced — a reaction is not worth a corrupt-record row.
+    pub reactions: BTreeMap<String, Vec<(String, String)>>,
+    /// Attachment records, metadata only — the base64 payload stays in the
+    /// Body map and is served solely by the `Attachment` query, so the
+    /// derived-snapshot cache never holds file bytes (CREATE-5).
+    pub attachments: Vec<AttachmentMeta>,
     pub events: Vec<IssueEvent>,
+}
+
+/// The metadata half of a stored attachment record — everything except
+/// `data_b64` (serde ignores it on decode, which is the point).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentMeta {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub mime: String,
+    /// Raw (decoded) size in bytes.
+    #[serde(default)]
+    pub size: u64,
+    /// The attaching actor key.
+    #[serde(default)]
+    pub by: String,
+    #[serde(default)]
+    pub ts: u64,
+    /// The comment this file rode with, when any.
+    #[serde(default)]
+    pub comment: String,
 }
 
 impl IssueState {
@@ -251,6 +507,26 @@ impl IssueState {
             })
             .unwrap_or_default();
         assignees.sort();
+        let mut followers: Vec<ActorId> = view
+            .sets
+            .get("followers")
+            .map(|s| {
+                s.iter()
+                    .filter_map(|v| ActorId::parse(&String::from_utf8_lossy(v)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        followers.sort();
+        let mut attachments: Vec<AttachmentMeta> = view
+            .maps
+            .get("attachments")
+            .map(|m| {
+                m.values()
+                    .filter_map(|v| serde_json::from_slice::<AttachmentMeta>(v).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        attachments.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
         let mut labels: Vec<String> = view
             .sets
             .get("labels")
@@ -279,6 +555,20 @@ impl IssueState {
                     .collect()
             })
             .unwrap_or_default();
+        let mut reactions: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        for (path, values) in &view.sets {
+            let Some(comment) = path.strip_prefix("reactions/") else {
+                continue;
+            };
+            let mut pairs: Vec<(String, String)> = values
+                .iter()
+                .filter_map(|v| super::contract::parse_reaction_value(v))
+                .collect();
+            pairs.sort();
+            if !pairs.is_empty() {
+                reactions.insert(comment.to_string(), pairs);
+            }
+        }
         Self {
             project: reg_str(view, "projectid").unwrap_or_default(),
             title: reg_str(view, "title").unwrap_or_default(),
@@ -290,9 +580,16 @@ impl IssueState {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
             description: view.texts.get("description").cloned().unwrap_or_default(),
+            duedate: reg_str(view, "duedate").and_then(|s| s.parse().ok()),
+            estimate: reg_str(view, "estimate").and_then(|s| s.parse().ok()),
             assignees,
+            followers,
+            milestone: reg_str(view, "milestone").filter(|m| !m.is_empty()),
+            cycle: reg_str(view, "cycle").filter(|c| !c.is_empty()),
             labels,
             comments,
+            reactions,
+            attachments,
             events,
         }
     }
@@ -327,7 +624,10 @@ fn collision_suffix(i: usize) -> String {
     s
 }
 
-pub fn derive_aliases(catalog: &CatalogState) -> DerivedAliases {
+pub fn derive_aliases<'a>(
+    catalog: &CatalogState,
+    project_of: impl Fn(&str) -> Option<&'a str>,
+) -> DerivedAliases {
     let mut out = DerivedAliases::default();
     let mut docs: Vec<String> = catalog.doc_ids();
     docs.sort();
@@ -359,17 +659,20 @@ pub fn derive_aliases(catalog: &CatalogState) -> DerivedAliases {
         let Some(&seq) = catalog.seqs.get(doc) else {
             continue;
         };
-        // The issue's project comes from the issue Body; the alias group uses
-        // the project the seq was assigned under, recorded in the catalog by
-        // the same transaction. We group by current board membership when
-        // available, else fall back to any project claiming the doc.
+        // Live issues are present in board order. Done issues are deliberately
+        // removed from that movable list, so their authoritative Issue body is
+        // the fallback that keeps KEY-n aliases stable after completion.
         let project = catalog
             .boards
             .iter()
             .find(|(_, entries)| entries.iter().any(|(_, d)| d == doc))
-            .map(|(p, _)| p.clone());
+            .map(|(p, _)| p.as_str())
+            .or_else(|| project_of(doc));
         if let Some(project) = project {
-            groups.entry((project, seq)).or_default().push(doc.clone());
+            groups
+                .entry((project.to_string(), seq))
+                .or_default()
+                .push(doc.clone());
         }
     }
     for ((project, seq), mut members) in groups {
@@ -423,13 +726,15 @@ pub fn project_row(
     issue: Option<&IssueState>,
     me: Option<&ActorId>,
 ) -> Row {
-    let (title, status, priority, assignees, project) = match issue {
+    let (title, status, priority, assignees, project, due_date, estimate) = match issue {
         Some(i) => (
             i.title.clone(),
             i.status.clone(),
             i.priority,
             i.assignees.clone(),
             i.project.clone(),
+            i.duedate,
+            i.estimate,
         ),
         None => (
             String::new(),
@@ -437,6 +742,8 @@ pub fn project_row(
             Priority::None,
             Vec::new(),
             String::new(),
+            None,
+            None,
         ),
     };
     Row {
@@ -455,6 +762,26 @@ pub fn project_row(
         assignees,
         tombstone: catalog.tombstones.contains(doc),
         provisional: issue.is_none(),
+        due_date,
+        estimate,
+        label_names: issue
+            .map(|i| {
+                i.labels
+                    .iter()
+                    .map(|id| {
+                        catalog
+                            .labels
+                            .get(id)
+                            .map(|l| l.name.clone())
+                            .unwrap_or_else(|| id.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        // Sub-issue progress is a board-projection concern (it needs the issues
+        // map to classify each child's status); the base row leaves it absent.
+        child_done: None,
+        child_total: None,
     }
 }
 
@@ -507,6 +834,14 @@ pub fn issue_view(
                     author_nick: None,
                     ts: c.t,
                     body: c.b.clone(),
+                    id: c.id.clone(),
+                    parent: c.parent.clone(),
+                    reactions: c
+                        .id
+                        .as_deref()
+                        .and_then(|id| issue.reactions.get(id))
+                        .map(|pairs| group_reactions(pairs))
+                        .unwrap_or_default(),
                 })
             })
             .collect(),
@@ -515,9 +850,47 @@ pub fn issue_view(
             .clone()
             .unwrap_or_else(|| ActorId::from_incept_hash(&"0".repeat(64))),
         created_at: issue.created_at,
+        due_date: issue.duedate,
+        estimate: issue.estimate,
+        followers: issue.followers.clone(),
+        milestone: issue.milestone.clone(),
+        cycle: issue.cycle.clone(),
+        attachments: issue
+            .attachments
+            .iter()
+            .map(|a| crate::dto::AttachmentMetaDto {
+                id: a.id.clone(),
+                name: a.name.clone(),
+                mime: a.mime.clone(),
+                size: a.size,
+                by: a.by.clone(),
+                ts: a.ts,
+                comment: a.comment.clone(),
+            })
+            .collect(),
         provisional: false,
         corrupt_records: Vec::new(),
     }
+}
+
+/// Group one comment's `(emoji, actor)` pairs into per-emoji actor lists,
+/// first-appearance emoji order (the pairs arrive sorted, so this is
+/// deterministic across replicas).
+fn group_reactions(pairs: &[(String, String)]) -> Vec<crate::dto::ReactionDto> {
+    let mut out: Vec<crate::dto::ReactionDto> = Vec::new();
+    for (emoji, actor) in pairs {
+        let Some(actor) = ActorId::parse(actor) else {
+            continue;
+        };
+        match out.iter_mut().find(|r| &r.emoji == emoji) {
+            Some(r) => r.actors.push(actor),
+            None => out.push(crate::dto::ReactionDto {
+                emoji: emoji.clone(),
+                actors: vec![actor],
+            }),
+        }
+    }
+    out
 }
 
 pub fn project_dto(id: &str, meta: &ProjectMeta) -> Option<ProjectDto> {
@@ -526,6 +899,12 @@ pub fn project_dto(id: &str, meta: &ProjectMeta) -> Option<ProjectDto> {
         name: meta.name.clone(),
         key: meta.key.clone(),
         color: meta.color.clone(),
+        description: meta.description.clone(),
+        lead: meta.lead.clone(),
+        start_date: meta.start_date,
+        target_date: meta.target_date,
+        archived: meta.archived,
+        team: meta.team.clone(),
     })
 }
 
@@ -558,6 +937,38 @@ pub fn board_view(
         .get(project_id)
         .map(|b| b.iter().map(|(_, d)| d.clone()).collect())
         .unwrap_or_default();
+    // Sub-issue progress per parent, computed once: total = live children,
+    // done = children whose status is a Done-category state. Built from the same
+    // `catalog.parents` edge map the graph view reads, minus tombstoned children.
+    let mut child_progress: BTreeMap<&str, (u32, u32)> = BTreeMap::new();
+    for (child, parent) in &catalog.parents {
+        if catalog.tombstones.contains(child) {
+            continue;
+        }
+        let entry = child_progress.entry(parent.as_str()).or_insert((0, 0));
+        entry.1 += 1;
+        let done = issues
+            .get(child)
+            .is_some_and(|i| catalog.status_category(&i.status) == StatusCategory::Done);
+        if done {
+            entry.0 += 1;
+        }
+    }
+    // Build a board row and stamp its sub-issue progress (absent when childless).
+    let row_of = |doc: &str| -> Row {
+        let mut row = project_row(
+            catalog,
+            aliases,
+            doc,
+            issues.get(doc).map(|i| i.as_ref()),
+            me,
+        );
+        if let Some((done, total)) = child_progress.get(doc) {
+            row.child_done = Some(*done);
+            row.child_total = Some(*total);
+        }
+        row
+    };
     let mut columns = Vec::new();
     for state in &catalog.workflow {
         let mut rows: Vec<Row> = Vec::new();
@@ -570,25 +981,13 @@ pub fn board_view(
                 ib.cmp(&ia).then_with(|| b.cmp(a))
             });
             for doc in done {
-                rows.push(project_row(
-                    catalog,
-                    aliases,
-                    doc,
-                    issues.get(doc.as_str()).map(|i| i.as_ref()),
-                    me,
-                ));
+                rows.push(row_of(doc));
             }
         } else {
             let mut seen = BTreeSet::new();
             for doc in &board_order {
                 if members.contains(&doc) && in_state(doc) && seen.insert(doc.clone()) {
-                    rows.push(project_row(
-                        catalog,
-                        aliases,
-                        doc,
-                        issues.get(doc).map(|i| i.as_ref()),
-                        me,
-                    ));
+                    rows.push(row_of(doc));
                 }
             }
             let mut unlisted: Vec<&&String> = members
@@ -597,13 +996,7 @@ pub fn board_view(
                 .collect();
             unlisted.sort();
             for doc in unlisted {
-                rows.push(project_row(
-                    catalog,
-                    aliases,
-                    doc,
-                    issues.get(doc.as_str()).map(|i| i.as_ref()),
-                    me,
-                ));
+                rows.push(row_of(doc));
             }
         }
         columns.push(BoardColumn {
@@ -684,5 +1077,36 @@ impl CatalogState {
             [one] => Some(one),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_issue_keeps_alias_from_authoritative_project() {
+        let doc = "iss_01JU6A5CHEI9UR3SGKEK05KIAR";
+        let mut catalog = CatalogState::default();
+        catalog.projects.insert(
+            "prj_board".into(),
+            ProjectMeta {
+                name: "Board".into(),
+                key: "BOARD".into(),
+                color: "blue".into(),
+                ..Default::default()
+            },
+        );
+        catalog.seqs.insert(doc.into(), 5);
+
+        let aliases = derive_aliases(&catalog, |candidate| {
+            (candidate == doc).then_some("prj_board")
+        });
+
+        assert_eq!(aliases.by_doc.get(doc).map(String::as_str), Some("BOARD-5"));
+        assert_eq!(
+            aliases.by_alias.get("board-5").map(String::as_str),
+            Some(doc)
+        );
     }
 }

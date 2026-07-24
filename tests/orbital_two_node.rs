@@ -114,6 +114,7 @@ fn two_orbital_daemons_join_admit_and_converge_over_the_socket() {
         Request::ProjectNew {
             name: "Core".into(),
             key: "core".into(),
+            color: None,
         },
     );
     assert!(
@@ -124,6 +125,8 @@ fn two_orbital_daemons_join_admit_and_converge_over_the_socket() {
         &client,
         &founder_home,
         Request::IssueNew {
+            due: None,
+            estimate: None,
             title: "Secret plan".into(),
             // Formation seeded the default project too — pick the explicit one.
             project: Some("core".into()),
@@ -236,6 +239,7 @@ fn two_orbital_daemons_join_admit_and_converge_over_the_socket() {
         &client,
         &joiner_home,
         Request::Comment {
+            reply_to: None,
             reff: "CORE-1".into(),
             body: "joined over the socket".into(),
         },
@@ -361,6 +365,193 @@ fn the_inviter_reciprocates_so_a_joiner_side_only_connect_admits() {
     assert!(
         admitted.is_some(),
         "the inviter never reciprocated — joiner-side-only Connect did not admit"
+    );
+
+    let _ = req(&client, &joiner_home, Request::Stop);
+    let _ = req(&client, &founder_home, Request::Stop);
+    let _ = joiner_handle.join();
+    let _ = founder_handle.join();
+    let _ = std::fs::remove_dir_all(&founder_home);
+    let _ = std::fs::remove_dir_all(&joiner_home);
+}
+
+/// GOV-11: elevation and demotion are signed `SetGrants` ops with a real
+/// product surface — promote/demote over the control socket, short-prefix
+/// subject resolution, and the last-admin fence.
+#[test]
+fn members_promote_and_demote_over_the_socket() {
+    const F_SEED: [u8; 32] = [231u8; 32];
+    const J_SEED: [u8; 32] = [232u8; 32];
+    let net = MemNet::new();
+
+    let founder_home = temp_home("role-founder");
+    lait::orbital::found_space_cli(&founder_home, &F_SEED, "Role Space").unwrap();
+    let founder_handle = spawn_daemon(founder_home.clone(), F_SEED, net.clone());
+    let client = tokio::runtime::Runtime::new().unwrap();
+    wait_online(&client, &founder_home);
+
+    let Response::Ref { reff: invite } = req(
+        &client,
+        &founder_home,
+        Request::Invite {
+            role: None,
+            reusable: false,
+            ttl_hours: Some(24),
+        },
+    ) else {
+        panic!("expected an invite link");
+    };
+    let joiner_home = temp_home("role-joiner");
+    lait::orbital::enter_space(&joiner_home, &J_SEED, &invite).unwrap();
+    let joiner_handle = spawn_daemon(joiner_home.clone(), J_SEED, net.clone());
+    wait_online(&client, &joiner_home);
+    let approach = lait::crypto::device_from_seed(&F_SEED).to_string();
+    let admitted = poll_until(Duration::from_secs(25), || {
+        req(
+            &client,
+            &joiner_home,
+            Request::Connect {
+                ticket: approach.clone(),
+            },
+        );
+        match req(&client, &joiner_home, Request::Status) {
+            Response::Status(info) if info.membership == "member" => Some(()),
+            _ => None,
+        }
+    });
+    assert!(admitted.is_some(), "the joiner was never admitted");
+
+    // The joiner's actor id, from the founder's roster (non-me row).
+    let joiner_actor = {
+        let Response::Members { members } = req(&client, &founder_home, Request::Members) else {
+            panic!("expected Members");
+        };
+        members
+            .iter()
+            .find(|m| !m.me)
+            .expect("joiner row")
+            .key
+            .clone()
+    };
+    let role_of = |actor: &str| -> String {
+        let Response::Members { members } = req(&client, &founder_home, Request::Members) else {
+            panic!("expected Members");
+        };
+        members
+            .iter()
+            .find(|m| m.key == actor)
+            .map(|m| m.role.clone())
+            .unwrap_or_default()
+    };
+    assert_eq!(role_of(&joiner_actor), "member");
+
+    // Promote by SHORT PREFIX — the form every surface prints.
+    let short: String = joiner_actor.chars().take(12).collect();
+    let resp = req(
+        &client,
+        &founder_home,
+        Request::MemberSetRole {
+            who: short,
+            admin: true,
+        },
+    );
+    assert!(
+        matches!(&resp, Response::Ok { .. }),
+        "promote failed: {resp:?}"
+    );
+    assert_eq!(role_of(&joiner_actor), "admin");
+
+    // A promoted admin is a FULL admin (GOV-11): promotion installs the
+    // policy-admin meta-grant, not just ACL standing, so the joiner can mint
+    // an invite from its OWN node. Converge the promotion, then mint as the
+    // joiner (the exact capability a half-admin lacked).
+    let minted = poll_until(Duration::from_secs(20), || {
+        req(
+            &client,
+            &joiner_home,
+            Request::Connect {
+                ticket: approach.clone(),
+            },
+        );
+        match req(
+            &client,
+            &joiner_home,
+            Request::Invite {
+                role: Some("contributor".into()),
+                reusable: false,
+                ttl_hours: Some(24),
+            },
+        ) {
+            Response::Ref { .. } => Some(()),
+            _ => None,
+        }
+    });
+    assert!(
+        minted.is_some(),
+        "a promoted admin could not mint an invite — promotion left the meta-grant off"
+    );
+
+    // Demote back to a plain member.
+    let resp = req(
+        &client,
+        &founder_home,
+        Request::MemberSetRole {
+            who: joiner_actor.clone(),
+            admin: false,
+        },
+    );
+    assert!(
+        matches!(&resp, Response::Ok { .. }),
+        "demote failed: {resp:?}"
+    );
+    assert_eq!(role_of(&joiner_actor), "member");
+
+    // Demotion reverses both layers: once it converges, the joiner can no
+    // longer mint invites (ACL standing gone and the meta-grant revoked).
+    let refused = poll_until(Duration::from_secs(20), || {
+        req(
+            &client,
+            &joiner_home,
+            Request::Connect {
+                ticket: approach.clone(),
+            },
+        );
+        match req(
+            &client,
+            &joiner_home,
+            Request::Invite {
+                role: Some("contributor".into()),
+                reusable: false,
+                ttl_hours: Some(24),
+            },
+        ) {
+            Response::Error { .. } => Some(()),
+            _ => None,
+        }
+    });
+    assert!(
+        refused.is_some(),
+        "a demoted member could still mint invites — the capability layer was not reversed"
+    );
+
+    // The last admin cannot demote themselves into a repair-proof space.
+    let founder_actor = {
+        let Response::Members { members } = req(&client, &founder_home, Request::Members) else {
+            panic!("expected Members");
+        };
+        members.iter().find(|m| m.me).expect("me row").key.clone()
+    };
+    let resp = req(
+        &client,
+        &founder_home,
+        Request::MemberSetRole {
+            who: founder_actor,
+            admin: false,
+        },
+    );
+    assert!(
+        matches!(&resp, Response::Error { ref message, .. } if message.contains("last admin")),
+        "the last-admin fence did not hold: {resp:?}"
     );
 
     let _ = req(&client, &joiner_home, Request::Stop);

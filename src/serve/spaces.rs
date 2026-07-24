@@ -26,7 +26,7 @@ use anyhow::{anyhow, Result};
 use serde::Serialize;
 use tokio::sync::{broadcast, Mutex};
 
-use crate::control::{self, Doorbell, Request};
+use crate::control::{self, Doorbell, Request, Response};
 use crate::spaces::{self, SpaceEntry, StorePresence};
 
 /// A doorbell, tagged with the space it rang for.
@@ -218,21 +218,30 @@ fn normalize(p: &Path) -> String {
 /// spaces` cannot disagree about what "up" means. The short timeout fails closed
 /// to `idle`: a picker that hangs on a wedged daemon is worse than one that
 /// under-reports it, and selecting the space will start it anyway.
-async fn status(entry: &SpaceEntry) -> &'static str {
+///
+/// The same `Status` round trip also carries the catalog `name` register — the
+/// space's authoritative, `SpaceRename`-mutable display label. We return it so the
+/// picker and sidebar show the shared name rather than this device's stale
+/// registry alias (the alias only survives as a fallback for `idle`/`missing`
+/// spaces, whose daemon we did not reach). `None` means "no answer — keep the
+/// alias".
+async fn status(entry: &SpaceEntry) -> (&'static str, Option<String>) {
     if spaces::presence(entry) == StorePresence::Missing {
-        return "missing";
+        return ("missing", None);
     }
-    let up = tokio::time::timeout(
+    let reply = tokio::time::timeout(
         Duration::from_millis(300),
         control::request(Path::new(&entry.path), &Request::Status),
     )
-    .await
-    .map(|r| r.is_ok())
-    .unwrap_or(false);
-    if up {
-        "up"
-    } else {
-        "idle"
+    .await;
+    match reply {
+        Ok(Ok(Response::Status(info))) => {
+            let name = (!info.name.trim().is_empty()).then(|| info.name.clone());
+            ("up", name)
+        }
+        // Reachable but not a Status reply (shouldn't happen) still means "up".
+        Ok(Ok(_)) => ("up", None),
+        _ => ("idle", None),
     }
 }
 
@@ -304,14 +313,18 @@ impl Supervisor {
             let e = s.entry.clone();
             let identity = s.identity.clone();
             set.spawn(async move {
+                let (status, catalog_name) = status(&e).await;
                 SpaceRow {
                     id: store_handle(&e.path),
                     space: e.space.clone(),
-                    name: e.name.clone(),
+                    // The catalog name is authoritative (`SpaceRename` writes it);
+                    // the registry alias is only a fallback for spaces we could not
+                    // reach. Without this, a rename in the viewer would never show.
+                    name: catalog_name.unwrap_or_else(|| e.name.clone()),
                     path: e.path.clone(),
                     origin: e.origin.to_string(),
                     last_opened: e.last_opened,
-                    status: status(&e).await,
+                    status,
                     identity,
                     projects: e.projects.clone(),
                 }

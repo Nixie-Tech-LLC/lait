@@ -26,7 +26,7 @@ export function Shortcuts({ ctx, onClose }: { ctx: Ctx; onClose: () => void }) {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex justify-center bg-black/45 pt-[10vh] backdrop-blur-[2px]"
+      className="ui-overlay fixed inset-0 z-50 flex justify-center bg-black/45 pt-[10vh] backdrop-blur-[2px]"
       onMouseDown={onClose}
     >
       <div
@@ -34,7 +34,7 @@ export function Shortcuts({ ctx, onClose }: { ctx: Ctx; onClose: () => void }) {
         aria-modal="true"
         aria-label="Keyboard shortcuts"
         onMouseDown={(e) => e.stopPropagation()}
-        className="border-line-strong bg-raised shadow-overlay flex max-h-[70vh] w-[min(560px,92vw)] flex-col overflow-hidden rounded-lg border"
+        className="ui-surface border-line-strong bg-raised shadow-overlay flex max-h-[70vh] w-[min(560px,92vw)] flex-col overflow-hidden rounded-lg border"
       >
         <header className="border-line flex items-center border-b px-4 py-3">
           <h2 className="flex-1 text-lg font-semibold">Keyboard shortcuts</h2>

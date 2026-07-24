@@ -29,6 +29,74 @@ mechanics::prefixed_id!(
     /// Label id — key in the Catalog's `labels` register.
     LabelId, "lbl_"
 );
+mechanics::prefixed_id!(
+    /// Comment id — element identity inside an issue's `comments` list.
+    ///
+    /// Stored and wired **lowercased** (`mint_comment_id`), because the id
+    /// doubles as a Body path segment (`reactions/<id>`) and the frozen path
+    /// grammar admits only `[a-z0-9_]`.
+    CommentId, "cmt_"
+);
+
+mechanics::prefixed_id!(
+    /// Project-update id — element identity in the Catalog's `project_updates`
+    /// grow-only log (keyed `<project>/<update>`). Sortable by mint time.
+    UpdateId, "upd_"
+);
+
+mechanics::prefixed_id!(
+    /// Milestone id — key in the Catalog's `project_milestones` map
+    /// (keyed `<project>/<milestone>`).
+    MilestoneId, "mls_"
+);
+mechanics::prefixed_id!(
+    /// Cycle id — key in the Catalog's `cycles` map (keyed `<project>/<cycle>`).
+    CycleId, "cyc_"
+);
+mechanics::prefixed_id!(
+    /// Initiative id — key in the Catalog's `initiatives` map.
+    InitiativeId, "ini_"
+);
+mechanics::prefixed_id!(
+    /// Team id — key in the Catalog's `teams` map.
+    TeamId, "tm_"
+);
+mechanics::prefixed_id!(
+    /// Triage-intake id — key in the Catalog's `triage` map.
+    TriageId, "trg_"
+);
+mechanics::prefixed_id!(
+    /// Attachment id — key in an issue Body's `attachments` map.
+    AttachmentId, "att_"
+);
+
+/// Mint a canonical (lowercase) comment id.
+pub fn mint_comment_id(clock: &dyn UlidSource) -> String {
+    CommentId::mint(clock).as_str().to_ascii_lowercase()
+}
+
+/// Mint a canonical (lowercase) project-update id.
+pub fn mint_update_id(clock: &dyn UlidSource) -> String {
+    UpdateId::mint(clock).as_str().to_ascii_lowercase()
+}
+
+/// Canonical (lowercase) mints for the newer catalog-object ids — several
+/// double as Body map keys, and one convention beats six.
+macro_rules! mint_lower {
+    ($($fn_name:ident => $t:ty),* $(,)?) => {$(
+        pub fn $fn_name(clock: &dyn UlidSource) -> String {
+            <$t>::mint(clock).as_str().to_ascii_lowercase()
+        }
+    )*};
+}
+mint_lower!(
+    mint_milestone_id => MilestoneId,
+    mint_cycle_id => CycleId,
+    mint_initiative_id => InitiativeId,
+    mint_team_id => TeamId,
+    mint_triage_id => TriageId,
+    mint_attachment_id => AttachmentId,
+);
 
 #[cfg(test)]
 mod tests {

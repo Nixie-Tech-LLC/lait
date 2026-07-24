@@ -396,6 +396,7 @@ fn issues_reference_performance_gate() {
             Request::ProjectNew {
                 name: format!("Project {p:02}"),
                 key: key.clone(),
+                color: None,
             },
         );
         project_keys.push(key);
@@ -514,6 +515,8 @@ fn issues_reference_performance_gate() {
                     &rt,
                     &home,
                     Request::IssueNew {
+                        due: None,
+                        estimate: None,
                         title: format!("reference issue {i:05}"),
                         project: Some(project.clone()),
                         project_hint: None,
@@ -533,6 +536,7 @@ fn issues_reference_performance_gate() {
                         &rt,
                         &home,
                         Request::Comment {
+                            reply_to: None,
                             reff: reff.clone(),
                             body: format!("event {e} on {reff}"),
                         },
@@ -631,6 +635,7 @@ fn issues_reference_performance_gate() {
             &rt,
             &f.home,
             Request::Comment {
+                reply_to: None,
                 reff: founder_refs[n % founder_refs.len()].clone(),
                 body: format!("cross-actor comment from contributor {n}"),
             },
@@ -643,6 +648,8 @@ fn issues_reference_performance_gate() {
             &rt,
             &viewer.home,
             Request::IssueNew {
+                due: None,
+                estimate: None,
                 title: "viewer must not author".into(),
                 project: Some(project_keys[0].clone()),
                 project_hint: None,
@@ -748,6 +755,8 @@ fn issues_reference_performance_gate() {
                     rt,
                     &home,
                     Request::IssueEdit {
+                        due: None,
+                        estimate: None,
                         reff: refs[i % refs.len()].clone(),
                         title: Some(format!("edited title {i}")),
                         status: None,
@@ -775,6 +784,8 @@ fn issues_reference_performance_gate() {
                     rt,
                     &home,
                     Request::IssueNew {
+                        due: None,
+                        estimate: None,
                         title: format!("warm create {i}"),
                         project: Some(project_keys[i % project_keys.len()].clone()),
                         project_hint: None,
@@ -844,6 +855,7 @@ fn issues_reference_performance_gate() {
             &rt,
             author,
             Request::Comment {
+                reply_to: None,
                 reff: refs[i % refs.len()].clone(),
                 body: format!("incremental op {i}"),
             },

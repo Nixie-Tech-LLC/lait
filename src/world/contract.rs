@@ -27,6 +27,21 @@ pub const VIEW_SCHEMA_VERSION: u32 = 3;
 pub const LINK_KINDS: [&str; 3] = ["blocks", "relates", "duplicates"];
 /// The default status a fresh issue carries.
 pub const DEFAULT_STATUS: &str = "backlog";
+/// The longest reaction emoji accepted, in UTF-8 bytes (a ZWJ family sequence
+/// fits; a paragraph does not).
+pub const MAX_REACTION_EMOJI_BYTES: usize = 32;
+/// The largest accepted estimate. Every scale humans use tops out far below
+/// this; the cap exists so a typo cannot become a permanent register.
+pub const MAX_ESTIMATE: u32 = 1000;
+/// Attachment bounds (CREATE-5): inline sealed records riding the issue Body
+/// and its existing sync/E2EE. Deliberately tight — the content-addressed
+/// blob store is the large-file follow-on, not this.
+pub const MAX_ATTACHMENT_BYTES: usize = 256 * 1024;
+pub const MAX_ATTACHMENTS_PER_ISSUE: usize = 8;
+/// The triage outcomes, frozen.
+pub const TRIAGE_OUTCOMES: [&str; 3] = ["accepted", "declined", "duplicate"];
+/// The self-reported health labels (project updates, initiatives).
+pub const HEALTH_LABELS: [&str; 3] = ["on_track", "at_risk", "off_track"];
 
 pub fn world_id() -> WorldId {
     WorldId::parse(PRODUCT_WORLD).expect("product world id")
@@ -77,6 +92,21 @@ pub fn demand_space_any(capability: &str) -> Vec<u8> {
     ])
     .encode_canonical()
     .expect("canonical space-any demand")
+}
+
+/// `Any(Require(<capability>, Project(<id>)), Require(space.admin, Space))` —
+/// a Project-scoped mutation with the explicit admin override (the shape
+/// `project.delete` uses).
+pub fn demand_project_any(capability: &str, project: &str) -> Vec<u8> {
+    AuthorizationDemand::Any(vec![
+        AuthorizationDemand::require(
+            space_cap(capability),
+            PolicyResource::project(PRODUCT_WORLD, project),
+        ),
+        AuthorizationDemand::require(space_cap("space.admin"), space_resource()),
+    ])
+    .encode_canonical()
+    .expect("canonical project-any demand")
 }
 
 /// `Require(space.issue.read, Space)` — every query's read demand.
@@ -240,6 +270,51 @@ pub fn board_path(project: &str) -> String {
     format!("board/{}", project.to_ascii_lowercase())
 }
 
+/// The reactions set path for one comment. Comment ids are canonically
+/// lowercase (`cmt_` + lowercased ULID) precisely so they are path-legal —
+/// the frozen path grammar admits only `[a-z0-9_]`.
+pub fn reaction_path(comment_id: &str) -> String {
+    format!("reactions/{comment_id}")
+}
+
+/// Whether `s` is a canonical comment id: `cmt_` + a 26-character lowercased
+/// ULID in the kernel's base32 alphabet (`0-9` then `a-v`, the lowercase of
+/// [`mechanics::ids`]' encoder). The daemon mints and lowercases; the World
+/// re-validates because ids arrive inside the intent.
+pub fn is_comment_id(s: &str) -> bool {
+    s.strip_prefix("cmt_").is_some_and(|ulid| {
+        ulid.len() == 26
+            && ulid
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'v').contains(&b))
+    })
+}
+
+/// One reaction as stored in a comment's reactions set: `emoji \t actor`.
+/// A set (not a map) so two actors reacting concurrently never clobber, and
+/// add-wins semantics keep a reaction that raced its own removal.
+pub fn reaction_value(emoji: &str, actor: &str) -> Vec<u8> {
+    format!("{emoji}\t{actor}").into_bytes()
+}
+
+/// Parse a stored reaction value back into `(emoji, actor)`.
+pub fn parse_reaction_value(raw: &[u8]) -> Option<(String, String)> {
+    let s = std::str::from_utf8(raw).ok()?;
+    let (emoji, actor) = s.split_once('\t')?;
+    if emoji.is_empty() || actor.is_empty() {
+        return None;
+    }
+    Some((emoji.to_string(), actor.to_string()))
+}
+
+/// Whether `emoji` is acceptable as a reaction: non-empty, bounded, and free
+/// of the control/whitespace bytes the storage encoding reserves.
+pub fn is_reaction_emoji(emoji: &str) -> bool {
+    !emoji.is_empty()
+        && emoji.len() <= MAX_REACTION_EMOJI_BYTES
+        && !emoji.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
 /// A board position, resolved to DocIds by the daemon before submit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "at", rename_all = "snake_case")]
@@ -256,6 +331,16 @@ pub struct NewLabel {
     pub id: String,
     pub name: String,
     pub color: String,
+}
+
+/// Deserialize a present field (including an explicit `null`) as the OUTER
+/// `Some` of a double option — absent stays `None` via `#[serde(default)]`.
+fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Deserialize::deserialize(de).map(Some)
 }
 
 /// The work-state actions.
@@ -305,6 +390,10 @@ pub enum IssueIntent {
         labels: Vec<String>,
         new_labels: Vec<NewLabel>,
         body: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duedate: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        estimate: Option<u32>,
         actor: String,
         device: String,
         ts: u64,
@@ -315,6 +404,23 @@ pub enum IssueIntent {
         status: Option<String>,
         priority: Option<String>,
         description: Option<String>,
+        /// Double-option: absent = untouched, `Some(None)` (JSON `null`) =
+        /// clear, `Some(Some(ts))` = set (unix seconds). The custom
+        /// deserializer is what keeps `null` distinct from absent — serde's
+        /// default reads both as the outer `None`.
+        #[serde(
+            default,
+            deserialize_with = "double_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        duedate: Option<Option<u64>>,
+        /// Same shape as `duedate`; points on whatever scale the team reads.
+        #[serde(
+            default,
+            deserialize_with = "double_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        estimate: Option<Option<u32>>,
         device: String,
         ts: u64,
     },
@@ -343,7 +449,29 @@ pub enum IssueIntent {
     Comment {
         doc: String,
         body: String,
+        /// Daemon-minted canonical comment id. Optional for wire compatibility
+        /// with pre-identity intents; a comment stored without one cannot
+        /// anchor reactions or replies.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        /// The id of the comment being replied to, when this is a reply.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<String>,
         actor: String,
+        device: String,
+        ts: u64,
+    },
+    /// Toggle one actor's emoji reaction on one comment. Deliberately writes
+    /// **no history event**: a reaction is a social signal, not a change of
+    /// record, and history rows for every 👍 would bury the changes that are.
+    React {
+        doc: String,
+        /// The target comment's canonical id.
+        comment: String,
+        emoji: String,
+        actor: String,
+        /// `true` adds, `false` removes.
+        on: bool,
         device: String,
         ts: u64,
     },
@@ -378,6 +506,7 @@ pub enum IssueIntent {
         id: String,
         name: String,
         key: String,
+        color: String,
         device: String,
         ts: u64,
     },
@@ -385,6 +514,212 @@ pub enum IssueIntent {
         id: String,
         name: String,
         color: String,
+        device: String,
+        ts: u64,
+    },
+    /// Rename and/or recolor a project in place. `key` is deliberately not
+    /// editable — it seeds every alias. An in-place `map_set` over the same
+    /// catalog key; LWW, `project.configure`-gated.
+    ProjectEdit {
+        id: String,
+        name: Option<String>,
+        color: Option<String>,
+        description: Option<String>,
+        lead: Option<String>,
+        /// Outer `None` leaves the date untouched; inner `None` clears it.
+        start_date: Option<Option<u64>>,
+        target_date: Option<Option<u64>>,
+        /// Soft-hide toggle: `None` leaves it, `Some(bool)` sets it (CUSTOM-9).
+        archived: Option<bool>,
+        /// Owning team id: `None` leaves it, `Some("")` clears (GOV-7).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        team: Option<String>,
+        device: String,
+        ts: u64,
+    },
+    /// Hard-delete an EMPTY project (CUSTOM-10 safe v1): refused while any
+    /// issue — live or tombstoned — still carries its `projectid`, else every
+    /// project-keyed catalog entry is removed. `project.delete`-gated (with
+    /// the admin override).
+    ProjectDelete { id: String, device: String, ts: u64 },
+    /// Toggle one actor's subscription to an issue (INBOX-9). Like `React`,
+    /// writes no history event — following is a personal signal, not a change
+    /// of record.
+    Follow {
+        doc: String,
+        actor: String,
+        on: bool,
+        device: String,
+        ts: u64,
+    },
+    /// Create or edit a project milestone (SCOPE-1): the daemon mints the id
+    /// on create; the whole record is rewritten so untouched fields survive.
+    MilestoneSet {
+        project_id: String,
+        id: String,
+        name: Option<String>,
+        /// Outer `None` leaves the date; inner `None` clears it.
+        #[serde(
+            default,
+            deserialize_with = "double_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        target_date: Option<Option<u64>>,
+        tombstone: Option<bool>,
+        device: String,
+        ts: u64,
+    },
+    /// Point an issue at a milestone (or clear it).
+    IssueMilestone {
+        doc: String,
+        milestone: Option<String>,
+        device: String,
+        ts: u64,
+    },
+    /// Create or edit a cycle (BOARD-11); same record shape as milestones.
+    CycleSet {
+        project_id: String,
+        id: String,
+        name: Option<String>,
+        #[serde(
+            default,
+            deserialize_with = "double_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        start: Option<Option<u64>>,
+        #[serde(
+            default,
+            deserialize_with = "double_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        end: Option<Option<u64>>,
+        tombstone: Option<bool>,
+        device: String,
+        ts: u64,
+    },
+    /// Schedule an issue into a cycle (or clear it).
+    IssueCycle {
+        doc: String,
+        cycle: Option<String>,
+        device: String,
+        ts: u64,
+    },
+    /// Create or edit an initiative (SCOPE-8). Membership arrives as the
+    /// complete replacement list (the router merges add/remove against the
+    /// snapshot), so the record write is LWW-whole like `projects`.
+    InitiativeSet {
+        id: String,
+        name: Option<String>,
+        description: Option<String>,
+        owner: Option<String>,
+        health: Option<String>,
+        #[serde(
+            default,
+            deserialize_with = "double_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        target_date: Option<Option<u64>>,
+        projects: Option<Vec<String>>,
+        tombstone: Option<bool>,
+        device: String,
+        ts: u64,
+    },
+    /// Create or edit a team (GOV-7). `key` binds at creation and is
+    /// immutable after (it seeds nothing yet, but the project-key rule is the
+    /// convention). Members arrive as the complete replacement list.
+    TeamSet {
+        id: String,
+        name: Option<String>,
+        key: Option<String>,
+        icon: Option<String>,
+        lead: Option<String>,
+        members: Option<Vec<String>>,
+        tombstone: Option<bool>,
+        device: String,
+        ts: u64,
+    },
+    /// Report work into the triage intake queue (SCOPE-7) — outside every
+    /// project workflow until reviewed.
+    TriageSubmit {
+        id: String,
+        title: String,
+        body: String,
+        source: String,
+        actor: String,
+        device: String,
+        ts: u64,
+    },
+    /// Decide a pending triage item exactly once. `accepted` atomically
+    /// creates the issue (`doc` = the daemon-minted DocId, `project`
+    /// required) in the same transaction that stamps the outcome; `duplicate`
+    /// names the existing issue in `doc`; `declined` needs neither.
+    TriageDecide {
+        id: String,
+        outcome: String,
+        project: Option<String>,
+        doc: Option<String>,
+        note: String,
+        actor: String,
+        device: String,
+        ts: u64,
+    },
+    /// Attach a bounded file to an issue (CREATE-5): a sealed record in the
+    /// issue Body's `attachments` map, riding the existing sync and E2EE.
+    Attach {
+        doc: String,
+        id: String,
+        name: String,
+        mime: String,
+        data_b64: String,
+        comment: Option<String>,
+        actor: String,
+        device: String,
+        ts: u64,
+    },
+    /// Remove an attachment record.
+    Detach {
+        doc: String,
+        id: String,
+        device: String,
+        ts: u64,
+    },
+    /// Append an immutable status update to a project's feed (SCOPE-1). A
+    /// grow-only `project_updates` log entry keyed `<project>/<id>`;
+    /// `project.configure`-gated like the other project mutations.
+    ProjectUpdatePost {
+        project_id: String,
+        id: String,
+        author: String,
+        body: String,
+        health: String,
+        device: String,
+        ts: u64,
+    },
+    /// Rename and/or recolor a label in place. Issues reference labels by id,
+    /// so a rename re-points every use for free. `catalog.label.configure`-gated.
+    LabelEdit {
+        id: String,
+        name: Option<String>,
+        color: Option<String>,
+        device: String,
+        ts: u64,
+    },
+    /// Remove a label from the registry. Ids left on issues resolve to the raw id
+    /// (graceful degradation), so this is a hard `MapRemove`. `catalog.label.configure`-gated.
+    LabelDelete { id: String, device: String, ts: u64 },
+    /// Set the space's mutable display label. The genesis/seed id is
+    /// name-independent, so this is a plain LWW `RegisterSet` on the catalog
+    /// `name` — never touches identity. `demand_admin`-gated.
+    SpaceRename {
+        name: String,
+        device: String,
+        ts: u64,
+    },
+    /// Set (or clear, with an empty string) the space's overview description — a
+    /// plain LWW `RegisterSet` on the catalog `description`, beside `name`
+    /// (SCOPE-2). `demand_admin`-gated like the rename.
+    SpaceDescribe {
+        description: String,
         device: String,
         ts: u64,
     },
@@ -519,6 +854,10 @@ pub enum IssueQuery {
         doc: String,
     },
     Projects,
+    /// A project's status-update feed, newest first (SCOPE-1).
+    ProjectUpdates {
+        project: String,
+    },
     Labels,
     /// Every role definition: built-ins plus custom heads (with conflict
     /// head lists).
@@ -545,6 +884,25 @@ pub enum IssueQuery {
     /// A project's workflow revision head(s).
     Workflow {
         project: String,
+    },
+    /// A project's milestones with derived progress (SCOPE-1).
+    Milestones {
+        project: String,
+    },
+    /// A project's cycles with derived counts (BOARD-11).
+    Cycles {
+        project: String,
+    },
+    /// Every live initiative with its derived roll-up (SCOPE-8).
+    Initiatives,
+    /// Every live team with its owned projects (GOV-7).
+    Teams,
+    /// The triage intake queue, pending first (SCOPE-7).
+    Triage,
+    /// One attachment's full record including the payload (CREATE-5).
+    Attachment {
+        doc: String,
+        id: String,
     },
 }
 
@@ -603,11 +961,24 @@ pub struct EventChange {
 }
 
 /// A stored comment list element.
+///
+/// `id`/`parent` arrived after v0.6 comments shipped, so both are optional
+/// with absent-means-absent serialization: pre-existing comments keep their
+/// exact stored bytes, and older builds deserialize enriched comments
+/// unchanged (serde ignores unknown fields). A comment without an `id`
+/// predates identity and simply cannot anchor reactions or replies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredComment {
     pub a: String,
     pub t: u64,
     pub b: String,
+    /// Canonical comment id (`cmt_…`, lowercase — see [`is_comment_id`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The comment this one replies to (one level; a reply to a reply names
+    /// the same root).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
 }
 
 /// The default workflow, exactly the legacy seed.

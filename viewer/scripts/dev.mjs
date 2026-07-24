@@ -65,7 +65,10 @@ function findLait() {
 /** Start the engine and resolve once it tells us where it is. */
 function startEngine(bin, port) {
   return new Promise((ok, fail) => {
-    const child = spawn(bin, ["serve", "--port", port, "--json"], {
+    const selector = process.env.LAIT_SPACE
+      ? ["-w", process.env.LAIT_SPACE]
+      : [];
+    const child = spawn(bin, [...selector, "serve", "--port", port, "--json"], {
       cwd: REPO,
       stdio: ["ignore", "pipe", "inherit"],
     });
@@ -89,6 +92,14 @@ function startEngine(bin, port) {
         // Not our line. `--json` puts the object first, but a stray warning ahead
         // of it should be passed through rather than mistaken for a protocol error.
         console.error(line);
+        return;
+      }
+      if (info?.kind === "error") {
+        fail(new Error(info.message || "lait serve failed to start"));
+        return;
+      }
+      if (!info?.token || typeof info.port !== "number") {
+        fail(new Error("lait serve returned an invalid readiness reply"));
         return;
       }
       lines.close();

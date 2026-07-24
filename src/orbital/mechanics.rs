@@ -253,10 +253,11 @@ impl Inner {
         Ok(())
     }
 
-    /// Resolve an actor by its actor id or by one of its device keys — the
-    /// orbital form of the legacy `resolve_actor`, used to interpret the
-    /// `--to` roots a recovery approver names.
-    pub(super) fn resolve_actor(&self, who: &str) -> Option<ActorId> {
+    /// Resolve an actor by its actor id, one of its device keys, or a unique
+    /// short prefix — the orbital form of the legacy `resolve_actor`, used to
+    /// interpret the `--to` roots a recovery approver names and the `members`
+    /// verbs' subjects.
+    pub(super) fn resolve_actor(&mut self, who: &str) -> Option<ActorId> {
         let who = who.trim();
         if let Some(actor) = ActorId::parse(who) {
             if self.actor_plane().exists(&actor) {
@@ -266,6 +267,29 @@ impl Inner {
         if let Some(device) = DeviceId::parse(who) {
             if let Some(actor) = self.actor_plane().actor_of_device(&device) {
                 return Some(actor.clone());
+            }
+        }
+        // A short display prefix (`act_7b6a9ca4` or its bare hex): every
+        // surface prints short forms, so the verbs must accept one when it
+        // names exactly one known principal (GOV-11). Ambiguity stays None —
+        // never guess an authority subject.
+        let needle = who.strip_prefix("act_").unwrap_or(who).to_ascii_lowercase();
+        if needle.len() >= 6 && needle.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let acl = self.acl();
+            let matches: Vec<ActorId> = acl
+                .members()
+                .into_iter()
+                .map(|(a, _)| a)
+                .chain(acl.agents().into_iter().map(|(a, _)| a))
+                .filter(|a| {
+                    a.as_str()
+                        .strip_prefix("act_")
+                        .unwrap_or(a.as_str())
+                        .starts_with(&needle)
+                })
+                .collect();
+            if let [one] = matches.as_slice() {
+                return Some(one.clone());
             }
         }
         None
@@ -1078,6 +1102,68 @@ impl OrbitalMechanics {
         self.lock().my_actor()
     }
 
+    /// The actor a device belongs to in the actor plane, independent of
+    /// standing — so a provisioned-but-unsponsored agent still resolves to its
+    /// own actor (for `whoami`), even before it holds a seat.
+    pub fn actor_of_device(&self, device: &DeviceId) -> Option<ActorId> {
+        self.lock().actor_plane().actor_of_device(device).cloned()
+    }
+
+    /// Whether `actor` holds membership in this space.
+    pub fn is_member(&self, actor: &ActorId) -> bool {
+        self.lock().acl().is_member(actor)
+    }
+
+    /// Whether `actor` holds content-write standing (can author issues).
+    pub fn can_write(&self, actor: &ActorId) -> bool {
+        self.lock().acl().can_write(actor)
+    }
+
+    /// Whether `actor` is a sponsored agent principal.
+    pub fn is_agent(&self, actor: &ActorId) -> bool {
+        self.lock().acl().is_agent(actor)
+    }
+
+    /// The coarse ACL role label of `actor` (`admin` | `member` | `viewer`).
+    pub fn role_of(&self, actor: &ActorId) -> String {
+        acl::role_label(&self.lock().acl().grants(actor)).to_string()
+    }
+
+    /// The sponsoring actor of `actor`, if it is a sponsored agent.
+    pub fn sponsor_of(&self, actor: &ActorId) -> Option<ActorId> {
+        self.lock().acl().sponsor_of(actor).cloned()
+    }
+
+    /// **Loud** partial-view report: the authorized key epochs this device
+    /// cannot open (holds no sealed key for), so content encrypted under them is
+    /// invisible here. Empty when whole. Refreshes the keyring first so a
+    /// just-synced envelope counts. This is the signal `whoami`/`sync` surface
+    /// and the authoring gate enforces — the end of inferring a missing epoch by
+    /// diffing 141-vs-154 issue counts (`docs/plans/09` §10 finding 3).
+    pub fn view_divergence(&self) -> Vec<String> {
+        let mut inner = self.lock();
+        inner.refresh_keyring();
+        let held: std::collections::BTreeSet<[u8; 16]> = inner.keyring.keys().copied().collect();
+        let mut lines = Vec::new();
+        for e in inner.acl().epochs() {
+            if !held.contains(&e.id) {
+                lines.push(format!(
+                    "authorized key epoch gen {} ({}) is not sealed to this device — \
+                     content under it is invisible here; run `lait sync`",
+                    e.gen,
+                    data_encoding::HEXLOWER.encode(&e.id),
+                ));
+            }
+        }
+        lines
+    }
+
+    /// Whether this device's view is *known* to be partial (missing an
+    /// authorized epoch key). A delegated agent must not author against a `true`.
+    pub fn is_view_partial(&self) -> bool {
+        !self.view_divergence().is_empty()
+    }
+
     /// The effective scoped capability names granted to `actor` (sorted,
     /// deduped) plus whether it holds Space policy administration — the
     /// admission gates' assignment oracle.
@@ -1094,32 +1180,40 @@ impl OrbitalMechanics {
         (names, acl_state.is_policy_admin(actor))
     }
 
-    /// The membership roster as `control::MemberDto` rows.
+    /// The membership roster as `control::MemberDto` rows — **one row per
+    /// member**, humans and sponsored agents alike (the "one surface"
+    /// principle). A sponsored member's `role` reflects its real grants (a
+    /// working agent reads as `member`, not a separate `agent` role), and its
+    /// `sponsor` names the human whose standing seats it. Sponsorship is
+    /// rendered as information — a badge + link the viewer draws — never a
+    /// distinct actor class.
     pub fn members(&self) -> Vec<crate::dto::MemberDto> {
         let mut inner = self.lock();
         let acl = inner.acl();
+        let plane = inner.actor_plane();
         let me = inner.my_actor();
-        let mut out: Vec<crate::dto::MemberDto> = acl
-            .members()
+        acl.members()
             .into_iter()
-            .map(|(actor, grants)| crate::dto::MemberDto {
-                key: actor.as_str().to_string(),
-                role: acl::role_label(&grants).to_string(),
-                me: me.as_ref() == Some(&actor),
-                sponsor: None,
-                alias: String::new(),
+            .map(|(actor, grants)| {
+                // A member's `did:key` — a synced-safe, self-certifying handle
+                // (unlike the local alias). An actor may hold several devices;
+                // we present its lowest device id deterministically, so every
+                // node renders the same did for the same member.
+                let did = plane
+                    .devices_of(&actor)
+                    .into_iter()
+                    .min()
+                    .and_then(|d| crate::crypto::did_key_from_device(&d));
+                crate::dto::MemberDto {
+                    key: actor.as_str().to_string(),
+                    role: acl::role_label(&grants).to_string(),
+                    did,
+                    me: me.as_ref() == Some(&actor),
+                    sponsor: acl.sponsor_of(&actor).map(|s| s.as_str().to_string()),
+                    alias: String::new(),
+                }
             })
-            .collect();
-        for (agent, sponsor) in acl.agents() {
-            out.push(crate::dto::MemberDto {
-                key: agent.as_str().to_string(),
-                role: "agent".into(),
-                me: me.as_ref() == Some(&agent),
-                sponsor: Some(sponsor.as_str().to_string()),
-                alias: String::new(),
-            });
-        }
-        out
+            .collect()
     }
 
     /// The signed ACL DAG replayed as an audit log.
@@ -1149,13 +1243,24 @@ impl OrbitalMechanics {
     /// inception must already be known (imported via a prior Contact/admission).
     pub fn member_add(&self, actor_str: &str, admin: bool) -> Result<()> {
         let mut inner = self.lock();
-        let actor = ActorId::parse(actor_str).ok_or_else(|| anyhow!("invalid actor id"))?;
+        let actor = match inner.resolve_actor(actor_str) {
+            Some(actor) => actor,
+            None if ActorId::parse(actor_str).is_some() => {
+                return Err(anyhow!(
+                    "that actor's identity is not known locally yet — has the joiner \
+                     reached this node? (`lait connect` from their side carries it)"
+                ))
+            }
+            None => {
+                return Err(anyhow!(
+                    "no actor matches '{actor_str}' — pass an actor id (full or a unique \
+                     act_ prefix) or one of their device ids"
+                ))
+            }
+        };
         match inner.my_actor() {
             Some(me) if inner.acl().is_admin(&me) => {}
             _ => return Err(anyhow!("only an admin may add members")),
-        }
-        if !inner.actor_plane().exists(&actor) {
-            return Err(anyhow!("that actor's identity is not known locally yet"));
         }
         if inner.acl().is_member(&actor) {
             return Ok(());
@@ -1174,10 +1279,15 @@ impl OrbitalMechanics {
         Ok(())
     }
 
-    /// Remove a member by actor id — admin-only.
+    /// Remove a member by actor id, device id, or unique prefix — admin-only.
     pub fn member_remove(&self, actor_str: &str) -> Result<()> {
         let mut inner = self.lock();
-        let actor = ActorId::parse(actor_str).ok_or_else(|| anyhow!("invalid actor id"))?;
+        let actor = inner.resolve_actor(actor_str).ok_or_else(|| {
+            anyhow!(
+                "no actor matches '{actor_str}' — pass an actor id (full or a unique \
+                 act_ prefix) or one of their device ids"
+            )
+        })?;
         match inner.my_actor() {
             Some(me) if inner.acl().is_admin(&me) => {}
             _ => return Err(anyhow!("only an admin may remove members")),
@@ -1187,6 +1297,128 @@ impl OrbitalMechanics {
         }
         inner.author(AclAction::RemoveMember { actor }, None, vec![], vec![])?;
         Ok(())
+    }
+
+    /// Elevate or demote an existing member: a **full** role change across both
+    /// authority layers, so a promoted admin is a real admin (GOV-11).
+    ///
+    /// Promotion writes the signed [`AclAction::SetGrants`] (ACL admin standing,
+    /// which gates member add/remove and key rotation) **and** installs the
+    /// administrator role's admission evidence — including the Mechanics
+    /// policy-admin meta-grant, the capability that `may_delegate` (and thus
+    /// invite minting) requires. Without the second half a "promoted" admin
+    /// could manage members but not mint invites; that half-admin was the bug.
+    /// Because minting a policy admin needs policy authority, promotion requires
+    /// the caller to *be* a policy admin (you cannot grant authority you lack).
+    /// Demotion reverses both: ACL standing back to a plain member and the
+    /// admin/meta capability grants revoked (contributor + read remain).
+    ///
+    /// Refuses to demote the last admin, and to promote an agent (agents hold
+    /// no membership authority by construction). Idempotent per layer.
+    pub fn member_set_role(&self, actor_str: &str, admin: bool) -> Result<ActorId> {
+        // Phase 1 (locked): resolve, gate, flip ACL standing, and collect the
+        // admin-capability grant ids to revoke on demotion.
+        let (actor, revoke_on_demote) = {
+            let mut inner = self.lock();
+            let actor = inner.resolve_actor(actor_str).ok_or_else(|| {
+                anyhow!(
+                    "no actor matches '{actor_str}' — pass an actor id (full or a unique \
+                     act_ prefix) or one of their device ids"
+                )
+            })?;
+            let gate_ok = match inner.my_actor() {
+                // Promotion mints policy authority, so the promoter must hold
+                // it; demotion is an ordinary admin action.
+                Some(me) if admin => inner.acl().is_policy_admin(&me),
+                Some(me) => inner.acl().is_admin(&me),
+                None => false,
+            };
+            if !gate_ok {
+                return Err(anyhow!(if admin {
+                    "only a policy admin may promote a member to a full admin (one who can \
+                     invite and manage policy) — ask a founder or an existing policy admin, \
+                     or admit them with an administrator invite"
+                } else {
+                    "only an admin may change a member's role"
+                }));
+            }
+            if inner.acl().is_agent(&actor) {
+                return Err(anyhow!(
+                    "{} is a sponsored agent — agents hold no membership authority",
+                    actor.short()
+                ));
+            }
+            if !inner.acl().is_member(&actor) {
+                return Err(anyhow!(
+                    "{} is not a member of this space — `members add` admits first",
+                    actor.short()
+                ));
+            }
+            if !admin {
+                let acl_state = inner.acl();
+                let admins = acl_state
+                    .members()
+                    .into_iter()
+                    .filter(|(a, _)| acl_state.is_admin(a))
+                    .count();
+                if admins <= 1 {
+                    return Err(anyhow!(
+                        "refusing to demote the last admin — promote someone else first"
+                    ));
+                }
+            }
+            // Flip ACL standing only when it needs flipping (idempotent).
+            if inner.acl().is_admin(&actor) != admin {
+                inner.author(
+                    AclAction::SetGrants {
+                        actor: actor.clone(),
+                        grants: acl::membership_grants(admin),
+                    },
+                    None,
+                    vec![],
+                    vec![],
+                )?;
+            }
+            // On demotion, gather the admin/meta capability grants to revoke.
+            let revoke = if admin {
+                Vec::new()
+            } else {
+                let space_res =
+                    mechanics::demand::PolicyResource::space(crate::world::contract::PRODUCT_WORLD);
+                let acl_state = inner.acl();
+                let mut ids = acl_state.effective_capability_grants(
+                    &actor,
+                    &mechanics::demand::PolicyCapability::new(
+                        crate::world::contract::PRODUCT_WORLD,
+                        "space.admin",
+                    ),
+                    &space_res,
+                );
+                ids.extend(acl_state.effective_capability_grants(
+                    &actor,
+                    &acl::policy_admin_capability(),
+                    &acl::policy_admin_resource(),
+                ));
+                ids
+            };
+            (actor, revoke)
+        };
+
+        // Phase 2 (re-locking helpers): sync the capability layer.
+        if admin {
+            // The administrator role's admission evidence uniquely carries the
+            // policy-admin meta-grant; grant_assignments is idempotent and
+            // re-checks that this caller may delegate every capability.
+            let revision = crate::world::roles::built_in("lait.administrator")
+                .ok_or_else(|| anyhow!("built-in administrator role is missing"))?;
+            let evidence = crate::world::roles::role_admission_evidence(&revision, [0u8; 32]);
+            self.grant_assignments(&actor, &evidence.assignments)?;
+        } else {
+            for grant_id in revoke_on_demote {
+                self.revoke_assignment(grant_id)?;
+            }
+        }
+        Ok(actor)
     }
 
     // ---- device management (M3): signed actor-plane authority actions -------
@@ -1401,32 +1633,108 @@ impl OrbitalMechanics {
 
     /// Sponsor an agent by its device key (any human member may sponsor). The
     /// agent's inception must already be known locally (it self-incepts on
-    /// join); this authors a signed `AddAgent` and seals it every held epoch.
-    /// Returns the sponsored agent's actor id.
+    /// join); this authors a signed `AddAgent` sealing it every held epoch, and
+    /// grants it **content authority** (the linchpin: a sponsored member is a
+    /// working colleague, not a mute spectator) through the same grant set any
+    /// member carries — never membership authority. Its standing still dies with
+    /// the sponsor. Returns the sponsored agent's actor id.
     pub fn agent_add(&self, key: &str) -> Result<ActorId> {
-        let mut inner = self.lock();
-        let me = inner
-            .my_actor()
-            .ok_or_else(|| anyhow!("no actor identity"))?;
-        if !inner.acl().is_human_member(&me) {
-            return Err(anyhow!("only a human member may sponsor an agent"));
-        }
-        let agent = inner
-            .resolve_actor(key)
-            .ok_or_else(|| anyhow!("that agent's identity is not known locally yet"))?;
-        if inner.acl().is_member(&agent) {
-            return Err(anyhow!("{} is already a principal", agent.short()));
-        }
-        let sealed = inner.seal_records_for_actor(&agent);
-        inner.author(
-            AclAction::AddAgent {
-                actor: agent.clone(),
-            },
-            None,
-            vec![],
-            sealed,
-        )?;
+        let agent = {
+            let mut inner = self.lock();
+            let me = inner
+                .my_actor()
+                .ok_or_else(|| anyhow!("no actor identity"))?;
+            if !inner.acl().is_human_member(&me) {
+                return Err(anyhow!("only a human member may sponsor an agent"));
+            }
+            let agent = inner.resolve_actor(key).ok_or_else(|| {
+                anyhow!(
+                    "that agent's identity is not known here yet — the agent must reach this \
+                     node once so its self-inception lands (run `lait connect` from the agent's \
+                     side, or share an invite it connects with); then `members agent <key>` \
+                     sponsors it"
+                )
+            })?;
+            if inner.acl().is_member(&agent) {
+                return Err(anyhow!("{} is already a principal", agent.short()));
+            }
+            let sealed = inner.seal_records_for_actor(&agent);
+            inner.author(
+                AclAction::AddAgent {
+                    actor: agent.clone(),
+                    grants: acl::sponsored_agent_grants(),
+                },
+                None,
+                vec![],
+                sealed,
+            )?;
+            agent
+        }; // lock dropped before granting the scoped capabilities below
+
+        // The ACL write grant is *content authority*; a functional
+        // contributor also needs the World's *scoped* capabilities — the
+        // mandatory `space.issue.read` (to even read the catalog) and
+        // `space.contributor` (the write demand). These live in the separate
+        // policy plane, so grant the sponsored member the contributor role's
+        // exact expansion. Requires the sponsor to be able to delegate them
+        // (a policy admin, or a delegate); a plain member cannot hand out
+        // authority it lacks, and the up-front check keeps that a clean refusal
+        // rather than a Write-but-cannot-read half-member.
+        self.grant_contributor_capabilities(&agent)?;
         Ok(agent)
+    }
+
+    /// Grant `actor` the built-in **contributor** role's scoped capabilities
+    /// (`space.contributor` + the mandatory `space.issue.read` baseline) on the
+    /// Space — so a sponsored member can actually read and write, not merely
+    /// hold the ACL write grant. Idempotent (already-effective grants skip).
+    fn grant_contributor_capabilities(&self, actor: &ActorId) -> Result<()> {
+        let contributor = crate::world::roles::built_in("lait.contributor")
+            .ok_or_else(|| anyhow!("built-in contributor role is missing"))?;
+        let assignments =
+            crate::world::roles::role_admission_evidence(&contributor, [0u8; 32]).assignments;
+        self.grant_assignments(actor, &assignments)?;
+        Ok(())
+    }
+
+    /// Provision a **co-located** agent identity in THIS shared store: incept
+    /// its actor from its own seed so the plane knows it — the local analogue of
+    /// a joiner's self-inception arriving over Contact, but with no round trip —
+    /// then sponsor it with the default content grant. One store, one step; this
+    /// is what makes "sponsor once, then it works" true for an agent on the same
+    /// machine (Architecture B). Idempotent: re-provisioning a known, sponsored
+    /// agent returns its actor. Returns the agent's actor id.
+    pub fn provision_agent(&self, agent_seed: &[u8; 32]) -> Result<ActorId> {
+        let agent_device = crypto::device_from_seed(agent_seed);
+        // 1. Incept into the shared actor plane if not already known. The
+        //    inception is self-signed (it proves key ownership); it establishes
+        //    that the actor *exists*, never that it has standing — standing is
+        //    the separate sponsorship below.
+        {
+            let mut inner = self.lock();
+            if inner.actor_plane().actor_of_device(&agent_device).is_none() {
+                let (inception, _actor) = actor::incept_single(
+                    agent_seed,
+                    &inner.space,
+                    super::rand16(),
+                    super::rand16(),
+                    None,
+                );
+                inner
+                    .ledger
+                    .commit_batch(&[LedgerEffect::Actor(inception).encode()], &[])
+                    .map_err(|e| anyhow!("agent inception: {e}"))?;
+            }
+        }
+        // 2. Sponsor with the default content grant. `agent_add` refuses an
+        //    existing principal, which for re-provisioning means "already done".
+        match self.agent_add(&agent_device.to_string()) {
+            Ok(actor) => Ok(actor),
+            Err(e) if e.to_string().contains("already a principal") => self
+                .actor_of_device(&agent_device)
+                .ok_or_else(|| anyhow!("agent inception vanished")),
+            Err(e) => Err(e),
+        }
     }
 
     /// The authority records this Station serves in a Contact (the export

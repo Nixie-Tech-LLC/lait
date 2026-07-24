@@ -529,11 +529,25 @@ impl SignedCoordinates {
         s
     }
 
-    /// Parse the base32 link body into canonical Coordinates.
+    /// Parse a Coordinates link into canonical Coordinates. Accepts both the
+    /// advertised `lait://join/<ticket>` form and the bare base32 ticket, and
+    /// tolerates interior whitespace (terminal line-wrap in a copied link) —
+    /// the base32 alphabet contains none, so stripping it is unambiguous.
     pub fn parse_link(link: &str) -> Result<Self, CoordinatesError> {
-        let upper = link.to_ascii_uppercase();
+        let mut body = link.trim();
+        for scheme in ["lait://join/", "lait://"] {
+            if body.len() >= scheme.len() && body[..scheme.len()].eq_ignore_ascii_case(scheme) {
+                body = &body[scheme.len()..];
+                break;
+            }
+        }
+        let compact: String = body
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .to_ascii_uppercase();
         let bytes = data_encoding::BASE32_NOPAD
-            .decode(upper.as_bytes())
+            .decode(compact.as_bytes())
             .map_err(|_| CoordinatesError::BadLink)?;
         Self::decode_canonical(&bytes)
     }

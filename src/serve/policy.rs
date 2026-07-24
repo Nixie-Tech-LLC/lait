@@ -36,12 +36,20 @@ pub fn is_read(req: &Request) -> bool {
         | Request::Status
         | Request::Diagnose { .. }
         | Request::Id
+        | Request::Whoami
         | Request::SeedList
         | Request::Log { .. }
         | Request::Who
         | Request::RoleList
         | Request::RoleShow { .. }
         | Request::AccessList { .. }
+        | Request::ProjectUpdates { .. }
+        | Request::MilestoneList { .. }
+        | Request::CycleList { .. }
+        | Request::InitiativeList
+        | Request::TeamList
+        | Request::TriageList
+        | Request::AttachmentGet { .. }
         | Request::WorkflowShow { .. }
         | Request::WorkflowValidate { .. }
         | Request::Hello { .. } => true,
@@ -56,21 +64,42 @@ pub fn is_read(req: &Request) -> bool {
         | Request::Assign { .. }
         | Request::Label { .. }
         | Request::Comment { .. }
+        | Request::React { .. }
         | Request::IssueDelete { .. }
         | Request::IssueRestore { .. }
         | Request::IssueLink { .. }
         | Request::IssueUnlink { .. }
         | Request::IssueParent { .. }
         | Request::AgentAdd { .. }
+        | Request::AgentProvision { .. }
         | Request::IssueStart { .. }
         | Request::IssueDone { .. }
         | Request::IssueStop { .. }
         // …the registries…
         | Request::ProjectNew { .. }
+        | Request::ProjectEdit { .. }
+        | Request::ProjectUpdatePost { .. }
+        | Request::ProjectDelete { .. }
+        | Request::Follow { .. }
+        | Request::MilestoneSet { .. }
+        | Request::IssueMilestone { .. }
+        | Request::CycleSet { .. }
+        | Request::IssueCycle { .. }
+        | Request::InitiativeSet { .. }
+        | Request::TeamSet { .. }
+        | Request::TriageSubmit { .. }
+        | Request::TriageDecide { .. }
+        | Request::Attach { .. }
+        | Request::Detach { .. }
         | Request::LabelNew { .. }
+        | Request::LabelEdit { .. }
+        | Request::LabelDelete { .. }
+        | Request::SpaceRename { .. }
+        | Request::SpaceDescribe { .. }
         // …the ACL, every op of which is signed by whoever's daemon runs it…
         | Request::MemberAdd { .. }
         | Request::MemberRemove { .. }
+        | Request::MemberSetRole { .. }
         | Request::MemberAlias { .. }
         | Request::KeyRotate
         | Request::InviteRevoke { .. }
@@ -91,6 +120,8 @@ pub fn is_read(req: &Request) -> bool {
         | Request::Invite { .. }
         | Request::Join { .. }
         | Request::Connect { .. }
+        // …sync drives convergence on the wire (like connect), not a read…
+        | Request::Sync
         | Request::SeedAdd { .. }
         | Request::SeedRemove { .. }
         // …role/access/workflow authoring mutates replicated policy…
@@ -101,6 +132,8 @@ pub fn is_read(req: &Request) -> bool {
         | Request::AccessGrant { .. }
         | Request::AccessRevoke { .. }
         | Request::WorkflowSet { .. }
+        // …implementation activation is a signed ACL write…
+        | Request::WorldUpgrade
         // …and node control.
         | Request::ConfigReload
         | Request::Stop => false,

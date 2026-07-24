@@ -203,6 +203,13 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+# A zero-wiring test entrypoint: a `#[cfg(test)] #[ctor]` scrubs ambient `LAIT_*`
+# env at unit-test process load, *before* any test runs, so a developer's
+# inherited `$LAIT_HOME`/`$LAIT_STORE` can never silently redirect store/identity
+# resolution mid-test (it broke `config::tests::discovery_never_creates_but_init
+# _path_does` exactly this way). Tests that *want* those vars set them explicitly
+# afterward (serialized by `ENV_LOCK`). Pulls only syn/quote, already in the tree.
+ctor = "0.2"
 # `tests/daemon_mem.rs` implements the transport factory to hand the daemon an
 # in-memory network. Production code composes the seam; only tests build one.
 async-trait = "0.1"

@@ -28,6 +28,9 @@ pub const MAX_ROUTE_HINTS: usize = 8;
 pub const MAX_ROUTE_HINT_BYTES: usize = 1024;
 /// The receiver-local lease cap for a route hint (seconds).
 pub const ROUTE_HINT_LEASE_SECS: u64 = 60;
+/// Beacon flag bit: the emitting Station announces planned dormancy. Signed
+/// quiescence — a station that de-orbits announced, versus one presumed lost.
+pub const BEACON_FLAG_DORMANT: u8 = 1;
 
 /// A typed route hint. `scheme` names the address family/mechanism; `bytes` is
 /// its scheme-specific encoding. Advisory only.
@@ -49,6 +52,9 @@ pub struct BeaconBody {
     /// summary), carried opaquely at this layer.
     pub frontier_root: [u8; 32],
     pub frontier_count: u64,
+    /// Signed announcement bits ([`BEACON_FLAG_DORMANT`]); unknown bits are
+    /// tolerated (advisory news, never authority).
+    pub flags: u8,
     pub routes: Vec<RouteHint>,
 }
 
@@ -103,6 +109,7 @@ impl SignedBeacon {
         sequence: u64,
         frontier_root: [u8; 32],
         frontier_count: u64,
+        flags: u8,
         routes: Vec<RouteHint>,
         station_seed: &[u8; 32],
     ) -> Option<Self> {
@@ -115,6 +122,7 @@ impl SignedBeacon {
             sequence,
             frontier_root,
             frontier_count,
+            flags,
             routes,
         };
         let signature = mechanics::crypto::sign_detached(station_seed, &Self::preimage(&body));
@@ -187,6 +195,7 @@ impl SignedBeacon {
             sequence: self.body.sequence,
             frontier_root: self.body.frontier_root,
             frontier_count: self.body.frontier_count,
+            flags: self.body.flags,
             routes: self.body.routes.clone(),
         })
     }
@@ -204,6 +213,7 @@ pub struct VerifiedBeacon {
     sequence: u64,
     frontier_root: [u8; 32],
     frontier_count: u64,
+    flags: u8,
     routes: Vec<RouteHint>,
 }
 
@@ -225,5 +235,9 @@ impl VerifiedBeacon {
     /// The verified route hints (advisory).
     pub fn routes(&self) -> &[RouteHint] {
         &self.routes
+    }
+    /// Whether the emitter announced planned dormancy (signed quiescence).
+    pub fn dormant(&self) -> bool {
+        self.flags & BEACON_FLAG_DORMANT != 0
     }
 }

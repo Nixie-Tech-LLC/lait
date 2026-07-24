@@ -4,6 +4,14 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="dark light" />
+    <script>
+      try {
+        const theme = localStorage.getItem("lait.theme");
+        if (theme === "light" || theme === "dark") document.documentElement.dataset.theme = theme;
+        const density = localStorage.getItem("lait.density");
+        if (density === "comfortable") document.documentElement.dataset.density = density;
+      } catch {}
+    </script>
     <title>lait</title>
   </head>
   <body>

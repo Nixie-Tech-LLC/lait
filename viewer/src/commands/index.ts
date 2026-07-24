@@ -36,6 +36,14 @@ export const coreCommands = contribute({
       run: (c) => c.app.toggleShortcuts(),
     },
     {
+      id: "search.issues",
+      title: "Search issues",
+      group: "General",
+      keys: ["q"],
+      when: (c) => !c.overlay && hasSpace(c),
+      run: (c) => c.app.openIssueSearch(),
+    },
+    {
       id: "view.refresh",
       title: "Refresh",
       group: "General",
@@ -43,6 +51,18 @@ export const coreCommands = contribute({
       when: (c) => !c.overlay,
       run: (c) => c.app.refresh(),
     },
+    ...(
+      [
+        ["system", "Use system theme"],
+        ["light", "Use light theme"],
+        ["dark", "Use dark theme"],
+      ] as const
+    ).map(([theme, title]) => ({
+      id: `appearance.${theme}`,
+      title,
+      group: "Appearance",
+      run: (c: Ctx) => c.app.setTheme(theme),
+    })),
     {
       id: "overlay.close",
       title: "Close",
@@ -60,9 +80,9 @@ export const coreCommands = contribute({
       [
         ["list", "l", "Issues"],
         ["board", "b", "Board"],
+        ["projects", "p", "Projects"],
         ["inbox", "i", "Inbox"],
         ["activity", "a", "Activity"],
-        ["members", "m", "Members"],
       ] as const
     ).map(([view, key, title]) => ({
       id: `go.${view}`,
@@ -80,6 +100,15 @@ export const coreCommands = contribute({
       keys: ["/"],
       when: (c) => !c.overlay && hasSpace(c) && (c.view === "list" || c.view === "board"),
       run: (c) => c.app.openFilter(),
+    },
+    {
+      id: "view.display",
+      title: "Display options",
+      group: "View",
+      // Linear's binding: shift+v arrives as the character "V".
+      keys: ["V"],
+      when: (c) => !c.overlay && hasSpace(c) && (c.view === "list" || c.view === "board"),
+      run: (c) => c.app.openDisplay(),
     },
 
     // ---- motion -----------------------------------------------------------
@@ -127,6 +156,54 @@ export const coreCommands = contribute({
       // and the engine will ask its own question anyway (409 confirm_required).
       when: (c) => !c.overlay && canWrite(c) && hasSelection(c),
       run: (c) => c.selection && c.app.deleteIssue(c.selection),
+    },
+    {
+      id: "issue.restore",
+      title: "Restore deleted issue",
+      group: "Issues",
+      // Palette-only, like delete: restoring the wrong issue is recoverable but
+      // still a write the history keeps.
+      when: (c) => !c.overlay && canWrite(c) && hasSelection(c),
+      run: (c) => c.selection && c.app.restoreIssue(c.selection),
+    },
+    {
+      id: "issue.assign.me",
+      title: "Assign to me / put down",
+      group: "Issues",
+      keys: ["i"],
+      when: (c) => !c.overlay && canWrite(c) && hasSelection(c),
+      run: (c) => c.app.assignMe(),
+    },
+
+    // ---- bulk selection ----------------------------------------------------
+    // `x` is Linear's grammar. The checks are a *set* beside the focus, so every
+    // bulk verb is the same per-issue Request the single-issue path sends — the
+    // bar in App.tsx multiplies verbs, it never invents one.
+    {
+      id: "select.toggle",
+      title: "Select issue",
+      group: "Selection",
+      keys: ["x"],
+      when: (c) => !c.overlay && canWrite(c) && hasSelection(c),
+      run: (c) => c.app.toggleCheck(),
+    },
+    {
+      id: "select.all",
+      title: "Select all issues",
+      group: "Selection",
+      keys: ["mod+a"],
+      when: (c) => !c.overlay && canWrite(c) && (c.view === "list" || c.view === "board"),
+      run: (c) => c.app.checkAll(),
+    },
+    {
+      id: "select.clear",
+      title: "Clear selection",
+      group: "Selection",
+      keys: ["esc"],
+      // Esc means "close the overlay" first; only with no overlay and checks
+      // outstanding does it mean "drop the checks".
+      when: (c) => !c.overlay && c.checkedCount > 0,
+      run: (c) => c.app.clearChecks(),
     },
 
     // ---- quick-action pickers ----------------------------------------------
@@ -188,6 +265,24 @@ export const coreCommands = contribute({
       when: (c) => !c.overlay && canWrite(c) && hasSelection(c),
       run: (c) => c.app.reorder(1),
     },
+    // Column extremes — Linear's alt+shift+arrows, same refusal in Done columns
+    // as `reorder` (the column isn't drawn from the movable list there).
+    {
+      id: "issue.move.top",
+      title: "Move issue to top",
+      group: "Issues",
+      keys: ["alt+shift+up"],
+      when: (c) => !c.overlay && canWrite(c) && hasSelection(c),
+      run: (c) => c.app.moveTo("top"),
+    },
+    {
+      id: "issue.move.bottom",
+      title: "Move issue to bottom",
+      group: "Issues",
+      keys: ["alt+shift+down"],
+      when: (c) => !c.overlay && canWrite(c) && hasSelection(c),
+      run: (c) => c.app.moveTo("bottom"),
+    },
     {
       id: "issue.status.prev",
       title: "Move issue to previous status",
@@ -224,6 +319,25 @@ export const coreCommands = contribute({
       // in it is named after; it is not a keystroke-frequency action.
       when: (c) => !c.overlay && canWrite(c),
       run: (c) => c.app.createProject(),
+    },
+
+    // ---- governance (read-only viewers) ------------------------------------
+    // Palette-only: consulting a rule is not a keystroke-frequency action, but
+    // it is the answer to "why was my status change refused" and has to be
+    // reachable without the CLI.
+    {
+      id: "workflow.view",
+      title: "View workflow & transition gates",
+      group: "Space",
+      when: (c) => !c.overlay && hasSpace(c),
+      run: (c) => c.app.openWorkflow(),
+    },
+    {
+      id: "roles.view",
+      title: "View roles & capabilities",
+      group: "Space",
+      when: (c) => !c.overlay && hasSpace(c),
+      run: (c) => c.app.openRoles(),
     },
   ],
 });

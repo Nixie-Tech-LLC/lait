@@ -1,163 +1,236 @@
 # Architecture
 
-This document describes the current implementation boundaries of lait. Product
-behavior starts in [`README.md`](./README.md) and [`UI.md`](./UI.md). Storage and
-wire invariants are defined by the data and protocol contracts.
+This document defines LAIT's current architectural boundaries, ownership model,
+and trust relationships. It describes the orbital architecture merged in PR 64.
+Historical node, Git-store, document-wrapper, ticket, and flat-grant designs are
+not part of the current system.
 
-## System shape
+## 1. LAIT in one view
 
-lait is a local-first issue tracker. Every participating device keeps a local
-replica; peers exchange signed authority state and encrypted collaborative state
-over iroh. Git is a local durability and inspection mechanism, never the sync
-transport or a shared source of truth.
+LAIT is a local-first collaboration substrate with an issue tracker shipped as
+its canonical first World. A Space is the cryptographic and replication
+boundary. Each device keeps its own durable participation and can activate it
+without a central server.
 
 ```text
-CLI ───────┐
-Web ───────┼─ local control protocol ─ daemon ─ lait-net ─ peer daemon
-MCP ───────┘                          │
-                                      ├─ Loro documents
-                                      ├─ signed authority planes
-                                      └─ local Git-backed store
+Space
+  └─ local participation
+       ├─ dormant: Orbit
+       └─ active: Station
+            ├─ Mechanics
+            ├─ Replica
+            │    └─ Fabric
+            ├─ Neighbor registry and Contact
+            ├─ hosted Worlds
+            └─ docked Sessions
 ```
 
-The daemon is the only process that owns live documents. Clients send typed
-intents and receive versioned projections. A streaming subscription carries
-dirty notifications, not state; clients re-read the affected projection.
+An Orbit is durable, inactive participation in one Space. `Orbit::activate`
+consumes it and produces the Station, the exclusive live owner. Dormancy drains
+the Station and returns the participation to an Orbit. There is never a second
+live daemon, Replica, or product store beside a Station.
 
-## Crate boundaries
+CLI, web, and MCP clients use one local control protocol. They do not open the
+store or CRDT engine. The daemon classifies each request to one terminal owner:
+lifecycle, Mechanics, Station, or the Issues World router.
 
-- `lait-kernel` contains pure identifiers, signatures, deterministic replay,
-  actor identity, membership, content authority, policy compilation, recovery,
-  custody, and cryptographic protocol logic. It does not own Loro documents or
-  network connections.
-- `lait-fabric` owns Loro containers, storage, history projection, and the
-  plaintext membership document that transports signed kernel events and sealed
-  key material.
-- `lait-net` owns the peer-to-peer seam — dialing, gossip rooms, framed streams —
-  and the network policy behind it. It is the only crate that names a concrete
-  network, so the transport is replaceable by a manifest change rather than a
-  daemon rewrite.
-- the application crate owns commands, the daemon, sync, configuration, local
-  secrets, projections, and product surfaces.
+## 2. Crate boundaries
 
-This boundary is intentional. The kernel determines **legitimacy** — identity,
-authority, custody, recovery, and which transitions are valid given signed
-history. The fabric maintains the **shared world** — documents, persistence,
-history, convergence, projection. They are separate crates because the
-dependency edge is a correctness boundary: convergence cannot confer legitimacy.
-Authority is a pure function of signed inputs; replication and persistence move
-those inputs but do not decide whether they are trusted. The two ship, test, and
-version together as lait's substrate.
+```text
+mechanics  signed Space authority, actors/devices, scoped policy,
+           admission, custody, recovery, and ceremony state
+journal    semantics-free immutable-object/manifest durability and recovery
+fabric     canonical collaborative Body engine and Fabric journal integration
+replica    Body transactions, protected material, Manifests, quotas,
+           validation, and convergence
+comms      transport, streams, discovery, gossip, and presence mechanisms
+runtime    Orbit/Station lifecycle, Contacts, Worlds, Sessions, observations
+lait       IssuesWorld and product/control adapters
+```
 
-`lait-net` is not a third pillar of that substrate. It is the replaceable
-mechanism by which independently held replicas exchange their material, sealed
-behind its own dependency edge for the same reason: a scaffold that moves bytes
-must not be able to decide what those bytes mean.
+Dependencies point inward through these boundaries. Product concepts such as
+issues, projects, comments, roles, and workflows belong only to `lait`.
+Mechanics does not interpret product roles. Fabric does not know authority,
+transport, or product meaning. Comms moves bytes but cannot legitimize them.
 
-## Identity
+Only Fabric names Loro. One collaborative Body maps to one Loro document, but
+Loro is an implementation detail behind the generic `Fabric` contract. Replica
+is the Body graph authority and is the only layer allowed to turn validated
+transactions into Fabric changes.
 
-A device has an ed25519 key represented by `DeviceId`. A person or agent is an
-`ActorId`, derived from the hash of an inception event. Actors are scoped to a
-space and therefore do not provide a global cross-space identifier.
+## 3. Mechanics and authority
 
-The actor plane is a signed, self-authorized hash DAG:
+Mechanics is the sole source of truth for:
 
-- `Incept` establishes the actor and its initial device set.
-- `AddDevice` binds a consenting device.
-- `RevokeDevice` removes a device; revocation wins over concurrent addition.
-- `Recover` uses a precommitted offline recovery key to reset the device set;
-  recovery supersedes concurrent device-authored events.
+- actors and their valid devices;
+- Space membership and admission;
+- scoped capability assignments and delegation;
+- historical authority frontiers and checkpoints;
+- active World implementation identities;
+- recovery configurations, custody, and explicit threshold ceremonies.
 
-Other authority planes resolve a signing device to its claimed actor at the
-actor-log frontier embedded in the signed operation. Current device membership
-is never substituted for this at-position check.
+Worlds select a canonical `AuthorizationDemand` for an operation. Mechanics
+evaluates it against signed history at the transaction's referenced authority
+frontier. A product role is provenance used while expanding assignments; it is
+never itself an effective grant.
 
-## Authority planes
+Authority evaluation is historical. A transaction validly authored before a
+later removal remains valid, while a currently authorized actor cannot validate
+a transaction from a frontier where it lacked authority.
 
-Lait has three distinct signed planes:
+Ordinary Space authority and ceremony traffic share one crash-safe Mechanics
+journal but remain distinct material classes:
 
-1. The actor plane determines which device keys may speak for an actor.
-2. The membership plane determines which actors belong to the space and which
-   grants they hold. `Admin` controls membership; `Write` controls content
-   mutation; an empty grant set is view-only.
-3. The content-authority plane carries authority-bearing content operations,
-   such as deletion and restoration, that must not be accepted as ordinary
-   unsigned CRDT values.
+- `SpaceAuthority` effects are terminal authority changes and may enter an
+  `AuthorityFrontier`.
+- `CeremonyMaterial` records sparse recovery, elevation, resharing, and custody
+  progress under a separate bounded cursor.
 
-Each plane is a grow-only set of signed, content-addressed events. Replicas
-converge by deterministic replay from the space genesis, rejecting invalid
-signatures, invalid ancestry, unresolved actor claims, and unauthorized actions.
-Loro transports the event sets but does not adjudicate them.
+Ceremony packets never enlarge ordinary authority frontiers. FROST is used only
+to produce explicit recovery/elevation/reshare authority, never for ordinary
+World transactions.
 
-## Collaborative data
+## 4. Replica, Fabric, and durability
 
-Issues and the catalog are Loro documents. Their merge rules are chosen per
-field: LWW registers, text CRDTs, present-key sets, immutable list entries, and
-movable-list ordering. The issue document is authoritative for issue content;
-catalog rows are replicated caches recomputed from it after local edits, imports,
-and load.
+A Replica owns the protected Body graph for one Space. Its durable root is a
+signed Manifest whose entries bind Body identities to their constituent signed
+transactions and protected payloads. Concurrent Body heads are preserved; a
+Manifest is an authenticated complete view, not a mutable cache index.
 
-Malformed stored records are not laundered into valid DTOs or silently dropped.
-Projection separates valid values from `CorruptRecord` diagnostics. This policy
-currently covers comment projection and must be extended to the remaining read
-sites listed in the roadmap.
+Local mutation follows one path:
 
-## Encryption and key epochs
+```text
+signed World action
+  -> Session pins authority frontier + Manifest root
+  -> World returns Body operations + demand
+  -> Runtime contains the operations
+  -> Mechanics authorizes and produces a bound receipt
+  -> Replica commits transaction and replacement Manifest
+  -> Fabric applies collaborative changes
+  -> durable acknowledgment
+  -> Observation publication
+```
 
-Collaborative payloads are encrypted with a space content key. Key epochs
-are signed, content-addressed records; concurrent rotations coexist and the
-active tip is selected deterministically. Ciphertext identifies its epoch so
-older held keys remain usable.
+The Manifest rename is the authoritative Body-plane commit point. The journal
+protocol reserves a monotonic sequence, stages immutable objects, records
+material readiness, atomically replaces the Manifest last, and then performs
+cleanup. Recovery exposes either the complete prior state or the complete new
+state. It never heuristically repairs partial data.
 
-Epoch keys are sealed to the device keys of current member actors. A key-holding
-peer can heal missing envelopes for current devices, allowing newly added or
-recovered devices to obtain access on later sync. Removing a member rotates the
-content key to fence future content.
+An acknowledged mutation is durable before it is observed. If the filesystem
+cannot determine whether the authoritative rename became durable, the operation
+returns `OutcomeUnknown`; the Station must reopen and must not blindly retry.
 
-Revocation is lazy. A removed or compromised device may retain content and keys
-it already possessed. Lait cannot claw back copied plaintext or old epoch keys.
+Fabric supplies generic collaborative primitives: registers, maps, stable-id
+lists, text, add-wins sets, counters, and atomic Bodies. Convergence of a
+primitive is not a product conflict policy. A World that chooses a register
+accepts its deterministic single-winner semantics. Causally significant product
+state should use explicit predecessor/revision structures when concurrent intent
+must remain visible.
 
-If an active epoch exists but a node lacks its key, the node must not emit
-locally available plaintext as a fallback. It serves no collaborative payload
-until it can encrypt under the active epoch.
+## 5. Worlds and Sessions
 
-## Networking
+A World is trusted in-process semantic code registered under an
+authority-approved `WorldImplementationId`. The id commits its descriptor,
+schemas, policy table, and artifact identity. Runtime verifies that exact
+implementation is active before any World callback or projection.
 
-Each device's iroh endpoint key is its `DeviceId`. Space identity comes
-from a `SpaceId` and genesis, not a display name. Tickets carry the space
-anchor, founder actor information, and optional invite authorization.
+A World receives only a bounded, Manifest-pinned view and immutable principal
+facts. It cannot access storage, Loro, transport, custody secrets, or authority
+mutation. It returns declared Body operations and a non-empty authorization
+demand. Runtime validates World/schema containment before committing anything.
 
-Signed gossip announces presence and changed heads. Direct QUIC protocols probe
-liveness and perform catalog-first synchronization. Membership state is imported
-before encrypted catalog and issue state so a newly authorized node can obtain
-the keys required to decrypt later frames.
+A Session binds a local identity to one World at an active Station. Queries and
+mutations are authorized independently. Query results are computed from one
+Manifest root and authority frontier; a derived cache must be keyed by that
+complete root. Cache entries are disposable and cannot become replicated truth.
 
-The exact compatibility contract is in [`PROTOCOL.md`](./PROTOCOL.md).
+Remote adoption never invokes World code. Replica verifies transaction
+structure, protected payload commitments, historical Mechanics receipts,
+parent-Manifest availability, quotas, and the authority-approved implementation
+identity. Nodes without a supported World or schema may retain and forward
+legitimate protected material opaquely.
 
-## Persistence and local state
+IssuesWorld (`com.lait.issues`) is the bundled reference World. It has no private
+architectural path unavailable to another conforming World.
 
-Each space has a store containing genesis, Loro snapshots, signed authority
-events, and sealed envelopes. Device secrets, actor recovery material, custody
-shares, petnames, configuration, the inbox, and space navigation are local
-machine state and are not synchronized as collaborative data.
+## 6. Communication model
 
-Secrets do touch local disk. The security boundary is that plaintext secrets are
-not committed to the synced Git repository or sent to an unauthorized peer.
+The communication layers have deliberately different semantics:
 
-## Security posture
+```text
+Coordinates         signed bootstrap locator and optional admission capability
+Beacon              signed, lossy news about reachability/change
+Neighbor presence   authenticated directed liveness
+Contact              bounded direct transfer transcript
+Convergence          validation and durable incorporation
+```
 
-The implementation uses established primitives but contains novel protocol and
-composition work. Actor replay, group access, DKG, resharing, recovery, and
-custody must be treated as unaudited until independent review says otherwise.
-The supported claims and explicit non-goals are in
-[`THREAT-MODEL.md`](./THREAT-MODEL.md).
+Gossip and presence improve discovery and convergence latency; they do not
+confer membership or authority. Any peer may announce only what its signed
+identity permits another node to verify independently.
 
-## Evolution rules
+Contact advertises a complete signed Manifest while transferring only material
+the initiator does not declare as held. The declaration is signed and bounded;
+a false declaration can starve only its claimant because adoption still
+requires complete-root validation. Contact framing receipts are not convergence
+receipts, and received bytes remain inert until Mechanics and Replica validate
+them.
 
-- Stored and wire formats are versioned; incompatible readers fail closed.
-- Signed domains and canonical encodings are protocol surface.
-- Authority checks are deterministic and position-aware.
-- New DTO fields are additive and defaultable where old clients must survive.
-- Historical designs belong in local notes or the changelog, not this document.
-- Exact APIs belong in source and rustdoc; this document owns boundaries and
-  invariants.
+Coordinates may provide direct iroh routes for the initial Contact. Relay and
+discovery configuration is guarded local deployment policy and is never
+accepted from an invite. Accepting valid Coordinates is the user approval for
+admission; redemption remains a verified Mechanics authority transition.
+
+## 7. IssuesWorld conflict ownership
+
+Fabric defines convergence mechanics; IssuesWorld defines issue semantics.
+
+- Scalar fields may deliberately use deterministic register semantics where a
+  single winner is acceptable.
+- Workflow status is causally significant. The canonical correction represents it by
+  predecessor-bound transition records; concurrent heads are a typed conflict
+  resolved by an authorized successor rather than silently delegated to LWW.
+- Comments that support replies, reactions, edits, or moderation are first-class
+  Bodies. Replies bind an immutable parent comment id, reactions are actor-keyed
+  add-wins membership, and editable text uses revision heads.
+- Durable semantic events are immutable records used for history and inbox
+  projection; engine oplogs are never a product history API.
+
+These are product-schema choices. They do not add issue-specific types to
+Fabric, Replica, Runtime, or Mechanics.
+
+The merged IssuesWorld still stores status in a register and comments in the
+Issue Body's event/list representation. Those converge, but they do not yet
+implement transition-head conflicts or first-class reply/reaction/edit semantics.
+This is a known IssuesWorld conformance gap, not a reason to change Fabric's
+baseline algebra.
+
+## 8. Security posture
+
+LAIT separates possession, convergence, and legitimacy:
+
+- Comms proves reachability and transports bounded bytes.
+- Protected Bodies provide confidentiality and content binding.
+- Replica proves structural completeness and durable graph membership.
+- Mechanics proves historical authority.
+- A pinned World implementation chooses product meaning and sufficient demand.
+
+Trusted native World code is not sandboxed or remotely attested. Cryptographic
+authorization cannot prevent a reviewed-but-malicious World implementation from
+selecting an insufficient demand; authority activation of the implementation id
+is therefore a trust decision.
+
+Body encryption, custody secrets, and device private keys are local secret
+material. Lazy revocation cannot erase plaintext or keys already copied by a
+removed device. Detailed claims and non-goals live in `THREAT-MODEL.md`.
+
+## 9. Evolution rules
+
+- Rust concepts use semantic names; versions live in encoded envelopes,
+  domains, ALPNs, schema metadata, and store markers.
+- Unknown signed, wire, or store versions fail closed.
+- Backward compatibility is explicit policy, never an accidental fallback.
+- Canonical encodings, domains, hashes, bounds, and tie-breaks are protocol.
+- Product conflict semantics belong to the World that selects the primitive.
+- Historical migration plans are not normative documentation.

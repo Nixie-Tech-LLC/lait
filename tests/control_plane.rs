@@ -101,6 +101,7 @@ fn seed_project_and_issue(rt: &tokio::runtime::Runtime, home: &Path) -> String {
         Request::ProjectNew {
             name: "Eng".into(),
             key: "ENG".into(),
+            color: None,
         },
     );
     assert!(
@@ -111,6 +112,8 @@ fn seed_project_and_issue(rt: &tokio::runtime::Runtime, home: &Path) -> String {
         rt,
         home,
         Request::IssueNew {
+            due: None,
+            estimate: None,
             title: "t1".into(),
             project: Some("ENG".into()),
             project_hint: None,
@@ -162,6 +165,8 @@ fn stale_since_after_restart_yields_reset() {
         let resp = request(
             &home,
             &Request::IssueEdit {
+                due: None,
+                estimate: None,
                 reff: reff.clone(),
                 title: None,
                 status: Some("in_progress".into()),
@@ -228,6 +233,8 @@ fn validate_then_commit_rings_no_doorbell() {
         let resp = request(
             &home,
             &Request::IssueEdit {
+                due: None,
+                estimate: None,
                 reff: reff.clone(),
                 title: None,
                 status: Some("definitely-not-a-status".into()),

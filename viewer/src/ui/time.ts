@@ -25,3 +25,40 @@ export function when(ts: number): string {
 
 /** Keys are 64 hex chars; nobody reads more than the head of one. */
 export const short = (key: string) => key.slice(0, 8);
+
+/**
+ * A due date's urgency, Linear's traffic-light reading: `overdue` (red) at or
+ * past the deadline, `soon` (orange) within a week, `later` (muted) beyond.
+ * One implementation so the list rows and the detail pane can never disagree
+ * about what counts as overdue.
+ */
+export function dueTone(ts: number): "overdue" | "soon" | "later" {
+  const now = Math.floor(Date.now() / 1000);
+  if (ts <= now) return "overdue";
+  if (ts - now <= 7 * 86_400) return "soon";
+  return "later";
+}
+
+/**
+ * A due date as a short calendar label (`Jul 30`, with year when not this year).
+ *
+ * Formatted in **UTC**, deliberately: the engine stores a due date as UTC
+ * midnight of the day the user named, so a local-time rendering would show
+ * "Jul 24" for a deadline typed as the 25th to everyone west of Greenwich —
+ * the label must agree with the date input beside it.
+ */
+export function dueLabel(ts: number): string {
+  const d = tsToDate(ts);
+  const sameYear = d.getUTCFullYear() === new Date().getUTCFullYear();
+  return d.toLocaleDateString(undefined, {
+    timeZone: "UTC",
+    month: "short",
+    day: "numeric",
+    ...(sameYear ? {} : { year: "numeric" }),
+  });
+}
+
+/** Unix seconds → the `YYYY-MM-DD` a date input (and the engine) speaks, UTC. */
+export function dueToInput(ts: number): string {
+  return tsToDate(ts).toISOString().slice(0, 10);
+}

@@ -52,6 +52,13 @@ describe("text filter", () => {
     expect(matchesText(row({ reff: "iss_x", title: "hi" }), "hi")).toBe(true);
     expect(matchesText(row({ reff: "iss_x", title: "hi" }), "ENG")).toBe(false);
   });
+
+  it("supports AND, OR, and negation without a server round trip", () => {
+    expect(matchesText(r, "login race")).toBe(true);
+    expect(matchesText(r, "login -race")).toBe(false);
+    expect(matchesText(r, "logout | ENG-12")).toBe(true);
+    expect(matchesText(r, "logout | settings")).toBe(false);
+  });
 });
 
 describe("what the daemon must answer", () => {

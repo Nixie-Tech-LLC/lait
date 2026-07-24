@@ -30,7 +30,7 @@ use std::time::{Duration, Instant, SystemTime};
 use mechanics::ids::{SpaceId, StationId};
 use replica::{AuthorityIncorporator, AuthoritySource, StagedContactMaterial};
 
-use crate::beacon::{RouteHint, SignedBeacon, BEACON_PROTOCOL};
+use crate::beacon::{RouteHint, SignedBeacon, BEACON_FLAG_DORMANT, BEACON_PROTOCOL};
 use crate::contact::{
     build_transfer_frames, AccepterEvent, AccepterValidator, ContactFrame, ContactHello,
     ContactHelloAck, ContactId, InitiatorReceiver, OutboundTransfer, Progress, ReceivedMaterial,
@@ -45,6 +45,15 @@ use crate::session::StationCore;
 
 /// The Contact scheduler's global in-flight bound.
 pub const MAX_CONTACTS_IN_FLIGHT: usize = 4;
+
+/// The decaying heartbeat's ceiling: under quiescence the floor backs off from
+/// `GossipOptions::beacon_interval` toward this (§4.1 emitter 5 — the
+/// staleness bound of last resort, nothing more).
+pub const BEACON_FLOOR_MAX: Duration = Duration::from_secs(300);
+
+/// The bounded quarantine for unadmitted Beacon emitters (W0-S2): hard cap,
+/// oldest-evicted, never persisted, never a route source.
+pub const MAX_QUARANTINE: usize = 64;
 
 /// Milliseconds since the unix epoch (receiver-local wall clock).
 pub(crate) fn now_ms() -> u64 {
@@ -76,7 +85,35 @@ pub struct GossipOptions {
     pub bootstrap: Vec<comms::PeerId>,
     /// The route hints this Station advertises in its Beacons.
     pub advertise: Vec<RouteHint>,
+    /// The heartbeat floor's starting interval. The interval is a floor, not
+    /// the design (§4.1): emission is edge-triggered on state change, greets
+    /// arriving swarm neighbors, and repairs on evidence; the floor only
+    /// bounds staleness and decays toward [`BEACON_FLOOR_MAX`] when quiet.
     pub beacon_interval: Duration,
+}
+
+/// Emission-model state shared between the gossip receiver task and the
+/// scheduler loop (both live on the driver's single-threaded LocalSet).
+#[derive(Default)]
+struct EmitState {
+    /// A swarm neighbor arrived — greet it with the current state vector
+    /// instead of leaving it deaf until the floor tick (§4.1 emitter 2).
+    greet: std::cell::Cell<bool>,
+    /// A received Beacon revealed staleness — answer after a randomized delay
+    /// unless an emission already flew (mDNS-style suppression, §4.1
+    /// emitter 3).
+    repair_at: std::cell::Cell<Option<Instant>>,
+    /// Unadmitted Beacon emitters: station key → last heard (ms). Bounded,
+    /// in-memory only; promotion happens implicitly when the station gains
+    /// standing and its next Beacon passes the fence.
+    quarantine: std::cell::RefCell<std::collections::BTreeMap<[u8; 32], u64>>,
+}
+
+/// A randomized 50–500 ms repair delay so simultaneous answerers spread out.
+fn repair_jitter() -> Duration {
+    let mut b = [0u8; 2];
+    let _ = getrandom::fill(&mut b);
+    Duration::from_millis(50 + (u16::from_le_bytes(b) % 450) as u64)
 }
 
 /// The comms configuration a Station activates with.
@@ -142,8 +179,12 @@ pub(crate) fn run_driver(ctx: DriverContext) {
 async fn drive(ctx: DriverContext) {
     let ctx = std::rc::Rc::new(ctx);
     let beacon_seq = std::rc::Rc::new(AtomicU64::new(0));
+    let emit_state = std::rc::Rc::new(EmitState::default());
 
-    // Gossip: subscribe, emit, ingest.
+    // Gossip: subscribe, emit, ingest. Every event kind is consumed —
+    // `Received` feeds the fence + registry; `NeighborUp`/`NeighborDown` are
+    // advisory reachability plus the transponder greet (never routes, never
+    // standing).
     let mut gossip_sender: Option<Box<dyn comms::GossipSender>> = None;
     if let Some(gossip) = &ctx.options.gossip {
         let topic = beacon_topic(&ctx.space);
@@ -155,13 +196,31 @@ async fn drive(ctx: DriverContext) {
         {
             gossip_sender = Some(sender);
             let ctx2 = ctx.clone();
+            let emit2 = emit_state.clone();
             tokio::task::spawn_local(async move {
                 while let Some(event) = receiver.next().await {
                     if ctx2.cancel.is_cancelled() {
                         break;
                     }
-                    if let comms::GossipEvent::Received { bytes, .. } = event {
-                        ingest_beacon(&ctx2, &bytes);
+                    match event {
+                        comms::GossipEvent::Received { bytes, .. } => {
+                            ingest_beacon(&ctx2, &emit2, &bytes)
+                        }
+                        comms::GossipEvent::NeighborUp(peer) => {
+                            emit2.greet.set(true);
+                            if let Some(station) = StationId::from_device(&peer) {
+                                let mut registry =
+                                    ctx2.registry.lock().unwrap_or_else(|p| p.into_inner());
+                                let _ = registry.note_swarm(&station, true, now_ms());
+                            }
+                        }
+                        comms::GossipEvent::NeighborDown(peer) => {
+                            if let Some(station) = StationId::from_device(&peer) {
+                                let mut registry =
+                                    ctx2.registry.lock().unwrap_or_else(|p| p.into_inner());
+                                let _ = registry.note_swarm(&station, false, now_ms());
+                            }
+                        }
                     }
                 }
             });
@@ -200,6 +259,15 @@ async fn drive(ctx: DriverContext) {
     let in_flight: std::rc::Rc<std::cell::RefCell<std::collections::BTreeSet<StationId>>> =
         Default::default();
     let mut last_beacon = Instant::now() - Duration::from_secs(3600);
+    // The state vector last carried by an emission; `None` forces the
+    // activation beacon on the first tick (§4.1 emitter 1).
+    let mut last_emitted: Option<([u8; 32], u64)> = None;
+    let mut floor = ctx
+        .options
+        .gossip
+        .as_ref()
+        .map(|g| g.beacon_interval)
+        .unwrap_or(Duration::from_secs(10));
     loop {
         if ctx.cancel.is_cancelled() {
             break;
@@ -207,7 +275,7 @@ async fn drive(ctx: DriverContext) {
         // Commands (administrative contacts + beacon ingestion).
         while let Ok(cmd) = ctx.commands.try_recv() {
             match cmd {
-                DriverCmd::Beacon(bytes) => ingest_beacon(&ctx, &bytes),
+                DriverCmd::Beacon(bytes) => ingest_beacon(&ctx, &emit_state, &bytes),
                 DriverCmd::Contact { station, reply } => {
                     if in_flight.borrow().contains(&station)
                         || in_flight.borrow().len() >= MAX_CONTACTS_IN_FLIGHT
@@ -229,12 +297,30 @@ async fn drive(ctx: DriverContext) {
                 }
             }
         }
-        // Periodic Beacon emission.
+        // Beacon emission per the §4.1 model: edge-triggered on a changed
+        // state vector (the 25 ms tick is the coalescing window), solicited
+        // greet on NeighborUp, reflexive repair after jitter, and the decaying
+        // floor as the staleness bound of last resort.
         if let (Some(sender), Some(gossip)) = (&gossip_sender, &ctx.options.gossip) {
-            if last_beacon.elapsed() >= gossip.beacon_interval {
+            let frontier = ctx.core.frontier();
+            let vector = (frontier.root, frontier.transaction_count);
+            let edge = last_emitted != Some(vector);
+            let greet = emit_state.greet.take();
+            let repair = emit_state
+                .repair_at
+                .get()
+                .is_some_and(|at| Instant::now() >= at);
+            let floor_due = last_beacon.elapsed() >= floor;
+            if edge || greet || repair || floor_due {
+                // The eager-push belt (W0-S3): a fresh local durable commit
+                // marks every known Neighbor pending, so loopback-scale
+                // convergence starts on this tick, not at the next floor.
+                if edge && last_emitted.is_some() {
+                    let mut registry = ctx.registry.lock().unwrap_or_else(|p| p.into_inner());
+                    let _ = registry.mark_all_pending(now_ms());
+                }
                 last_beacon = Instant::now();
                 let sequence = beacon_seq.fetch_add(1, Ordering::SeqCst) + 1;
-                let frontier = ctx.core.frontier();
                 if let Some(beacon) = SignedBeacon::emit(
                     BEACON_PROTOCOL,
                     &ctx.space,
@@ -242,12 +328,26 @@ async fn drive(ctx: DriverContext) {
                     sequence,
                     frontier.root,
                     frontier.transaction_count,
+                    0,
                     gossip.advertise.clone(),
                     &ctx.options.station_seed,
                 ) {
                     let _ = sender.broadcast(beacon.encode()).await;
                 }
+                last_emitted = Some(vector);
+                emit_state.repair_at.set(None);
+                // Activity resets the floor; a pure floor tick decays it.
+                floor = if edge || greet || repair {
+                    gossip.beacon_interval
+                } else {
+                    (floor * 2).min(BEACON_FLOOR_MAX)
+                };
             }
+        }
+        // Drain coalesced registry freshness writes.
+        {
+            let mut registry = ctx.registry.lock().unwrap_or_else(|p| p.into_inner());
+            let _ = registry.flush(now_ms());
         }
         // Scheduler: dial eligible Neighbors, fair order, bounded fan-out.
         let eligible = {
@@ -275,6 +375,30 @@ async fn drive(ctx: DriverContext) {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    // Signed quiescence (§4.1): announce planned dormancy so peers can tell a
+    // de-orbited station from a lost one, then drain the registry.
+    if let (Some(sender), Some(gossip)) = (&gossip_sender, &ctx.options.gossip) {
+        let sequence = beacon_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let frontier = ctx.core.frontier();
+        if let Some(beacon) = SignedBeacon::emit(
+            BEACON_PROTOCOL,
+            &ctx.space,
+            mechanics::ids::StationEpoch::from_u64(ctx.epoch),
+            sequence,
+            frontier.root,
+            frontier.transaction_count,
+            BEACON_FLAG_DORMANT,
+            gossip.advertise.clone(),
+            &ctx.options.station_seed,
+        ) {
+            let _ = tokio::time::timeout(Duration::from_secs(1), sender.broadcast(beacon.encode()))
+                .await;
+        }
+    }
+    {
+        let mut registry = ctx.registry.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = registry.flush_now(now_ms());
+    }
     ctx.options.transport.shutdown().await;
 }
 
@@ -285,7 +409,7 @@ fn beacon_topic(space: &SpaceId) -> comms::Topic {
     comms::Topic(*h.finalize().as_bytes())
 }
 
-fn ingest_beacon(ctx: &DriverContext, bytes: &[u8]) {
+fn ingest_beacon(ctx: &DriverContext, emit: &EmitState, bytes: &[u8]) {
     let Ok(signed) = SignedBeacon::decode_canonical(bytes) else {
         return;
     };
@@ -293,17 +417,46 @@ fn ingest_beacon(ctx: &DriverContext, bytes: &[u8]) {
         return;
     };
     // Never register ourselves.
-    if verified.station().key_bytes() == ctx.station_key {
+    let station_key = verified.station().key_bytes();
+    if station_key == ctx.station_key {
         return;
     }
+    // The eclipse fence (W0-S2): routes and durable registry state are
+    // accepted only from stations holding standing at our current authority
+    // frontier — a self-signed Beacon proves control of a key, not admission.
+    // Everything else sits in a bounded, in-memory quarantine until authority
+    // recognition (its next Beacon then passes this gate on its own).
+    let authority = (ctx.options.mechanics.frontier)();
+    let admitted = ctx
+        .options
+        .mechanics
+        .source
+        .signer_authorized(&station_key, &authority);
+    if !admitted {
+        let mut quarantine = emit.quarantine.borrow_mut();
+        if quarantine.len() >= MAX_QUARANTINE && !quarantine.contains_key(&station_key) {
+            if let Some(oldest) = quarantine
+                .iter()
+                .min_by_key(|(_, seen)| **seen)
+                .map(|(k, _)| *k)
+            {
+                quarantine.remove(&oldest);
+            }
+        }
+        quarantine.insert(station_key, now_ms());
+        return;
+    }
+    emit.quarantine.borrow_mut().remove(&station_key);
     // Teach the transport the advertised routes (scheme 1: UTF-8 socket addr).
-    for hint in verified.routes() {
-        if hint.scheme == 1 {
-            if let Ok(text) = std::str::from_utf8(&hint.bytes) {
-                if let Ok(addr) = text.parse() {
-                    ctx.options
-                        .transport
-                        .learn(verified.station().as_device(), &[addr]);
+    if !verified.dormant() {
+        for hint in verified.routes() {
+            if hint.scheme == 1 {
+                if let Ok(text) = std::str::from_utf8(&hint.bytes) {
+                    if let Ok(addr) = text.parse() {
+                        ctx.options
+                            .transport
+                            .learn(verified.station().as_device(), &[addr]);
+                    }
                 }
             }
         }
@@ -316,6 +469,16 @@ fn ingest_beacon(ctx: &DriverContext, bytes: &[u8]) {
         now_ms(),
         ctx.options.route_lease.as_millis() as u64,
     );
+    drop(registry);
+    // Reflexive repair (§4.1 emitter 3): a differing state vector means our
+    // answer may be the missing news — schedule one emission after jitter;
+    // any emission in the meantime suppresses it.
+    if !verified.dormant()
+        && verified.frontier() != (frontier.root, frontier.transaction_count)
+        && emit.repair_at.get().is_none()
+    {
+        emit.repair_at.set(Some(Instant::now() + repair_jitter()));
+    }
 }
 
 fn record_result(

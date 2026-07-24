@@ -1,11 +1,15 @@
 import { useState } from "react";
 import * as Popover from "@radix-ui/react-popover";
-import { cva, type VariantProps } from "class-variance-authority";
 import { Command } from "cmdk";
-import { Check, ChevronDown } from "lucide-react";
+import { Check, ChevronDown, Plus } from "lucide-react";
 
 import { cmdkFilter } from "../core/fuzzy";
-import { cn } from "./primitives";
+import {
+  cn,
+  controlTrigger,
+  type ControlTriggerVariant,
+  PopoverContent,
+} from "./primitives";
 
 /**
  * A pill that opens a searchable menu — the tracker's workhorse control.
@@ -36,25 +40,6 @@ import { cn } from "./primitives";
  * could not be driven from the registry.
  */
 
-/**
- * Two shapes, one behaviour.
- *
- * `pill` is a standalone control — the composer's row of choices, where each needs
- * its own edge to read as separate. `bare` is for a property list, where the `dt`
- * already names the field and five bordered pills stacked vertically would draw
- * five boxes around information that is already in a box. Chrome recedes; the
- * affordance arrives on hover.
- */
-const trigger = cva("flex items-center gap-1.5 text-sm", {
-  variants: {
-    variant: {
-      pill: "border-line hover:bg-hover data-[state=open]:bg-hover rounded-full border px-2 py-1",
-      bare: "hover:bg-hover data-[state=open]:bg-hover -mx-1 min-w-0 rounded px-1 py-0.5 text-left",
-    },
-  },
-  defaultVariants: { variant: "pill" },
-});
-
 export interface Option {
   id: string;
   label: string;
@@ -83,8 +68,23 @@ type Props = {
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
   emptyText?: string;
-} & Mode &
-  VariantProps<typeof trigger>;
+  /**
+   * Make the picker *creatable*: typing a name no option carries offers a
+   * "Create" row (Linear's on-the-fly labels). The daemon is the one that
+   * actually mints — this only forwards the typed name — so the row appears
+   * exactly when the query matches no existing label, not on every keystroke.
+   */
+  onCreate?: (text: string) => void;
+  /**
+   * The shape a colour swatch takes. Round is the default — a label, a status,
+   * a member colour. Projects are square everywhere else they are identified
+   * (sidebar, project cards, the header crumb), so their pickers say square too:
+   * one object, one glyph, whichever surface you meet it on.
+   */
+  swatchShape?: "dot" | "square";
+} & Mode & {
+  variant?: ControlTriggerVariant;
+};
 
 export function Combobox(props: Props) {
   const {
@@ -98,26 +98,30 @@ export function Combobox(props: Props) {
     onOpenChange,
     emptyText,
     variant,
+    onCreate,
+    swatchShape,
   } = props;
+  const swatch = cn("size-2 shrink-0", swatchShape === "square" ? "rounded-[3px]" : "rounded-full");
 
   // Open state is internal *and* overridable. A keybinding needs to force it open;
   // a single-select pick needs to close it. Both have to work, so the component owns
   // a copy and mirrors any controlled value over the top.
   const [internal, setInternal] = useState(false);
+  // The live query, held only so the create row can offer what was typed.
+  const [query, setQuery] = useState("");
   const isOpen = open ?? internal;
   const setOpen = (o: boolean) => {
     setInternal(o);
     onOpenChange?.(o);
+    if (!o) setQuery("");
   };
 
   const single = props.multi !== true ? props.value : null;
   const content = face ?? (
     <>
       {single?.icon}
-      {single?.swatch && (
-        <span className="size-2 shrink-0 rounded-full" style={{ background: single.swatch }} />
-      )}
-      <span className={cn(!single && "text-mute")}>{single?.label ?? placeholder ?? label}</span>
+      {single?.swatch && <span className={swatch} style={{ background: single.swatch }} />}
+      <span className={cn("min-w-0 truncate", !single && "text-mute")}>{single?.label ?? placeholder ?? label}</span>
     </>
   );
 
@@ -128,10 +132,8 @@ export function Combobox(props: Props) {
     return (
       <span
         className={cn(
-          "flex items-center gap-1.5 text-sm",
-          variant === "bare"
-            ? "text-dim px-1 py-0.5"
-            : "border-line text-dim rounded-full border px-2 py-1",
+          controlTrigger({ variant }),
+          "text-dim",
           className,
         )}
       >
@@ -145,7 +147,7 @@ export function Combobox(props: Props) {
 
   return (
     <Popover.Root open={isOpen} onOpenChange={setOpen}>
-      <Popover.Trigger aria-label={label} className={cn(trigger({ variant }), className)}>
+      <Popover.Trigger aria-label={label} className={cn(controlTrigger({ variant }), className)}>
         {content}
         {/* A bare trigger keeps its chevron hidden until hover: in a property list
             the value is the content and five permanent chevrons are five arrows
@@ -153,27 +155,29 @@ export function Combobox(props: Props) {
         <ChevronDown
           className={cn(
             "text-mute size-3 shrink-0",
-            variant === "bare" &&
+            variant === "property" &&
               "opacity-0 transition-opacity group-hover/prop:opacity-100 group-focus-within/prop:opacity-100",
           )}
         />
       </Popover.Trigger>
-      <Popover.Portal>
-        <Popover.Content
-          sideOffset={4}
-          align="start"
-          className="border-line-strong bg-raised shadow-overlay z-50 w-60 overflow-hidden rounded-lg border p-0"
-        >
+      <PopoverContent align="start" className="w-60 overflow-hidden p-0">
           <Command filter={cmdkFilter} loop>
             <Command.Input
               autoFocus
+              value={query}
+              onValueChange={setQuery}
               placeholder={`${label}…`}
               className="border-line placeholder:text-mute w-full border-b bg-transparent px-3 py-2 text-sm outline-none"
             />
             <Command.List className="max-h-64 overflow-y-auto p-1">
-              <Command.Empty className="text-mute px-2 py-3 text-center text-sm">
-                {emptyText ?? "No matches"}
-              </Command.Empty>
+              {/* The create row replaces "no matches" when creating is possible:
+                  an empty result with a dead end and an empty result with a way
+                  forward are different answers. */}
+              {!(onCreate && query.trim()) && (
+                <Command.Empty className="text-mute px-2 py-3 text-center text-sm">
+                  {emptyText ?? "No matches"}
+                </Command.Empty>
+              )}
               {options.map((o) => (
                 <Command.Item
                   key={o.id}
@@ -194,12 +198,10 @@ export function Combobox(props: Props) {
                       setOpen(false);
                     }
                   }}
-                  className="data-[selected=true]:bg-hover flex cursor-default items-center gap-2 rounded px-2 py-1 text-sm outline-none"
+                  className="data-[selected=true]:bg-active flex cursor-default items-center gap-2 rounded px-2 py-1 text-sm outline-none"
                 >
                   {o.icon}
-                  {o.swatch && (
-                    <span className="size-2 shrink-0 rounded-full" style={{ background: o.swatch }} />
-                  )}
+                  {o.swatch && <span className={swatch} style={{ background: o.swatch }} />}
                   <span className="min-w-0 flex-1 truncate">{o.label}</span>
                   {o.hint && <span className="text-mute shrink-0 font-mono text-2xs">{o.hint}</span>}
                   {/* Reserve the check's width always, or every row shifts sideways
@@ -209,10 +211,30 @@ export function Combobox(props: Props) {
                   </span>
                 </Command.Item>
               ))}
+              {onCreate &&
+                query.trim() &&
+                !options.some((o) => o.label.toLowerCase() === query.trim().toLowerCase()) && (
+                  <Command.Item
+                    // forceMount: this row must survive cmdk's filter — its whole
+                    // point is to show when nothing else matches the query.
+                    forceMount
+                    value={`create:${query.trim()}`}
+                    onSelect={() => {
+                      onCreate(query.trim());
+                      setQuery("");
+                      if (props.multi !== true) setOpen(false);
+                    }}
+                    className="data-[selected=true]:bg-active flex cursor-default items-center gap-2 rounded px-2 py-1 text-sm outline-none"
+                  >
+                    <Plus className="size-3 shrink-0" />
+                    <span className="min-w-0 flex-1 truncate">
+                      Create “{query.trim()}”
+                    </span>
+                  </Command.Item>
+                )}
             </Command.List>
           </Command>
-        </Popover.Content>
-      </Popover.Portal>
+      </PopoverContent>
     </Popover.Root>
   );
 }

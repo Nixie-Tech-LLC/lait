@@ -21,8 +21,8 @@ use rmcp::{
 use serde::Deserialize;
 
 use crate::{
-    cli::client,
-    control::{BoardPos, Filter, Request, Response},
+    cli::client_as,
+    control::{BoardPos, ErrorKind, Filter, Request, Response},
 };
 
 /// The replica command tags (`Request` serde `cmd` values) an agent must be able
@@ -108,6 +108,8 @@ pub const MCP_TOOL_NAMES: &[&str] = &[
     "join_room",
     "connect",
     "who",
+    "whoami",
+    "sync",
 ];
 
 // ---- tool argument schemas ----
@@ -132,6 +134,12 @@ pub struct IssueNewArgs {
     /// Optional body/description.
     #[serde(default)]
     pub body: Option<String>,
+    /// Due date: `YYYY-MM-DD` (UTC) or unix seconds.
+    #[serde(default)]
+    pub due: Option<String>,
+    /// Estimate points.
+    #[serde(default)]
+    pub estimate: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -159,6 +167,12 @@ pub struct IssueEditArgs {
     /// Replace the whole description buffer.
     #[serde(default)]
     pub description: Option<String>,
+    /// Due date: `YYYY-MM-DD` (UTC), unix seconds, or `none` to clear.
+    #[serde(default)]
+    pub due: Option<String>,
+    /// Estimate points, or `none` to clear.
+    #[serde(default)]
+    pub estimate: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -195,6 +209,20 @@ pub struct LabelArgs {
 pub struct CommentArgs {
     pub reff: String,
     pub body: String,
+    /// Reply to a comment (its `cmt_…` id from the issue view).
+    #[serde(default)]
+    pub reply_to: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReactArgs {
+    pub reff: String,
+    /// The target comment's id (`cmt_…`, from the issue view).
+    pub comment: String,
+    pub emoji: String,
+    /// Remove the reaction instead of adding it.
+    #[serde(default)]
+    pub remove: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -243,6 +271,9 @@ pub struct ProjectNewArgs {
     pub name: String,
     /// Short key (the `ENG` in `ENG-142`).
     pub key: String,
+    /// Catalog colour name or hex (default: blue).
+    #[serde(default)]
+    pub color: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -383,6 +414,12 @@ pub struct ConnectArgs {
 #[derive(Clone)]
 pub struct LaitMcp {
     home: PathBuf,
+    /// The local agent identity this server acts as (from `$LAIT_AGENT`), so
+    /// every tool call is signed and attributed to the *agent*, not the human
+    /// whose home hosts the daemon (Architecture B). `None` = the primary
+    /// identity, the pre-B behavior. The human sponsors the agent once
+    /// (`lait members agent --new <name>`); MCP attaches as it thereafter.
+    act_as: Option<String>,
     #[allow(dead_code)]
     tool_router: ToolRouter<LaitMcp>,
 }
@@ -408,20 +445,38 @@ fn parse_position(s: &str) -> Option<BoardPos> {
 #[tool_router]
 impl LaitMcp {
     pub fn new(home: PathBuf) -> Self {
+        // `$LAIT_AGENT` names the sponsored local agent identity this MCP server
+        // acts as, so its work is attributed to the agent (Architecture B). Unset
+        // → the primary identity (pre-B behavior).
+        let act_as = std::env::var("LAIT_AGENT").ok().filter(|s| !s.is_empty());
         Self {
             home,
+            act_as,
             tool_router: Self::tool_router(),
         }
     }
 
     /// Drive the daemon and return its `Response` as JSON text (the same
     /// versioned DTO the CLI `--json` emits).
+    ///
+    /// Failures are mapped to **typed, actionable** MCP errors rather than an
+    /// opaque `internal_error(blob)`: an authorization failure (`Denied`) — the
+    /// first wall a freshly-sponsored agent hits — becomes an `invalid_request`
+    /// carrying the daemon's actionable message (what standing is missing and
+    /// how to get it), a `NotFound` becomes an `invalid_request`, and only a
+    /// genuine internal/transport failure stays `internal_error`. The daemon's
+    /// message already names the next step; MCP just preserves the typing so the
+    /// agent isn't told "internal error" for something it can act on.
     async fn run(&self, req: Request) -> Result<CallToolResult, McpError> {
-        match client(&self.home, req).await {
+        match client_as(&self.home, req, self.act_as.as_deref()).await {
+            Ok(Response::Error {
+                message,
+                error_kind,
+            }) => Err(match error_kind {
+                ErrorKind::Denied | ErrorKind::NotFound => McpError::invalid_request(message, None),
+                ErrorKind::Error => McpError::internal_error(message, None),
+            }),
             Ok(resp) => {
-                if let Response::Error { message, .. } = &resp {
-                    return Err(McpError::internal_error(message.clone(), None));
-                }
                 let json = serde_json::to_string(&resp)
                     .unwrap_or_else(|_| "{\"kind\":\"ok\"}".to_string());
                 Ok(CallToolResult::success(vec![Content::text(json)]))
@@ -447,6 +502,8 @@ impl LaitMcp {
             priority: a.priority,
             labels: a.labels,
             body: a.body,
+            due: a.due,
+            estimate: a.estimate,
         })
         .await
     }
@@ -506,6 +563,8 @@ impl LaitMcp {
             status: a.status,
             priority: a.priority,
             description: a.description,
+            due: a.due,
+            estimate: a.estimate,
         })
         .await
     }
@@ -557,6 +616,24 @@ impl LaitMcp {
         self.run(Request::Comment {
             reff: a.reff,
             body: a.body,
+            reply_to: a.reply_to,
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Toggle an emoji reaction on a comment (comment ids come from the \
+                       issue view). Writes no history event."
+    )]
+    async fn react(
+        &self,
+        Parameters(a): Parameters<ReactArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::React {
+            reff: a.reff,
+            comment: a.comment,
+            emoji: a.emoji,
+            on: !a.remove,
         })
         .await
     }
@@ -683,6 +760,7 @@ impl LaitMcp {
         self.run(Request::ProjectNew {
             name: a.name,
             key: a.key,
+            color: a.color,
         })
         .await
     }
@@ -982,6 +1060,26 @@ impl LaitMcp {
     async fn who(&self) -> Result<CallToolResult, McpError> {
         self.run(Request::Who).await
     }
+
+    #[tool(
+        description = "Who am I here? Your actor id, did:key, role, capabilities, sponsor, \
+                       space, and whether your view is complete — in one shot. Call this \
+                       first: it tells you if you are a member (attach) or need sponsoring, \
+                       and whether it is safe to author (partial_view must be false)."
+    )]
+    async fn whoami(&self) -> Result<CallToolResult, McpError> {
+        self.run(Request::Whoami).await
+    }
+
+    #[tool(
+        description = "Converge now and report whether your view is complete. Call before \
+                       acting on a 'close what's done' style request: it names any missing \
+                       epoch key loudly, and the daemon refuses to let you author against a \
+                       known-partial view."
+    )]
+    async fn sync(&self) -> Result<CallToolResult, McpError> {
+        self.run(Request::Sync).await
+    }
 }
 
 #[tool_handler]
@@ -991,12 +1089,21 @@ impl ServerHandler for LaitMcp {
             .with_server_info(Implementation::from_build_env())
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions(
-                "A local-first, peer-to-peer issue tracker. File and drive issues natively: \
-                 create with issue_new, edit with issue_edit, move/assign/label/comment, read \
-                 with list/board/issue_view, and follow work with activity. Refs are a short \
-                 iss_ handle or a KEY-n alias (ENG-142); @me is you. Onboarding across nodes is \
-                 one step: the host calls invite_ticket and shares it; the other side calls \
-                 connect. Every tool returns the same versioned JSON DTO the CLI --json emits."
+                "A local-first, peer-to-peer issue tracker. You are a member of this space \
+                 with your OWN identity — you do not rebuild or re-join per session; you \
+                 attach. Start by calling whoami: it reports who you are (your actor + \
+                 did:key), your role and capabilities, who sponsors you, and the space. If \
+                 whoami shows you are not yet a member, a human runs `lait agent add <your \
+                 device key>` once to sponsor you — then you hold write access and act as \
+                 yourself (your work is attributed to you, not the human). Do NOT treat \
+                 onboarding as invite→connect; that is the peer-JOIN flow for a new node, \
+                 not for you. File and drive issues natively: create with issue_new, edit \
+                 with issue_edit, move/assign/label/comment, read with list/board/issue_view, \
+                 follow work with activity. Refs are a short iss_ handle or a KEY-n alias \
+                 (ENG-142); @me is you. Before acting on a 'close what's done' style request, \
+                 call sync — it converges and refuses to let you author against a known-partial \
+                 view. Every tool returns the same versioned JSON DTO the CLI --json emits; \
+                 a denied action tells you exactly what standing you lack and how to get it."
                     .to_string(),
             )
     }

@@ -50,26 +50,53 @@ export interface FilterState {
   label: string | null;
   /** Status ids to show. Empty means all — see the module note. Client-side. */
   status: readonly string[];
+  /** Priorities to show. Empty means all. Client-side, like `status`: the row
+   *  already carries the priority the daemon put there, so matching re-derives
+   *  nothing. */
+  priority: readonly string[];
+  /** Assignee keys to show (rows assigned to ANY selected key). Empty means all.
+   *  Client-side: the row carries its assignee keys, so this is a set membership
+   *  test, not the ACL question `mine` answers. */
+  assignees: readonly string[];
 }
 
-export const EMPTY_FILTER: FilterState = { text: "", mine: false, label: null, status: [] };
+export const EMPTY_FILTER: FilterState = {
+  text: "",
+  mine: false,
+  label: null,
+  status: [],
+  priority: [],
+  assignees: [],
+};
 
 /** Whether anything is narrowing the view. */
 export const isActive = (f: FilterState): boolean =>
-  f.text.trim() !== "" || f.mine || f.label !== null || f.status.length > 0;
+  f.text.trim() !== "" ||
+  f.mine ||
+  f.label !== null ||
+  f.status.length > 0 ||
+  f.priority.length > 0 ||
+  f.assignees.length > 0;
 
 /** Whether the daemon has to be asked — i.e. the parts we refuse to guess at. */
 export const needsServer = (f: FilterState): boolean => f.mine || f.label !== null;
 
-/** Case-insensitive match over the fields a human would type. */
+/**
+ * Case-insensitive expression over title/ref/alias.
+ * Whitespace is AND, `|` separates OR branches, and `-term` excludes a term.
+ */
 export function matchesText(row: Row, query: string): boolean {
   const q = query.trim().toLowerCase();
   if (!q) return true;
-  return (
-    row.title.toLowerCase().includes(q) ||
-    row.reff.toLowerCase().includes(q) ||
-    (row.key_alias?.toLowerCase().includes(q) ?? false)
-  );
+  const haystack = [row.title, row.reff, row.key_alias ?? ""].join(" ").toLowerCase();
+  return q.split("|").some((branch) => {
+    const terms = branch.trim().split(/\s+/).filter(Boolean);
+    return terms.length > 0 && terms.every((term) =>
+      term.startsWith("-") && term.length > 1
+        ? !haystack.includes(term.slice(1))
+        : haystack.includes(term),
+    );
+  });
 }
 
 /**
@@ -101,7 +128,11 @@ export function applyFilter(
       .map((c) => ({
         ...c,
         rows: c.rows.filter(
-          (r) => matchesText(r, f.text) && (allowed === null || allowed.has(r.doc_id)),
+          (r) =>
+            matchesText(r, f.text) &&
+            (allowed === null || allowed.has(r.doc_id)) &&
+            (f.priority.length === 0 || f.priority.includes(r.priority)) &&
+            (f.assignees.length === 0 || r.assignees.some((a) => f.assignees.includes(a))),
         ),
       })),
   };

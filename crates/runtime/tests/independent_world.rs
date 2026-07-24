@@ -669,6 +669,7 @@ fn beacons_contact_and_opaque_forwarding_across_three_stations() {
         1,
         [0xAB; 32], // a frontier C does not hold → newsworthy
         1,
+        0,
         vec![],
         &STATION_B_SEED,
     )
@@ -689,29 +690,111 @@ fn beacons_contact_and_opaque_forwarding_across_three_stations() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    // MemNet resolves peers by id, so no route hint is needed; but the
-    // registry demands an unexpired lease before dialing — drive the dial
-    // explicitly through the privileged Contact instead.
-    let outcome = station_c
-        .contact(
-            &StationId::from_device(&mechanics::crypto::device_from_seed(&STATION_B_SEED)).unwrap(),
-            ContactOptions,
-        )
-        .unwrap();
-    assert!(
-        outcome.convergence.accepted >= 1,
-        "C interprets what B could only forward byte-identically"
-    );
+    // A fresh verified Beacon renews the bare-id dial lease (W0), so C's
+    // scheduler pulls B on its own — the forwarded (opaque-at-B) material
+    // converges into C with no explicit dial at all.
     let session_c = station_c.dock(&world_id(), &writer()).unwrap();
-    assert_eq!(
-        query_json(&session_c, serde_json::json!({"q":"entry","k":"routed"})),
-        b"through-b"
-    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if query_json(&session_c, serde_json::json!({"q":"entry","k":"routed"})) == b"through-b" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "C never auto-converged the material B could only forward"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
 
     let _ = station_a.go_dormant();
     let _ = station_b.go_dormant();
     let _ = station_c.go_dormant();
     let _ = std::fs::remove_dir_all(&root_a);
     let _ = std::fs::remove_dir_all(&root_b);
+    let _ = std::fs::remove_dir_all(&root_c);
+}
+
+#[test]
+fn the_eclipse_fence_quarantines_unadmitted_beacon_emitters() {
+    // W0-S2: a validly SIGNED beacon from a station with no standing at our
+    // authority frontier must not create durable registry state or teach
+    // routes — a self-signed beacon proves control of a key, not admission.
+    let (_space, coords) = coordinates();
+    let net = comms::mem::MemNet::new();
+    let tc: Arc<dyn comms::Transport> =
+        Arc::new(net.peer(mechanics::crypto::device_from_seed(&STATION_C_SEED)));
+    let root_c = temp_root("fence-c");
+    let rt_c = Runtime::open(root_c.clone(), registry(true), authority(), test_keys());
+    let station_c = rt_c
+        .enter_orbit(&coords, EnterOptions)
+        .unwrap()
+        .activate(ActivationOptions {
+            drain_deadline: Duration::from_secs(5),
+            comms: Some(comms_options(tc, STATION_C_SEED)),
+            observation_capacity: 0,
+        })
+        .unwrap();
+
+    // A stranger key AnyKnownSigner does not authorize.
+    const STRANGER_SEED: [u8; 32] = [99u8; 32];
+    let stranger_beacon = runtime::SignedBeacon::emit(
+        runtime::beacon::BEACON_PROTOCOL,
+        station_c.space_id(),
+        station_c.epoch(),
+        1,
+        [0xCD; 32],
+        1,
+        0,
+        vec![],
+        &STRANGER_SEED,
+    )
+    .unwrap();
+    station_c.observe_beacon(&stranger_beacon.encode());
+
+    // Prove the ingestion pipeline is live with an ADMITTED emitter, then
+    // check the stranger stayed out — absence is meaningful, not a race.
+    let admitted_beacon = runtime::SignedBeacon::emit(
+        runtime::beacon::BEACON_PROTOCOL,
+        station_c.space_id(),
+        station_c.epoch(),
+        1,
+        [0xAB; 32],
+        1,
+        0,
+        vec![],
+        &STATION_B_SEED,
+    )
+    .unwrap();
+    station_c.observe_beacon(&admitted_beacon.encode());
+    let b_station =
+        StationId::from_device(&mechanics::crypto::device_from_seed(&STATION_B_SEED)).unwrap();
+    let stranger_station =
+        StationId::from_device(&mechanics::crypto::device_from_seed(&STRANGER_SEED)).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let neighbors = station_c.neighbors();
+        assert!(
+            !neighbors.iter().any(|n| n.station == stranger_station),
+            "an unadmitted emitter reached the durable registry"
+        );
+        if neighbors.iter().any(|n| n.station == b_station) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the admitted beacon never landed — the pipeline was not live"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // One more look after the admitted one landed: still fenced out.
+    assert!(
+        !station_c
+            .neighbors()
+            .iter()
+            .any(|n| n.station == stranger_station),
+        "the stranger appeared after the admitted beacon"
+    );
+
+    let _ = station_c.go_dormant();
     let _ = std::fs::remove_dir_all(&root_c);
 }

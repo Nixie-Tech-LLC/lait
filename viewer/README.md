@@ -25,6 +25,7 @@ It drives `../target/debug/lait` by default (then `release`, then `PATH`) — so
 | Env | Effect |
 |---|---|
 | `LAIT_BIN` | Path to the `lait` binary to run instead of the `target/` one. |
+| `LAIT_SPACE` | Space name, id, or path passed to `lait -w` (useful from a multi-space checkout). |
 | `LAIT_PORT` | Engine port (default `7717`). |
 | `LAIT_TOKEN` | **Skip spawning.** Use an engine you started yourself, with this token. |
 

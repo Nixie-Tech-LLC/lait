@@ -107,6 +107,38 @@ fn link_roundtrips() {
 }
 
 #[test]
+fn the_advertised_link_forms_all_parse() {
+    // GOV-8: `lait invite` advertises lait://join/<ticket>; join must accept
+    // exactly what invite prints — plus the bare ticket, terminal-wrapped
+    // copies (interior newlines), and mixed case.
+    let coords = valid_coordinates();
+    let ticket = coords.render();
+    let prefixed = format!("lait://join/{ticket}");
+    assert_eq!(SignedCoordinates::parse_link(&prefixed).unwrap(), coords);
+    assert_eq!(
+        SignedCoordinates::parse_link(&format!("LAIT://JOIN/{ticket}")).unwrap(),
+        coords
+    );
+    let wrapped: String = ticket
+        .as_bytes()
+        .chunks(64)
+        .map(|c| std::str::from_utf8(c).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        SignedCoordinates::parse_link(&format!("  lait://join/{wrapped}\n")).unwrap(),
+        coords
+    );
+    // Garbage still fails typed, not garbled.
+    assert_eq!(
+        SignedCoordinates::parse_link("lait://join/not!base32?"),
+        Err(CoordinatesError::BadLink)
+    );
+    // A truncated copy dies loudly rather than decoding to something else.
+    assert!(SignedCoordinates::parse_link(&ticket[..ticket.len() - 8]).is_err());
+}
+
+#[test]
 fn signing_is_deterministic() {
     // Ed25519 + fixed seeds → byte-stable Coordinates, a golden anchor.
     assert_eq!(valid_coordinates().encode(), valid_coordinates().encode());

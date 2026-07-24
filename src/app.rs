@@ -112,6 +112,31 @@ fn resolve_space_selector(sel: &str) -> Result<std::path::PathBuf> {
     }
 }
 
+/// A minimal extension→MIME map for attachments — enough for the common
+/// cases; anything else is an honest octet-stream.
+fn mime_for(name: &str) -> String {
+    let ext = name
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "txt" | "log" => "text/plain",
+        "md" => "text/markdown",
+        "json" => "application/json",
+        "csv" => "text/csv",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
 /// Parse arguments, run, and report any failure the way the CLI contract says.
 ///
 /// Returns the process exit code rather than a `Result`: handing an error back to
@@ -414,6 +439,91 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
             Special::Id => {
                 let seed = load_or_create_identity(&config::identity_dir()?)?;
                 crate::cli::emit_text(crate::crypto::device_from_seed(&seed).as_str(), out);
+                // The actor line (GOV-11): a pending joiner must be able to
+                // name their own actor to the approving admin, and the daemon
+                // resolves it from the actor plane even before admission.
+                // Best-effort: no running daemon, no line — the device id
+                // above stays the stable first line either way.
+                if !out.json {
+                    if let Ok(Response::Ok { message: Some(m) }) =
+                        crate::control::request(&home, &Request::Id).await
+                    {
+                        if let Some(actor_line) = m.lines().nth(1) {
+                            println!("{actor_line}");
+                        }
+                    }
+                }
+            }
+            Special::Attach => {
+                let reff = m.get_one::<String>("reff").cloned().unwrap_or_default();
+                let path = m.get_one::<String>("file").cloned().unwrap_or_default();
+                let bytes =
+                    std::fs::read(&path).map_err(|e| anyhow!("could not read {path}: {e}"))?;
+                if bytes.is_empty() {
+                    return Err(anyhow!("{path} is empty — nothing to attach"));
+                }
+                if bytes.len() > crate::world::contract::MAX_ATTACHMENT_BYTES {
+                    return Err(anyhow!(
+                        "{path} is {} KiB — attachments are capped at {} KiB (they ride \
+                         the issue's replicated document). Link large files instead.",
+                        bytes.len() / 1024,
+                        crate::world::contract::MAX_ATTACHMENT_BYTES / 1024
+                    ));
+                }
+                let name = std::path::Path::new(&path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone());
+                let mime = mime_for(&name);
+                let req = Request::Attach {
+                    reff,
+                    name,
+                    mime: Some(mime),
+                    data_b64: data_encoding::BASE64.encode(&bytes),
+                    comment: m.get_one::<String>("comment").cloned(),
+                };
+                crate::cli::run(&home, req, out).await?
+            }
+            Special::AttachmentGet => {
+                let reff = m.get_one::<String>("reff").cloned().unwrap_or_default();
+                let id = m.get_one::<String>("id").cloned().unwrap_or_default();
+                if reff.is_empty() || id.is_empty() {
+                    return Err(anyhow!(
+                        "usage: lait attachment get <reff> <att_id> [--out <path>]"
+                    ));
+                }
+                let resp = crate::cli::client(&home, Request::AttachmentGet { reff, id }).await?;
+                match resp {
+                    Response::Attachment {
+                        name,
+                        mime: _,
+                        data_b64,
+                    } => {
+                        let bytes = data_encoding::BASE64
+                            .decode(data_b64.as_bytes())
+                            .map_err(|_| anyhow!("stored attachment did not decode"))?;
+                        let dest = m
+                            .get_one::<String>("out")
+                            .cloned()
+                            .unwrap_or_else(|| name.clone());
+                        std::fs::write(&dest, &bytes)
+                            .map_err(|e| anyhow!("could not write {dest}: {e}"))?;
+                        if out.json {
+                            crate::cli::emit_ok(
+                                &format!("saved {} bytes to {dest}", bytes.len()),
+                                out,
+                            );
+                        } else {
+                            println!("saved {} bytes to {dest}", bytes.len());
+                        }
+                    }
+                    other => {
+                        let code = crate::cli::print_response(&other, out);
+                        if code != 0 {
+                            std::process::exit(code);
+                        }
+                    }
+                }
             }
             Special::Daemon => {
                 tracing_subscriber::fmt()
@@ -653,6 +763,22 @@ async fn run_join_orbital(m: &ArgMatches, link: &str, out: Out) -> Result<()> {
         config::store_dir_for_init(&cwd)?
     };
 
+    // A pre-orbital store at the resolved home is a wrong-directory signal for
+    // a JOINER, not a migration problem (LOCAL-10): a bare `lait join` lands
+    // wherever home resolution points (an unset LAIT_HOME turns it into the
+    // cwd), so name the aim and the ways to re-aim instead of dead-ending on
+    // clean-break guidance meant for the store's owner.
+    if let Some(err) = crate::orbital::unsupported_store_at(&target) {
+        eprintln!("{err}");
+        eprintln!(
+            "this join was aimed at {} — if that is not where you keep this space, \
+             set LAIT_HOME, pass --dir <path>, or cd elsewhere and retry. The old \
+             store there was not touched.",
+            target.display()
+        );
+        std::process::exit(2);
+    }
+
     // Refuse to re-bind a directory that already holds a different space.
     if crate::orbital::space_store_present(&target) {
         match crate::orbital::discover_space_id(&target) {
@@ -701,21 +827,49 @@ async fn run_join_orbital(m: &ArgMatches, link: &str, out: Out) -> Result<()> {
     if !out.json {
         println!("joining space {space} — reaching the inviter…");
     }
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let started = tokio::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(30);
     let mut admitted = false;
+    // Progress beats (GOV-9): a first-time joiner must be able to tell "slow
+    // handshake" from "hung forever" — say when the inviter answered, and keep
+    // a heartbeat with the last failure while they haven't.
+    let mut contacted = false;
+    let mut last_err: Option<String> = None;
+    let mut last_beat = started;
     while tokio::time::Instant::now() < deadline {
-        let _ = crate::control::request(
+        match crate::control::request(
             &target,
             &Request::Connect {
                 ticket: approach.clone(),
             },
         )
-        .await;
+        .await
+        {
+            Ok(Response::Ok { .. }) => {
+                if !contacted && !out.json {
+                    println!("· contacted the inviter — waiting for the admission to seal…");
+                }
+                contacted = true;
+            }
+            Ok(Response::Error { message, .. }) => last_err = Some(message),
+            _ => {}
+        }
         if let Ok(Response::Status(info)) = crate::control::request(&target, &Request::Status).await
         {
             if info.membership == "member" {
                 admitted = true;
                 break;
+            }
+        }
+        if !out.json && last_beat.elapsed() >= std::time::Duration::from_secs(8) {
+            last_beat = tokio::time::Instant::now();
+            let secs = started.elapsed().as_secs();
+            if contacted {
+                println!("· still waiting for the admission to seal… ({secs}s)");
+            } else if let Some(e) = &last_err {
+                println!("· still reaching the inviter ({secs}s) — last attempt: {e}");
+            } else {
+                println!("· still reaching the inviter… ({secs}s)");
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -761,9 +915,16 @@ async fn run_join_cli(m: &ArgMatches, out: Out) -> Result<()> {
              legacy space ticket from an older lait). Ask the inviter for a fresh \
              `lait invite` link."
         )),
+        Err(runtime::coordinates::CoordinatesError::BadLink) => Err(anyhow!(
+            "this invite does not decode as a lait Coordinates link: it contains \
+             characters outside the ticket alphabet. Both the lait://join/<ticket> \
+             form and the bare ticket work — the usual cause is a partial copy, so \
+             re-copy the whole link (line breaks are fine)."
+        )),
         Err(e) => Err(anyhow!(
-            "this invite could not be read as a lait Coordinates link ({e:?}). Ask the \
-             inviter for a fresh `lait invite` link."
+            "this invite could not be read as a lait Coordinates link ({e:?}). \
+             Re-copy the whole link; if it still fails, ask the inviter for a fresh \
+             `lait invite` link."
         )),
     }
 }

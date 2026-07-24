@@ -23,6 +23,7 @@ fn beacon(epoch: u64, sequence: u64, routes: Vec<RouteHint>) -> SignedBeacon {
         sequence,
         [1u8; 32],
         3,
+        0,
         routes,
         &STATION_SEED,
     )
@@ -140,6 +141,7 @@ fn an_unsupported_protocol_version_is_refused_not_negotiated() {
         StationEpoch::from_u64(1),
         0,
         [1u8; 32],
+        0,
         0,
         vec![],
         &STATION_SEED,

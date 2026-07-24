@@ -196,8 +196,8 @@ impl App {
             ttl_hours: None,
         };
         match request(&self.home, &req).await {
-            Ok(Response::Text { text }) => {
-                let token = text.trim().to_string();
+            Ok(Response::Ref { reff }) => {
+                let token = reff.trim().to_string();
                 let link = format!("lait://join/{token}");
                 self.status = Some(if crate::cli::copy_to_clipboard(&link) {
                     "invite link copied — single-use, auto-admit, expires in 7d".into()
@@ -558,6 +558,7 @@ mod tests {
             MemberDto {
                 key: format!("act_{}", "9f2a".repeat(16)),
                 role: "admin".to_string(),
+                did: None,
                 me: true,
                 sponsor: None,
                 alias: String::new(),
@@ -565,6 +566,7 @@ mod tests {
             MemberDto {
                 key: format!("act_{}", "3b7c".repeat(16)),
                 role: "member".to_string(),
+                did: None,
                 me: false,
                 sponsor: None,
                 alias: "carol".to_string(),

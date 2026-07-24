@@ -3,6 +3,8 @@ import { createRoot } from "react-dom/client";
 
 import { App } from "./App";
 import { contribute, registry } from "./core/registry";
+import { WorldViewStoreProvider } from "./core/worldViewReact";
+import { ProjectViewerStore, ProjectViewerStoreProvider } from "./projectStore";
 import "./styles.css";
 
 /**
@@ -33,9 +35,14 @@ window.lait = { contribute, registry };
 
 const root = document.getElementById("root");
 if (!root) throw new Error("#root missing from index.html");
+const projectStore = new ProjectViewerStore();
 
 createRoot(root).render(
   <StrictMode>
-    <App />
+    <WorldViewStoreProvider store={projectStore.resources}>
+      <ProjectViewerStoreProvider store={projectStore}>
+        <App />
+      </ProjectViewerStoreProvider>
+    </WorldViewStoreProvider>
   </StrictMode>,
 );

@@ -638,12 +638,27 @@ fn daemon_exited_error(status: std::process::ExitStatus, log_path: &Path) -> any
     }
 }
 
-/// Ensure the daemon is up, then send one request.
+/// Ensure the daemon is up, then send one request as the primary identity — or,
+/// if `$LAIT_AS` names a local agent, as that agent (the shell-scoped selector,
+/// e.g. `LAIT_AS=scout lait new "…"`). Architecture B's "act as" on the CLI.
 pub async fn client(home: &Path, req: Request) -> Result<Response> {
+    // `LAIT_AS` is the CLI's own selector; `LAIT_AGENT` is what the MCP surface
+    // uses (and what an agent's launch env sets). Honour either here so a single
+    // exported var attributes both CLI and MCP calls to the same agent.
+    let act_as = std::env::var("LAIT_AS")
+        .ok()
+        .or_else(|| std::env::var("LAIT_AGENT").ok())
+        .filter(|s| !s.is_empty());
+    client_as(home, req, act_as.as_deref()).await
+}
+
+/// Ensure the daemon is up, then send one request acting as `act_as` (a local
+/// agent name, or `None` for the primary human identity).
+pub async fn client_as(home: &Path, req: Request, act_as: Option<&str>) -> Result<Response> {
     ensure_daemon(home).await?;
     // The daemon answered the probe a moment ago, so a failure here is the
     // transport giving out mid-exchange: `3`, daemon unreachable.
-    request(home, &req)
+    crate::control::request_as(home, &req, act_as)
         .await
         .map_err(|e| CliError::unreachable(format!("{e:#}")).into())
 }
@@ -1196,6 +1211,24 @@ fn print_graph(g: &crate::dto::GraphView, out: Out) {
 }
 
 /// Print a response; return the process exit code it implies.
+/// Render unix seconds as the UTC `YYYY-MM-DD` day (the inverse of the
+/// router's `parse_due`; same civil-date arithmetic).
+fn fmt_day(ts: u64) -> String {
+    let days = (ts / 86_400) as i64;
+    // Howard Hinnant's civil-from-days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 pub fn print_response(resp: &Response, out: Out) -> i32 {
     if out.json {
         let json = serde_json::to_string(resp).unwrap_or_else(|_| "{}".into());
@@ -1315,6 +1348,113 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
             for p in projects {
                 println!("{:<6} {}  ({})", p.key, p.name, p.id);
             }
+            0
+        }
+        Response::Updates { updates } => {
+            if updates.is_empty() {
+                println!("(no updates yet — post one: `lait projects update KEY \"…\"`)");
+            }
+            for u in updates {
+                let health = if u.health.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", u.health.replace('_', " "))
+                };
+                println!("{}{health}  {}", u.ts, u.body);
+                let _ = &u.author;
+            }
+            0
+        }
+        Response::Milestones { milestones } => {
+            if milestones.is_empty() {
+                println!("(no milestones — add one: `lait milestone new KEY \"…\"`)");
+            }
+            for m in milestones {
+                let target = m
+                    .target_date
+                    .map(|t| format!("  → {}", fmt_day(t)))
+                    .unwrap_or_default();
+                println!("{:<24} {}/{}{target}  ({})", m.name, m.done, m.total, m.id);
+            }
+            0
+        }
+        Response::Cycles { cycles } => {
+            if cycles.is_empty() {
+                println!("(no cycles — add one: `lait cycle new KEY \"…\"`)");
+            }
+            for c in cycles {
+                let window = match (c.start, c.end) {
+                    (0, 0) => String::new(),
+                    (s, 0) => format!("  {} →", fmt_day(s)),
+                    (0, e) => format!("  → {}", fmt_day(e)),
+                    (s, e) => format!("  {} → {}", fmt_day(s), fmt_day(e)),
+                };
+                println!("{:<24} {}/{}{window}  ({})", c.name, c.done, c.total, c.id);
+            }
+            0
+        }
+        Response::Initiatives { initiatives } => {
+            if initiatives.is_empty() {
+                println!("(no initiatives — add one: `lait initiative new \"…\"`)");
+            }
+            for i in initiatives {
+                let health = if i.health.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", i.health.replace('_', " "))
+                };
+                let projects = if i.projects.is_empty() {
+                    "(no projects)".to_string()
+                } else {
+                    i.projects.join(", ")
+                };
+                println!(
+                    "{:<24} {}/{}{health}  {}  ({})",
+                    i.name, i.done, i.total, projects, i.id
+                );
+            }
+            0
+        }
+        Response::Teams { teams } => {
+            if teams.is_empty() {
+                println!("(no teams — add one: `lait team new \"…\" --key T`)");
+            }
+            for t in teams {
+                let projects = if t.projects.is_empty() {
+                    String::new()
+                } else {
+                    format!("  → {}", t.projects.join(", "))
+                };
+                println!(
+                    "{:<8} {:<20} {} member(s){projects}  ({})",
+                    t.key,
+                    t.name,
+                    t.members.len(),
+                    t.id
+                );
+            }
+            0
+        }
+        Response::TriageItems { items } => {
+            if items.is_empty() {
+                println!("(triage queue is empty — report with `lait triage submit \"…\"`)");
+            }
+            for t in items {
+                let state = if t.outcome.is_empty() {
+                    "pending".to_string()
+                } else if t.reff.is_empty() {
+                    t.outcome.clone()
+                } else {
+                    format!("{} → {}", t.outcome, t.reff)
+                };
+                println!("{}  {:<10} {}", t.id, state, t.title);
+            }
+            0
+        }
+        Response::Attachment { name, mime, .. } => {
+            // Reaching stdout with a payload would splat base64; the CLI's
+            // `attachment get` writes the file itself and never prints this.
+            println!("attachment {name} ({mime}) — use `lait attachment get` to save it");
             0
         }
         Response::Labels { labels } => {
@@ -1524,6 +1664,58 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
             }
             0
         }
+        Response::Whoami(w) => {
+            let none = "—".to_string();
+            println!(
+                "actor    {}",
+                w.actor.as_deref().unwrap_or("(not admitted yet)")
+            );
+            if let Some(did) = &w.did {
+                println!("did      {did}");
+            }
+            println!("device   {}", w.device);
+            println!("space    {}", w.space.as_deref().unwrap_or(&none));
+            println!("name     {}", w.name.as_deref().unwrap_or(&none));
+            let write = if w.can_write { "write" } else { "view-only" };
+            println!("standing {} ({})", w.role, write);
+            if let Some(s) = &w.sponsor {
+                println!("sponsor  {s}  (sponsored — standing dies with this member)");
+            }
+            if w.policy_admin {
+                println!("policy   policy-admin (can invite + manage policy)");
+            }
+            if !w.capabilities.is_empty() {
+                println!("caps     {}", w.capabilities.join(", "));
+            }
+            if w.partial_view {
+                eprintln!(
+                    "{}  view is PARTIAL — run `lait sync`:",
+                    paint(out.color, ansi::YELLOW, "!")
+                );
+                for d in &w.divergence {
+                    eprintln!("    - {d}");
+                }
+            } else {
+                println!("view     complete");
+            }
+            0
+        }
+        Response::Sync {
+            whole,
+            divergence,
+            message,
+        } => {
+            if *whole {
+                println!("{message}");
+                0
+            } else {
+                eprintln!("{message}");
+                for d in divergence {
+                    eprintln!("    - {d}");
+                }
+                1
+            }
+        }
         Response::Error {
             message,
             error_kind,
@@ -1538,7 +1730,7 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
 fn exit_code_for_kind(kind: ErrorKind) -> i32 {
     match kind {
         ErrorKind::NotFound => 2,
-        ErrorKind::Error => 1,
+        ErrorKind::Error | ErrorKind::Denied => 1,
     }
 }
 
@@ -1678,7 +1870,7 @@ pub async fn run_invite(
     )
     .await?;
     let token = match resp {
-        Response::Text { text } => text.trim().to_string(),
+        Response::Ref { reff } => reff.trim().to_string(),
         other => {
             print_response(&other, out);
             return Ok(());
@@ -2117,6 +2309,8 @@ mod tests {
                 project: None,
                 project_hint: None,
                 body: None,
+                due: None,
+                estimate: None,
                 assignees: vec![],
                 priority: None,
                 labels: vec![],
