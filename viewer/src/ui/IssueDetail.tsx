@@ -60,7 +60,7 @@ import { Markdown } from "./Markdown";
 import { DatePicker } from "./DatePicker";
 import { NewLabelDialog } from "./NewLabel";
 import { Combobox, type Option } from "./Picker";
-import { Button, ChipButton, EditableSurface, IconButton, InlineAction, PopoverContent, Textarea } from "./primitives";
+import { Button, ChipButton, cn, EditableSurface, IconButton, InlineAction, PopoverContent, Textarea } from "./primitives";
 import {
   Breadcrumbs,
   IssueCrumb,
@@ -316,7 +316,14 @@ export function IssueDetail({
   const setPicker = (f: IssueField) => (o: boolean) => onOpenField(o ? f : null);
 
   return (
-    <aside className="issue-detail border-line @container flex h-full min-h-0 flex-col overflow-y-auto border-l">
+    <aside
+      className={cn(
+        "issue-detail @container flex h-full min-h-0 flex-col overflow-y-auto",
+        // Full width sits straight against the sidebar seam; a second rule there
+        // reads as a 2px gutter.
+        !focused && "border-line border-l",
+      )}
+    >
       <SurfaceHeader className="gap-2">
         {/* The issue's own lineage — its project, then itself — not the view you
             arrived from. "Issues" here was a guess that Board, My issues and Inbox

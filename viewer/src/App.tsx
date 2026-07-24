@@ -1019,14 +1019,30 @@ export function App() {
     onlySaveAfterUserInteractions: true,
   });
 
+  /**
+   * Full width is a *view*, not an overlay.
+   *
+   * It draws in the work area, beside the sidebar, exactly like the list and the
+   * board — so the shell stays navigable while you read. It used to be a `fixed
+   * inset-0` sheet, which took the sidebar with it and made the one surface
+   * people dwell on the one they could not leave except by closing it.
+   *
+   * Mechanically it is the split pane's own move run the other way: the third
+   * panel collapses and the issue is drawn in the main one. Stretching that
+   * third panel to 100% instead would mean re-negotiating its ceiling with the
+   * layout library mid-collapse, which it applies a render later and against the
+   * old constraint — leaving the list stubbornly on screen.
+   */
+  const fullWidthDetail = detailVisible && focusedDetail;
+
   // Layout effects run before paint, so a route without a selected issue never
   // flashes the detail panel's stored width. `expand` restores the last user size.
   useLayoutEffect(() => {
     const panel = detailPanel.current;
     if (!panel) return;
-    if (detailVisible) panel.expand();
+    if (detailVisible && !fullWidthDetail) panel.expand();
     else panel.collapse();
-  }, [detailPanel, detailVisible]);
+  }, [detailPanel, detailVisible, fullWidthDetail]);
 
   useEffect(() => {
     registry.validate();
@@ -1185,6 +1201,81 @@ export function App() {
         },
       ];
 
+  /**
+   * The open issue, built once and hung in one of two places: the third panel
+   * when it is a split, the work area itself when it is full width. One element,
+   * so the two placements cannot drift into two different issue surfaces.
+   */
+  const issuePane =
+    detailVisible && selection && current && routeSpace && board ? (
+      rows.some((row) => row.reff === selection) ||
+      deletedRows.some((row) => row.reff === selection) ? (
+        <IssueDetail
+          // Remount on a different issue: a stale draft must not survive into
+          // the next one, and `key` says that in one line.
+          key={selection}
+          spaceId={current}
+          canonicalSpaceId={routeSpace}
+          reff={selection}
+          states={states}
+          members={members}
+          labels={labels}
+          projects={projects}
+          readOnly={readOnly}
+          // A deleted issue is not on the board at all, so the trash rows
+          // are the only place its tombstone can be read from.
+          tombstone={deletedRows.some((r) => r.reff === selection)}
+          openField={field}
+          onOpenField={setField}
+          onError={setError}
+          onDelete={api.deleteIssue}
+          onPredict={api.predict}
+          onNavigate={api.select}
+          onClose={() => {
+            api.select(null);
+            setDetail(false);
+            setFocusedDetail(false);
+          }}
+          onOpenProject={(key) => {
+            api.select(null);
+            setDetail(false);
+            setFocusedDetail(false);
+            api.pickProject(key);
+          }}
+          focused={focusedDetail}
+          onToggleFocus={() => {
+            const next = !focusedDetail;
+            window.history.pushState(
+              null,
+              "",
+              formatRoute({ spaceId: routeSpace, project, view, issue: selection, focused: next, filter }),
+            );
+            setFocusedDetail(next);
+          }}
+          {...(rows.findIndex((row) => row.reff === selection) > 0
+            ? {
+                onPrevious: () =>
+                  api.select(rows[rows.findIndex((row) => row.reff === selection) - 1]!.reff),
+              }
+            : {})}
+          {...(rows.findIndex((row) => row.reff === selection) >= 0 &&
+          rows.findIndex((row) => row.reff === selection) < rows.length - 1
+            ? {
+                onNext: () =>
+                  api.select(rows[rows.findIndex((row) => row.reff === selection) + 1]!.reff),
+              }
+            : {})}
+        />
+      ) : (
+        <EmptyState
+          kind="unavailable"
+          title="Issue not found in this local project"
+          body={`${selection} is not present in the current local projection. It may belong to another project, still be arriving, or not exist on this replica.`}
+          action={<Button onClick={() => api.select(null)}>Clear selection</Button>}
+        />
+      )
+    ) : null;
+
   return (
     <TooltipProvider>
     <Group
@@ -1240,7 +1331,13 @@ export function App() {
       </Separator>
 
       <Panel id="main" role="main" className="flex min-w-0 flex-col">
-        <div className={view === "settings" ? "hidden" : "@container shrink-0"}>
+        {/* A full-width issue brings its own header — the trail, the pager, the
+            overflow — so the shell's would be a second one saying less. */}
+        <div
+          className={
+            view === "settings" || fullWidthDetail ? "hidden" : "@container shrink-0"
+          }
+        >
           <SurfaceHeader className="gap-0.5">
             <IconButton label="Toggle sidebar" chord="⌘B" onClick={() => run("view.sidebar")}>
               <PanelLeft className="size-4" />
@@ -1324,7 +1421,11 @@ export function App() {
           />
         )}
 
-        {filterOpen && (view === "list" || view === "board") && (
+        {fullWidthDetail && (
+          <div className="ui-detail flex min-h-0 flex-1 flex-col">{issuePane}</div>
+        )}
+
+        {!fullWidthDetail && filterOpen && (view === "list" || view === "board") && (
           <FilterBar
             filter={filter}
             labels={labels}
@@ -1348,7 +1449,9 @@ export function App() {
           id={projectShell ? "project-view-panel" : undefined}
           role={projectShell ? "tabpanel" : undefined}
           aria-labelledby={projectShell && isProjectView(view) ? `project-tab-${view}` : undefined}
-          className="group/list flex min-h-0 flex-1 flex-col"
+          // Hidden rather than unmounted behind a full-width issue: coming back
+          // should land you where you were in the list, not at the top of it.
+          className={`group/list flex min-h-0 flex-1 flex-col${fullWidthDetail ? " hidden" : ""}`}
         >
           {!current ? (
             <EmptyState
@@ -1539,10 +1642,11 @@ export function App() {
         </div>
       </Panel>
 
+      {/* Nothing to drag when the list beside it is collapsed. */}
       <Separator
-        disabled={!detailVisible}
+        disabled={!detailVisible || fullWidthDetail}
         className={
-          detailVisible
+          detailVisible && !fullWidthDetail
             ? "bg-line data-[state=dragging]:bg-accent hover:bg-accent/60 relative w-px outline-none transition-colors max-[960px]:hidden"
             : "pointer-events-none invisible relative w-px"
         }
@@ -1558,85 +1662,12 @@ export function App() {
         collapsible
         collapsedSize="0%"
         className={
-          !detailVisible
+          !detailVisible || fullWidthDetail
             ? "ui-detail overflow-hidden"
-            : focusedDetail
-            ? "ui-detail bg-bg fixed inset-0 z-30"
             : "ui-detail max-[960px]:fixed max-[960px]:inset-0 max-[960px]:z-30 max-[960px]:bg-bg max-[960px]:pt-[env(safe-area-inset-top)] max-[960px]:pb-[env(safe-area-inset-bottom)]"
         }
       >
-        {detailVisible && selection && current && routeSpace && board && (
-          rows.some((row) => row.reff === selection) ||
-          deletedRows.some((row) => row.reff === selection) ? (
-            <IssueDetail
-              // Remount on a different issue: a stale draft must not survive into
-              // the next one, and `key` says that in one line.
-              key={selection}
-              spaceId={current}
-              canonicalSpaceId={routeSpace}
-              reff={selection}
-              states={states}
-              members={members}
-              labels={labels}
-              projects={projects}
-              readOnly={readOnly}
-              // A deleted issue is not on the board at all, so the trash rows
-              // are the only place its tombstone can be read from.
-              tombstone={deletedRows.some((r) => r.reff === selection)}
-              openField={field}
-              onOpenField={setField}
-              onError={setError}
-              onDelete={api.deleteIssue}
-              onPredict={api.predict}
-              onNavigate={api.select}
-              onClose={() => {
-                api.select(null);
-                setDetail(false);
-                setFocusedDetail(false);
-              }}
-              onOpenProject={(key) => {
-                api.select(null);
-                setDetail(false);
-                setFocusedDetail(false);
-                api.pickProject(key);
-              }}
-              focused={focusedDetail}
-              onToggleFocus={() => {
-                const next = !focusedDetail;
-                window.history.pushState(
-                  null,
-                  "",
-                  formatRoute({ spaceId: routeSpace, project, view, issue: selection, focused: next, filter }),
-                );
-                setFocusedDetail(next);
-              }}
-              {...(rows.findIndex((row) => row.reff === selection) > 0
-                ? {
-                    onPrevious: () =>
-                      api.select(
-                        rows[rows.findIndex((row) => row.reff === selection) - 1]!.reff,
-                      ),
-                  }
-                : {})}
-              {...(rows.findIndex((row) => row.reff === selection) >= 0 &&
-              rows.findIndex((row) => row.reff === selection) < rows.length - 1
-                ? {
-                    onNext: () =>
-                      api.select(
-                        rows[rows.findIndex((row) => row.reff === selection) + 1]!.reff,
-                      ),
-                  }
-                : {})}
-            />
-          ) : (
-            <EmptyState
-              kind="unavailable"
-              title="Issue not found in this local project"
-              body={`${selection} is not present in the current local projection. It may belong to another project, still be arriving, or not exist on this replica.`}
-              action={<Button onClick={() => api.select(null)}>Clear selection</Button>}
-            />
-          )
-        )}
+        {!fullWidthDetail && issuePane}
       </Panel>
 
       {composing && current && routeSpace && board && (
