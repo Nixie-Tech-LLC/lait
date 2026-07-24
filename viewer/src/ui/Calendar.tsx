@@ -125,6 +125,7 @@ export function Calendar({
                 {dayRows.map((r) => (
                   <button
                     key={r.reff}
+                    data-issue-ref={r.reff}
                     onClick={() => onSelect(r.reff)}
                     title={r.title}
                     className="bg-raised border-line hover:border-line-strong flex items-center gap-1 rounded border px-1 py-0.5 text-left text-2xs"

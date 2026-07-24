@@ -333,6 +333,7 @@ function IssueRow({
         }
       }}
       aria-current={selected ? "true" : undefined}
+      data-issue-ref={row.reff}
       data-bulk-selected={checked || undefined}
       tabIndex={selected ? 0 : -1}
     >

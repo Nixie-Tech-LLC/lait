@@ -30,6 +30,7 @@ import {
 } from "lucide-react";
 
 import { rpc } from "../api";
+import { useIssueDetail, useProjectViewerStore } from "../projectStore";
 import { clearDraft, loadDraft, saveDraft } from "../core/drafts";
 import { describeChanges, describeEvent, type NameResolver } from "../core/activity";
 import type { Field as PredictField } from "../core/overlay";
@@ -40,7 +41,6 @@ import {
   type AttachmentMetaDto,
   type GraphView,
   type LinkDto,
-  type MilestoneDto,
   type Row,
   PRIORITY_ORDER,
   tsToDate,
@@ -99,7 +99,6 @@ export function IssueDetail({
   onNext,
   focused,
   onToggleFocus,
-  revision,
 }: {
   spaceId: string;
   canonicalSpaceId: string;
@@ -127,13 +126,13 @@ export function IssueDetail({
   onNext?: () => void;
   focused: boolean;
   onToggleFocus: () => void;
-  /** Bumped by the doorbell; re-reads without this pane knowing why. */
-  revision: number;
 }) {
-  const [issue, setIssue] = useState<IssueView | null>(null);
-  const [events, setEvents] = useState<ActivityEvent[]>([]);
-  const [graph, setGraph] = useState<GraphView | null>(null);
-  const [milestones, setMilestones] = useState<MilestoneDto[]>([]);
+  const projectStore = useProjectViewerStore();
+  const detail = useIssueDetail(spaceId, reff);
+  const issue = detail.issue;
+  const events = detail.history.data ?? [];
+  const graph = detail.graph.data ?? null;
+  const milestones = detail.milestones.data ?? [];
   const [draft, setDraft] = useState(() => loadDraft(canonicalSpaceId, reff, "title"));
   const [comment, setComment] = useState(() => loadDraft(canonicalSpaceId, reff, "comment"));
   const [commentPending, setCommentPending] = useState(false);
@@ -166,41 +165,8 @@ export function IssueDetail({
   }, [undoWork]);
 
   useEffect(() => {
-    let alive = true;
-    void (async () => {
-      try {
-        // Both halves of the story, in one trip. `history` is a separate `Request`
-        // because the activity ring is not part of the issue document — see the
-        // Timeline note on what that costs.
-        const [view, hist, gr] = await Promise.all([
-          rpc(spaceId, { cmd: "issue_view", reff }),
-          // A failed history/graph must not take the issue down with it: the pane is
-          // still useful without them, and both are secondary to the issue itself.
-          rpc(spaceId, { cmd: "history", reff }).catch(() => null),
-          rpc(spaceId, { cmd: "issue_graph", reff }).catch(() => null),
-        ]);
-        if (!alive) return;
-        if (view.kind === "issue") {
-          setIssue(view);
-          setDraft((current) => current || view.title);
-          // Milestones are project-scoped, so the project comes from the view.
-          const ms = await rpc(spaceId, {
-            cmd: "milestone_list",
-            project: view.project_id,
-          }).catch(() => null);
-          if (alive) setMilestones(ms?.kind === "milestones" ? ms.milestones : []);
-        }
-        setEvents(hist?.kind === "activity" ? hist.events : []);
-        setGraph(gr?.kind === "graph" ? gr : null);
-      } catch (e) {
-        if (alive) onError(e instanceof Error ? e.message : String(e));
-      }
-    })();
-    return () => {
-      alive = false;
-    };
-    // `revision` is the doorbell: a change anywhere in this space re-reads.
-  }, [spaceId, reff, revision, onError]);
+    if (issue) setDraft((current) => current || issue.title);
+  }, [issue]);
 
   const edit = useCallback(
     async (patch: { title?: string; description?: string }) => {
@@ -224,6 +190,15 @@ export function IssueDetail({
     },
     [onError],
   );
+
+  const runCommand = useCallback(async (command: Promise<boolean>): Promise<boolean> => {
+    try {
+      return await command;
+    } catch (error) {
+      onError(error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  }, [onError]);
 
   const memberOf = useCallback(
     (key: string): MemberDto | undefined => members.find((m) => m.key === key),
@@ -278,9 +253,7 @@ export function IssueDetail({
       clearDraft(canonicalSpaceId, reff, "title");
       return;
     }
-    void onPredict(issue.doc_id, "title", next, () =>
-      rpc(spaceId, { cmd: "issue_edit", reff, title: next }),
-    ).then((accepted) => {
+    void runCommand(projectStore.editTitle(spaceId, reff, next)).then((accepted) => {
       if (accepted) clearDraft(canonicalSpaceId, reff, "title");
     });
   };
@@ -366,6 +339,11 @@ export function IssueDetail({
       </SurfaceHeader>
 
       <div className="issue-detail-body flex flex-col gap-4 p-4">
+        {Boolean(detail.body.error || detail.secondaryError) && (
+          <div className="border-warn/30 bg-warn/5 text-dim rounded border px-3 py-2 text-sm" role="status">
+            Some issue details could not be refreshed. Known content remains available.
+          </div>
+        )}
         {tombstone && (
           <div className="border-danger/30 bg-danger/5 text-dim rounded border px-3 py-2 text-sm">
             This issue is deleted. Restore it from the More actions menu.
@@ -484,9 +462,7 @@ export function IssueDetail({
                 icon: <StatusIcon category={s.category} color={catalogColor(s.color)} />,
               }))}
               onPick={(id) =>
-                onPredict(issue.doc_id, "status", id, () =>
-                  rpc(spaceId, { cmd: "issue_edit", reff, status: id }),
-                )
+                void runCommand(projectStore.setStatus(spaceId, reff, id))
               }
             />
           </PropertyRow>
@@ -512,9 +488,7 @@ export function IssueDetail({
                 icon: <PriorityIcon priority={p} />,
               }))}
               onPick={(id) =>
-                onPredict(issue.doc_id, "priority", id, () =>
-                  rpc(spaceId, { cmd: "issue_edit", reff, priority: id }),
-                )
+                void runCommand(projectStore.setPriority(spaceId, reff, id))
               }
             />
           </PropertyRow>

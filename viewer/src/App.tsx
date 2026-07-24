@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Group, Panel, Separator, useDefaultLayout, usePanelRef } from "react-resizable-panels";
 import * as Dialog from "@radix-ui/react-dialog";
 import {
@@ -9,7 +9,6 @@ import {
 
 import { ConfirmRequired, LaitError, rpc, spaces as fetchSpaces } from "./api";
 import { useDoorbell } from "./doorbell";
-import { coalesce } from "./core/coalesce";
 import { runBounded, type BulkProgress } from "./core/bulk";
 import { groupRows, loadDisplay, saveDisplay, type DisplayState } from "./core/display";
 import {
@@ -70,14 +69,16 @@ import {
   needsServer,
   type FilterState,
 } from "./core/filter";
-import { applyOverlay, Overlay, PREDICTION_TTL_MS, type Field } from "./core/overlay";
+import { PREDICTION_TTL_MS, type Field } from "./core/overlay";
+import {
+  projectKeys,
+  useProjectBoard,
+  useProjectRegistry,
+  useProjectViewerStore,
+} from "./projectStore";
 import {
   isReadOnly,
   type BoardPos,
-  type BoardView,
-  type LabelDto,
-  type MemberDto,
-  type ProjectDto,
   type Row,
   type SpaceRow,
   type StatusInfo,
@@ -90,6 +91,7 @@ type ThemePreference = "system" | "light" | "dark";
 type DensityPreference = "compact" | "comfortable";
 const THEME_PREFERENCE = "lait.theme";
 const DENSITY_PREFERENCE = "lait.density";
+const LAYOUT_PANEL_IDS = ["sidebar", "main", "detail"];
 
 /**
  * The shell.
@@ -112,7 +114,6 @@ export function App() {
    * machine-local store handle used by RPC. */
   const [routeSpace, setRouteSpace] = useState<string | null>(initialRoute.spaceId);
   const [current, setCurrent] = useState<string | null>(null);
-  const [board, setBoard] = useState<BoardView | null>(null);
   const [selection, setSelection] = useState<string | null>(initialRoute.issue);
   const [modal, setModal] = useState<Modal>(null);
   const [error, setError] = useState<string | null>(null);
@@ -138,15 +139,6 @@ export function App() {
   const [checked, setChecked] = useState<ReadonlySet<string>>(new Set());
   const [bulkProgress, setBulkProgress] = useState<BulkProgress | null>(null);
   const bulkOperation = useRef<((reff: string) => Promise<unknown>) | null>(null);
-  const [labels, setLabels] = useState<LabelDto[]>([]);
-  const [members, setMembers] = useState<MemberDto[]>([]);
-  const [projects, setProjects] = useState<ProjectDto[]>([]);
-  const [statusInfo, setStatusInfo] = useState<StatusInfo | null>(null);
-  /** Projects offered for navigation/creation. Archived ones are soft-hidden
-   *  here (the engine already keeps them out of the default board and all-project
-   *  lists) but stay in `projects` so the Projects page can list and restore them,
-   *  and a directly-opened archived board still renders. */
-  const liveProjects = useMemo(() => projects.filter((p) => !p.archived), [projects]);
   /** Which project's board is on screen. `null` = let the daemon's chain pick
    *  (branch key → `project.default` → the only project), same as a bare `lait board`. */
   const [project, setProject] = useState<string | null>(initialRoute.project);
@@ -159,29 +151,80 @@ export function App() {
    *  Deleting an issue REMOVES it from `boards[P]` (the board genuinely does
    *  not know it), so the trash comes from `list all:true`, not the board. */
   const [deletedRows, setDeletedRows] = useState<Row[]>([]);
-  /** Local predictions. A ref, not state: the doorbell handler mutates it and we
-   *  re-render explicitly — putting it in state would make every `set` a new Map
-   *  and every render a new overlay. */
-  const overlay = useRef(new Overlay());
-  const [predicted, setPredicted] = useState(0);
   const [mutationNotice, setMutationNotice] = useState("");
-  /** Monotonic load token — see `loadBoard`. A generalisation of an `alive` flag:
-   *  it also orders two loads of the *same* space, which `alive` cannot. Bumped
-   *  when a load is *requested*, not when it starts: once requests coalesce, the
-   *  request is the thing that supersedes, and a run that starts later already
-   *  carries the newer args. */
-  const boardSeq = useRef(0);
   /** Last doorbell epoch seen per space — the daemon-boot nonce (UI.md §4.1). */
   const epochs = useRef(new Map<string, number>());
   // Bumped on every doorbell for this space: the detail pane re-reads off it.
   const [revision, setRevision] = useState(0);
   const sidebar = usePanelRef();
+  const detailPanel = usePanelRef();
   const [density, setDensity] = useState<DensityPreference>(() => loadDensity());
+  const projectStore = useProjectViewerStore();
+  const boardSpace = isProjectView(view) ? current : null;
+  const { board } = useProjectBoard(boardSpace, isProjectView(view) ? project : null);
+  const labelsResource = useProjectRegistry(
+    current ? projectKeys.labels(current) : "project:none/labels",
+    useCallback(
+      () => current ? projectStore.ensureLabels(current) : Promise.resolve([]),
+      [current, projectStore],
+    ),
+  );
+  const membersResource = useProjectRegistry(
+    current ? projectKeys.members(current) : "project:none/members",
+    useCallback(
+      () => current ? projectStore.ensureMembers(current) : Promise.resolve([]),
+      [current, projectStore],
+    ),
+  );
+  const projectsResource = useProjectRegistry(
+    current ? projectKeys.projects(current) : "project:none/projects",
+    useCallback(
+      () => current ? projectStore.ensureProjects(current) : Promise.resolve([]),
+      [current, projectStore],
+    ),
+  );
+  const statusResource = useProjectRegistry(
+    current ? projectKeys.status(current) : "project:none/status",
+    useCallback(
+      () => current ? projectStore.ensureStatus(current) : Promise.resolve(null as never),
+      [current, projectStore],
+    ),
+  );
+  const labels = labelsResource.data ?? [];
+  const projects = projectsResource.data ?? [];
+  const statusInfo = (statusResource.data ?? null) as StatusInfo | null;
+  const members = useMemo(() => {
+    const source = membersResource.data ?? [];
+    const nick = statusInfo?.nick.trim() ?? "";
+    return nick
+      ? source.map((member) => member.me && !member.alias ? { ...member, alias: nick } : member)
+      : source;
+  }, [membersResource.data, statusInfo?.nick]);
+  /** Projects offered for navigation/creation. Archived ones stay cached but are
+   * hidden from navigation until explicitly opened. */
+  const liveProjects = useMemo(() => projects.filter((p) => !p.archived), [projects]);
 
   useEffect(() => {
     applyTheme(loadTheme());
     applyDensity(loadDensity());
   }, []);
+
+  useEffect(() => {
+    const prefetch = (event: Event) => {
+      if (!current) return;
+      const target = event.target instanceof Element
+        ? event.target.closest<HTMLElement>("[data-issue-ref]")
+        : null;
+      const reff = target?.dataset.issueRef;
+      if (reff) projectStore.prefetchIssue(current, reff);
+    };
+    document.addEventListener("pointerover", prefetch);
+    document.addEventListener("focusin", prefetch);
+    return () => {
+      document.removeEventListener("pointerover", prefetch);
+      document.removeEventListener("focusin", prefetch);
+    };
+  }, [current, projectStore]);
   const spacesRef = useRef(spaces);
   spacesRef.current = spaces;
   const routeSpaceRef = useRef(routeSpace);
@@ -247,15 +290,13 @@ export function App() {
     projects.length > 0 &&
     !projects.some((candidate) => candidate.key === project);
 
-  // Overlay first, then filter: a predicted title should be findable by the text
-  // you just typed into it, and a predicted status should filter as its new one.
-  // `predicted` is the re-render trigger — the overlay itself is a mutable ref.
   const { shown, optimistic } = useMemo(() => {
     if (!board) return { shown: null, optimistic: new Set<string>() as ReadonlySet<string> };
-    const o = applyOverlay(board, overlay.current);
-    return { shown: applyFilter(o.board, filter, allowed), optimistic: o.optimistic };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [board, filter, allowed, predicted]);
+    return {
+      shown: applyFilter(board, filter, allowed),
+      optimistic: new Set(projectStore.overlay.docs()),
+    };
+  }, [allowed, board, filter, projectStore]);
 
   /** The list's arrangement (the board renders columns straight off `shown`). */
   const groups = useMemo(() => (shown ? groupRows(shown, display) : []), [shown, display]);
@@ -320,74 +361,16 @@ export function App() {
     }
   }, []);
 
-  /**
-   * Load the board, and keep trying.
-   *
-   * A failed load must not be terminal. The daemon this space talks to can
-   * restart under us — someone runs `lait shutdown`, an update swaps the binary,
-   * two processes race to respawn it — and the failure lasts milliseconds. But
-   * nothing would re-trigger the load: doorbells arrive through the very
-   * attachment that just broke, so a transient error froze the view and left a
-   * stale banner over it until the user thought to press `r`. The error was
-   * honest; its permanence was the bug.
-   *
-   * Backs off rather than hammering, and gives up after a few tries so a genuinely
-   * dead space says so instead of spinning forever.
-   */
-  const loadBoardRaw = useCallback(async (id: string | null, proj: string | null): Promise<void> => {
-    // Only the newest load may commit. Two doorbells in quick succession issue
-    // two loads, and the one that resolves *last* is not the one issued last —
-    // so an older board could silently overwrite a newer one, and nothing would
-    // correct it until the next ring. The retry below makes it worse by holding a
-    // load open for ~2.8s, long enough to land on a space you have since left and
-    // paint its error over the one you are looking at.
-    const seq = boardSeq.current;
-    const stale = () => seq !== boardSeq.current;
-
-    if (!id) return setBoard(null);
-    for (let attempt = 0; ; attempt++) {
-      try {
-        const r = await rpc(id, { cmd: "board", project: proj });
-        if (stale()) return;
-        setBoard(r.kind === "board" ? r : null);
-        setError(null);
-        return;
-      } catch (e) {
-        if (stale()) return;
-        if (attempt < 3) {
-          await new Promise((r) => window.setTimeout(r, 400 * 2 ** attempt));
-          if (stale()) return;
-          continue;
-        }
-        setBoard(null);
-        setError(e instanceof Error ? e.message : String(e));
-        return;
-      }
+  const loadBoard = useCallback(async (id: string | null, proj: string | null): Promise<void> => {
+    if (!id) return;
+    try {
+      await projectStore.ensureBoard(id, proj, true);
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
     }
-  }, []);
-
-  /**
-   * The two re-reads a doorbell fans out to, coalesced.
-   *
-   * A ring is per commit, not per user action, so a sync burst asked for the same
-   * board ten times in a couple hundred milliseconds. The `seq` guard kept the
-   * *answers* honest, but the questions were all still asked. See `core/coalesce.ts`
-   * for why this is one-in-flight-plus-one-trailing rather than a plain throttle —
-   * the trailing run is what makes the read postdate the news that provoked it.
-   *
-   * Bumping `boardSeq` here rather than inside the run is what lets a queued request
-   * cut a doomed one short: a load for the space you just left sees `stale()` at its
-   * next check and returns without painting, and a retry chain mid-backoff stops
-   * waiting out its ~2.8s once there is a newer question to answer.
-   */
-  const loadBoard = useMemo(() => {
-    const run = coalesce(loadBoardRaw);
-    return (id: string | null, proj: string | null): Promise<void> => {
-      boardSeq.current++;
-      return run(id, proj);
-    };
-  }, [loadBoardRaw]);
-  const loadSpaces = useMemo(() => coalesce(loadSpacesRaw), [loadSpacesRaw]);
+  }, [projectStore]);
+  const loadSpaces = useCallback(() => loadSpacesRaw(), [loadSpacesRaw]);
 
   // The project is read through a ref by the doorbell handler and the sweep, which
   // must not re-subscribe every time it changes.
@@ -397,10 +380,6 @@ export function App() {
   useEffect(() => {
     void loadSpaces();
   }, [loadSpaces]);
-  useEffect(() => {
-    void loadBoard(isProjectView(view) ? current : null, isProjectView(view) ? project : null);
-  }, [current, project, view, loadBoard]);
-
   /**
    * Name a project once we know there is a choice.
    *
@@ -421,55 +400,6 @@ export function App() {
     if (!isProjectView(view) || project !== null || projects.length === 0) return;
     setProject((projects.find((candidate) => !candidate.archived) ?? projects[0])!.key);
   }, [projects, project, view]);
-
-  /**
-   * The three registries every picker reads from — the daemon's, never ours.
-   *
-   * Fetched together because they share a lifetime (this space, this revision) and
-   * a failure mode: none of them is worth an error banner. A picker with fewer
-   * options is a smaller menu; a red bar across the board is a broken app. The
-   * board is the thing whose failure is worth shouting about, and it already does.
-   *
-   * Same race as `loadBoard`: switch space mid-flight and the old space's members
-   * would land in the new space's assignee picker — hence `alive`.
-   */
-  useEffect(() => {
-    if (!current) {
-      setLabels([]);
-      setMembers([]);
-      setProjects([]);
-      setStatusInfo(null);
-      return;
-    }
-    let alive = true;
-    void (async () => {
-      const [l, m, p, s] = await Promise.all([
-        rpc(current, { cmd: "label_list" }).catch(() => null),
-        rpc(current, { cmd: "members" }).catch(() => null),
-        rpc(current, { cmd: "project_list" }).catch(() => null),
-        rpc(current, { cmd: "status" }).catch(() => null),
-      ]);
-      if (!alive) return;
-      if (l?.kind === "labels") setLabels(l.labels);
-      if (p?.kind === "projects") setProjects(p.projects);
-      if (s?.kind === "status") setStatusInfo(s);
-      if (m?.kind === "members") {
-        // `members` carries no alias for **you**: a petname is something you assign
-        // to other people, so `replica.rs::members` reports `alias: ""` for `me`.
-        // Your own name lives in `user.nick`, which only `status` reports — and
-        // without it yours is the one avatar in the space with no letter on it,
-        // which is a strange way to meet yourself. Patched here rather than in the
-        // avatar, so every surface agrees on what you are called.
-        const nick = s?.kind === "status" ? s.nick.trim() : "";
-        setMembers(
-          nick ? m.members.map((x) => (x.me && !x.alias ? { ...x, alias: nick } : x)) : m.members,
-        );
-      }
-    })();
-    return () => {
-      alive = false;
-    };
-  }, [current, revision]);
 
   // The trash. Scoped to the board's project so the group matches the view,
   // re-read on every doorbell (a remote delete is exactly the news it carries).
@@ -550,9 +480,7 @@ export function App() {
     useCallback(
       (d) => {
         if (!d) {
-          // We can't say which docs moved, so no prediction can be trusted.
-          overlay.current.clear();
-          setPredicted((n) => n + 1);
+          projectStore.overlay.clear();
           void loadSpaces();
           void loadBoard(current, projectRef.current);
           setRevision((r) => r + 1);
@@ -570,29 +498,14 @@ export function App() {
         const rebaseline = d.reset || (prev !== undefined && prev !== d.epoch);
 
         if (d.space !== current) return;
-        // The doorbell is the spine of the optimism: it names the docs that
-        // moved, and the arrival of truth about a doc is what kills every guess
-        // about it — no ids to match, nothing to reconcile. Re-read FIRST, then
-        // drop the predictions: clearing before the fresh rows land would flash
-        // the old server value for a frame, which is the one thing the optimism
-        // exists to prevent.
-        void loadBoard(current, projectRef.current).then(() => {
-          const docs = Object.values(d.dirty_by_project).flat();
-          let cleared = false;
-          for (const doc of docs) cleared = overlay.current.clearDoc(doc) || cleared;
-          if (rebaseline) {
-            overlay.current.clear();
-            cleared = true;
-          }
-          if (cleared) setPredicted((n) => n + 1);
-        });
+        void projectStore.handleDoorbell(rebaseline ? { ...d, reset: true } : d);
         setRevision((r) => r + 1);
         // On a rebaseline the space list is exactly as suspect as the board: a
         // daemon that restarted may have changed its own name, projects, or
         // whether it is up at all.
         if (rebaseline || d.dirty_catalog.length) void loadSpaces();
       },
-      [current, loadBoard, loadSpaces],
+      [current, loadBoard, loadSpaces, projectStore],
     ),
   );
 
@@ -635,16 +548,12 @@ export function App() {
    */
   const predict = useCallback(
     async (doc: string, field: Field, value: string, send: () => Promise<unknown>) => {
-      overlay.current.set(doc, field, value);
-      setPredicted((n) => n + 1);
       setMutationNotice(`Saving ${field} on this device…`);
       try {
-        await send();
+        await projectStore.predictValue(currentRef.current ?? "", doc, field, value, send);
         setMutationNotice(`${field} saved on this device`);
         return true;
       } catch (e) {
-        overlay.current.clearDoc(doc);
-        setPredicted((n) => n + 1);
         setMutationNotice(`${field} was refused · local value restored`);
         if (!(e instanceof ConfirmRequired)) {
           setError(e instanceof LaitError ? e.message : String(e));
@@ -652,7 +561,7 @@ export function App() {
         return false;
       }
     },
-    [],
+    [projectStore],
   );
 
   /** Writes never refetch — the daemon rings and the doorbell reloads. */
@@ -1085,8 +994,32 @@ export function App() {
   );
 
   const pending = useKeys(ctx);
-  // Width + collapsed state, persisted to localStorage by the library.
-  const layout = useDefaultLayout({ id: "lait.layout", panelIds: ["sidebar", "main"] });
+  const detailVisible = Boolean(
+    detail &&
+    selection &&
+    current &&
+    routeSpace &&
+    board &&
+    (view === "list" || view === "board" || view === "calendar"),
+  );
+  // Keep one panel topology for every view. The old two-id declaration mounted a
+  // third panel only for issue-capable views, so the library rebalanced the
+  // sidebar whenever that panel entered or left. Programmatic collapse/expand is
+  // intentionally not persisted; only the user's resize choices are.
+  const layout = useDefaultLayout({
+    id: "lait.layout.v2",
+    panelIds: LAYOUT_PANEL_IDS,
+    onlySaveAfterUserInteractions: true,
+  });
+
+  // Layout effects run before paint, so a route without a selected issue never
+  // flashes the detail panel's stored width. `expand` restores the last user size.
+  useLayoutEffect(() => {
+    const panel = detailPanel.current;
+    if (!panel) return;
+    if (detailVisible) panel.expand();
+    else panel.collapse();
+  }, [detailPanel, detailVisible]);
 
   useEffect(() => {
     registry.validate();
@@ -1106,15 +1039,13 @@ export function App() {
   // the one thing it exists to do.
   useEffect(() => {
     const t = window.setInterval(() => {
-      if (!overlay.current.sweep()) return;
+      if (!currentRef.current || !projectStore.expirePredictions(currentRef.current)) return;
       setMutationNotice("Local confirmation was delayed; refreshing authoritative state");
-      setPredicted((n) => n + 1);
       void loadBoard(currentRef.current, projectRef.current);
-      // The detail pane reads off `revision`, not the board.
       setRevision((r) => r + 1);
     }, PREDICTION_TTL_MS / 2);
     return () => window.clearInterval(t);
-  }, [loadBoard]);
+  }, [loadBoard, projectStore]);
 
   useEffect(() => {
     if (!mutationNotice || mutationNotice.startsWith("Saving")) return;
@@ -1190,6 +1121,7 @@ export function App() {
         maxSize="32%"
         collapsible
         collapsedSize={0}
+        groupResizeBehavior="preserve-pixel-size"
         className="bg-raised max-[960px]:hidden"
       >
         <Sidebar
@@ -1556,24 +1488,35 @@ export function App() {
         </div>
       </Panel>
 
-      {detail && selection && current && routeSpace && board && (view === "list" || view === "board" || view === "calendar") && (
-        <>
-          <Separator className="bg-line data-[state=dragging]:bg-accent hover:bg-accent/60 relative w-px outline-none transition-colors max-[960px]:hidden">
-            <span className="absolute inset-y-0 -left-[3px] w-[7px]" />
-          </Separator>
-          <Panel
-            id="detail"
-            defaultSize="34%"
-            minSize="300px"
-            maxSize="58%"
-            className={
-              focusedDetail
-                ? "ui-detail bg-bg fixed inset-0 z-30"
-                : "ui-detail max-[960px]:fixed max-[960px]:inset-0 max-[960px]:z-30 max-[960px]:bg-bg max-[960px]:pt-[env(safe-area-inset-top)] max-[960px]:pb-[env(safe-area-inset-bottom)]"
-            }
-          >
-            {rows.some((row) => row.reff === selection) ||
-            deletedRows.some((row) => row.reff === selection) ? (
+      <Separator
+        disabled={!detailVisible}
+        className={
+          detailVisible
+            ? "bg-line data-[state=dragging]:bg-accent hover:bg-accent/60 relative w-px outline-none transition-colors max-[960px]:hidden"
+            : "pointer-events-none invisible relative w-px"
+        }
+      >
+        <span className="absolute inset-y-0 -left-[3px] w-[7px]" />
+      </Separator>
+      <Panel
+        id="detail"
+        panelRef={detailPanel}
+        defaultSize="34%"
+        minSize="300px"
+        maxSize="58%"
+        collapsible
+        collapsedSize="0%"
+        className={
+          !detailVisible
+            ? "ui-detail overflow-hidden"
+            : focusedDetail
+            ? "ui-detail bg-bg fixed inset-0 z-30"
+            : "ui-detail max-[960px]:fixed max-[960px]:inset-0 max-[960px]:z-30 max-[960px]:bg-bg max-[960px]:pt-[env(safe-area-inset-top)] max-[960px]:pb-[env(safe-area-inset-bottom)]"
+        }
+      >
+        {detailVisible && selection && current && routeSpace && board && (
+          rows.some((row) => row.reff === selection) ||
+          deletedRows.some((row) => row.reff === selection) ? (
             <IssueDetail
               // Remount on a different issue: a stale draft must not survive into
               // the next one, and `key` says that in one line.
@@ -1591,7 +1534,6 @@ export function App() {
               tombstone={deletedRows.some((r) => r.reff === selection)}
               openField={field}
               onOpenField={setField}
-              revision={revision}
               onError={setError}
               onDelete={api.deleteIssue}
               onPredict={api.predict}
@@ -1629,17 +1571,16 @@ export function App() {
                   }
                 : {})}
             />
-            ) : (
-              <EmptyState
-                kind="unavailable"
-                title="Issue not found in this local project"
-                body={`${selection} is not present in the current local projection. It may belong to another project, still be arriving, or not exist on this replica.`}
-                action={<Button onClick={() => api.select(null)}>Clear selection</Button>}
-              />
-            )}
-          </Panel>
-        </>
-      )}
+          ) : (
+            <EmptyState
+              kind="unavailable"
+              title="Issue not found in this local project"
+              body={`${selection} is not present in the current local projection. It may belong to another project, still be arriving, or not exist on this replica.`}
+              action={<Button onClick={() => api.select(null)}>Clear selection</Button>}
+            />
+          )
+        )}
+      </Panel>
 
       {composing && current && routeSpace && board && (
         <NewIssue

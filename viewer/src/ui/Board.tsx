@@ -646,6 +646,7 @@ function Card({
       {gap === "before" && <DropLine />}
       <li
         ref={el}
+        data-issue-ref={row.reff}
         draggable={draggable}
         onClick={(event) => {
           event.currentTarget.focus({ preventScroll: true });
