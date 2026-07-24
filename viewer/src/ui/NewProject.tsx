@@ -4,7 +4,7 @@ import { X } from "lucide-react";
 
 import { rpc } from "../api";
 import { ColorPicker } from "./ColorPicker";
-import { Button, IconButton, Kbd } from "./primitives";
+import { Button, FieldLabel, IconButton, Input, Kbd } from "./primitives";
 
 /**
  * The project composer.
@@ -95,21 +95,20 @@ export function NewProject({
             </header>
 
             <div className="flex flex-col gap-3 p-4">
-              <label className="flex flex-col gap-1">
-                <span className="text-mute text-2xs uppercase">Name</span>
-                <input
+              <FieldLabel>
+                <span>Name</span>
+                <Input
                   autoFocus
                   value={name}
                   placeholder="Engineering"
                   onChange={(e) => setName(e.target.value)}
                   onKeyDown={(e) => e.stopPropagation()}
-                  className="border-line focus:border-line-strong placeholder:text-mute rounded border bg-transparent px-2 py-1.5 outline-none"
                 />
-              </label>
+              </FieldLabel>
 
-              <label className="flex flex-col gap-1">
-                <span className="text-mute text-2xs uppercase">Key</span>
-                <input
+              <FieldLabel>
+                <span>Key</span>
+                <Input
                   value={derived}
                   placeholder="ENG"
                   onChange={(e) => {
@@ -117,9 +116,7 @@ export function NewProject({
                     setKey(e.target.value);
                   }}
                   onKeyDown={(e) => e.stopPropagation()}
-                  className={`rounded border bg-transparent px-2 py-1.5 font-mono uppercase outline-none ${
-                    problem ? "border-danger" : "border-line focus:border-line-strong"
-                  }`}
+                  className="font-mono uppercase"
                   aria-invalid={problem !== null}
                   aria-describedby="project-key-guidance"
                 />
@@ -129,7 +126,7 @@ export function NewProject({
                       ? `Issues here will be ${upper}-1, ${upper}-2…`
                       : "Becomes the KEY in KEY-1 — 1–8 letters")}
                 </span>
-              </label>
+              </FieldLabel>
 
               <div className="flex flex-col gap-1.5">
                 <span className="text-mute text-2xs uppercase">Color</span>

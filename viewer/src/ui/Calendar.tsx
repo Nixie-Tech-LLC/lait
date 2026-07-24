@@ -4,7 +4,7 @@ import { ChevronLeft, ChevronRight } from "lucide-react";
 import type { BoardView, Row } from "../types";
 import { tsToDate } from "../types";
 import { PriorityIcon } from "./icons";
-import { IconButton } from "./primitives";
+import { Button, IconButton } from "./primitives";
 
 /**
  * The calendar view — the same filtered query as the list and board, placed on a
@@ -78,12 +78,13 @@ export function Calendar({
             <ChevronRight className="size-4" />
           </IconButton>
         </div>
-        <button
+        <Button
           onClick={toThisMonth}
-          className="border-line hover:bg-hover ml-1 rounded border px-2 py-0.5 text-xs"
+          variant="outline"
+          className="ml-1"
         >
           Today
-        </button>
+        </Button>
         <span className="text-mute ml-auto text-xs">
           {rows.length - undated.length} scheduled · {undated.length} undated
         </span>

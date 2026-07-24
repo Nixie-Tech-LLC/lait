@@ -10,7 +10,7 @@ import { ApplicationState } from "./AppState";
 import { catalogColor } from "./colors";
 import { PriorityIcon, StatusIcon } from "./icons";
 import { MenuContent, MenuItem } from "./layout";
-import { Button, IconButton } from "./primitives";
+import { Button, Checkbox, IconButton, interactiveRow } from "./primitives";
 import { dueLabel, dueTone } from "./time";
 
 /**
@@ -221,14 +221,14 @@ function Group({
       {/* Sticky so you never lose which bucket you are reading — the one piece of
           context a long list silently takes away. */}
       <header className="bg-raised/95 border-line sticky top-0 z-10 flex h-9 items-center gap-2 border-b px-4 backdrop-blur-sm">
-        <button
+        <IconButton
+          label={`${collapsed ? "Expand" : "Collapse"} ${title}`}
           onClick={() => setCollapsed((value) => !value)}
-          aria-label={`${collapsed ? "Expand" : "Collapse"} ${title}`}
           aria-expanded={!collapsed}
-          className="text-mute hover:text-fg -ml-2 flex size-6 items-center justify-center rounded"
+          className="-ml-2"
         >
           <ChevronRight className={`size-3 transition-transform ${collapsed ? "" : "rotate-90"}`} />
-        </button>
+        </IconButton>
         <GroupIcon group={group} members={members} />
         <h2 className="text-base font-semibold capitalize">{title}</h2>
         <span className="text-mute text-sm tabular-nums">{rows.length}</span>
@@ -308,8 +308,8 @@ function IssueRow({
     <li
       ref={el}
       className={clsxish([
-        "border-line/60 group/row flex h-8 cursor-default items-center gap-3 border-b px-4",
-        selected ? "bg-active" : "hover:bg-hover",
+        interactiveRow({ selected }),
+        "group/row flex h-8 items-center gap-2 px-4",
         checked && !selected && "bg-accent/5 shadow-[inset_2px_0_var(--color-accent)]",
         // A row whose body hasn't synced yet is real but not yet trustworthy;
         // say so quietly rather than rendering it as settled (UI.md §3.3).
@@ -331,26 +331,29 @@ function IssueRow({
       data-bulk-selected={checked || undefined}
       tabIndex={selected ? 0 : -1}
     >
-      {!readOnly && (
-        <span
-          className={clsxish([
-            "flex size-6 shrink-0 items-center justify-center",
-            !anyChecked && "opacity-0 transition-opacity group-hover/row:opacity-100 focus-within:opacity-100",
-          ])}
-        >
-          <input
-            type="checkbox"
+      {/* This 16px column is shared with the group chevron above it. Keeping the
+          selection affordance in that column lets priority/status/title retain
+          exactly the same geometry when the checkbox appears. */}
+      <span className="flex size-4 shrink-0 items-center justify-center">
+        {!readOnly && (
+          <Checkbox
             checked={checked}
-            onChange={(event) => onToggleCheck(
-              row.reff,
-              (event.nativeEvent as MouseEvent).shiftKey,
-            )}
-            onClick={(e) => e.stopPropagation()}
+            onCheckedChange={() => onToggleCheck(row.reff, false)}
+            onClick={(event) => {
+              event.stopPropagation();
+              if ((event.nativeEvent as MouseEvent).shiftKey) {
+                event.preventDefault();
+                onToggleCheck(row.reff, true);
+              }
+            }}
             aria-label={`Select ${row.key_alias ?? row.reff}`}
-            className="size-4"
+            className={clsxish([
+              !anyChecked && !checked &&
+                "opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100",
+            ])}
           />
-        </span>
-      )}
+        )}
+      </span>
       <PriorityIcon priority={row.priority} />
       {/* Fixed width + tabular numerals: the ids form a straight edge to scan. */}
       <span className="text-mute w-20 shrink-0 truncate font-mono text-xs tabular-nums">

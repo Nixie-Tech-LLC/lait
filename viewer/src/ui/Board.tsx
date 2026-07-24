@@ -448,14 +448,13 @@ function Column({
   return (
     <section className={`group/col flex shrink-0 flex-col transition-[width] ${collapsed ? "w-10" : rows.length ? "w-72" : "w-60"}`}>
       <header className="flex h-8 shrink-0 items-center gap-2 px-1">
-        <button
-          className="text-mute hover:text-fg flex size-6 items-center justify-center rounded"
+        <IconButton
+          label={`${collapsed ? "Expand" : "Collapse"} ${col.state.name}`}
           onClick={() => setCollapsed((value) => !value)}
-          aria-label={`${collapsed ? "Expand" : "Collapse"} ${col.state.name}`}
           aria-expanded={!collapsed}
         >
           <ChevronRight className={`size-3 transition-transform ${collapsed ? "" : "rotate-90"}`} />
-        </button>
+        </IconButton>
         {!collapsed && <>
         <StatusIcon category={col.state.category} color={catalogColor(col.state.color)} />
         <h2 className="text-base font-semibold">{col.state.name}</h2>
@@ -503,12 +502,12 @@ function Column({
         </>}
       </header>
       {collapsed ? (
-        <button
-          className="text-mute hover:text-fg flex min-h-0 flex-1 items-start justify-center py-2 text-xs [writing-mode:vertical-rl]"
+        <Button
+          className="min-h-0 flex-1 items-start py-2 text-xs [writing-mode:vertical-rl]"
           onClick={() => setCollapsed(false)}
         >
           {col.state.name} · {rows.length}
-        </button>
+        </Button>
       ) : (
       <ul
         aria-label={`${col.state.name} issues`}

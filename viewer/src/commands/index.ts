@@ -83,7 +83,6 @@ export const coreCommands = contribute({
         ["projects", "p", "Projects"],
         ["inbox", "i", "Inbox"],
         ["activity", "a", "Activity"],
-        ["members", "m", "Members"],
       ] as const
     ).map(([view, key, title]) => ({
       id: `go.${view}`,

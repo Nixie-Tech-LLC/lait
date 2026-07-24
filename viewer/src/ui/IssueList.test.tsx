@@ -31,7 +31,7 @@ describe("IssueList semantics", () => {
     const item = host!.querySelector("li[aria-current=true]") as HTMLLIElement;
     expect(item.tabIndex).toBe(0);
     expect(host!.querySelector('[role="listbox"], [role="option"]')).toBeNull();
-    expect(host!.querySelector('input[aria-label="Select LIST-1"]')).toBeTruthy();
+    expect(host!.querySelector('[role="checkbox"][aria-label="Select LIST-1"]')).toBeTruthy();
     act(() => item.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })));
     expect(onOpen).toHaveBeenCalledWith(current.reff);
   });
@@ -77,7 +77,7 @@ describe("IssueList semantics", () => {
       </TooltipProvider>,
     ));
 
-    const checks = [...host.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')];
+    const checks = [...host.querySelectorAll<HTMLButtonElement>('[role="checkbox"]')];
     act(() => checks[0]!.click());
     act(() => checks[2]!.dispatchEvent(new MouseEvent("click", { bubbles: true, shiftKey: true })));
     expect(toggled.mock.calls.map(([reff]) => reff)).toEqual(rows.map((item) => item.reff));

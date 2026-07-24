@@ -4,6 +4,7 @@ import type { ProjectDto } from "../types";
 import { tsToDate } from "../types";
 import { catalogColor } from "./colors";
 import { EmptyState } from "./AppState";
+import { Button } from "./primitives";
 
 /**
  * The timeline / roadmap view — projects as horizontal bars across months.
@@ -86,21 +87,21 @@ export function Timeline({
             const width = Math.max(1.5, pct(e) - left);
             return (
               <div key={p.id} className="flex items-center gap-2">
-                <button
+                <Button
                   onClick={() => onOpenProject(p.key)}
-                  className="hover:text-fg text-dim flex w-48 shrink-0 items-center gap-2 truncate text-left text-sm"
+                  className="w-48 justify-start truncate px-1 text-left"
                 >
                   <span
                     className="size-2.5 shrink-0 rounded-full"
                     style={{ background: catalogColor(p.color) }}
                   />
                   <span className="truncate">{p.name}</span>
-                </button>
+                </Button>
                 <div className="relative h-6 flex-1">
-                  <button
+                  <Button
                     onClick={() => onOpenProject(p.key)}
                     title={`${p.name}${p.start_date == null ? " (no start)" : ""}${p.target_date == null ? " (no target)" : ""}`}
-                    className="absolute top-0.5 h-5 rounded"
+                    className="absolute top-0.5 h-5 p-0"
                     style={{
                       left: `${left}%`,
                       width: `${width}%`,
@@ -121,17 +122,17 @@ export function Timeline({
             </h3>
             <div className="flex flex-wrap gap-1.5">
               {unscheduled.map((p) => (
-                <button
+                <Button
                   key={p.id}
                   onClick={() => onOpenProject(p.key)}
-                  className="border-line hover:bg-hover flex items-center gap-1.5 rounded border px-2 py-1 text-sm"
+                  variant="outline"
                 >
                   <span
                     className="size-2.5 rounded-full"
                     style={{ background: catalogColor(p.color) }}
                   />
                   {p.name}
-                </button>
+                </Button>
               ))}
             </div>
           </div>

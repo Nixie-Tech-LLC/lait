@@ -32,11 +32,14 @@ export function Members({
   revision,
   readOnly,
   onError,
+  embedded = false,
 }: {
   spaceId: string;
   revision: number;
   readOnly: boolean;
   onError: (m: string) => void;
+  /** Settings owns scrolling and content width when Members is a tab. */
+  embedded?: boolean;
 }) {
   const [members, setMembers] = useState<MemberDto[] | null>(null);
   const [log, setLog] = useState<MemberLogEntry[]>([]);
@@ -90,9 +93,9 @@ export function Members({
   }
 
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto">
-      <div className="mx-auto flex max-w-2xl flex-col gap-6 p-6">
-                <section>
+    <div className={embedded ? undefined : "min-h-0 flex-1 overflow-y-auto"}>
+      <div className={embedded ? "flex flex-col gap-6" : "mx-auto flex max-w-2xl flex-col gap-6 p-6"}>
+        <section>
           <h2 className="text-mute mb-2 text-2xs font-semibold tracking-wider uppercase">
             Members · {members.length}
           </h2>

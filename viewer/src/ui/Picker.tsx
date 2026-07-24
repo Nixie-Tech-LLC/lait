@@ -1,11 +1,15 @@
 import { useState } from "react";
 import * as Popover from "@radix-ui/react-popover";
-import { cva, type VariantProps } from "class-variance-authority";
 import { Command } from "cmdk";
 import { Check, ChevronDown, Plus } from "lucide-react";
 
 import { cmdkFilter } from "../core/fuzzy";
-import { cn, PopoverContent } from "./primitives";
+import {
+  cn,
+  controlTrigger,
+  type ControlTriggerVariant,
+  PopoverContent,
+} from "./primitives";
 
 /**
  * A pill that opens a searchable menu — the tracker's workhorse control.
@@ -35,25 +39,6 @@ import { cn, PopoverContent } from "./primitives";
  * reach the assignee menu without a mouse, and a component with private open state
  * could not be driven from the registry.
  */
-
-/**
- * Two shapes, one behaviour.
- *
- * `pill` is a standalone control — the composer's row of choices, where each needs
- * its own edge to read as separate. `bare` is for a property list, where the `dt`
- * already names the field and five bordered pills stacked vertically would draw
- * five boxes around information that is already in a box. Chrome recedes; the
- * affordance arrives on hover.
- */
-const trigger = cva("flex items-center gap-1.5 text-sm", {
-  variants: {
-    variant: {
-      pill: "border-line hover:bg-hover data-[state=open]:bg-hover rounded-full border px-2 py-1",
-      bare: "hover:bg-hover data-[state=open]:bg-hover -mx-1 min-h-6 min-w-0 rounded px-1 py-0.5 text-left",
-    },
-  },
-  defaultVariants: { variant: "pill" },
-});
 
 export interface Option {
   id: string;
@@ -90,8 +75,9 @@ type Props = {
    * exactly when the query matches no existing label, not on every keystroke.
    */
   onCreate?: (text: string) => void;
-} & Mode &
-  VariantProps<typeof trigger>;
+} & Mode & {
+  variant?: ControlTriggerVariant;
+};
 
 export function Combobox(props: Props) {
   const {
@@ -139,10 +125,8 @@ export function Combobox(props: Props) {
     return (
       <span
         className={cn(
-          "flex items-center gap-1.5 text-sm",
-          variant === "bare"
-            ? "text-dim px-1 py-0.5"
-            : "border-line text-dim rounded-full border px-2 py-1",
+          controlTrigger({ variant }),
+          "text-dim",
           className,
         )}
       >
@@ -156,7 +140,7 @@ export function Combobox(props: Props) {
 
   return (
     <Popover.Root open={isOpen} onOpenChange={setOpen}>
-      <Popover.Trigger aria-label={label} className={cn(trigger({ variant }), className)}>
+      <Popover.Trigger aria-label={label} className={cn(controlTrigger({ variant }), className)}>
         {content}
         {/* A bare trigger keeps its chevron hidden until hover: in a property list
             the value is the content and five permanent chevrons are five arrows
@@ -164,7 +148,7 @@ export function Combobox(props: Props) {
         <ChevronDown
           className={cn(
             "text-mute size-3 shrink-0",
-            variant === "bare" &&
+            variant === "property" &&
               "opacity-0 transition-opacity group-hover/prop:opacity-100 group-focus-within/prop:opacity-100",
           )}
         />

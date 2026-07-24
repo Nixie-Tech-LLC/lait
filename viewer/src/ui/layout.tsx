@@ -50,7 +50,7 @@ export function Toast({
 }) {
   return (
     <div
-      className={cn("border-line bg-raised text-dim flex items-center gap-3 rounded border px-3 py-2 text-sm shadow-raised", className)}
+      className={cn("border-line bg-raised text-dim flex items-center gap-3 rounded-md border px-3 py-2 text-sm shadow-raised", className)}
       role="status"
       aria-live="polite"
     >
@@ -81,7 +81,7 @@ export function MenuItem({
   return (
     <DropdownMenu.Item
       className={cn(
-        "flex h-7 cursor-default select-none items-center gap-2 rounded px-2 outline-none data-[highlighted]:bg-active data-[disabled]:opacity-50",
+        "flex h-7 cursor-default select-none items-center gap-2 rounded-md px-2 outline-none data-[highlighted]:bg-active data-[disabled]:opacity-50",
         danger ? "text-danger" : "text-dim",
         className,
       )}

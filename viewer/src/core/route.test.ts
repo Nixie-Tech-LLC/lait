@@ -58,6 +58,34 @@ describe("viewer routes", () => {
     ).toBe("/spaces/ws_1/inbox");
   });
 
+  it("does not carry project scope onto workspace destinations", () => {
+    expect(
+      parseRoute({ pathname: "/spaces/ws_1/settings", search: "?project=WEB&q=stale&mine=1" }),
+    ).toEqual({ spaceId: "ws_1", project: null, view: "settings", issue: null });
+    expect(
+      formatRoute({
+        spaceId: "ws_1",
+        project: "WEB",
+        view: "settings",
+        issue: null,
+        filter: {
+          text: "stale",
+          mine: true,
+          label: null,
+          status: [],
+          priority: [],
+          assignees: [],
+        },
+      }),
+    ).toBe("/spaces/ws_1/settings");
+  });
+
+  it("redirects legacy members routes into the settings shell", () => {
+    expect(
+      parseRoute({ pathname: "/spaces/ws_1/members", search: "?project=WEB" }),
+    ).toEqual({ spaceId: "ws_1", project: null, view: "settings", issue: null });
+  });
+
   it("round-trips the durable project portfolio destination", () => {
     const href = formatRoute({
       spaceId: "ws_1",

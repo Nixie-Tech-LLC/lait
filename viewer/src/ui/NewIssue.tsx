@@ -389,7 +389,7 @@ export function NewIssue({
               onCreate={(name) => setNewLabel(name)}
             />
             <DatePicker
-              variant="pill"
+              variant="chip"
               value={due || null}
               placeholder="Due date"
               onChange={(next) => setDue(next ?? "")}

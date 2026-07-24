@@ -1,9 +1,15 @@
 import { useState } from "react";
 import * as Popover from "@radix-ui/react-popover";
-import { cva, type VariantProps } from "class-variance-authority";
 import { Calendar, ChevronLeft, ChevronRight, X } from "lucide-react";
 
-import { cn, PopoverContent } from "./primitives";
+import {
+  Button,
+  cn,
+  controlTrigger,
+  type ControlTriggerVariant,
+  IconButton,
+  PopoverContent,
+} from "./primitives";
 
 /**
  * A date picker that belongs to the design system — the one control that used to
@@ -66,19 +72,6 @@ function labelFor(value: string): string {
   });
 }
 
-// Mirrors the Combobox trigger shapes so a date field reads as a sibling of the
-// pickers beside it — a bordered pill in a composer, chrome-that-recedes in a
-// property list.
-const trigger = cva("flex items-center gap-1.5 text-sm", {
-  variants: {
-    variant: {
-      pill: "border-line hover:bg-hover data-[state=open]:bg-hover rounded-full border px-2 py-1",
-      bare: "hover:bg-hover data-[state=open]:bg-hover -mx-1 min-h-6 rounded px-1 py-0.5 text-left",
-    },
-  },
-  defaultVariants: { variant: "pill" },
-});
-
 export function DatePicker({
   value,
   onChange,
@@ -96,7 +89,8 @@ export function DatePicker({
   placeholder?: string;
   /** Extra trigger classes — the caller's tone colour rides here. */
   className?: string;
-} & VariantProps<typeof trigger>) {
+  variant?: ControlTriggerVariant;
+}) {
   const [open, setOpen] = useState(false);
   const [view, setView] = useState<Date>(() =>
     startOfMonth(value ? parseInput(value) : todayUtc()),
@@ -113,7 +107,7 @@ export function DatePicker({
   // A read-only field still shows its value — it just can't open a menu over it.
   if (disabled) {
     return (
-      <span className={cn("text-dim px-1 py-0.5 text-sm", !value && "text-mute", className)}>
+      <span className={cn(controlTrigger({ variant }), "text-dim", !value && "text-mute", className)}>
         {value ? labelFor(value) : placeholder}
       </span>
     );
@@ -142,55 +136,33 @@ export function DatePicker({
     >
       <Popover.Trigger
         aria-label={ariaLabel}
-        className={cn(trigger({ variant }), !value && "text-mute", className)}
+        className={cn(controlTrigger({ variant }), !value && "text-mute", className)}
       >
         <Calendar className="text-mute size-3.5 shrink-0" />
         <span>{value ? labelFor(value) : placeholder}</span>
-        {value && (
-          <span
-            role="button"
-            tabIndex={0}
-            aria-label="Clear due date"
-            onClick={(e) => {
-              e.stopPropagation();
-              pick(null);
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
-                e.stopPropagation();
-                pick(null);
-              }
-            }}
-            className="text-mute hover:text-fg -mr-0.5 ml-0.5 rounded"
-          >
-            <X className="size-3" />
-          </span>
-        )}
       </Popover.Trigger>
       <PopoverContent align="start" className="w-64 p-2">
         <div className="mb-1 flex flex-col gap-0.5">
           {quick.map((q) => (
-            <button
+            <Button
               key={q.label}
               onClick={() => pick(q.value)}
-              className="hover:bg-active flex items-center justify-between rounded px-2 py-1 text-left text-sm"
+              className="w-full justify-between"
             >
               {q.label}
               {q.value === null && selected && <X className="text-mute size-3" />}
-            </button>
+            </Button>
           ))}
         </div>
 
         <div className="border-line border-t pt-2">
           <div className="mb-1 flex items-center justify-between px-1">
-            <button
+            <IconButton
+              label="Previous month"
               onClick={() => setView(addMonths(view, -1))}
-              aria-label="Previous month"
-              className="hover:bg-hover text-mute hover:text-fg rounded p-0.5"
             >
               <ChevronLeft className="size-3.5" />
-            </button>
+            </IconButton>
             <span className="text-sm font-medium">
               {view.toLocaleDateString(undefined, {
                 timeZone: "UTC",
@@ -198,13 +170,12 @@ export function DatePicker({
                 year: "numeric",
               })}
             </span>
-            <button
+            <IconButton
+              label="Next month"
               onClick={() => setView(addMonths(view, 1))}
-              aria-label="Next month"
-              className="hover:bg-hover text-mute hover:text-fg rounded p-0.5"
             >
               <ChevronRight className="size-3.5" />
-            </button>
+            </IconButton>
           </div>
 
           <div className="grid grid-cols-7 gap-0.5">
@@ -219,9 +190,10 @@ export function DatePicker({
               const isSelected = iso === selected;
               const isToday = iso === toInput(today);
               return (
-                <button
+                <Button
                   key={iso}
                   onClick={() => pick(iso)}
+                  size="icon"
                   aria-label={cell.toLocaleDateString(undefined, {
                     timeZone: "UTC",
                     weekday: "long",
@@ -231,7 +203,7 @@ export function DatePicker({
                   })}
                   aria-pressed={isSelected}
                   className={cn(
-                    "flex h-7 items-center justify-center rounded text-sm tabular-nums",
+                    "size-7 text-sm tabular-nums",
                     isSelected
                       ? "bg-accent text-accent-fg"
                       : inMonth
@@ -241,7 +213,7 @@ export function DatePicker({
                   )}
                 >
                   {cell.getUTCDate()}
-                </button>
+                </Button>
               );
             })}
           </div>

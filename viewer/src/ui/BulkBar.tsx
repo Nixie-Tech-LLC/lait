@@ -183,7 +183,7 @@ export function BulkBar({
         onPick={onProject}
       />
       <DatePicker
-        variant="pill"
+        variant="chip"
         value={null}
         placeholder="Due"
         ariaLabel="Set due date on selected"

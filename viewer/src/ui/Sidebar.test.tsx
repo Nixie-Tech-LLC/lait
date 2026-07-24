@@ -20,9 +20,8 @@ describe("Sidebar navigation", () => {
     host = null;
   });
 
-  it("routes named destinations and governance to their real actions", () => {
+  it("routes named destinations and gates settings in the workspace menu", () => {
     const onGo = vi.fn();
-    const onGovernance = vi.fn();
     const onMyIssues = vi.fn();
     host = document.createElement("div");
     document.body.append(host);
@@ -48,7 +47,6 @@ describe("Sidebar navigation", () => {
           onApplySavedView={vi.fn()}
           onToggleFavorite={vi.fn()}
           onCreateProject={vi.fn()}
-          onOpenGovernance={onGovernance}
         /></TooltipProvider>,
       );
     });
@@ -59,8 +57,8 @@ describe("Sidebar navigation", () => {
     expect(onGo).toHaveBeenCalledWith("activity");
     click("My issues");
     expect(onMyIssues).toHaveBeenCalledOnce();
-    click("Governance");
-    expect(onGovernance).toHaveBeenCalledOnce();
+    click("Workspace settings");
+    expect(onGo).toHaveBeenCalledWith("settings");
     expect(host.textContent).toContain("3");
     expect([...host.querySelectorAll("button")].filter((item) => item.textContent?.includes("Board"))).toHaveLength(1);
   });

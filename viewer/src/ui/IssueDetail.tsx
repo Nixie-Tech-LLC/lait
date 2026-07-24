@@ -63,7 +63,7 @@ import { Markdown } from "./Markdown";
 import { DatePicker } from "./DatePicker";
 import { NewLabelDialog } from "./NewLabel";
 import { Combobox, type Option } from "./Picker";
-import { Button, IconButton, PopoverContent } from "./primitives";
+import { Button, ChipButton, EditableSurface, IconButton, InlineAction, PopoverContent, Textarea } from "./primitives";
 import { MenuContent, MenuItem, PropertyRow, SectionHeader, SurfaceHeader, Toast } from "./layout";
 import * as ask from "./dialogs";
 import { dueToInput, dueTone, short, when } from "./time";
@@ -363,7 +363,7 @@ export function IssueDetail({
           </IconButton>
           {!locked && !tombstone && (
             <Button
-              variant="primary"
+              variant="toolbar"
               disabled={pendingAction !== null}
               aria-busy={pendingAction === lifecycle.action}
               onClick={() => void runWorkAction(lifecycle.action)}
@@ -493,7 +493,7 @@ export function IssueDetail({
         <dl className="issue-detail-properties flex flex-col gap-1 text-sm">
           <PropertyRow label="Status">
             <Combobox
-              variant="bare"
+              variant="property"
               label="Status"
               disabled={locked}
               open={pickerOpen("status")}
@@ -524,7 +524,7 @@ export function IssueDetail({
 
           <PropertyRow label="Priority">
             <Combobox
-              variant="bare"
+              variant="property"
               label="Priority"
               className="capitalize"
               disabled={locked}
@@ -552,7 +552,7 @@ export function IssueDetail({
 
           <PropertyRow label="Assignees">
             <Combobox
-              variant="bare"
+              variant="property"
               multi
               label="Assignees"
               disabled={locked}
@@ -599,7 +599,7 @@ export function IssueDetail({
 
           <PropertyRow label="Labels">
             <Combobox
-              variant="bare"
+              variant="property"
               multi
               label="Labels"
               disabled={locked}
@@ -656,7 +656,7 @@ export function IssueDetail({
 
           <PropertyRow label="Estimate">
             <Combobox
-              variant="bare"
+              variant="property"
               label="Estimate"
               disabled={locked}
               value={
@@ -680,7 +680,7 @@ export function IssueDetail({
           {(milestones.length > 0 || issue.milestone) && (
             <PropertyRow label="Milestone">
               <Combobox
-                variant="bare"
+                variant="property"
                 label="Milestone"
                 disabled={locked}
                 value={
@@ -726,7 +726,7 @@ export function IssueDetail({
 
           <PropertyRow label="Project">
             <Combobox
-              variant="bare"
+              variant="property"
               label="Project"
               disabled={locked}
               open={pickerOpen("project")}
@@ -957,17 +957,17 @@ function FollowToggle({
   const following = meKey != null && followers.includes(meKey);
   const others = followers.length - (following ? 1 : 0);
   return (
-    <button
+    <Button
       type="button"
+      variant={following ? "active" : "ghost"}
       disabled={readOnly || meKey == null}
       onClick={() => onToggle(!following)}
-      className="text-ink hover:bg-surface-2 flex items-center gap-1.5 rounded px-1.5 py-0.5 text-sm disabled:opacity-50"
       title={following ? "Stop receiving this issue's activity" : "Receive this issue's activity in your inbox"}
     >
       {following ? <BellOff className="size-3.5" /> : <Bell className="size-3.5" />}
       {following ? "Following" : "Follow"}
       {others > 0 && <span className="text-mute">+{others}</span>}
-    </button>
+    </Button>
   );
 }
 
@@ -1136,7 +1136,7 @@ function DueDate({
     value !== null ? { overdue: "text-danger", soon: "text-warn", later: "" }[dueTone(value)] : "";
   return (
     <DatePicker
-      variant="bare"
+      variant="property"
       value={value !== null ? dueToInput(value) : null}
       disabled={readOnly}
       placeholder="None"
@@ -1530,16 +1530,16 @@ function RelRow({
 }) {
   return (
     <div className="group/rel -mx-1 flex items-center gap-2 rounded px-1 py-0.5 text-sm">
-      <button
+      <Button
         onClick={() => onNavigate(row.reff)}
-        className="hover:bg-hover flex min-w-0 flex-1 items-center gap-2 rounded text-left"
+        className="min-w-0 flex-1 shrink justify-start px-1 text-left"
       >
         <span className="flex size-3 shrink-0 items-center justify-center">{icon}</span>
         <span className="text-mute w-16 shrink-0 truncate font-mono text-2xs tabular-nums">
           {row.key_alias ?? row.reff}
         </span>
         <span className="min-w-0 flex-1 truncate">{row.title}</span>
-      </button>
+      </Button>
       {onRemove && (
         <IconButton
           label="Remove relation"
@@ -1743,21 +1743,16 @@ function Comment({
               {(c.reactions ?? []).map((r) => {
                 const mine = meKey !== null && r.actors.includes(meKey);
                 return (
-                  <button
+                  <ChipButton
                     key={r.emoji}
                     disabled={!canAct}
                     onClick={() => c.id && onReact(c.id, r.emoji, !mine)}
                     title={r.actors.map((a) => nameOf(a, memberOf(a))).join(", ")}
                     aria-pressed={mine}
-                    className={`flex items-center gap-1 rounded-full border px-1.5 py-px text-xs ${
-                      mine
-                        ? "border-accent bg-accent/10"
-                        : "border-line hover:border-line-strong"
-                    }`}
                   >
                     {r.emoji}
                     <span className="tabular-nums">{r.actors.length}</span>
-                  </button>
+                  </ChipButton>
                 );
               })}
               {canAct && (
@@ -1767,53 +1762,55 @@ function Comment({
                       footer sideways. */}
                   <Popover.Root open={picking} onOpenChange={setPicking}>
                     <Popover.Trigger asChild>
-                      <button
+                      <IconButton
                         aria-label="Add reaction"
-                        className="text-mute hover:text-fg rounded-full px-1 opacity-0 transition-opacity group-hover/comment:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100"
+                        label="Add reaction"
+                        className="opacity-0 transition-opacity group-hover/comment:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100"
                       >
                         <SmilePlus className="size-3.5" />
-                      </button>
+                      </IconButton>
                     </Popover.Trigger>
                     <PopoverContent align="start" className="flex gap-0.5 p-1">
                       {REACTION_EMOJIS.map((emoji) => (
-                        <button
+                        <Button
                           key={emoji}
                           onClick={() => {
                             setPicking(false);
                             if (c.id) onReact(c.id, emoji, true);
                           }}
                           aria-label={`React ${emoji}`}
-                          className="hover:bg-hover rounded px-1.5 py-1 text-base"
+                          size="icon"
+                          className="text-base"
                         >
                           {emoji}
-                        </button>
+                        </Button>
                       ))}
                     </PopoverContent>
                   </Popover.Root>
                   {/* Replies to a reply re-anchor to the root: one level. */}
                   {!c.parent && (
-                    <button
+                    <InlineAction
                       onClick={() => setReplying("")}
-                      className="text-mute hover:text-fg text-xs opacity-0 transition-opacity group-hover/comment:opacity-100 focus-visible:opacity-100"
+                      className="opacity-0 transition-opacity group-hover/comment:opacity-100 focus-visible:opacity-100"
                     >
                       Reply
-                    </button>
+                    </InlineAction>
                   )}
                   {c.id && (
                     <>
-                      <button
+                      <InlineAction
                         onClick={() => onCopyLink(c.id!)}
-                        className="text-mute hover:text-fg text-xs opacity-0 transition-opacity group-hover/comment:opacity-100 focus-visible:opacity-100"
+                        className="opacity-0 transition-opacity group-hover/comment:opacity-100 focus-visible:opacity-100"
                       >
                         Copy link
-                      </button>
-                      <button
+                      </InlineAction>
+                      <InlineAction
                         onClick={() => onCreateFromComment(c.body)}
                         title="Create a new issue from this comment"
-                        className="text-mute hover:text-fg text-xs opacity-0 transition-opacity group-hover/comment:opacity-100 focus-visible:opacity-100"
+                        className="opacity-0 transition-opacity group-hover/comment:opacity-100 focus-visible:opacity-100"
                       >
                         New issue
-                      </button>
+                      </InlineAction>
                     </>
                   )}
                 </>
@@ -1923,32 +1920,24 @@ function Description({
   }, [draftKey.spaceId, draftKey.reff, draft, editing, value]);
 
   if (readOnly || (!editing && value)) {
-    return (
-      <div
-        className={`min-h-8 ${readOnly ? "" : "hover:bg-hover -mx-2 cursor-text rounded px-2"}`}
-        onClick={(e) => {
-          // A link inside the prose is a link first: following it must not
-          // also flip the paragraph into an editor underneath the new tab.
-          if ((e.target as HTMLElement).closest("a, input")) return;
-          if (!readOnly) setEditing(true);
-        }}
-      >
-        {value ? <Markdown text={value} /> : <span className="text-mute">No description</span>}
-      </div>
+    const content = value ? <Markdown text={value} /> : <span className="text-mute">No description</span>;
+    return readOnly ? (
+      <div className="min-h-10 py-2">{content}</div>
+    ) : (
+      <EditableSurface label="Edit description" onEdit={() => setEditing(true)}>
+        {content}
+      </EditableSurface>
     );
   }
   if (!editing) {
     return (
-      <button
-        onClick={() => setEditing(true)}
-        className="text-mute hover:text-fg -mx-2 rounded px-2 py-1 text-left"
-      >
-        Add description…
-      </button>
+      <EditableSurface label="Add description" onEdit={() => setEditing(true)}>
+        <span className="text-mute">Add description…</span>
+      </EditableSurface>
     );
   }
   return (
-    <textarea
+    <Textarea
       autoFocus
       value={draft}
       rows={5}
@@ -1967,7 +1956,6 @@ function Description({
           setEditing(false);
         }
       }}
-      className="border-line focus:border-line-strong resize-y rounded border bg-transparent p-2 outline-none"
       aria-label="Description"
     />
   );

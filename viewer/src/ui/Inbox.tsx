@@ -13,7 +13,7 @@ import {
 import type { InboxEntry } from "../types";
 import { ApplicationState, EmptyState, LoadingState } from "./AppState";
 import { Combobox } from "./Picker";
-import { Button, Checkbox, PopoverContent } from "./primitives";
+import { Button, Checkbox, IconButton, InlineAction, interactiveRow, PopoverContent } from "./primitives";
 import { short, when } from "./time";
 
 /**
@@ -167,19 +167,19 @@ export function Inbox({
           {unreadCount > 0 && <span className="text-accent"> · {unreadCount} unread</span>}
         </span>
         {unreadCount > 0 && (
-          <button
+          <Button
             onClick={() => void load(true)}
-            className="text-mute hover:text-fg ml-auto flex items-center gap-1.5 text-sm"
+            className="ml-auto"
           >
             <CheckCheck className="size-3.5" />
             Mark {unreadCount === 1 ? "notification" : `all ${unreadCount} notifications`} read
-          </button>
+          </Button>
         )}
         <Popover.Root>
           <Popover.Trigger asChild>
-            <button className="text-mute hover:bg-hover hover:text-fg ml-auto flex min-h-7 items-center gap-1.5 rounded px-2 text-sm" aria-label="Inbox preferences">
+            <Button className="ml-auto" aria-label="Inbox preferences">
               <Settings2 className="size-3.5" /> Preferences
-            </button>
+            </Button>
           </Popover.Trigger>
           <PopoverContent align="end" sideOffset={6} className="w-64 p-3">
               <h2 className="mb-1 text-sm font-medium">Inbox preferences</h2>
@@ -214,7 +214,7 @@ export function Inbox({
                   }
                 />
               </div>
-              {snoozedCount > 0 && <button onClick={() => savePreferences({ ...preferences, snoozed: {} })} className="text-accent mt-3 text-xs">Restore {snoozedCount} snoozed</button>}
+              {snoozedCount > 0 && <InlineAction onClick={() => savePreferences({ ...preferences, snoozed: {} })} className="mt-3">Restore {snoozedCount} snoozed</InlineAction>}
           </PopoverContent>
         </Popover.Root>
       </div>
@@ -259,7 +259,8 @@ export function Inbox({
                 }
               }}
               className={[
-                "border-line/60 hover:bg-hover focus-visible:bg-hover focus-visible:ring-accent/60 group flex cursor-default items-start gap-3 border-b px-4 py-2 outline-none focus-visible:ring-1 focus-visible:ring-inset",
+                interactiveRow({ density: "normal" }),
+                "group flex items-start gap-3 px-4 py-2",
                 // `unread` counts entries past the watermark, and they are the
                 // newest — so the first N are the unread ones.
                 isUnread(e, i) ? "bg-accent/5" : "",
@@ -282,19 +283,18 @@ export function Inbox({
                 </span>
               </span>
               <time className="text-mute shrink-0 text-xs">{when(e.ts)}</time>
-              <button
+              <Button
                 onClick={(event) => {
                   event.stopPropagation();
                   setReadState(e, !isUnread(e, i));
                 }}
-                className="text-mute hover:text-fg min-h-6 shrink-0 rounded px-1 text-xs"
                 aria-label={`${isUnread(e, i) ? "Mark read" : "Mark unread on this device"}: ${e.title}`}
               >
                 {isUnread(e, i) ? "Mark read" : "Mark unread"}
-              </button>
-              <button onClick={(event) => { event.stopPropagation(); snooze(e); }} className="text-mute hover:text-fg min-h-6 shrink-0 rounded px-1 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100" aria-label={`Snooze for one hour: ${e.title}`} title="Snooze 1 hour (S)">
+              </Button>
+              <IconButton label={`Snooze for one hour: ${e.title}`} onClick={(event) => { event.stopPropagation(); snooze(e); }} className="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100">
                 <Timer className="size-3.5" />
-              </button>
+              </IconButton>
             </li>
               ))}
               </ul>

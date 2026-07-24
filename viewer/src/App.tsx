@@ -53,7 +53,6 @@ import { Inbox } from "./ui/Inbox";
 import { IssueSearch, rememberIssue } from "./ui/IssueSearch";
 import { Projects } from "./ui/Projects";
 import { SurfaceHeader } from "./ui/layout";
-import { Members } from "./ui/Members";
 import { Settings } from "./ui/Settings";
 import { IssueDetail } from "./ui/IssueDetail";
 import { IssueList } from "./ui/IssueList";
@@ -1184,12 +1183,17 @@ export function App() {
           onApplySavedView={applySavedView}
           onToggleFavorite={toggleFavorite}
           onCreateProject={api.createProject}
-          onOpenGovernance={api.openWorkflow}
         />
       </Panel>
 
       {/* A 1px seam with a 7px hit area: thin to look at, big enough to grab. */}
-      <Separator className="bg-line data-[state=dragging]:bg-accent hover:bg-accent/60 relative w-px outline-none transition-colors max-[960px]:hidden">
+      <Separator
+        className={
+          view === "settings"
+            ? "pointer-events-none invisible relative w-px max-[960px]:hidden"
+            : "bg-line data-[state=dragging]:bg-accent hover:bg-accent/60 relative w-px outline-none transition-colors max-[960px]:hidden"
+        }
+      >
         <span className="absolute inset-y-0 -left-[3px] w-[7px]" />
       </Separator>
 
@@ -1203,7 +1207,7 @@ export function App() {
         {/* `@container`: the tab labels below collapse on the *header's* own
             width, not the viewport's — the detail pane stealing half the main
             column is what actually crowds this row. */}
-        <SurfaceHeader className="@container">
+        <SurfaceHeader className={view === "settings" ? "hidden" : "@container"}>
           <IconButton label="Toggle sidebar" chord="⌘B" onClick={() => run("view.sidebar")}>
             <PanelLeft className="size-4" />
           </IconButton>
@@ -1220,7 +1224,7 @@ export function App() {
           <h1 className="ml-1 flex min-w-0 items-baseline gap-1.5">
             {liveProjects.length > 1 ? (
               <Combobox
-                variant="bare"
+                variant="property"
                 label="Project"
                 className="font-semibold"
                 value={
@@ -1424,13 +1428,6 @@ export function App() {
                 api.select(reff);
                 setDetail(true);
               }}
-            />
-          ) : view === "members" ? (
-            <Members
-              spaceId={current}
-              revision={revision}
-              readOnly={readOnly}
-              onError={setError}
             />
           ) : view === "settings" ? (
             <Settings
@@ -1727,10 +1724,6 @@ export function App() {
               onToggleFavorite={toggleFavorite}
               onCreateProject={() => {
                 api.createProject();
-                setMobileNav(false);
-              }}
-              onOpenGovernance={() => {
-                api.openWorkflow();
                 setMobileNav(false);
               }}
             />

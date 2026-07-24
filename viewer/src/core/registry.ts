@@ -36,7 +36,6 @@ export type View =
   | "projects"
   | "inbox"
   | "activity"
-  | "members"
   | "settings";
 
 /** The work-view render modes a saved view / the switcher toggles between —

@@ -9,6 +9,7 @@ import type { ActivityEvent, MemberDto } from "../types";
 import { EmptyState, LoadingState } from "./AppState";
 import { memberName } from "./Avatar";
 import { when } from "./time";
+import { Button, interactiveRow } from "./primitives";
 
 /**
  * The space feed.
@@ -87,12 +88,11 @@ export function Activity({
     <ul className="min-h-0 flex-1 overflow-y-auto">
       {events.length > visibleCount && (
         <li className="border-line/60 border-b p-2 text-center">
-          <button
-            className="text-accent rounded px-2 py-1 text-sm"
+          <Button
             onClick={() => setVisibleCount((count) => count + 80)}
           >
             Show {Math.min(80, events.length - visibleCount)} older changes
-          </button>
+          </Button>
         </li>
       )}
       {/* Newest first: the feed answers "what just happened", not "what happened". */}
@@ -106,7 +106,7 @@ export function Activity({
             if (event.key === "Enter") onOpen(e.reff);
           }}
           tabIndex={0}
-          className="border-line/60 hover:bg-hover focus-visible:bg-hover focus-visible:ring-accent/60 flex cursor-default items-start gap-3 border-b px-4 py-2.5 outline-none focus-visible:ring-1 focus-visible:ring-inset"
+          className={`${interactiveRow({ density: "normal" })} flex items-start gap-3 px-4 py-2.5`}
         >
           <span className="text-mute w-20 shrink-0 truncate font-mono text-xs tabular-nums">
             {e.reff}

@@ -13,18 +13,16 @@ import {
   LayoutGrid,
   FolderKanban,
   Plus,
-  Settings2,
   Star,
   StarOff,
   UserRound,
-  Users,
 } from "lucide-react";
 
 import type { View } from "../core/registry";
 import type { SavedView } from "../core/savedViews";
 import type { ProjectDto, SpaceRow } from "../types";
 import { catalogColor } from "./colors";
-import { cn, IconButton } from "./primitives";
+import { Badge, cn, IconButton, navigationItem } from "./primitives";
 
 /** Linear-shaped navigation over lait's local identities and projects. */
 export function Sidebar({
@@ -48,7 +46,6 @@ export function Sidebar({
   onApplySavedView,
   onToggleFavorite,
   onCreateProject,
-  onOpenGovernance,
 }: {
   spaces: SpaceRow[];
   current: string | null;
@@ -73,7 +70,6 @@ export function Sidebar({
   onApplySavedView: (view: SavedView) => void;
   onToggleFavorite: (key: string) => void;
   onCreateProject: () => void;
-  onOpenGovernance: () => void;
 }) {
   const space = spaces.find((s) => s.id === current) ?? null;
   const agent = space?.identity.kind === "agent" ? space.identity.name : null;
@@ -101,6 +97,7 @@ export function Sidebar({
         memberCount={memberCount}
         membership={membership}
         onPick={onPickSpace}
+        onOpenSettings={() => onGo("settings")}
       />
 
       {agent && (
@@ -199,11 +196,6 @@ export function Sidebar({
         )}
       </div>
 
-      <div className="border-line mt-2 flex flex-col gap-px border-t pt-2">
-        <NavItem icon={<Users />} label="Members" active={view === "members"} onClick={() => onGo("members")} />
-        <NavItem icon={<Cog />} label="Settings" active={view === "settings"} onClick={() => onGo("settings")} />
-        <NavItem icon={<Settings2 />} label="Governance" onClick={onOpenGovernance} />
-      </div>
     </nav>
   );
 }
@@ -215,6 +207,7 @@ function SpaceSwitcher({
   memberCount,
   membership,
   onPick,
+  onOpenSettings,
 }: {
   spaces: SpaceRow[];
   current: string | null;
@@ -222,6 +215,7 @@ function SpaceSwitcher({
   memberCount?: number | undefined;
   membership?: string | null | undefined;
   onPick: (id: string) => void;
+  onOpenSettings: () => void;
 }) {
   const selected = spaces.find((s) => s.id === current) ?? null;
   return (
@@ -270,6 +264,21 @@ function SpaceSwitcher({
             </button>
           ))
         )}
+        {selected && (
+          <>
+            <div className="bg-line my-1 h-px" />
+            <button
+              onClick={(event) => {
+                onOpenSettings();
+                event.currentTarget.closest("details")?.removeAttribute("open");
+              }}
+              className="text-dim hover:bg-hover hover:text-fg flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm"
+            >
+              <Cog className="text-mute size-3.5" />
+              Workspace settings
+            </button>
+          </>
+        )}
       </div>
     </details>
   );
@@ -296,8 +305,7 @@ function ProjectRow({
       <button
         onClick={() => onPick(project.key)}
         className={cn(
-          "flex h-7 w-full min-w-0 items-center gap-2 rounded px-2 text-left text-sm",
-          active ? "bg-active text-fg" : "text-dim hover:bg-hover hover:text-fg",
+          navigationItem({ selected: active }),
         )}
       >
         <span className="size-2 shrink-0 rounded-sm" style={{ background: catalogColor(project.color) }} />
@@ -337,14 +345,15 @@ function NavItem({ icon, label, active, badge, compact, onClick }: { icon: React
       onClick={onClick}
       aria-current={active ? "page" : undefined}
       className={cn(
-        "flex w-full items-center gap-2 rounded px-2 text-left text-sm",
-        compact ? "h-6" : "h-7",
-        active ? "bg-active text-fg" : "text-dim hover:bg-hover hover:text-fg",
+        navigationItem({
+          selected: active,
+          density: compact ? "compact" : "normal",
+        }),
       )}
     >
       <span className="text-mute [&>svg]:size-3.5">{icon}</span>
       <span className="min-w-0 flex-1 truncate">{label}</span>
-      {!!badge && <span className="bg-accent text-accent-fg min-w-4 rounded-full px-1 text-center text-2xs tabular-nums">{badge}</span>}
+      {!!badge && <Badge tone="accent" className="justify-center tabular-nums">{badge}</Badge>}
     </button>
   );
 }

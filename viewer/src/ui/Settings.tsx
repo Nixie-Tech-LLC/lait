@@ -8,6 +8,7 @@ import {
   SlidersHorizontal,
   Tag,
   Trash2,
+  Users,
   X,
 } from "lucide-react";
 
@@ -19,10 +20,11 @@ import { ColorPicker } from "./ColorPicker";
 import * as ask from "./dialogs";
 import { StatusIcon } from "./icons";
 import { SurfaceHeader } from "./layout";
+import { Members } from "./Members";
 import { Combobox } from "./Picker";
-import { Button, IconButton } from "./primitives";
+import { Button, cn, IconButton, Input, navigationItem, Textarea } from "./primitives";
 
-type Tab = "general" | "labels" | "workflow" | "access";
+type Tab = "general" | "members" | "labels" | "workflow" | "access";
 
 /**
  * The settings surface — the place a space is administered like an application.
@@ -60,8 +62,9 @@ export function Settings({
   // Read the initial tab from `?tab=` so a settings sub-page is deep-linkable
   // (and reliably reachable by a headless driver via `open`, no click needed).
   const [tab, setTabState] = useState<Tab>(() => {
+    if (window.location.pathname.split("/").filter(Boolean).at(-1) === "members") return "members";
     const t = new URLSearchParams(window.location.search).get("tab");
-    return t === "labels" || t === "workflow" || t === "access" ? t : "general";
+    return t === "members" || t === "labels" || t === "workflow" || t === "access" ? t : "general";
   });
   const setTab = (next: Tab) => {
     setTabState(next);
@@ -74,13 +77,14 @@ export function Settings({
   useEffect(() => {
     const onNav = (event: Event) => {
       const t = (event as CustomEvent).detail?.tab;
-      if (t === "general" || t === "labels" || t === "workflow" || t === "access") setTab(t);
+      if (t === "general" || t === "members" || t === "labels" || t === "workflow" || t === "access") setTab(t);
     };
     window.addEventListener("lait:nav", onNav as EventListener);
     return () => window.removeEventListener("lait:nav", onNav as EventListener);
   }, []);
   const tabs: { id: Tab; label: string; icon: React.ReactNode }[] = [
     { id: "general", label: "General", icon: <SlidersHorizontal className="size-3.5" /> },
+    { id: "members", label: "Members", icon: <Users className="size-3.5" /> },
     { id: "labels", label: "Labels", icon: <Tag className="size-3.5" /> },
     { id: "workflow", label: "Workflow", icon: <Palette className="size-3.5" /> },
     { id: "access", label: "Roles & access", icon: <ShieldCheck className="size-3.5" /> },
@@ -100,9 +104,7 @@ export function Settings({
             <button
               key={t.id}
               onClick={() => setTab(t.id)}
-              className={`flex h-8 items-center gap-2 rounded px-2 text-left text-sm ${
-                tab === t.id ? "bg-active text-fg" : "text-dim hover:bg-hover hover:text-fg"
-              }`}
+              className={cn(navigationItem({ selected: tab === t.id, density: "roomy" }))}
             >
               {t.icon}
               {t.label}
@@ -118,6 +120,15 @@ export function Settings({
                 spaceDescription={spaceDescription}
                 readOnly={readOnly}
                 onError={onError}
+              />
+            )}
+            {tab === "members" && (
+              <Members
+                spaceId={spaceId}
+                revision={revision}
+                readOnly={readOnly}
+                onError={onError}
+                embedded
               />
             )}
             {tab === "labels" && (
@@ -207,11 +218,11 @@ function GeneralPanel({
     <>
       <Section title="Space name" hint="A mutable display label. The space's identity (below) never changes.">
         <div className="flex items-center gap-2">
-          <input
+          <Input
             value={name}
             disabled={readOnly}
             onChange={(e) => setName(e.target.value)}
-            className="border-line focus:border-line-strong w-full max-w-sm rounded border bg-transparent px-2 py-1.5 text-sm outline-none disabled:opacity-50"
+            className="max-w-sm"
             aria-label="Space name"
           />
           <Button variant="primary" size="md" disabled={!dirty || readOnly} loading={saving} onClick={() => void save()}>
@@ -221,13 +232,12 @@ function GeneralPanel({
       </Section>
       <Section title="Description" hint="A short overview of what this space is for. Shared with everyone in the space.">
         <div className="flex max-w-lg flex-col items-start gap-2">
-          <textarea
+          <Textarea
             value={description}
             disabled={readOnly}
             rows={3}
             placeholder="What is this space for? Goals, scope, links…"
             onChange={(e) => setDescription(e.target.value)}
-            className="border-line focus:border-line-strong placeholder:text-mute w-full resize-y rounded border bg-transparent px-2 py-1.5 text-sm outline-none disabled:opacity-50"
             aria-label="Space description"
           />
           {!readOnly && (

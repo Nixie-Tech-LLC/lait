@@ -10,7 +10,7 @@ import { DatePicker } from "./DatePicker";
 import { Markdown } from "./Markdown";
 import { Combobox } from "./Picker";
 import { PropertyRow, SurfaceHeader } from "./layout";
-import { Button, IconButton, PopoverContent } from "./primitives";
+import { Button, EditableSurface, IconButton, PopoverContent, Textarea } from "./primitives";
 import { when } from "./time";
 import * as Popover from "@radix-ui/react-popover";
 
@@ -167,7 +167,7 @@ export function ProjectOverview({
           <dl className="flex flex-col gap-1 text-sm md:border-l md:border-line md:pl-6">
             <PropertyRow label="Lead">
               <Combobox
-                variant="bare"
+                variant="property"
                 label="Lead"
                 disabled={readOnly}
                 value={
@@ -195,7 +195,7 @@ export function ProjectOverview({
             </PropertyRow>
             <PropertyRow label="Start">
               <DatePicker
-                variant="bare"
+                variant="property"
                 value={toInput(project.start_date)}
                 disabled={readOnly}
                 placeholder="—"
@@ -205,7 +205,7 @@ export function ProjectOverview({
             </PropertyRow>
             <PropertyRow label="Target">
               <DatePicker
-                variant="bare"
+                variant="property"
                 value={toInput(project.target_date)}
                 disabled={readOnly}
                 placeholder="—"
@@ -253,26 +253,27 @@ function Description({
   }, [value, editing]);
 
   if (readOnly || !editing) {
-    return (
-      <div
-        className={`min-h-16 ${readOnly ? "" : "hover:bg-hover -mx-2 cursor-text rounded px-2 py-1"}`}
-        onClick={(e) => {
-          if ((e.target as HTMLElement).closest("a")) return;
-          if (!readOnly) setEditing(true);
-        }}
+    const content = value ? (
+      <Markdown text={value} />
+    ) : (
+      <span className="text-mute">
+        {readOnly ? "No description" : "Add a project overview…"}
+      </span>
+    );
+    return readOnly ? (
+      <div className="min-h-16 py-2">{content}</div>
+    ) : (
+      <EditableSurface
+        label="Edit project overview"
+        className="min-h-16"
+        onEdit={() => setEditing(true)}
       >
-        {value ? (
-          <Markdown text={value} />
-        ) : (
-          <span className="text-mute">
-            {readOnly ? "No description" : "Add a project overview…"}
-          </span>
-        )}
-      </div>
+        {content}
+      </EditableSurface>
     );
   }
   return (
-    <textarea
+    <Textarea
       autoFocus
       value={draft}
       rows={8}
@@ -288,7 +289,6 @@ function Description({
           setEditing(false);
         }
       }}
-      className="border-line focus:border-line-strong placeholder:text-mute w-full resize-y rounded border bg-transparent p-2 outline-none"
       aria-label="Project description"
     />
   );
@@ -416,7 +416,7 @@ function Milestones({
             aria-label="New milestone name"
           />
           <DatePicker
-            variant="bare"
+            variant="property"
             value={target}
             placeholder="Target"
             ariaLabel="Milestone target date"

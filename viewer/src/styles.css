@@ -22,7 +22,7 @@
   --color-bg: light-dark(#ffffff, #0b0b0d);
   --color-raised: light-dark(#fafafa, #131316);
   --color-hover: light-dark(#f2f2f4, #1a1a1f);
-  --color-active: light-dark(#e9e9ee, #202027);
+  --color-active: light-dark(#ededf0, #202027);
   --color-line: light-dark(#e6e6ea, #26262d);
   --color-line-strong: light-dark(#d2d2d9, #34343d);
 
@@ -51,9 +51,13 @@
      depends on; rows are tight and the spacing has to be predictable. */
   --spacing: 4px;
 
-  --radius-sm: 4px;
-  --radius-DEFAULT: 6px;
-  --radius-lg: 10px;
+  /* Tailwind v4 generates `rounded-*` from named radius tokens. There is no
+     `radius-DEFAULT` namespace entry, so the old 6px value never reached the
+     common `rounded` utility. Keep a deliberate three-step hierarchy instead:
+     tight marks, ordinary controls, floating surfaces. */
+  --radius-sm: 3px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
 
   --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;

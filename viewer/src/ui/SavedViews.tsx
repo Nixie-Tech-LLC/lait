@@ -6,7 +6,7 @@ import type { DisplayState } from "../core/display";
 import type { FilterState } from "../core/filter";
 import type { WorkView } from "../core/registry";
 import { loadSavedViews, removeView, saveView, type SavedView } from "../core/savedViews";
-import { Button, IconButton, PopoverContent } from "./primitives";
+import { Button, IconButton, Input, navigationItem, PopoverContent } from "./primitives";
 
 export function SavedViews({ space, project, view, filter, display, onApply, onChange }: { space: string; project: string; view: WorkView; filter: FilterState; display: DisplayState; onApply: (view: SavedView) => void; onChange?: () => void }) {
   const [views, setViews] = useState(() => loadSavedViews(space, project));
@@ -40,9 +40,9 @@ export function SavedViews({ space, project, view, filter, display, onApply, onC
           ) : (
             <div className="mb-2 flex max-h-52 flex-col gap-px overflow-y-auto">
               {views.map((view) => (
-                <div key={view.id} className="group/view hover:bg-hover flex items-center rounded">
-                  <button onClick={() => onApply(view)} className="min-w-0 flex-1 truncate px-2 py-1.5 text-left text-sm">{view.name}</button>
-                  <IconButton label={`Delete ${view.name}`} className="opacity-0 group-hover/view:opacity-100 focus-visible:opacity-100" onClick={() => { setViews(removeView(space, project, view.id)); onChange?.(); }}>
+                <div key={view.id} className="group/view relative">
+                  <button onClick={() => onApply(view)} className={`${navigationItem()} pr-8`}>{view.name}</button>
+                  <IconButton label={`Delete ${view.name}`} className="absolute top-0.5 right-0.5 opacity-0 group-hover/view:opacity-100 focus-visible:opacity-100" onClick={() => { setViews(removeView(space, project, view.id)); onChange?.(); }}>
                     <Trash2 className="size-3" />
                   </IconButton>
                 </div>
@@ -50,7 +50,7 @@ export function SavedViews({ space, project, view, filter, display, onApply, onC
             </div>
           )}
           <div className="border-line flex items-center gap-1 border-t pt-2">
-            <input value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(event) => event.key === "Enter" && create()} placeholder="Name this view…" className="placeholder:text-mute min-w-0 flex-1 bg-transparent px-2 py-1 outline-none" />
+            <Input size="sm" value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(event) => event.key === "Enter" && create()} placeholder="Name this view…" className="min-w-0 flex-1" />
             <Button variant="outline" disabled={!name.trim()} onClick={create}>
               <Plus className="size-3" /> Save
             </Button>

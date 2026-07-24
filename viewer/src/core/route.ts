@@ -34,7 +34,6 @@ const VIEWS = new Set<View>([
   "projects",
   "inbox",
   "activity",
-  "members",
   "settings",
 ]);
 const LAST_ROUTE = "lait.last-route";
@@ -54,7 +53,14 @@ export function parseRoute(location: Pick<Location, "pathname" | "search">): Vie
   if (parts[0] !== "spaces" || !parts[1]) return DEFAULT_ROUTE;
 
   const candidate = parts[2];
-  const view = candidate && VIEWS.has(candidate as View) ? (candidate as View) : "list";
+  // Members used to be a root destination. It now lives inside workspace
+  // settings; old bookmarks still land in Settings instead of a project list.
+  const view =
+    candidate === "members"
+      ? "settings"
+      : candidate && VIEWS.has(candidate as View)
+        ? (candidate as View)
+        : "list";
   const query = new URLSearchParams(location.search);
   const filter: FilterState = {
     text: clean(query.get("q")) ?? "",
@@ -69,11 +75,11 @@ export function parseRoute(location: Pick<Location, "pathname" | "search">): Vie
 
   return {
     spaceId: parts[1],
-    project: clean(query.get("project")),
+    project: carriesProjectScope(view) ? clean(query.get("project")) : null,
     view,
     issue,
     ...(focused ? { focused: true } : {}),
-    ...(isActive(filter) ? { filter } : {}),
+    ...(carriesProjectScope(view) && isActive(filter) ? { filter } : {}),
   };
 }
 
@@ -81,12 +87,12 @@ export function formatRoute(route: ViewerRoute): string {
   if (!route.spaceId) return "/";
 
   const query = new URLSearchParams();
-  if (route.project) query.set("project", route.project);
+  if (route.project && carriesProjectScope(route.view)) query.set("project", route.project);
   if (route.issue && (route.view === "list" || route.view === "board")) {
     query.set("issue", route.issue);
     if (route.focused) query.set("focus", "1");
   }
-  if (route.filter && isActive(route.filter)) {
+  if (carriesProjectScope(route.view) && route.filter && isActive(route.filter)) {
     if (route.filter.text.trim()) query.set("q", route.filter.text.trim());
     if (route.filter.mine) query.set("mine", "1");
     if (route.filter.label) query.set("label", route.filter.label);
@@ -150,4 +156,10 @@ function decode(value: string): string {
   } catch {
     return value;
   }
+}
+
+/** Only issue arrangements are scoped to one project. Workspace destinations
+ * must never inherit a stale project in their canonical URL. */
+function carriesProjectScope(view: View): boolean {
+  return view === "list" || view === "board" || view === "calendar";
 }
